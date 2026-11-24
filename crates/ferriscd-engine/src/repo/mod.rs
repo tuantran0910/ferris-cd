@@ -3,6 +3,7 @@
 //! This module defines the backend-agnostic [`GitClient`] trait so the GitOps engine
 //! and tests never depend directly on `gix` types.
 
+pub(crate) mod auth;
 pub mod cache;
 pub mod error;
 pub mod gix_client;

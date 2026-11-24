@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicBool;
 
 use tempfile::TempDir;
 
+use super::auth::AuthContext;
 use super::error::RepoError;
 use super::types::{
     GitSource, RepoCheckout, RepoCredentials, RepoUrlPolicy, ResolvedRevision, validate_commit_sha,
@@ -35,11 +36,36 @@ pub struct GixGitClientConfig {
     /// Optional parent directory for temporary bare repositories and checked-out worktrees.
     /// When `None`, the operating system's temporary directory is used.
     pub work_root: Option<PathBuf>,
+    /// Permits SSH key credentials without a `known_hosts` entry (**insecure; tests only**).
+    ///
+    /// Defaults to `false`: production transports MUST verify host keys. With the default, a
+    /// missing or whitespace-only `known_hosts` is a terminal
+    /// [`RepoError::HostKeyVerificationFailed`] and the generated SSH command pins
+    /// `StrictHostKeyChecking=yes`.
+    ///
+    /// Enabling this flag does two things:
+    ///
+    /// * a missing `known_hosts` is accepted instead of rejected, and
+    /// * the generated command switches to `StrictHostKeyChecking=accept-new`
+    ///   (trust-on-first-use), so the connection can actually proceed against a host that is
+    ///   not yet known.
+    ///
+    /// `UserKnownHostsFile=<scratch>/known_hosts` and `BatchMode=yes` are still applied, so the
+    /// operator's real `~/.ssh` files are neither read nor written. This flag still removes the
+    /// MITM protection that host key verification provides: enable it only in tests or in a
+    /// trusted development environment.
+    pub allow_missing_known_hosts: bool,
+    /// SSH program used for `ssh://` and SCP-style remotes.
+    ///
+    /// Defaults to `None`, which resolves to `ssh` from `PATH`. The override exists so tests
+    /// (and embedded environments) can inject a recording/fake program without mutating the
+    /// process-wide `PATH` or `GIT_SSH_COMMAND` environment.
+    pub ssh_program: Option<PathBuf>,
 }
 
 impl GixGitClientConfig {
-    /// Creates a new configuration with default settings ([`RepoUrlPolicy::Production`] and
-    /// system temp directory).
+    /// Creates a new configuration with default settings ([`RepoUrlPolicy::Production`],
+    /// system temp directory, strict host key verification, `ssh` from `PATH`).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -58,10 +84,88 @@ impl GixGitClientConfig {
         self.work_root = Some(work_root.into());
         self
     }
+
+    /// Allows SSH key credentials without a `known_hosts` entry (**insecure; tests only**).
+    ///
+    /// Also downgrades the generated SSH command from `StrictHostKeyChecking=yes` to
+    /// `StrictHostKeyChecking=accept-new` (trust-on-first-use) so the connection can proceed;
+    /// see [`GixGitClientConfig::allow_missing_known_hosts`].
+    #[must_use]
+    pub fn with_allow_missing_known_hosts(mut self, allow: bool) -> Self {
+        self.allow_missing_known_hosts = allow;
+        self
+    }
+
+    /// Overrides the SSH program used for SSH remotes (mainly for tests/embedded use).
+    #[must_use]
+    pub fn with_ssh_program(mut self, ssh_program: impl Into<PathBuf>) -> Self {
+        self.ssh_program = Some(ssh_program.into());
+        self
+    }
+
+    /// Snapshot of the owned inputs needed by the blocking layer.
+    fn blocking_options(&self) -> BlockingOptions {
+        BlockingOptions {
+            url_policy: self.url_policy,
+            work_root: self.work_root.clone(),
+            allow_missing_known_hosts: self.allow_missing_known_hosts,
+            ssh_program: self.ssh_program.clone(),
+        }
+    }
+}
+
+/// Owned, `Send + 'static` inputs handed to the blocking worker.
+#[derive(Debug, Clone)]
+struct BlockingOptions {
+    url_policy: RepoUrlPolicy,
+    work_root: Option<PathBuf>,
+    allow_missing_known_hosts: bool,
+    ssh_program: Option<PathBuf>,
+}
+
+impl BlockingOptions {
+    /// Builds the [`AuthContext`] for one blocking operation.
+    ///
+    /// Created here (never on a Tokio worker) so the ephemeral SSH key/`known_hosts` file I/O
+    /// and zeroization happen on the blocking pool.
+    fn auth_context(
+        &self,
+        url: &gix::Url,
+        creds: &RepoCredentials,
+    ) -> Result<AuthContext, RepoError> {
+        AuthContext::new(
+            creds,
+            url,
+            self.allow_missing_known_hosts,
+            self.ssh_program.as_deref(),
+        )
+    }
+
+    /// Borrows this operation's inputs together with its [`AuthContext`].
+    fn context<'a>(&'a self, auth: &'a AuthContext) -> BlockingContext<'a> {
+        BlockingContext {
+            url_policy: self.url_policy,
+            work_root: self.work_root.as_deref(),
+            auth,
+        }
+    }
+}
+
+/// Borrowed per-operation context threaded through the blocking helpers.
+struct BlockingContext<'a> {
+    url_policy: RepoUrlPolicy,
+    work_root: Option<&'a Path>,
+    auth: &'a AuthContext,
 }
 
 /// Pure-Rust `gix`-backed [`GitClient`] implementation supporting local (`file://` / path when
-/// permitted by policy) and unauthenticated HTTPS repositories.
+/// permitted by policy), HTTPS (anonymous, bearer token, or basic), and SSH-key repositories.
+///
+/// Credentials never appear in the clone URL, on-disk `.git/config`, `Debug` output, or error
+/// messages: HTTPS identities flow exclusively through the [`gix`] credential callback, and SSH
+/// key material is confined to an ephemeral `0600` file inside a [`super::auth::TempKeyGuard`]
+/// scratch directory that is zeroized and deleted when the blocking operation ends. See
+/// [`super::auth`] for the full transport-hardening design.
 #[derive(Debug, Clone, Default)]
 pub struct GixGitClient {
     config: GixGitClientConfig,
@@ -89,15 +193,14 @@ impl GitClient for GixGitClient {
     ) -> RepoFuture<'a, ResolvedRevision> {
         Box::pin(async move {
             src.validate(self.config.url_policy)?;
-            ensure_anonymous_credentials(creds)?;
 
             let url = parse_gix_url(&src.repo_url, self.config.url_policy)?;
             let target_revision = src.target_revision.clone();
-            let url_policy = self.config.url_policy;
-            let work_root = self.config.work_root.clone();
+            let options = self.config.blocking_options();
+            let creds = creds.clone();
 
             run_blocking("resolve_revision", move || {
-                resolve_revision_blocking(url, target_revision, url_policy, work_root.as_deref())
+                resolve_revision_blocking(url, target_revision, &creds, &options)
             })
             .await
         })
@@ -112,7 +215,6 @@ impl GitClient for GixGitClient {
         Box::pin(async move {
             src.validate(self.config.url_policy)?;
             validate_commit_sha(sha)?;
-            ensure_anonymous_credentials(creds)?;
 
             let url = parse_gix_url(&src.repo_url, self.config.url_policy)?;
             let target_oid = gix::ObjectId::from_hex(sha.as_bytes()).map_err(|err| {
@@ -123,8 +225,8 @@ impl GitClient for GixGitClient {
             })?;
             let target_revision = src.target_revision.clone();
             let sha_owned = sha.to_owned();
-            let url_policy = self.config.url_policy;
-            let work_root = self.config.work_root.clone();
+            let options = self.config.blocking_options();
+            let creds = creds.clone();
 
             run_blocking("checkout", move || {
                 checkout_blocking(
@@ -132,8 +234,8 @@ impl GitClient for GixGitClient {
                     target_revision,
                     sha_owned,
                     target_oid,
-                    url_policy,
-                    work_root.as_deref(),
+                    &creds,
+                    &options,
                 )
             })
             .await
@@ -153,17 +255,6 @@ where
         }),
         Err(join_err) => Err(RepoError::RepositoryError {
             message: format!("git {op_name} worker panicked: {join_err}"),
-        }),
-    }
-}
-
-fn ensure_anonymous_credentials(creds: &RepoCredentials) -> Result<(), RepoError> {
-    match creds {
-        RepoCredentials::Anonymous => Ok(()),
-        other => Err(RepoError::AuthFailed {
-            reason: format!(
-                "authenticated HTTPS/SSH transports ({other}) are not yet configured for this client"
-            ),
         }),
     }
 }
@@ -197,12 +288,6 @@ fn parse_gix_url(raw_url: &str, policy: RepoUrlPolicy) -> Result<gix::Url, RepoE
         url: raw_url.to_owned(),
         reason: format!("failed to parse repository URL: {err:#}"),
     })?;
-
-    if parsed.scheme == gix::url::Scheme::Ssh {
-        return Err(RepoError::AuthFailed {
-            reason: "SSH transport is not yet configured for this client".to_owned(),
-        });
-    }
 
     if parsed.scheme == gix::url::Scheme::File {
         if !matches!(policy, RepoUrlPolicy::AllowLocal) {
@@ -265,16 +350,24 @@ fn create_temp_dir(work_root: Option<&Path>) -> Result<TempDir, RepoError> {
 
 fn init_isolated_bare_repo(
     dir: &Path,
-    url_policy: RepoUrlPolicy,
+    ctx: &BlockingContext<'_>,
 ) -> Result<gix::Repository, RepoError> {
     let mut overrides: Vec<gix::bstr::BString> = vec![
         "protocol.allow=never".into(),
         "protocol.https.allow=always".into(),
+        // SSH is a production transport (key + strict host key verification enforced by
+        // `AuthContext`), so it is always allowed. `protocol.git://` stays disabled.
+        "protocol.ssh.allow=always".into(),
         "http.followRedirects=false".into(),
     ];
-    if matches!(url_policy, RepoUrlPolicy::AllowLocal) {
+    if matches!(ctx.url_policy, RepoUrlPolicy::AllowLocal) {
         overrides.push("protocol.file.allow=always".into());
     }
+    // `core.sshCommand` is the configuration equivalent of `GIT_SSH_COMMAND`; applying it as a
+    // per-repository override keeps secret key paths out of `.git/config` on disk and out of
+    // the process environment.
+    overrides.extend(ctx.auth.config_overrides());
+
     let open_options = gix::open::Options::isolated().config_overrides(overrides);
     gix::ThreadSafeRepository::init_opts(
         dir,
@@ -302,12 +395,13 @@ fn fetch_ref_map(
     repo: &gix::Repository,
     url: gix::Url,
     refspecs: &[&str],
+    ctx: &BlockingContext<'_>,
 ) -> Result<gix::remote::fetch::RefMap, RepoError> {
     let remote = open_remote(repo, url, refspecs)?;
     let connection = remote
         .connect(gix::remote::Direction::Fetch)
         .map_err(map_gix_error)?
-        .with_credentials(|_action| Ok(None));
+        .with_credentials(ctx.auth.credentials_callback());
     let (ref_map, _handshake) = connection
         .ref_map(&mut gix::progress::Discard, Default::default())
         .map_err(map_gix_error)?;
@@ -329,12 +423,13 @@ fn fetch_with_refspecs(
     url: gix::Url,
     refspecs: &[&str],
     shallow: gix::remote::fetch::Shallow,
+    ctx: &BlockingContext<'_>,
 ) -> Result<(), FetchStageError> {
     let remote = open_remote(repo, url, refspecs).map_err(FetchStageError::ConnectOrRefMap)?;
     let connection = remote
         .connect(gix::remote::Direction::Fetch)
         .map_err(|err| FetchStageError::ConnectOrRefMap(map_gix_error(err)))?
-        .with_credentials(|_action| Ok(None));
+        .with_credentials(ctx.auth.credentials_callback());
 
     let pending = connection
         .prepare_fetch(&mut gix::progress::Discard, Default::default())
@@ -355,11 +450,14 @@ fn fetch_with_refspecs(
 fn resolve_revision_blocking(
     url: gix::Url,
     target_revision: String,
-    url_policy: RepoUrlPolicy,
-    work_root: Option<&Path>,
+    creds: &RepoCredentials,
+    options: &BlockingOptions,
 ) -> Result<ResolvedRevision, RepoError> {
-    let bare_dir = create_temp_dir(work_root)?;
-    let repo = init_isolated_bare_repo(bare_dir.path(), url_policy)?;
+    let auth = options.auth_context(&url, creds)?;
+    let ctx = options.context(&auth);
+
+    let bare_dir = create_temp_dir(ctx.work_root)?;
+    let repo = init_isolated_bare_repo(bare_dir.path(), &ctx)?;
 
     if validate_commit_sha(&target_revision).is_ok() {
         let target_oid = gix::ObjectId::from_hex(target_revision.as_bytes()).map_err(|err| {
@@ -368,14 +466,7 @@ fn resolve_revision_blocking(
                 reason: format!("invalid commit SHA: {err}"),
             }
         })?;
-        return resolve_sha_revision(
-            &repo,
-            url,
-            target_revision,
-            target_oid,
-            url_policy,
-            work_root,
-        );
+        return resolve_sha_revision(&repo, url, target_revision, target_oid, &ctx);
     }
 
     let branch_candidate = format!("refs/heads/{target_revision}");
@@ -388,7 +479,7 @@ fn resolve_revision_blocking(
         vec![branch_candidate.as_str(), tag_candidate.as_str()]
     };
 
-    let ref_map = fetch_ref_map(&repo, url.clone(), &refspecs)?;
+    let ref_map = fetch_ref_map(&repo, url.clone(), &refspecs, &ctx)?;
     let matched =
         find_matching_remote_ref(&ref_map.remote_refs, &target_revision).ok_or_else(|| {
             RepoError::RevisionNotFound {
@@ -396,8 +487,7 @@ fn resolve_revision_blocking(
             }
         })?;
 
-    let commit_sha =
-        resolve_matched_ref(&repo, url, matched, &target_revision, url_policy, work_root)?;
+    let commit_sha = resolve_matched_ref(&repo, url, matched, &target_revision, &ctx)?;
     validate_commit_sha(&commit_sha)?;
 
     Ok(ResolvedRevision {
@@ -445,8 +535,7 @@ fn resolve_matched_ref(
     url: gix::Url,
     matched: &gix::protocol::handshake::Ref,
     requested_revision: &str,
-    url_policy: RepoUrlPolicy,
-    work_root: Option<&Path>,
+    ctx: &BlockingContext<'_>,
 ) -> Result<String, RepoError> {
     use gix::bstr::ByteSlice;
     use gix::protocol::handshake::Ref;
@@ -470,15 +559,7 @@ fn resolve_matched_ref(
                             "remote ref name for '{requested_revision}' is not valid UTF-8"
                         ),
                     })?;
-                fetch_ref_and_peel_to_commit(
-                    repo,
-                    url,
-                    ref_name,
-                    *object,
-                    requested_revision,
-                    url_policy,
-                    work_root,
-                )
+                fetch_ref_and_peel_to_commit(repo, url, ref_name, *object, requested_revision, ctx)
             }
         }
         Ref::Symbolic {
@@ -507,8 +588,7 @@ fn resolve_matched_ref(
                     ref_name,
                     start_oid,
                     requested_revision,
-                    url_policy,
-                    work_root,
+                    ctx,
                 )
             }
         }
@@ -527,15 +607,7 @@ fn resolve_matched_ref(
                         "remote ref name for '{requested_revision}' is not valid UTF-8"
                     ),
                 })?;
-            fetch_ref_and_peel_to_commit(
-                repo,
-                url,
-                ref_name,
-                *tag,
-                requested_revision,
-                url_policy,
-                work_root,
-            )
+            fetch_ref_and_peel_to_commit(repo, url, ref_name, *tag, requested_revision, ctx)
         }
     }
 }
@@ -545,11 +617,10 @@ fn fetch_ref_with_shallow_fallback(
     url: gix::Url,
     ref_name: &str,
     requested_revision: &str,
-    url_policy: RepoUrlPolicy,
-    work_root: Option<&Path>,
+    ctx: &BlockingContext<'_>,
 ) -> Result<Option<(TempDir, gix::Repository)>, RepoError> {
     let shallow = gix::remote::fetch::Shallow::DepthAtRemote(NonZeroU32::MIN);
-    match fetch_with_refspecs(repo, url.clone(), &[ref_name], shallow) {
+    match fetch_with_refspecs(repo, url.clone(), &[ref_name], shallow, ctx) {
         Ok(()) => Ok(None),
         Err(FetchStageError::ConnectOrRefMap(err)) => Err(err),
         Err(FetchStageError::MissingRequiredMapping) => Err(RepoError::RevisionNotFound {
@@ -561,13 +632,14 @@ fn fetch_ref_with_shallow_fallback(
             }
             // Some servers reject `deepen 1` on non-commit targets (e.g. tag -> blob/tree);
             // fall back on a clean bare repo with `Shallow::NoChange` so we can inspect the object kind.
-            let fallback_dir = create_temp_dir(work_root)?;
-            let fallback_repo = init_isolated_bare_repo(fallback_dir.path(), url_policy)?;
+            let fallback_dir = create_temp_dir(ctx.work_root)?;
+            let fallback_repo = init_isolated_bare_repo(fallback_dir.path(), ctx)?;
             fetch_with_refspecs(
                 &fallback_repo,
                 url,
                 &[ref_name],
                 gix::remote::fetch::Shallow::NoChange,
+                ctx,
             )
             .map_err(fetch_stage_error_into_repo_error(requested_revision))?;
             Ok(Some((fallback_dir, fallback_repo)))
@@ -581,17 +653,9 @@ fn fetch_ref_and_peel_to_commit(
     ref_name: &str,
     start_oid: gix::ObjectId,
     requested_revision: &str,
-    url_policy: RepoUrlPolicy,
-    work_root: Option<&Path>,
+    ctx: &BlockingContext<'_>,
 ) -> Result<String, RepoError> {
-    let fallback = fetch_ref_with_shallow_fallback(
-        repo,
-        url,
-        ref_name,
-        requested_revision,
-        url_policy,
-        work_root,
-    )?;
+    let fallback = fetch_ref_with_shallow_fallback(repo, url, ref_name, requested_revision, ctx)?;
     let active_repo = fallback.as_ref().map_or(repo, |(_, r)| r);
     peel_local_object_to_commit(active_repo, start_oid, requested_revision)
 }
@@ -602,17 +666,9 @@ fn fetch_ref_and_verify_exact_commit(
     ref_name: &str,
     target_oid: gix::ObjectId,
     requested_revision: &str,
-    url_policy: RepoUrlPolicy,
-    work_root: Option<&Path>,
+    ctx: &BlockingContext<'_>,
 ) -> Result<String, RepoError> {
-    let fallback = fetch_ref_with_shallow_fallback(
-        repo,
-        url,
-        ref_name,
-        requested_revision,
-        url_policy,
-        work_root,
-    )?;
+    let fallback = fetch_ref_with_shallow_fallback(repo, url, ref_name, requested_revision, ctx)?;
     let active_repo = fallback.as_ref().map_or(repo, |(_, r)| r);
     verify_local_commit(active_repo, target_oid, requested_revision)?;
     Ok(requested_revision.to_owned())
@@ -659,13 +715,12 @@ fn resolve_sha_revision(
     url: gix::Url,
     target_revision: String,
     target_oid: gix::ObjectId,
-    url_policy: RepoUrlPolicy,
-    work_root: Option<&Path>,
+    ctx: &BlockingContext<'_>,
 ) -> Result<ResolvedRevision, RepoError> {
     use gix::bstr::ByteSlice;
     use gix::protocol::handshake::Ref;
 
-    let ref_map = fetch_ref_map(repo, url.clone(), ALL_REFS_LIST_SPECS)?;
+    let ref_map = fetch_ref_map(repo, url.clone(), ALL_REFS_LIST_SPECS, ctx)?;
     if target_oid.is_null() {
         return Err(RepoError::RevisionNotFound {
             revision: target_revision,
@@ -699,8 +754,7 @@ fn resolve_sha_revision(
                         ref_name,
                         *object,
                         &target_revision,
-                        url_policy,
-                        work_root,
+                        ctx,
                     )?;
                     return Ok(ResolvedRevision {
                         commit_sha: sha,
@@ -729,8 +783,7 @@ fn resolve_sha_revision(
                     ref_name,
                     *object,
                     &target_revision,
-                    url_policy,
-                    work_root,
+                    ctx,
                 )?;
                 return Ok(ResolvedRevision {
                     commit_sha: sha,
@@ -769,8 +822,7 @@ fn resolve_sha_revision(
                         ref_name,
                         *object,
                         &target_revision,
-                        url_policy,
-                        work_root,
+                        ctx,
                     )?;
                     return Ok(ResolvedRevision {
                         commit_sha: sha,
@@ -789,8 +841,7 @@ fn resolve_sha_revision(
         &target_revision,
         &[target_revision.as_str()],
         target_oid,
-        url_policy,
-        work_root,
+        ctx,
     )?;
 
     verify_local_commit(&active_repo, target_oid, &target_revision)?;
@@ -805,9 +856,12 @@ fn checkout_blocking(
     target_revision: String,
     sha: String,
     target_oid: gix::ObjectId,
-    url_policy: RepoUrlPolicy,
-    work_root: Option<&Path>,
+    creds: &RepoCredentials,
+    options: &BlockingOptions,
 ) -> Result<RepoCheckout, RepoError> {
+    let auth = options.auth_context(&url, creds)?;
+    let ctx = options.context(&auth);
+
     if target_oid.is_null() {
         return Err(RepoError::RevisionNotFound { revision: sha });
     }
@@ -830,12 +884,11 @@ fn checkout_blocking(
         &sha,
         &shallow_refspecs,
         target_oid,
-        url_policy,
-        work_root,
+        &ctx,
     )?;
 
     let root_tree_id = verify_local_commit(&active_repo, target_oid, &sha)?;
-    let checkout_dir = materialize_commit_worktree(&active_repo, root_tree_id, work_root)?;
+    let checkout_dir = materialize_commit_worktree(&active_repo, root_tree_id, ctx.work_root)?;
     let checkout_path = checkout_dir.path().to_path_buf();
 
     Ok(RepoCheckout::with_lease(
@@ -874,17 +927,17 @@ fn fetch_sha_shallow_then_fallback(
     revision_label: &str,
     shallow_refspecs: &[&str],
     target_oid: gix::ObjectId,
-    url_policy: RepoUrlPolicy,
-    work_root: Option<&Path>,
+    ctx: &BlockingContext<'_>,
 ) -> Result<(TempDir, gix::Repository), RepoError> {
-    let shallow_dir = create_temp_dir(work_root)?;
-    let shallow_repo = init_isolated_bare_repo(shallow_dir.path(), url_policy)?;
+    let shallow_dir = create_temp_dir(ctx.work_root)?;
+    let shallow_repo = init_isolated_bare_repo(shallow_dir.path(), ctx)?;
 
     match fetch_with_refspecs(
         &shallow_repo,
         url.clone(),
         shallow_refspecs,
         gix::remote::fetch::Shallow::DepthAtRemote(NonZeroU32::MIN),
+        ctx,
     ) {
         Ok(()) => {
             if shallow_repo
@@ -910,8 +963,8 @@ fn fetch_sha_shallow_then_fallback(
     drop(shallow_repo);
     drop(shallow_dir);
 
-    let fallback_dir = create_temp_dir(work_root)?;
-    let fallback_repo = init_isolated_bare_repo(fallback_dir.path(), url_policy)?;
+    let fallback_dir = create_temp_dir(ctx.work_root)?;
+    let fallback_repo = init_isolated_bare_repo(fallback_dir.path(), ctx)?;
     let fallback_specs = build_fallback_refspecs(target_revision);
     let fallback_spec_refs: Vec<&str> = fallback_specs.iter().map(String::as_str).collect();
     fetch_with_refspecs(
@@ -919,6 +972,7 @@ fn fetch_sha_shallow_then_fallback(
         url,
         &fallback_spec_refs,
         gix::remote::fetch::Shallow::NoChange,
+        ctx,
     )
     .map_err(fetch_stage_error_into_repo_error(revision_label))?;
 
@@ -1410,6 +1464,22 @@ mod tests {
         GixGitClient::new(cfg)
     }
 
+    /// Credential-free [`AuthContext`] for tests that only exercise repo plumbing.
+    fn anonymous_auth() -> AuthContext {
+        let url = gix::url::parse(b"https://example.invalid/org/repo.git".as_slice())
+            .expect("valid https url");
+        AuthContext::new(&RepoCredentials::Anonymous, &url, false, None).expect("anonymous auth")
+    }
+
+    /// Borrowed [`BlockingContext`] around `auth` for direct helper tests.
+    fn blocking_ctx<'a>(auth: &'a AuthContext, url_policy: RepoUrlPolicy) -> BlockingContext<'a> {
+        BlockingContext {
+            url_policy,
+            work_root: None,
+            auth,
+        }
+    }
+
     fn snapshot_tree(root: &Path) -> BTreeMap<String, String> {
         fn walk(base: &Path, cur: &Path, out: &mut BTreeMap<String, String>) {
             for entry in std::fs::read_dir(cur).expect("read dir") {
@@ -1866,7 +1936,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_anonymous_credentials_fail_explicitly_without_leaking_secrets() {
+    async fn credentials_incompatible_with_file_urls_fail_without_leaking_secrets() {
+        // A local (`file://`) fixture can never be authenticated: HTTPS credentials and SSH keys
+        // are rejected as terminal misconfiguration before any transport is spawned.
         let fx = build_fixture();
         let client = local_client(None);
         let src = GitSource::new(fx.bare_path.to_str().expect("utf8"), "main", "");
@@ -1896,14 +1968,14 @@ mod tests {
             let err1 = client
                 .resolve_revision(&src, creds)
                 .await
-                .expect_err("non-anonymous creds must return AuthFailed");
+                .expect_err("incompatible creds must return AuthFailed");
             assert!(matches!(err1, RepoError::AuthFailed { .. }));
             assert!(!err1.is_retryable());
 
             let err2 = client
                 .checkout(&src, &fx.c3, creds)
                 .await
-                .expect_err("non-anonymous creds must return AuthFailed");
+                .expect_err("incompatible creds must return AuthFailed");
             assert!(matches!(err2, RepoError::AuthFailed { .. }));
             assert!(!err2.is_retryable());
 
@@ -1947,6 +2019,8 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_urls_with_anonymous_credentials_fail_without_spawning_ssh() {
+        // Anonymous SSH can never be host-key verified, so it is rejected before any `ssh`
+        // process is spawned (and before any known_hosts/key material exists).
         let creds = RepoCredentials::Anonymous;
         let sha = "0123456789abcdef0123456789abcdef01234567";
 
@@ -1960,31 +2034,205 @@ mod tests {
                 let res_err = client
                     .resolve_revision(&src, &creds)
                     .await
-                    .expect_err("unconfigured SSH must fail cleanly");
+                    .expect_err("anonymous SSH must fail cleanly");
                 assert!(
-                    matches!(res_err, RepoError::AuthFailed { .. }),
-                    "expected AuthFailed resolving {url}, got {res_err:?}"
+                    matches!(res_err, RepoError::HostKeyVerificationFailed { .. }),
+                    "expected HostKeyVerificationFailed resolving {url}, got {res_err:?}"
                 );
                 assert!(!res_err.is_retryable());
 
                 let co_err = client
                     .checkout(&src, sha, &creds)
                     .await
-                    .expect_err("unconfigured SSH checkout must fail cleanly");
+                    .expect_err("anonymous SSH checkout must fail cleanly");
                 assert!(
-                    matches!(co_err, RepoError::AuthFailed { .. }),
-                    "expected AuthFailed checking out {url}, got {co_err:?}"
+                    matches!(co_err, RepoError::HostKeyVerificationFailed { .. }),
+                    "expected HostKeyVerificationFailed checking out {url}, got {co_err:?}"
                 );
                 assert!(!co_err.is_retryable());
             }
         }
     }
 
+    #[tokio::test]
+    async fn ssh_key_without_known_hosts_is_rejected_before_spawning_ssh() {
+        let creds = RepoCredentials::SshKey {
+            private_key_pem:
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nBODY\n-----END OPENSSH PRIVATE KEY-----"
+                    .to_owned(),
+            passphrase: None,
+            known_hosts: None,
+        };
+        let client = GixGitClient::default();
+        let src = GitSource::new("ssh://git@example.invalid/org/repo.git", "main", "");
+        let err = client
+            .resolve_revision(&src, &creds)
+            .await
+            .expect_err("missing known_hosts must be rejected");
+        match &err {
+            RepoError::HostKeyVerificationFailed { host, reason } => {
+                assert_eq!(host, "example.invalid");
+                assert!(reason.contains("known_hosts"), "{reason}");
+            }
+            other => panic!("expected HostKeyVerificationFailed, got {other:?}"),
+        }
+        assert!(!err.is_retryable());
+        assert!(!format!("{err} {err:?}").contains("BODY"));
+    }
+
+    /// Records every invocation of a fake `ssh` program into a log file, then fails.
+    ///
+    /// Keeping the recorder out-of-process lets the test prove the *real* spawn saw the
+    /// ephemeral `0600` key (mode and existence are checked by the script itself while it runs).
+    #[cfg(unix)]
+    fn write_fake_ssh(dir: &Path, log: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A deliberately hostile program path: the command must be shell-quoted correctly
+        // (`'...fake ssh dir/fake'\''ssh'`) for the script to even run.
+        let script_dir = dir.join("fake ssh dir");
+        std::fs::create_dir_all(&script_dir).expect("create fake ssh dir");
+        let script = script_dir.join("fake'ssh");
+        let body = format!(
+            r#"#!/bin/sh
+log='{log}'
+printf 'CALL\n' >> "$log"
+prev=''
+key=''
+for arg in "$@"; do
+  printf 'ARG:%s\n' "$arg" >> "$log"
+  if [ "$prev" = "-i" ]; then key="$arg"; fi
+  prev="$arg"
+done
+if [ -n "$key" ]; then
+  if [ -f "$key" ]; then
+    printf 'KEY_EXISTS\n' >> "$log"
+  else
+    printf 'KEY_MISSING\n' >> "$log"
+  fi
+  mode=$(stat -f '%Lp' "$key" 2>/dev/null || stat -c '%a' "$key" 2>/dev/null)
+  printf 'KEY_MODE:%s\n' "$mode" >> "$log"
+  printf 'KEY_DIR:%s\n' "$(dirname "$key")" >> "$log"
+fi
+exit 255
+"#,
+            log = log.display()
+        );
+        std::fs::write(&script, body).expect("write fake ssh script");
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat script")
+            .permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&script, perms).expect("chmod fake ssh script");
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_transport_passes_hardened_command_and_cleans_up_ephemeral_key() {
+        // Local bare-repo fixture (same git-CLI pattern as the rest of this module); the fake
+        // `ssh` never connects, so the remote URL only has to look like a real SSH remote.
+        let fx = build_fixture();
+        let scratch = tempfile::tempdir().expect("create ssh scratch root");
+        let log = scratch.path().join("ssh-args.log");
+        let fake_ssh = write_fake_ssh(scratch.path(), &log);
+        assert!(
+            fake_ssh.to_str().expect("utf8 fake ssh path").contains(' '),
+            "the fixture must exercise shell quoting of the ssh program path"
+        );
+
+        let creds = RepoCredentials::SshKey {
+            private_key_pem: "-----BEGIN OPENSSH PRIVATE KEY-----\nSUPER_SECRET_KEY_BODY\n-----END OPENSSH PRIVATE KEY-----"
+                .to_owned(),
+            passphrase: None,
+            known_hosts: Some(
+                "example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISECRETHOSTKEY".to_owned(),
+            ),
+        };
+        let client = GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::Production)
+                .with_ssh_program(fake_ssh)
+                .with_work_root(scratch.path().join("work")),
+        );
+        let url = format!(
+            "ssh://git@example.invalid{}",
+            fx.bare_path.to_str().expect("utf8 path")
+        );
+        let src = GitSource::new(&url, "main", "");
+
+        let err = client
+            .resolve_revision(&src, &creds)
+            .await
+            .expect_err("fake ssh always fails");
+
+        // The failure is clean and secret-free, never a panic/abort.
+        let text = format!("{err} {err:?}");
+        assert!(!text.contains("SUPER_SECRET_KEY_BODY"), "{text}");
+        assert!(!text.contains("SECRETHOSTKEY"), "{text}");
+
+        let recorded = std::fs::read_to_string(&log).expect("fake ssh must have been invoked");
+        assert!(recorded.contains("CALL"), "{recorded}");
+
+        // The temp key directory must be recorded while ssh is running...
+        let key_dir = recorded
+            .lines()
+            .find_map(|line| line.strip_prefix("KEY_DIR:"))
+            .expect("fake ssh must record the key directory")
+            .to_owned();
+        assert!(
+            key_dir.contains("ferriscd-ssh-"),
+            "ephemeral key must live in a dedicated scratch dir: {key_dir}"
+        );
+        assert!(
+            recorded.contains(&format!("ARG:{key_dir}/ferriscd-deploy-key")),
+            "`-i` must point at the ephemeral key inside {key_dir}:\n{recorded}"
+        );
+        // The exact scratch `known_hosts` path must reach ssh, not just the option prefix.
+        let expected_known_hosts = format!("ARG:UserKnownHostsFile={key_dir}/known_hosts");
+        assert!(
+            recorded.lines().any(|line| line == expected_known_hosts),
+            "ssh must receive exactly {expected_known_hosts}:\n{recorded}"
+        );
+        for expected in [
+            "-i",
+            "IdentitiesOnly=yes",
+            "StrictHostKeyChecking=yes",
+            "UserKnownHostsFile=",
+            "BatchMode=yes",
+            "git@example.invalid",
+            "KEY_EXISTS",
+        ] {
+            assert!(
+                recorded.contains(expected),
+                "recorded ssh invocation missing {expected}:\n{recorded}"
+            );
+        }
+        assert!(
+            !recorded.contains("KEY_MISSING"),
+            "the ephemeral key must exist while ssh runs:\n{recorded}"
+        );
+        assert!(
+            recorded.contains("KEY_MODE:600"),
+            "the ephemeral key must be 0600 while ssh runs:\n{recorded}"
+        );
+
+        // ...and must be gone once the blocking operation finished.
+        assert!(
+            !Path::new(&key_dir).exists(),
+            "ephemeral SSH key directory must be removed: {key_dir}"
+        );
+    }
+
     #[test]
     fn isolated_bare_repo_disables_http_redirects_and_restricts_protocols() {
         let prod_dir = tempfile::tempdir().expect("prod bare dir");
-        let prod_repo = init_isolated_bare_repo(prod_dir.path(), RepoUrlPolicy::Production)
-            .expect("init prod bare repo");
+        let auth = anonymous_auth();
+        let prod_repo = init_isolated_bare_repo(
+            prod_dir.path(),
+            &blocking_ctx(&auth, RepoUrlPolicy::Production),
+        )
+        .expect("init prod bare repo");
         let prod_cfg = prod_repo.config_snapshot();
         assert_eq!(prod_cfg.boolean("http.followRedirects"), Some(false));
         assert_eq!(
@@ -1995,20 +2243,149 @@ mod tests {
             prod_cfg.string("protocol.https.allow"),
             Some(gix::bstr::BString::from("always"))
         );
-        assert!(prod_cfg.string("protocol.ssh.allow").is_none());
+        // SSH is a production transport (key + strict host key verification).
+        assert_eq!(
+            prod_cfg.string("protocol.ssh.allow"),
+            Some(gix::bstr::BString::from("always"))
+        );
         assert!(prod_cfg.string("protocol.http.allow").is_none());
         assert!(prod_cfg.string("protocol.file.allow").is_none());
+        assert!(
+            prod_cfg.string("protocol.git.allow").is_none(),
+            "the unauthenticated git:// protocol must stay disabled"
+        );
+        assert!(prod_cfg.string("core.sshCommand").is_none());
 
         let local_dir = tempfile::tempdir().expect("local bare dir");
-        let local_repo = init_isolated_bare_repo(local_dir.path(), RepoUrlPolicy::AllowLocal)
-            .expect("init local bare repo");
+        let local_repo = init_isolated_bare_repo(
+            local_dir.path(),
+            &blocking_ctx(&auth, RepoUrlPolicy::AllowLocal),
+        )
+        .expect("init local bare repo");
         let local_cfg = local_repo.config_snapshot();
         assert_eq!(local_cfg.boolean("http.followRedirects"), Some(false));
         assert_eq!(
             local_cfg.string("protocol.file.allow"),
             Some(gix::bstr::BString::from("always"))
         );
-        assert!(local_cfg.string("protocol.ssh.allow").is_none());
+        assert_eq!(
+            local_cfg.string("protocol.ssh.allow"),
+            Some(gix::bstr::BString::from("always"))
+        );
+        assert!(local_cfg.string("protocol.git.allow").is_none());
+    }
+
+    #[test]
+    fn isolated_bare_repo_applies_ssh_command_override_for_key_credentials() {
+        let url = gix::url::parse(b"ssh://git@example.invalid/org/repo.git".as_slice())
+            .expect("valid ssh url");
+        let creds = RepoCredentials::SshKey {
+            private_key_pem: "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET_BODY\n-----END OPENSSH PRIVATE KEY-----"
+                .to_owned(),
+            passphrase: None,
+            known_hosts: Some("example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKEY".to_owned()),
+        };
+        let auth = AuthContext::new(&creds, &url, false, None).expect("auth context");
+        let dir = tempfile::tempdir().expect("bare dir");
+        let repo =
+            init_isolated_bare_repo(dir.path(), &blocking_ctx(&auth, RepoUrlPolicy::Production))
+                .expect("init bare repo");
+
+        let ssh_command = repo
+            .config_snapshot()
+            .string("core.sshCommand")
+            .map(|value| value.to_string())
+            .expect("core.sshCommand must be overridden");
+        assert!(ssh_command.contains("-i "), "{ssh_command}");
+        assert!(
+            ssh_command.contains("StrictHostKeyChecking=yes"),
+            "{ssh_command}"
+        );
+        assert!(ssh_command.contains("UserKnownHostsFile="), "{ssh_command}");
+        assert!(ssh_command.contains("IdentitiesOnly=yes"), "{ssh_command}");
+        assert!(ssh_command.contains("BatchMode=yes"), "{ssh_command}");
+        assert!(
+            !ssh_command.contains("SECRET_BODY"),
+            "private key material must never reach configuration"
+        );
+
+        // `gix` resolves this override exactly like `GIT_SSH_COMMAND` when building an SSH remote.
+        let ssh_options = repo.ssh_connect_options().expect("ssh connect options");
+        assert_eq!(
+            ssh_options.ssh_command().to_str(),
+            Some(ssh_command.as_str()),
+            "gix must use the overridden ssh command for SSH remotes"
+        );
+        // `ssh.variant=ssh` keeps the command OpenSSH-shaped, so ports are supported.
+        assert!(
+            matches!(
+                ssh_options.kind,
+                Some(gix::protocol::transport::client::blocking_io::ssh::ProgramKind::Ssh)
+            ),
+            "the ssh variant must be pinned to OpenSSH, got {:?}",
+            ssh_options.kind
+        );
+
+        // The key file must not leak into the on-disk `.git/config`.
+        let config_on_disk =
+            std::fs::read_to_string(dir.path().join("config")).expect("read config");
+        assert!(!config_on_disk.contains("UserKnownHostsFile"));
+        assert!(!config_on_disk.contains("SECRET_BODY"));
+    }
+
+    #[test]
+    fn allow_missing_known_hosts_defaults_to_false_and_round_trips() {
+        assert!(
+            !GixGitClientConfig::default().allow_missing_known_hosts,
+            "strict host key verification must be the default"
+        );
+        assert!(!GixGitClientConfig::new().allow_missing_known_hosts);
+
+        let insecure = GixGitClientConfig::new().with_allow_missing_known_hosts(true);
+        assert!(insecure.allow_missing_known_hosts);
+        assert_eq!(
+            insecure,
+            GixGitClientConfig::new().with_allow_missing_known_hosts(true),
+            "the builder must round-trip the flag"
+        );
+        // The flag must survive into the blocking layer that builds the `AuthContext`.
+        assert!(insecure.blocking_options().allow_missing_known_hosts);
+        assert!(
+            GixGitClient::new(insecure.clone())
+                .config()
+                .allow_missing_known_hosts
+        );
+
+        let url = gix::url::parse(b"ssh://git@example.invalid/org/repo.git".as_slice())
+            .expect("valid ssh url");
+        let creds = RepoCredentials::SshKey {
+            private_key_pem: "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET_BODY\n-----END OPENSSH PRIVATE KEY-----"
+                .to_owned(),
+            passphrase: None,
+            known_hosts: None,
+        };
+
+        let auth = insecure
+            .blocking_options()
+            .auth_context(&url, &creds)
+            .expect("the insecure dev flag must allow a missing known_hosts");
+        let command = auth.ssh_command().expect("ssh command").to_owned();
+        assert!(
+            command.contains("StrictHostKeyChecking=accept-new"),
+            "the insecure dev flag must use trust-on-first-use: {command}"
+        );
+        assert!(!command.contains("StrictHostKeyChecking=yes"), "{command}");
+        assert!(command.contains("UserKnownHostsFile="), "{command}");
+        assert!(command.contains("BatchMode=yes"), "{command}");
+        assert!(!command.contains("SECRET_BODY"), "{command}");
+
+        // The default configuration still rejects the very same credentials.
+        let err = GixGitClientConfig::new()
+            .blocking_options()
+            .auth_context(&url, &creds)
+            .expect_err("the default config must reject a missing known_hosts");
+        assert!(matches!(err, RepoError::HostKeyVerificationFailed { .. }));
+        assert!(!err.is_retryable());
     }
 
     #[tokio::test]
