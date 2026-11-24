@@ -2110,7 +2110,7 @@ if [ -n "$key" ]; then
   else
     printf 'KEY_MISSING\n' >> "$log"
   fi
-  mode=$(stat -f '%Lp' "$key" 2>/dev/null || stat -c '%a' "$key" 2>/dev/null)
+  mode=$(stat -c '%a' "$key" 2>/dev/null || stat -f '%Lp' "$key" 2>/dev/null)
   printf 'KEY_MODE:%s\n' "$mode" >> "$log"
   printf 'KEY_DIR:%s\n' "$(dirname "$key")" >> "$log"
 fi
