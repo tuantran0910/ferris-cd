@@ -35,9 +35,67 @@ kubectl config current-context | grep -q '^kind-'
 make test-integration
 ```
 
+## Commit Convention
+
+All commit messages and Pull Request titles follow **[Conventional Commits 1.0.0](https://www.conventionalcommits.org/)** and are automatically validated in CI (`.github/workflows/commit-lint.yml`).
+
+### Format
+
+```text
+<type>(<scope>): <imperative summary>
+
+[optional body explaining why]
+
+[optional footer(s), e.g., BREAKING CHANGE: ...]
+```
+
+### Allowed Types
+
+| Type | When to use |
+|---|---|
+| `feat` | New user-facing or engine capability |
+| `fix` | Bug fix or trap/regression fix |
+| `docs` | Documentation, ADRs, roadmap, or phase lessons |
+| `refactor` | Code restructuring without behavior changes |
+| `perf` | Performance or memory optimization |
+| `test` | Adding or updating unit, integration, or chaos tests |
+| `build` | Cargo dependencies, Dockerfiles, Helm/packaging changes |
+| `ci` | GitHub Actions workflows, Makefile, lint/hook config |
+| `chore` | Repository maintenance and housekeeping |
+| `style` | Formatting-only changes (`cargo fmt`) |
+| `revert` | Reverting a previous commit |
+
+### Recommended Scopes
+
+Use lowercase scopes (`[a-z0-9._,-]+`) matching the roadmap task/phase (`t02.1`, `phase-02`), crate (`crd`, `engine`, `controller`, `cli`, `server`, `web`), or domain (`adr`, `lessons`, `ci`, `deps`, `repo`, `kind`).
+
+### Subject Rules
+
+- Use imperative present tense (`add`, `fix`, `strip`, not `added` or `adds`).
+- Start with a lowercase word and omit any trailing period.
+- Aim for ≤ 72 characters (hard CI limit: 100 characters).
+- Mark breaking changes with `!` before `:` (e.g., `feat(crd)!: ...`) and/or a `BREAKING CHANGE:` footer.
+
+### Examples
+
+```text
+feat(t02.1): define GitClient trait and redacted RepoCredentials
+fix(diff): redact Secret.stringData before rendering dry-run diff
+docs(adr): add ADR-0003 for GKNN inventory and tracking-id
+ci(deps): bump actions/checkout from 4 to 5
+```
+
+### Enable Local Commit Hook
+
+Enable the repository's local `commit-msg` validator once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Pull Request Workflow
 
-1. Branch from `main` using a descriptive branch name (e.g., `feat/t02-1-git-client-trait`, `docs/t01-adrs-and-examples`, `fix/ssa-namespace-mismatch`).
-2. Keep pull requests small, atomic, and scoped to a single roadmap task or cohesive task pair (`TXX.Y`).
-3. Use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `ci:`, `chore:`, `refactor:`, `test:`).
-4. Complete the checklist in the pull request template and ensure GitHub Actions CI is green.
+1. Branch from `main` using `<type>/<short-kebab-description>` (e.g., `feat/t02-1-git-client-trait`, `docs/t01-adrs-and-examples`, `chore/commit-convention`).
+2. Keep pull requests small, atomic, and scoped to a single roadmap task or cohesive task pair (`TXX.Y`); stack PRs linearly when one depends on another.
+3. Ensure your PR title follows the Conventional Commits format above (required for Squash & Merge).
+4. Complete the checklist in the pull request template and verify GitHub Actions CI is green.
