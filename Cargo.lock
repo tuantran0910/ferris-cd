@@ -782,12 +782,14 @@ dependencies = [
 name = "ferriscd-engine"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "dashmap",
  "ferriscd-crd",
  "gix",
  "k8s-openapi",
  "kube",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "tempfile",
  "thiserror",

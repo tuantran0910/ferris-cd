@@ -22,8 +22,6 @@ ferriscd-engine.workspace = true
 k8s-openapi = { workspace = true, features = ["v1_35"] }
 kube.workspace = true
 serde-saphyr.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

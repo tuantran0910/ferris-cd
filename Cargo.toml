@@ -10,6 +10,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 gix = { version = "0.90", default-features = false, features = [

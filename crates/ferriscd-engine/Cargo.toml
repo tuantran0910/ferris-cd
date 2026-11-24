@@ -16,6 +16,7 @@ workspace = true
 test-utils = []
 
 [dependencies]
+base64.workspace = true
 dashmap.workspace = true
 ferriscd-crd.workspace = true
 gix.workspace = true
@@ -23,6 +24,7 @@ k8s-openapi.workspace = true
 kube.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde-saphyr.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
