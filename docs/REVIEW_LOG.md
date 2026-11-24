@@ -63,7 +63,7 @@ An independent adversarial review pass audited `MASTER_PLAN.md` v1.0 and `ROADMA
 
 ## Pass 3: Final Plan Integrity Verification
 
-- [x] **Every task has Why, Detailed Requirements, Outputs, Verification, and Trap Guard** across all 82 tasks in Tracks A–D.
+- [x] **Every task has Why, Detailed Requirements, Outputs, Verification, and Trap Guard** across all 82 original tasks in Tracks A–D plus follow-up `T02.7` (83 total).
 - [x] **Zero circular or backward phase dependencies:** Verified DAG from Phase 01 through Phase 16 (`T03.4` offline vs `T05.4` cluster-aware split; `T03.5` minimal sort feeds `v0.1`/`v0.2`; `T12.4` webhook moved to `T14.2`; `T14.1` OpenAPI feeds `T16.1` TS codegen).
 - [x] **Crate & tool versions verified against 2026 ecosystem & local machine:** `rustc 1.99.0`, `kube 5.1`, `k8s-openapi 0.29` (`v1_35` only in binaries/tests), `schemars 1`, `gix`, `serde-saphyr`, `kind 0.33.0`, `kubectl v1.35.0`, `helm v4.3.2`, `kustomize v5.8.3`.
 - [x] **Zero unaddressed critical or high traps remaining.**

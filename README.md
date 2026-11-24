@@ -72,7 +72,7 @@ kubectl get cm demo-config -n default -o yaml --show-managed-fields
 
 ## Roadmap & Milestones
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for all 82 atomic tasks across 16 phases:
+See [docs/ROADMAP.md](docs/ROADMAP.md) for all 83 atomic tasks across 16 phases:
 
 | Milestone | Phases | Deliverable |
 |---|---|---|
