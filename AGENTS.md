@@ -1,0 +1,48 @@
+# FerrisCD — Workspace Rules & Coordinator Protocol
+
+FerrisCD is a Kubernetes-native GitOps Continuous Delivery platform written in Rust (`rustc 1.99+`, Edition 2024).
+
+## Authoritative Project Docs
+- Architecture, ADRs, CRD schema, and stack: `docs/MASTER_PLAN.md`
+- Master roadmap & milestones: `docs/ROADMAP.md`
+- Atomic task specifications (`T01.1`–`T16.8`): `docs/roadmap/track-{a-core,b-engine,c-enterprise,d-platform}.md`
+- Trap & review audit log: `docs/REVIEW_LOG.md`
+
+---
+
+## Multi-Agent Workflow (Coordinator Model)
+
+The **main agent is the Coordinator**. For any non-trivial roadmap task (`TXX.Y`), follow the `ferriscd-task-cycle` skill:
+
+1. **Coordinator (Main Agent — strong model):** Owns roadmap state, cross-crate invariants, user alignment, task briefs, and final acceptance. Handles trivial edits (<30 lines of glue/docs/typos) directly without spawning subagents.
+2. **Research (`research` built-in subagent — `Model: "flash"`):** Read-only investigation of `kube 5.1`, `gix`, `serde-saphyr`, or Kubernetes API edge cases when uncertain. Escalate to `"pro"` only for deep protocol/security RFCs.
+3. **Implementer (`implementer` subagent — `EnableWriteTools: true`):**
+   - Use **`Model: "flash"`** for standard, well-specified tasks (scaffolding, CI, CRDs, pure data structures, sorters, health snapshots, CLI commands, metrics, Helm/Docker, standard React UI).
+   - Use **`Model: "pro"`** for high-risk / subtle tasks: `gix` cloning/locking/SSH (`T02.2–T02.5`), YAML budgets & normalizer (`T03.2`, `T03.4`), watch predicates/finalizers/`DiscoveryCache` (`T05.1–T05.4`), GKNN inventory & SSA dry-run diff/redaction (`T06.2`, `T07.1–T07.4`, `T08.3–T08.5`), re-entrant wave/hook state machine & rollback (`T10.1–T10.5`), renderer sandboxing/SSRF & multi-tenancy/impersonation (`T11.2–T11.3`, `T12.1–T12.3`), native Lease HA & webhook/RBAC security (`T13.2`, `T14.2–T14.4`).
+   - If running two Implementers in parallel, use `Workspace: "share"` (git worktree) or strictly disjoint crates/files.
+4. **Reviewer (`reviewer` subagent — `EnableWriteTools: false`, `Model: "pro"`):**
+   - Always strictly read-only and fresh-context. Never invoke Reviewer until the Implementer's hard pre-review gate is green (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`).
+   - Send review fixes back to the **existing** Implementer via `send_message` (reuse warm context; never spawn a cold Implementer for review fixes).
+
+---
+
+## Hard FerrisCD Engineering Invariants (Never Violate)
+
+### Rust & Workspace
+- **Modular monolith (4→5 crates):** Keep `ferriscd-crd`, `ferriscd-engine`, `ferriscd-controller`, `ferriscd-cli` (and `ferriscd-server` in Phase 14). Do not fragment into extra crates.
+- **`k8s-openapi` feature hygiene:** Pin `kube 5.1`, `k8s-openapi 0.29`, `schemars 1`. Enable `k8s-openapi` version feature (`v1_35`) **only** in binary and integration-test crates—**never** in library crates (`ferriscd-crd`, `ferriscd-engine`).
+- **No panics in runtime code:** Never use `unwrap()` or `expect()` in library or controller code (tests only). Classify engine errors as retryable vs. terminal (`is_retryable()`).
+- **Async hygiene:** Run blocking `gix` disk/network operations inside `tokio::task::spawn_blocking`. Never sleep/block a reconcile worker waiting for a wave/Job to finish (persist `operationState` and requeue).
+
+### Kubernetes, SSA & GitOps Safety
+- **Version-agnostic GKNN keys:** Key `ResourceKey` and `status.inventory` strictly on `Group + Kind + Namespace + Name` (store `version` only as a non-key hint) so API upgrades never self-prune.
+- **Crash-safe inventory formula:** `next_inventory = (prev_inventory \ pruned_ok) ∪ applied_ok`.
+- **Always-update-status & composite predicate:** Patch `/status` subresource on **both** `Ok` and `Err`. Never use bare `predicates::generation` (it swallows deletions/finalizers/annotations).
+- **SSA defaults:** `serverSideForce` defaults to `false`; normalize `Secret.stringData` → base64 `.data`; strip `.status` before apply; skip dry-run for `DeferredPendingCrd` / `DeferredPendingNamespace`.
+- **Prune safety:** Verify `ferriscd.io/tracking-id` immediately before delete. Never auto-prune `CustomResourceDefinition` or `Namespace` unless explicitly opted in.
+- **Model 1 drift detection (`v1.0`):** On-demand scoped fetch (`desired ∪ prev_inventory`) on requeue/webhook/spec change; no background cluster-wide informers.
+
+### Security & Testing
+- **Secret hygiene:** Redact all `Secret` `.data`/`.stringData` values in diffs/logs; redact `RepoCredentials` in `Debug`/`Display`.
+- **Untrusted repo defense:** Sanitize symlinks across the entire checked-out worktree before running any renderer; configure `serde-saphyr` parser budgets; block Kustomize remote URLs and clear subprocess env.
+- **Safe `kind` testing:** Before running any live Kubernetes integration test, assert `kubectl config current-context` starts with `kind-`. Never touch a non-`kind` cluster.
