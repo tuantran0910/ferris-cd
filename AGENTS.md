@@ -12,17 +12,29 @@ FerrisCD is a Kubernetes-native GitOps Continuous Delivery platform written in R
 
 ## Multi-Agent Workflow (Coordinator Model)
 
+Project subagents are committed in `.commandcode/agents/` and load on the next turn:
+
+| Agent | Role | Model / effort |
+|---|---|---|
+| `ferriscd-researcher` | Read-only API/library research (exact signatures, feature flags) | `deepseek/deepseek-v4.1-flash` / medium |
+| `ferriscd-implementer` | Scoped implementation + tests, runs the gate | `deepseek/deepseek-v4.1-flash` / high |
+| `ferriscd-fast-fix` | Applies a supplied review-findings list only | `deepseek/deepseek-v4.1-flash` / medium |
+| `ferriscd-reviewer` | Read-only adversarial review | `deepseek/deepseek-v4.1-flash` / high |
+
+**Model ids are exact.** `flash` = `deepseek/deepseek-v4.1-flash`; `pro` = `deepseek/deepseek-v4-pro`. Never put the aliases `"flash"`/`"pro"` in an agent `model:` field. Pass a one-off `model` override for high-risk tasks (the high-risk list below) when the Coordinator wants `pro`; the agent files pin `flash` for speed.
+
 The **main agent is the Coordinator**. For any non-trivial roadmap task (`TXX.Y`), follow the `ferriscd-task-cycle` skill:
 
-1. **Coordinator (Main Agent — strong model):** Owns roadmap state, cross-crate invariants, user alignment, task briefs, and final acceptance. Handles trivial edits (<30 lines of glue/docs/typos) directly without spawning subagents.
-2. **Research (`research` built-in subagent — `Model: "flash"`):** Read-only investigation of `kube 5.1`, `gix`, `serde-saphyr`, or Kubernetes API edge cases when uncertain. Escalate to `"pro"` only for deep protocol/security RFCs.
-3. **Implementer (`implementer` subagent — `EnableWriteTools: true`):**
-   - Use **`Model: "flash"`** for standard, well-specified tasks (scaffolding, CI, CRDs, pure data structures, sorters, health snapshots, CLI commands, metrics, Helm/Docker, standard React UI).
-   - Use **`Model: "pro"`** for high-risk / subtle tasks: `gix` cloning/locking/SSH (`T02.2–T02.5`), YAML budgets & normalizer (`T03.2`, `T03.4`), watch predicates/finalizers/`DiscoveryCache` (`T05.1–T05.4`), GKNN inventory & SSA dry-run diff/redaction (`T06.2`, `T07.1–T07.4`, `T08.3–T08.5`), re-entrant wave/hook state machine & rollback (`T10.1–T10.5`), renderer sandboxing/SSRF & multi-tenancy/impersonation (`T11.2–T11.3`, `T12.1–T12.3`), native Lease HA & webhook/RBAC security (`T13.2`, `T14.2–T14.4`).
-   - If running two Implementers in parallel, use `Workspace: "share"` (git worktree) or strictly disjoint crates/files.
-4. **Reviewer (`reviewer` subagent — `EnableWriteTools: false`, `Model: "pro"`):**
-   - Always strictly read-only and fresh-context. Never invoke Reviewer until the Implementer's hard pre-review gate is green (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`).
-   - Send review fixes back to the **existing** Implementer via `send_message` (reuse warm context; never spawn a cold Implementer for review fixes).
+1. **Coordinator (Main Agent):** Owns roadmap state, cross-crate invariants, user alignment, short task briefs, and final acceptance. Handles trivial edits (<30 lines of glue/docs/typos) directly without subagents.
+2. **Research:** Delegate to `ferriscd-researcher` only when a crate API (`kube 5.1`, `gix`, `serde-saphyr`, `utoipa`) or Kubernetes edge case is uncertain. Ask for exact signatures and flags, not tutorials.
+3. **Implementer:** Delegate to `ferriscd-implementer` with a compact brief — task ID, spec path, outputs, Trap Guard, branch, and any research facts. The agent reads the spec itself, writes tests, runs `make gate`, and self-reviews. Do not paste the whole spec into the prompt.
+   - Default `flash` for standard work. Override to `deepseek/deepseek-v4-pro` for high-risk / subtle tasks: `gix` cloning/locking/SSH (`T02.2–T02.5`), YAML budgets & normalizer (`T03.2`, `T03.4`), watch predicates/finalizers/`DiscoveryCache` (`T05.1–T05.4`), GKNN inventory & SSA dry-run diff/redaction (`T06.2`, `T07.1–T07.4`, `T08.3–T08.5`), re-entrant wave/hook state machine & rollback (`T10.1–T10.5`), renderer sandboxing/SSRF & multi-tenancy/impersonation (`T11.2–T11.3`, `T12.1–T12.3`), native Lease HA & webhook/RBAC security (`T13.2`, `T14.2–T14.4`).
+   - If running two Implementers in parallel, use a git worktree or strictly disjoint crates/files.
+4. **Gate:** Require `make gate` (fmt + clippy + test) green before review. Never review code that does not compile, lint, or pass tests.
+5. **Reviewer:** Delegate to `ferriscd-reviewer`, read-only and fresh-context, scoped to the task diff plus untracked files. First pass is exhaustive; fix-round confirmations audit only the new hunks.
+6. **Fix loop:** Use `ferriscd-fast-fix` for the exact Critical/High findings (plus explicitly approved Medium). Re-run `make gate`, then one confirmatory review pass. Escalate after 2 rounds.
+
+Speed rules: batch independent research in parallel; never re-audit unchanged files; prefer `make gate` as the single gate command; keep per-task prompts short because the agent files carry the standing instructions.
 
 ---
 

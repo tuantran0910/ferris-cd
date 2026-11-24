@@ -16,3 +16,8 @@
 .ferriscd-cache/
 .cache/
 .tmp/
+
+# Local agent tooling state (taste/scratchpad); shared agent/skill definitions stay tracked
+.commandcode/taste/
+.commandcode/scratchpad/
+.commandcode/settings.local.json
