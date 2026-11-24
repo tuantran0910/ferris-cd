@@ -49,7 +49,7 @@ jobs:
             echo "has_cargo=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         if: steps.workspace.outputs.has_cargo == 'true'
         with:
           components: rustfmt, clippy
