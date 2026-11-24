@@ -363,7 +363,13 @@ pub enum LiveStateError {
         resource: String,
         /// HTTP status code (`0` for transport/decode failures).
         code: u16,
-        /// Server-provided message (never contains secret payloads).
+        /// Server-provided message.
+        ///
+        /// Not *guaranteed* payload-free: a `400`/`422` from the API server can quote the value
+        /// it rejected. The dry-run path replaces such a message with
+        /// [`crate::dry_run::REDACTED_SERVER_MESSAGE`] for `v1/Secret` because a diff is reported
+        /// to users; a `GET` failure here is a reconcile error, but the same caution applies
+        /// before logging one.
         message: String,
     },
 

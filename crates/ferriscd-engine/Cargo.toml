@@ -20,6 +20,7 @@ base64.workspace = true
 dashmap.workspace = true
 ferriscd-crd.workspace = true
 gix.workspace = true
+jsonptr.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 serde.workspace = true

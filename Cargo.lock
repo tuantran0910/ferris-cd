@@ -790,6 +790,7 @@ dependencies = [
  "dashmap",
  "ferriscd-crd",
  "gix",
+ "jsonptr",
  "k8s-openapi",
  "kube",
  "serde",

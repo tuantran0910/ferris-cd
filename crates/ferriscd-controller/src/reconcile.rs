@@ -67,6 +67,20 @@ pub const REASON_CLEANUP_SKIPPED: &str = "CleanupSkipped";
 /// ([`crate::sync::PENDING_REQUEUE`]) instead of failing the reconcile.
 pub const REASON_PENDING: &str = "PendingDependencies";
 
+/// Condition reason recorded when the sync-decision gate deliberately applied nothing.
+///
+/// A skip is a *successful* reconcile (`Ready=True`): the pass read Git, diffed the cluster and
+/// concluded that nothing should be applied (`automated: None`, `selfHeal: false` with an
+/// unchanged source, or "already up to date"). `status.sync.status` carries the drift verdict,
+/// so a skipped-but-drifting `Application` is visible as `OutOfSync` without being an error.
+pub const REASON_SYNC_SKIPPED: &str = "SyncSkipped";
+
+/// Condition reason recorded when a managed object belongs to another `Application`.
+///
+/// Terminal (trap T10): no apply FerrisCD could issue would resolve the conflict, so the
+/// reconcile fails once and is retried on the terminal backoff instead of self-healing forever.
+pub const REASON_OWNERSHIP_CONFLICT: &str = "OwnershipConflict";
+
 /// Whether a deletion cascades through `status.inventory`.
 ///
 /// Defaulting to [`CleanupMode::Orphan`] means deleting an `Application` never silently
@@ -191,6 +205,28 @@ pub enum ReconcileError {
     #[error(transparent)]
     Manifest(#[from] ManifestError),
 
+    /// The Server-Side Apply `dryRun=All` diff pass failed (T07.1–T07.3).
+    ///
+    /// A diff that cannot read the API server must retry instead of guessing: a guessed
+    /// "synced" would silently skip an apply that is actually needed.
+    #[error(transparent)]
+    Diff(#[from] crate::dry_run::DryRunError),
+
+    /// A desired object is managed by a different `Application` (trap T10).
+    ///
+    /// Terminal: the apply this pass would issue cannot succeed, so retrying is pointless and
+    /// must not become a self-heal loop. The pass still reports `status.sync.status = OutOfSync`
+    /// with the unchanged inventory, so the conflict stays visible in `kubectl describe`.
+    #[error("{message}")]
+    OwnershipConflict {
+        /// Actionable, secret-free description naming every conflicting key and its owner.
+        message: String,
+        /// The inventory as it was before the pass: nothing was applied, so nothing changed.
+        inventory: Inventory,
+        /// The revision that could not be synced.
+        revision: Option<String>,
+    },
+
     /// A Server-Side Apply call failed for a specific resource.
     #[error("server-side apply failed for {resource}: {source}")]
     Apply {
@@ -246,10 +282,13 @@ impl ReconcileError {
                 is_absent(err)
             }
             Self::Discovery(err) => err.is_no_matches_for_kind(),
-            Self::Scope(_) | Self::Invalid { .. } | Self::PartialSync { .. } => false,
+            Self::Scope(_)
+            | Self::Invalid { .. }
+            | Self::PartialSync { .. }
+            | Self::OwnershipConflict { .. } => false,
             // A kind nobody serves means nothing is left to clean up.
             Self::Live(err) => matches!(err, LiveStateError::UnknownKind { .. }),
-            Self::Repo(_) | Self::Manifest(_) => false,
+            Self::Repo(_) | Self::Manifest(_) | Self::Diff(_) => false,
         }
     }
 
@@ -265,7 +304,12 @@ impl ReconcileError {
             }
             Self::Discovery(DiscoveryError::NoMatchesForKind { .. }) => FailureClass::Terminal,
             Self::Discovery(DiscoveryError::Refresh { .. }) => FailureClass::Retryable,
-            Self::Scope(_) | Self::Invalid { .. } => FailureClass::Terminal,
+            // An ownership conflict cannot be fixed by retrying: another `Application` owns the
+            // object, so the terminal backoff is what stops a self-heal loop (trap T10).
+            Self::Scope(_) | Self::Invalid { .. } | Self::OwnershipConflict { .. } => {
+                FailureClass::Terminal
+            }
+            Self::Diff(err) => classify_engine_error(err.is_retryable()),
             Self::Live(err) => {
                 if err.is_retryable() {
                     FailureClass::Retryable
@@ -280,14 +324,22 @@ impl ReconcileError {
         }
     }
 
-    /// The inventory and revision a partially applied sync already confirms.
+    /// The inventory and revision a failure already determines.
     ///
     /// `apply_once` persists these on the failure path so the crash-safe inventory property
-    /// holds even when the reconcile fails half-way.
+    /// holds even when the reconcile fails half-way, and so an unfixable state (an ownership
+    /// conflict) is reported as `OutOfSync` instead of only living in the error message.
     #[must_use]
     pub fn partial_status(&self) -> Option<(&Inventory, Option<&String>)> {
         match self {
             Self::PartialSync {
+                inventory,
+                revision,
+                ..
+            } => Some((inventory, revision.as_ref())),
+            // Nothing was applied, so the inventory is the one that was already true; the
+            // conflict still has to surface as `OutOfSync` (T07.4 semantics).
+            Self::OwnershipConflict {
                 inventory,
                 revision,
                 ..
@@ -556,6 +608,8 @@ pub fn failure_reason(err: &ReconcileError) -> &'static str {
         | ReconcileError::Invalid { .. }
         | ReconcileError::Live(LiveStateError::UnknownKind { .. })
         | ReconcileError::Live(LiveStateError::ScopeMismatch { .. }) => REASON_INVALID_SPEC,
+        // A foreign owner is not a spec bug: `kubectl describe` must name the conflict.
+        ReconcileError::OwnershipConflict { .. } => REASON_OWNERSHIP_CONFLICT,
         _ => REASON_SYNC_ERROR,
     }
 }
@@ -664,7 +718,9 @@ pub async fn apply_once(
         Err(err) => {
             record_failure(&mut status, generation, &err, now());
             // Crash safety: a sync that half applied still persists the inventory it confirms,
-            // so a create that succeeded can never become an untracked orphan (finding C1).
+            // so a create that succeeded can never become an untracked orphan (finding C1). An
+            // ownership conflict carries the *unchanged* inventory and lands here too, which is
+            // what surfaces it as `status.sync.status = OutOfSync` (T07.4 semantics).
             if let Some((inventory, revision)) = err.partial_status() {
                 status.set_inventory(ferriscd_engine::inventory::to_status_entries(inventory));
                 merge_sync_state(
@@ -1198,9 +1254,59 @@ mod tests {
                 },
                 FailureClass::Terminal,
             ),
+            // Trap T10: another `Application` owns the object, so no amount of retrying helps.
+            (
+                ReconcileError::OwnershipConflict {
+                    message: "owned by ferriscd-system/other".to_owned(),
+                    inventory: Inventory::new(),
+                    revision: Some("deadbeef".to_owned()),
+                },
+                FailureClass::Terminal,
+            ),
         ];
         for (err, expected) in cases {
             assert_eq!(err.failure_class(), expected, "unexpected class for {err}");
+        }
+
+        // A failed `dryRun=All` classification is classified exactly like the apply path's API
+        // errors (finding M2): transient conditions back off, the rest is terminal.
+        let diff_error = |code: u16| {
+            ReconcileError::Diff(crate::dry_run::DryRunError::Api {
+                resource: "apps/Deployment/payments/api".to_owned(),
+                code,
+                message: "boom".to_owned(),
+            })
+        };
+        for code in [0u16, 408, 409, 425, 429, 500, 503] {
+            assert_eq!(
+                diff_error(code).failure_class(),
+                FailureClass::Retryable,
+                "a {code} dry-run must back off and retry"
+            );
+        }
+        for code in [403u16, 404, 422] {
+            assert_eq!(
+                diff_error(code).failure_class(),
+                FailureClass::Terminal,
+                "a {code} dry-run cannot succeed by retrying"
+            );
+        }
+        // An unserved kind and an unserializable document are terminal too: neither converges.
+        for err in [
+            crate::dry_run::DryRunError::Discovery(DiscoveryError::NoMatchesForKind {
+                group: "example.com".to_owned(),
+                version: "v1".to_owned(),
+                kind: "Widget".to_owned(),
+            }),
+            crate::dry_run::DryRunError::Serialization {
+                resource: "apps/Deployment/payments/api".to_owned(),
+                message: "nope".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                ReconcileError::Diff(err).failure_class(),
+                FailureClass::Terminal
+            );
         }
     }
 

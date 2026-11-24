@@ -1,63 +1,84 @@
-//! The wired `v0.2` sync pipeline: `Application` -> Git -> manifests -> scope -> live state
-//! -> ordered SSA apply -> crash-safe inventory -> `/status`.
+//! The wired sync pipeline: `Application` -> Git -> manifests -> scope -> live state ->
+//! SSA `dryRun=All` diff -> sync decision -> ordered SSA apply -> crash-safe inventory ->
+//! `/status`.
 //!
-//! This is the first *real* [`SyncPipeline`]. It deliberately stops short of Phases 07–10:
+//! This is the first *real* [`SyncPipeline`]. Phase 07 replaced the `v0.2` "apply everything on
+//! every pass" loop with a diff-gated one: the pipeline classifies the whole bundle with a
+//! Server-Side Apply dry-run (T07.1–T07.3), asks
+//! [`ferriscd_engine::diff::should_sync`] whether this reconcile may apply anything (T07.4), and
+//! then applies **only** what the diff says needs it (`applyOutOfSyncOnly`).
 //!
-//! | Concern | `v0.2` (here) | Later phase |
+//! | Concern | Here | Later phase |
 //! |---|---|---|
-//! | Drift detection | every reconcile applies the whole desired set (no dry-run diff) | `T07.x` dry-run diff + `ignoreDifferences` |
-//! | Force | always `force: false` (trap T5); `serverSideForce` is logged and ignored | `T07.x` |
-//! | Sync decision gate | `automated: None` is not treated as manual-only yet (the controller only works when it is enqueued) | `T07.x` |
-//! | Prune | minimal: only with `automated.prune`, only `OwnedBySelf`, never `CRD`/`Namespace` unless opted in, reverse key order (not reverse wave order) | `T08.1` reverse prune order, `T08.2` `SyncPlan`, `T08.5` ownership-verified pruner |
+//! | Drift detection | SSA `dryRun=All` diff of the stamped desired set, `ignoreDifferences` honoured | — |
+//! | Sync decision gate | `automated: None` / `selfHeal` / source change (`revision` + `lastSyncedSpecHash`) / manual operation | `T10.x` consumes `ferriscd.io/operation` |
+//! | Force | `false` for both the dry-run and the apply (trap T5); `serverSideForce` is logged and ignored | `T08.4` (`takeoverFieldManagers`) |
+//! | Prune | minimal: only with `automated.prune` and only when the gate executes; only `OwnedBySelf`, never `CRD`/`Namespace` unless opted in, reverse key order (not reverse wave order) | `T08.1` reverse prune order, `T08.2` `SyncPlan`, `T08.5` ownership-verified pruner |
 //! | CRD `Established` wait | a CRD + CR bundle simply requeues (`DeferredPendingCrd`) until discovery serves the kind | `T08.3` |
 //! | `createNamespace: true` | **rejected** with an actionable message; namespace creation is not wired | `T08.2`/`T08.3` (`pre_create_namespace`) |
 //! | Waves/hooks | rejected with an actionable message instead of being mis-ordered | `T10.x` |
 //! | Destination clusters | `in-cluster` only; anything else is rejected | `T12.x` credentials |
 //! | Git credentials | anonymous only | `T12.x` |
-//! | `lastSyncedSpecHash` | not written (finding H7 needs the diff gate) | `T07.x` |
 //!
 //! Blocking work never runs on a Tokio worker: manifest file I/O and YAML parsing run in
 //! `tokio::task::spawn_blocking` here, and the repo/git layer does the same internally. Every
-//! Kubernetes call is a plain async `kube` request.
+//! Kubernetes call — the live GETs, the `dryRun=All` PATCHes and the real applies — is a plain
+//! async `kube` request. The diff *comparison* itself is CPU-only engine code over the payloads
+//! the API server returned, so it never blocks a worker on a syscall either.
 //!
-//! `syncOptions.createNamespace` is rejected instead of silently livelocking: `v0.2` has no
+//! `syncOptions.createNamespace` is rejected instead of silently livelocking: there is no
 //! namespace creator, so a `404` in a namespace nobody declares would classify as
 //! `DeferredPendingNamespace` and requeue forever. Declaring the `Namespace` in Git (or
 //! creating it by hand) is the supported path until `T08.3` adds on-demand creation.
 //!
-//! Two safety properties are non-negotiable and implemented here:
+//! Three safety properties are non-negotiable and implemented here:
 //!
 //! * **Ownership is verified before any mutation** (the `T06.4` trap guard, trap T10). Every
 //!   desired key whose live object carries a *foreign* `ferriscd.io/tracking-id` fails the
-//!   reconcile **before** a single `Patch` is issued, so two `Application`s pointing at the
-//!   same manifest can never fight over (or prune) each other's workloads.
-//! * **The inventory is crash-safe.** It is only ever `next_inventory(prev, applied_ok,
+//!   reconcile **before** a single `Patch` is issued — before the dry-run pass too — so two
+//!   `Application`s pointing at the same manifest can never fight over (or prune) each other's
+//!   workloads. The failure is terminal (retrying cannot help) and still reports
+//!   `status.sync.status = OutOfSync`.
+//! * **Nothing is applied without proof it is needed.** The dry-run diff decides; a `Skip` from
+//!   [`should_sync`] issues **zero** mutating `Patch` calls, and a second reconcile of an
+//!   already-synced `Application` converges to exactly that (the assertion the T07.5 live test
+//!   makes against a real API server).
+//! * **The inventory is crash-safe.** It is only ever `next_inventory(prev, confirmed,
 //!   pruned_ok)`, and a mid-sync failure still persists the partial inventory
 //!   ([`ReconcileError::PartialSync`]), so a create that already succeeded can never become an
 //!   untracked orphan (finding C1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferriscd_crd::application::DEFAULT_DESTINATION_CLUSTER;
 use ferriscd_crd::status::{REASON_SYNC_SUCCEEDED, SyncState, SyncStatus};
 use ferriscd_crd::{Application, SyncOptions, annotations};
+use ferriscd_engine::diff::{
+    DiffStatus, DiffSummary, IgnoreRuleSet, ResourceDiff, SyncDecision, should_sync,
+    source_spec_hash,
+};
 use ferriscd_engine::graph::sort_by_tier;
 use ferriscd_engine::inventory::{self, Inventory, InventoryEntry, Ownership};
 use ferriscd_engine::manifest::{self, DesiredResource, ManifestLoaderConfig, ResourceKey};
 use ferriscd_engine::repo::{GitSource, RepoCache, RepoCheckout, RepoCredentials, RepoUrlPolicy};
 use futures::future::BoxFuture;
+use kube::ResourceExt;
 use kube::api::{self, Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::discovery::Scope;
 use tracing::warn;
 
 use crate::discovery::DiscoveryCache;
+use crate::dry_run::{DryRunApi, DryRunEvaluator};
 use crate::live_state::{
-    ClusterStateReader, FetchRequest, LiveObjectSource, LiveState, TrackingOwner, plan_fetch,
+    ClusterStateReader, FetchRequest, LiveObjectSource, LiveState, LiveStateMap, TrackingOwner,
+    plan_fetch,
 };
 use crate::reconcile::{
-    ApplyOutcome, CleanupMode, CleanupOutcome, REASON_PENDING, ReconcileError, SyncPipeline, now,
+    ApplyOutcome, CleanupMode, CleanupOutcome, REASON_PENDING, REASON_SYNC_SKIPPED, ReconcileError,
+    SyncPipeline, now,
 };
 use crate::scope::{self, InBundleCrd};
 
@@ -78,7 +99,14 @@ pub const IN_CLUSTER: &str = DEFAULT_DESTINATION_CLUSTER;
 /// setting `FERRISCD_ALLOW_EMPTY_DESIRED=1` (or `true`) restores the literal GitOps behaviour.
 pub const ALLOW_EMPTY_DESIRED_ENV: &str = "FERRISCD_ALLOW_EMPTY_DESIRED";
 
-/// Counts reported in the `Ready` condition message.
+/// How many invalid `ignoreDifferences` pointers are logged individually per reconcile.
+///
+/// The rule set is compiled on every pass, so an `Application` with thousands of typos must not
+/// turn each reconcile into thousands of log lines. The full count still reaches
+/// `Application.status` through the `Ready` message.
+pub const MAX_LOGGED_INVALID_POINTERS: usize = 8;
+
+/// What the `Ready` condition message reports.
 #[derive(Clone, Copy, Debug, Default)]
 struct SyncCounts {
     /// Resources in the desired set.
@@ -91,6 +119,15 @@ struct SyncCounts {
     retained_orphans: usize,
     /// Resources deferred on a `CustomResourceDefinition` or a `Namespace`.
     pending: usize,
+    /// `ignoreDifferences` pointers that are not valid RFC 6901 and were therefore ignored
+    /// (finding H1).
+    invalid_ignore_pointers: usize,
+    /// Whether `spec.syncPolicy.automated.prune` is enabled.
+    ///
+    /// It decides how a retained orphan is reported: with pruning enabled an orphan still means
+    /// "a prune is due" (`OutOfSync`), with pruning disabled it can never be deleted, so it must
+    /// not pin the status (finding H2).
+    prune_enabled: bool,
 }
 
 /// What one prune pass did.
@@ -277,14 +314,16 @@ pub fn apply_body(object: &DynamicObject) -> DynamicObject {
     body
 }
 
-/// The wired `v0.2` [`SyncPipeline`].
+/// The wired [`SyncPipeline`].
 pub struct InventorySyncPipeline {
     repos: Arc<RepoCache>,
     discovery: DiscoveryCache,
     reader: ClusterStateReader,
     applier: Arc<dyn Applier>,
+    dry_run: Arc<dyn DryRunApi>,
     loader: ManifestLoaderConfig,
     url_policy: RepoUrlPolicy,
+    mutating_applies: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for InventorySyncPipeline {
@@ -299,21 +338,42 @@ impl std::fmt::Debug for InventorySyncPipeline {
 
 impl InventorySyncPipeline {
     /// Builds the pipeline from its collaborators.
+    ///
+    /// `dry_run` is required, not optional: without it the pipeline cannot tell "already synced"
+    /// from "drifted", and guessing would either apply everything on every pass (the `v0.2`
+    /// behaviour) or apply nothing at all.
     #[must_use]
     pub fn new(
         repos: Arc<RepoCache>,
         discovery: DiscoveryCache,
         live: Arc<dyn LiveObjectSource>,
         applier: Arc<dyn Applier>,
+        dry_run: Arc<dyn DryRunApi>,
     ) -> Self {
         Self {
             repos,
             discovery,
             reader: ClusterStateReader::new(live),
             applier,
+            dry_run,
             loader: ManifestLoaderConfig::default(),
             url_policy: RepoUrlPolicy::Production,
+            mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Number of mutating Server-Side Apply calls this pipeline has issued so far.
+    ///
+    /// A metric/test seam, not part of the stable API. Every in-place mutation goes through
+    /// [`Applier`]; every *prediction* goes through [`DryRunApi`] (`dryRun=All`) and is
+    /// deliberately **not** counted here. The delta across two reconciles is therefore exactly
+    /// "how many mutating `Patch` calls did that pass issue", which is the seam the T07.5
+    /// invariant is asserted on: an already-synced `Application` performs zero of them (its
+    /// dry-run PATCHes still happen, and must).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn mutating_applies(&self) -> usize {
+        self.mutating_applies.load(Ordering::SeqCst)
     }
 
     /// Accepts `file://` and local repository paths (tests/dev only; never a production
@@ -417,16 +477,101 @@ impl InventorySyncPipeline {
             )
             .await?;
 
-        // Trap guard: ownership is verified for the whole bundle *before* any mutation.
-        reject_foreign_ownership(&resources, &live)?;
+        // Trap guard: ownership is verified for the whole bundle *before* any mutation — and
+        // before the dry-run pass, so an object another `Application` owns never even receives a
+        // `dryRun=All` PATCH. The failure is terminal and still reports `OutOfSync`.
+        if let Err(err) = reject_foreign_ownership(&resources, &live) {
+            return Err(ReconcileError::OwnershipConflict {
+                message: err.to_string(),
+                inventory: prev_inventory,
+                revision: Some(revision),
+            });
+        }
 
+        // --- Phase 07: diff gate -------------------------------------------------------
+        // The dry-run diff runs over `resources`, which is the *stamped* slice the applier
+        // receives below (see `DryRunEvaluator::evaluate`'s desired-body contract: diffing a
+        // pre-stamp body would look like a request to remove `ferriscd.io/tracking-id`, leaving
+        // every resource `OutOfSync` forever).
+        let orphans = inventory::orphans(&desired_inventory, &prev_inventory);
+        let rules = IgnoreRuleSet::from_ignore_differences(&app.spec.ignore_differences);
+        // Finding H1: a pointer that is not valid RFC 6901 is never applied (a typo must not
+        // fail the reconcile), so it must be *visible* instead of silently dropped: one warning
+        // per pointer here, plus a count in the `Ready` message below (a log line is not
+        // observable on the CR).
+        let invalid_ignore_pointers = report_invalid_pointers(&rules, &owner);
+        let diffs = self
+            .evaluate_diff(&resources, &orphans, &live, &rules)
+            .await?;
+        let summary = DiffSummary::from_diffs(&diffs);
+        let spec_hash = source_spec_hash(&app.spec).map_err(|err| ReconcileError::Invalid {
+            message: err.to_string(),
+        })?;
+        let decision = should_sync(app, &revision, &spec_hash, &summary, manual_operation(app));
+        let statuses = status_by_key(&diffs);
+        let apply_keys = apply_selection(
+            decision,
+            &statuses,
+            &resources,
+            options.apply_out_of_sync_only,
+        );
+        let execute = decision.is_execute();
+        if execute {
+            tracing::debug!(
+                app.namespace = %owner.namespace,
+                app.name = %owner.name,
+                decision = %decision,
+                to_apply = apply_keys.len(),
+                out_of_sync = summary.out_of_sync,
+                missing = summary.missing,
+                synced = summary.synced,
+                "diff gate decided to sync"
+            );
+        } else {
+            tracing::debug!(
+                app.namespace = %owner.namespace,
+                app.name = %owner.name,
+                decision = %decision,
+                out_of_sync = summary.out_of_sync,
+                missing = summary.missing,
+                "diff gate skipped this reconcile"
+            );
+        }
+
+        // --- apply -------------------------------------------------------------------------
+        // `applied_ok`: applies this pass confirmed (the crash-safe inventory input).
+        // `synced_ok`: resources the diff verified are already in place *and* carry our
+        // `tracking-id`, so they are recorded without a mutating call.
         let mut applied_ok = Inventory::new();
+        let mut synced_ok = Inventory::new();
         let mut pending: Vec<ResourceKey> = Vec::new();
 
         for resource in &resources {
             if live.get(&resource.key).is_some_and(LiveState::is_deferred) {
-                // `DeferredPendingCrd` / `DeferredPendingNamespace`: requeue, never fail.
-                pending.push(resource.key.clone());
+                // `DeferredPendingCrd` / `DeferredPendingNamespace`: requeue, never fail — but
+                // only a pass that actually tried to apply has something to wait for.
+                if execute {
+                    pending.push(resource.key.clone());
+                }
+                continue;
+            }
+
+            // Finding C1: a `Synced` resource exists and is ours, so it belongs in the
+            // inventory even on a skipped pass — otherwise a wiped `status.inventory` would leak
+            // it as an untracked orphan (the `v0.2` loop re-applied everything and self-healed).
+            if statuses
+                .get(&resource.key)
+                .is_some_and(DiffStatus::is_synced)
+            {
+                synced_ok.insert(
+                    resource.key.clone(),
+                    InventoryEntry::new(resource.gvk.version.clone()),
+                );
+            }
+
+            if !apply_keys.contains(&resource.key) {
+                // `applyOutOfSyncOnly` (the default): the diff says this one already matches,
+                // so it must not be patched again.
                 continue;
             }
 
@@ -436,10 +581,12 @@ impl InventorySyncPipeline {
                 resource,
                 api_resource: &target.api_resource,
                 namespace: namespace.as_deref(),
-                // Phase 07 honors `serverSideForce`; v0.2 pins the safe default (trap T5).
+                // `serverSideForce` stays ignored: the dry-run and the apply must agree, and a
+                // forced apply silently steals fields another manager owns (trap T5).
                 force: false,
             };
 
+            self.mutating_applies.fetch_add(1, Ordering::SeqCst);
             match self.applier.apply(request).await {
                 Ok(_) => {
                     applied_ok.insert(
@@ -458,8 +605,10 @@ impl InventorySyncPipeline {
             }
         }
 
-        let prune = self
-            .prune(
+        // Prune is part of "execute": a gate that decided to skip issues no deletes either.
+        let prune_enabled = prune_enabled(app);
+        let prune = if execute {
+            self.prune(
                 app,
                 &options,
                 &desired_inventory,
@@ -469,21 +618,59 @@ impl InventorySyncPipeline {
                 &revision,
                 &owner,
             )
-            .await?;
+            .await?
+        } else {
+            PruneReport::default()
+        };
 
-        let next_inventory = inventory::next_inventory(&prev_inventory, &applied_ok, &prune.pruned);
+        // Finding H2: with pruning disabled `prune()` is a pure no-op and reports zero, while the
+        // diff still classified the tracked-but-undesired keys as orphans. They *are* retained
+        // (FerrisCD will never delete them), so the count comes from the summary there.
+        let retained_orphans = if prune_enabled {
+            prune.retained
+        } else {
+            summary.orphaned
+        };
+
+        let confirmed = inventory::next_inventory(&applied_ok, &synced_ok, &[]);
+        let next_inventory = inventory::next_inventory(&prev_inventory, &confirmed, &prune.pruned);
         Ok(build_outcome(
             app,
+            decision,
+            &summary,
+            &spec_hash,
             SyncCounts {
                 desired: resources.len(),
                 applied: applied_ok.len(),
                 pruned: prune.pruned.len(),
-                retained_orphans: prune.retained,
+                retained_orphans,
                 pending: pending.len(),
+                invalid_ignore_pointers,
+                prune_enabled,
             },
             revision,
             next_inventory,
         ))
+    }
+
+    /// Classifies the stamped desired set with the SSA `dryRun=All` evaluator (T07.1–T07.3).
+    ///
+    /// `resources` **must** be the stamped slice the applier receives (the desired-body contract
+    /// documented on [`DryRunEvaluator::evaluate`]). Handing the evaluator a pre-stamp body would
+    /// make it predict the removal of the `ferriscd.io/tracking-id` annotation the apply actually
+    /// keeps, so every resource would be `OutOfSync` forever. A diff that cannot read the API
+    /// server is an error, never a guessed "synced": guessing would silently skip a needed apply.
+    async fn evaluate_diff(
+        &self,
+        resources: &[DesiredResource],
+        orphans: &[ResourceKey],
+        live: &LiveStateMap,
+        rules: &IgnoreRuleSet,
+    ) -> Result<Vec<ResourceDiff>, ReconcileError> {
+        DryRunEvaluator::with_api(self.dry_run.clone(), self.discovery.clone())
+            .evaluate(resources, orphans, live, rules)
+            .await
+            .map_err(ReconcileError::Diff)
     }
 
     /// Resolves the revision and loads the desired manifest set off the worker pool.
@@ -634,12 +821,7 @@ impl InventorySyncPipeline {
         owner: &TrackingOwner,
     ) -> Result<PruneReport, ReconcileError> {
         let mut report = PruneReport::default();
-        let prune_enabled = app
-            .spec
-            .sync_policy
-            .as_ref()
-            .is_some_and(|policy| policy.prune_enabled());
-        if !prune_enabled {
+        if !prune_enabled(app) {
             return Ok(report);
         }
 
@@ -872,9 +1054,142 @@ fn status_inventory(app: &Application) -> Result<Inventory, ReconcileError> {
     }
 }
 
+/// Returns whether `app` carries a **manual sync request** (T07.4 `SyncTrigger::Manual`).
+///
+/// `ferriscd.io/operation` is the annotation the CLI/API writes to ask for a sync
+/// (`{"sync":{"revision":"..."}}`). Any non-blank value counts as a manual operation, which
+/// bypasses `automated` and `selfHeal` entirely — that is the documented escape hatch for
+/// `automated: None`, and the reason a blank value is *not* an operation (an empty annotation
+/// is what a `kubectl annotate --overwrite` with an empty string leaves behind).
+///
+/// `ferriscd.io/refresh` is deliberately **not** a manual operation: it only asks for an
+/// immediate reconcile (the composite watch predicate), and the diff gate must still decide
+/// whether anything is applied. Whether an operation annotation came from this reconcile or a
+/// previous one is not trackable until `T10.x` persists and clears `status.operationState`; until
+/// then "present operation ⇒ manual" is the conservative reading (it can only cause an extra
+/// idempotent apply, never a missed sync).
+#[must_use]
+pub fn manual_operation(app: &Application) -> bool {
+    app.annotations()
+        .get(annotations::OPERATION)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Indexes a diff pass by resource key.
+fn status_by_key(diffs: &[ResourceDiff]) -> BTreeMap<ResourceKey, DiffStatus> {
+    diffs
+        .iter()
+        .map(|diff| (diff.key().clone(), diff.status().clone()))
+        .collect()
+}
+
+/// Returns whether `spec.syncPolicy.automated.prune` is enabled.
+///
+/// One helper, so the prune pass and the status mapping can never disagree about whether an
+/// orphan may be deleted in this milestone.
+#[must_use]
+fn prune_enabled(app: &Application) -> bool {
+    app.spec
+        .sync_policy
+        .as_ref()
+        .is_some_and(|policy| policy.prune_enabled())
+}
+
+/// Warns about every `ignoreDifferences` pointer that is not valid RFC 6901 and returns the total
+/// (finding H1).
+///
+/// [`IgnoreRule::with_json_pointer`](ferriscd_engine::diff::ignore::IgnoreRule) records such a
+/// pointer instead of applying it, so a typo never fails a reconcile — but an ignored rule that
+/// silently does nothing is worse than an error: the operator believes a field is ignored while
+/// it keeps reporting drift. The warnings are bounded by
+/// [`MAX_LOGGED_INVALID_POINTERS`]; the count that reaches `Application.status` is not.
+fn report_invalid_pointers(rules: &IgnoreRuleSet, owner: &TrackingOwner) -> usize {
+    let mut total = 0;
+    for pointer in rules.invalid_pointers() {
+        total += 1;
+        if total <= MAX_LOGGED_INVALID_POINTERS {
+            warn!(
+                app.namespace = %owner.namespace,
+                app.name = %owner.name,
+                pointer = %pointer,
+                "spec.ignoreDifferences contains a JSON pointer that is not valid RFC 6901: it is \
+                 not applied, so the field it names is still compared"
+            );
+        }
+    }
+    if total > MAX_LOGGED_INVALID_POINTERS {
+        warn!(
+            app.namespace = %owner.namespace,
+            app.name = %owner.name,
+            omitted = total - MAX_LOGGED_INVALID_POINTERS,
+            "further invalid spec.ignoreDifferences pointers are not logged individually"
+        );
+    }
+    total
+}
+
+/// Maps a diff summary onto `status.sync.status` **without** counting orphans (finding H2).
+///
+/// [`DiffSummary::sync_status`] deliberately reports `OutOfSync` for an orphan — the operator
+/// removed a resource from Git and must be told — and that engine semantic is unchanged. The
+/// controller needs a narrower reading when pruning is **disabled**: FerrisCD will never delete
+/// that object, so counting it makes the `Skip` pass that follows an executing one flip the
+/// status to `OutOfSync` forever, for a resource the operator explicitly asked to keep (the T06
+/// contract). Retained orphans are still reported, in the `Ready` message.
+#[must_use]
+fn sync_status_without_orphans(summary: &DiffSummary) -> SyncStatus {
+    DiffSummary {
+        orphaned: 0,
+        ..*summary
+    }
+    .sync_status()
+}
+
+/// Selects the desired keys this pass must apply.
+///
+/// The trap guard for `syncOptions.applyOutOfSyncOnly` (default `true`) lives here, as one pure
+/// function, so the "synced resources are skipped cleanly" property is provable without a
+/// cluster: a `Skip` decision (or a resource the diff classified `Synced`) can never end up in
+/// the returned set. A resource with no diff entry at all is *not* applied — every desired key is
+/// classified by [`DryRunEvaluator::evaluate`], so a missing entry means the pass never looked at
+/// it, and patching something that was never compared would defeat the gate.
+#[must_use]
+fn apply_selection(
+    decision: SyncDecision,
+    statuses: &BTreeMap<ResourceKey, DiffStatus>,
+    resources: &[DesiredResource],
+    apply_out_of_sync_only: bool,
+) -> BTreeSet<ResourceKey> {
+    if decision.is_skip() {
+        return BTreeSet::new();
+    }
+    resources
+        .iter()
+        .filter(|resource| {
+            !apply_out_of_sync_only
+                || statuses
+                    .get(&resource.key)
+                    .is_some_and(DiffStatus::needs_apply)
+        })
+        .map(|resource| resource.key.clone())
+        .collect()
+}
+
 /// Builds the successful [`ApplyOutcome`], including the crash-safe inventory and sync state.
+///
+/// `status.sync.status` is derived from the diff summary, **not** from "did an apply succeed":
+/// a pass that deliberately skipped over a drifting cluster must still report `OutOfSync` (the
+/// operator has to see it), and only a pass that executed and finished every resource may claim
+/// `Synced` and advance the `lastSynced*` markers.
+///
+/// Counts (retained orphans, ignored `ignoreDifferences` pointers) and the `prune` policy all
+/// reach the `Ready` message: `Application.status` is the only place an operator looks, so a
+/// warning that only exists in a log line is invisible (findings H1/H2).
 fn build_outcome(
     app: &Application,
+    decision: SyncDecision,
+    summary: &DiffSummary,
+    spec_hash: &str,
     counts: SyncCounts,
     revision: String,
     inventory: Inventory,
@@ -885,24 +1200,32 @@ fn build_outcome(
         pruned,
         retained_orphans,
         pending,
+        invalid_ignore_pointers,
+        prune_enabled,
     } = counts;
     let complete = pending == 0;
+    // Only "executed *and* nothing left pending" may claim a full sync.
+    let synced = decision.is_execute() && complete;
     let sync = SyncState {
-        status: if complete {
+        status: if synced {
             SyncStatus::Synced
+        } else if prune_enabled {
+            summary.sync_status()
         } else {
-            SyncStatus::OutOfSync
+            // Finding H2: an orphan FerrisCD will never delete must not pin `OutOfSync` forever.
+            sync_status_without_orphans(summary)
         },
         revision: Some(revision.clone()),
-        // Only a fully applied desired set counts as synced; a pending resource is not.
-        last_synced_revision: complete.then(|| revision.clone()),
-        // `lastSyncedSpecHash` needs the Phase 07 sync-decision gate (finding H7).
-        last_synced_spec_hash: None,
-        last_synced_at: complete.then(now),
+        // Finding H7: the (revision, spec hash) pair is what `selfHeal: false` compares, so both
+        // markers are written together by the same successful pass. `merge_sync_state` keeps the
+        // previous values when a pass reports `None` here.
+        last_synced_revision: synced.then(|| revision.clone()),
+        last_synced_spec_hash: synced.then(|| spec_hash.to_owned()),
+        last_synced_at: synced.then(now),
     };
 
     // A stuck orphan is otherwise invisible: `prune: true` that deletes nothing looks exactly
-    // like "there was nothing to prune".
+    // like "there was nothing to prune", and `prune: false` would report nothing at all.
     let retained = if retained_orphans == 0 {
         String::new()
     } else {
@@ -910,34 +1233,51 @@ fn build_outcome(
             "; {retained_orphans} orphan(s) retained (not owned, not prunable, or still pending)"
         )
     };
+    // Finding H1: a pointer that is not valid RFC 6901 is never applied, so the operator must see
+    // that the rule did nothing (the count is a number, so the message stays bounded).
+    let invalid = match invalid_ignore_pointers {
+        0 => String::new(),
+        1 => "; 1 invalid ignoreDifferences pointer ignored".to_owned(),
+        count => format!("; {count} invalid ignoreDifferences pointers ignored"),
+    };
+    let short = short_sha(&revision);
 
-    let (reason, message) = if complete {
-        (
+    let (reason, message) = match decision {
+        SyncDecision::Skip(skip) => (
+            REASON_SYNC_SKIPPED,
+            format!(
+                "no sync performed: {skip}; {desired} resource(s) at revision {short}, \
+                 {} out of sync, {} missing, {} orphan(s){retained}{invalid}",
+                summary.out_of_sync, summary.missing, summary.orphaned
+            ),
+        ),
+        SyncDecision::Execute(trigger) if complete => (
             REASON_SYNC_SUCCEEDED,
             format!(
-                "applied {applied} of {desired} resource(s) at revision {}, pruned {pruned}{retained}",
-                short_sha(&revision)
+                "applied {applied} of {desired} resource(s) at revision {short}, \
+                 pruned {pruned}{retained}{invalid} ({trigger})"
             ),
-        )
-    } else {
-        (
+        ),
+        SyncDecision::Execute(_) => (
             REASON_PENDING,
             format!(
-                "applied {applied} of {desired} resource(s) at revision {}; {pending} resource(s) \
-                 pending on a CustomResourceDefinition or namespace{retained}",
-                short_sha(&revision)
+                "applied {applied} of {desired} resource(s) at revision {short}; {pending} \
+                 resource(s) pending on a CustomResourceDefinition or namespace{retained}{invalid}"
             ),
-        )
+        ),
+    };
+
+    let requeue = if decision.is_execute() && !complete {
+        // A deferred resource is retried quickly; the full interval is for settled passes.
+        PENDING_REQUEUE
+    } else {
+        Duration::from_secs(u64::from(app.spec.requeue_after_seconds))
     };
 
     ApplyOutcome::ready(reason, message)
         .with_inventory(inventory)
         .with_sync(sync)
-        .with_requeue(if complete {
-            Duration::from_secs(u64::from(app.spec.requeue_after_seconds))
-        } else {
-            PENDING_REQUEUE
-        })
+        .with_requeue(requeue)
 }
 
 /// Returns whether an empty desired set may prune the inventory.
@@ -1132,18 +1472,21 @@ fn load_desired_resources(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ferriscd_crd::application::{
         DEFAULT_REQUEUE_AFTER_SECONDS, DEFAULT_REVISION_HISTORY_LIMIT,
     };
-    use ferriscd_crd::status::{ApplicationStatus, HealthState, HealthStatus};
+    use ferriscd_crd::status::{
+        ApplicationStatus, CONDITION_READY, Condition, ConditionStatus, HealthState, HealthStatus,
+    };
     use ferriscd_crd::{
         ApplicationSpec, AutomatedSyncPolicy, DestinationSpec, GitSourceSpec, RendererSpec,
         SourceSpec, SyncPolicy,
     };
+    use ferriscd_engine::diff::{SkipReason, SyncTrigger};
     use ferriscd_engine::manifest::GroupVersionKind;
     use ferriscd_engine::repo::{FakeGitClient, FakeGitClientConfig, RepoCacheConfig};
     use kube::discovery::ApiCapabilities;
@@ -1151,7 +1494,9 @@ mod tests {
 
     use super::*;
     use crate::discovery::{DiscoveryFuture, DiscoverySnapshot, DiscoverySource};
+    use crate::dry_run::{DryRunFuture, DryRunOutcome, DryRunTarget};
     use crate::live_state::{FetchTarget, LiveFuture};
+    use crate::reconcile::{REASON_OWNERSHIP_CONFLICT, StatusWriter, apply_once};
 
     // ---------------------------------------------------------------------
     // Fixtures
@@ -1163,6 +1508,7 @@ mod tests {
         objects: StdMutex<BTreeMap<String, DynamicObject>>,
         namespaces: StdMutex<Vec<String>>,
         applies: StdMutex<Vec<String>>,
+        applied_objects: StdMutex<Vec<DynamicObject>>,
         applied_tracking_ids: StdMutex<Vec<String>>,
         deletes: StdMutex<Vec<String>>,
         fail_apply: StdMutex<Vec<String>>,
@@ -1201,6 +1547,26 @@ mod tests {
 
         fn applies(&self) -> Vec<String> {
             self.applies.lock().unwrap().clone()
+        }
+
+        /// Makes every object the applier has written live, modelling the API server write.
+        ///
+        /// Re-seeding the same key overwrites it with the newest body, exactly like a real apply.
+        fn seed_applied(&self) {
+            let applied = self.applied_objects.lock().unwrap().clone();
+            let mut objects = self.objects.lock().unwrap();
+            for object in applied {
+                objects.insert(gknn_of_object(&object), object);
+            }
+        }
+
+        /// Applies `mutate` to the live object at `gknn` (drift injection).
+        fn drift(&self, gknn: &str, mutate: impl FnOnce(&mut DynamicObject)) {
+            let mut objects = self.objects.lock().unwrap();
+            let object = objects
+                .get_mut(gknn)
+                .unwrap_or_else(|| panic!("no live object at {gknn}"));
+            mutate(object);
         }
 
         fn applied_tracking_ids(&self) -> Vec<String> {
@@ -1316,6 +1682,11 @@ mod tests {
                 }
                 self.cluster.applies.lock().unwrap().push(key);
                 self.cluster
+                    .applied_objects
+                    .lock()
+                    .unwrap()
+                    .push(body.clone());
+                self.cluster
                     .applied_tracking_ids
                     .lock()
                     .unwrap()
@@ -1428,7 +1799,10 @@ mod tests {
                 cluster: IN_CLUSTER.to_owned(),
                 namespace: destination_namespace.to_owned(),
             },
-            sync_policy: None,
+            // Automated self-healing is the fixture default: a first pass has no
+            // `lastSyncedRevision`, so it always executes (`SourceChanged`) and applies the
+            // whole desired set. Tests that care about the gate override this.
+            sync_policy: Some(self_heal_policy()),
             ignore_differences: Vec::new(),
             requeue_after_seconds: DEFAULT_REQUEUE_AFTER_SECONDS,
             revision_history_limit: DEFAULT_REVISION_HISTORY_LIMIT,
@@ -1437,6 +1811,31 @@ mod tests {
         app.metadata.namespace = Some("ferriscd-system".to_owned());
         app.metadata.generation = Some(4);
         app
+    }
+
+    /// `automated: { prune: false, selfHeal: true }`: the "drift is corrected, nothing is
+    /// deleted automatically" default of the fixtures.
+    fn self_heal_policy() -> SyncPolicy {
+        SyncPolicy {
+            automated: Some(AutomatedSyncPolicy {
+                prune: false,
+                self_heal: true,
+            }),
+            sync_options: None,
+            retry: None,
+        }
+    }
+
+    /// The same policy with `selfHeal: false` (source-change-only sync).
+    fn source_only_policy() -> SyncPolicy {
+        SyncPolicy {
+            automated: Some(AutomatedSyncPolicy {
+                prune: false,
+                self_heal: false,
+            }),
+            sync_options: None,
+            retry: None,
+        }
     }
 
     fn auto_prune(app: &mut Application) {
@@ -1478,17 +1877,58 @@ mod tests {
         }
     }
 
+    /// Scripted `dryRun=All` source.
+    ///
+    /// An unscripted dry-run echoes the apply body it was handed, which is exactly "the API
+    /// server accepted the body and defaulted nothing" — the case an in-sync object diffs
+    /// `Synced` against. Tests script a different prediction to model API-defaulted or
+    /// webhook-mutated fields.
+    #[derive(Default)]
+    struct FakeDryRun {
+        calls: StdMutex<Vec<String>>,
+        predictions: StdMutex<BTreeMap<String, DynamicObject>>,
+    }
+
+    impl FakeDryRun {
+        /// Canonical keys of every dry-run this pipeline issued (prediction PATCHes are *not*
+        /// mutations, so they must keep happening even when zero applies are allowed).
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl DryRunApi for FakeDryRun {
+        fn dry_run<'a>(&'a self, target: DryRunTarget<'a>) -> DryRunFuture<'a> {
+            let key = target.key.canonical();
+            self.calls.lock().unwrap().push(key.clone());
+            let echoed = apply_body(target.object);
+            let predicted = self
+                .predictions
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .unwrap_or(echoed);
+            Box::pin(async move { Ok(DryRunOutcome::Predicted(Box::new(predicted))) })
+        }
+    }
+
     /// A hermetic pipeline: fake Git, fake discovery, fake live cluster, fake applier.
     struct Fixture {
         git: Arc<FakeGitClient>,
         cluster: Arc<FakeCluster>,
         discovery: Arc<FakeDiscovery>,
+        dry_run: Arc<FakeDryRun>,
         pipeline: InventorySyncPipeline,
         repo_url: String,
         _temp: tempfile::TempDir,
     }
 
     fn fixture(cluster: FakeCluster) -> Fixture {
+        fixture_with(cluster, FakeDryRun::default())
+    }
+
+    fn fixture_with(cluster: FakeCluster, dry_run: FakeDryRun) -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let git = Arc::new(FakeGitClient::with_config(FakeGitClientConfig {
             url_policy: RepoUrlPolicy::AllowLocal,
@@ -1496,6 +1936,7 @@ mod tests {
         }));
         let cluster = Arc::new(cluster);
         let discovery = Arc::new(FakeDiscovery::with_cluster_kinds());
+        let dry_run = Arc::new(dry_run);
         let repos = Arc::new(RepoCache::new(
             git.clone(),
             RepoCacheConfig::new(temp.path().join("cache")),
@@ -1507,6 +1948,7 @@ mod tests {
             Arc::new(FakeApplier {
                 cluster: cluster.clone(),
             }),
+            dry_run.clone(),
         )
         .with_url_policy(RepoUrlPolicy::AllowLocal);
         let repo_url = temp.path().join("repo.git").display().to_string();
@@ -1514,6 +1956,7 @@ mod tests {
             git,
             cluster,
             discovery,
+            dry_run,
             pipeline,
             repo_url,
             _temp: temp,
@@ -1531,8 +1974,20 @@ mod tests {
     }
 
     const CONFIGMAP: &str = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n";
+    /// The same ConfigMap with a `data` field, for the `ignoreDifferences` tests.
+    const CONFIGMAP_WITH_DATA: &str =
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  key: value\n";
     const DEPLOYMENT: &str =
         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  replicas: 1\n";
+
+    /// Stand-in for `status.sync.lastSyncedSpecHash` in outcomes built by hand: only its
+    /// presence and round-trip matter, never the digest itself (the real value comes from
+    /// `source_spec_hash`, which is pinned by its own engine tests).
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// Canonical GKNN keys of the two fixture resources.
+    const CONFIGMAP_KEY: &str = "/ConfigMap/payments/settings";
+    const DEPLOYMENT_KEY: &str = "apps/Deployment/payments/api";
 
     // ---------------------------------------------------------------------
     // Happy path
@@ -1584,7 +2039,11 @@ mod tests {
         assert_eq!(sync.revision.as_deref(), Some(sha.as_str()));
         assert_eq!(sync.last_synced_revision.as_deref(), Some(sha.as_str()));
         assert!(sync.last_synced_at.is_some());
-        assert!(sync.last_synced_spec_hash.is_none());
+        assert_eq!(
+            sync.last_synced_spec_hash.as_deref(),
+            Some(source_spec_hash(&app.spec).expect("spec hash").as_str()),
+            "finding H7: a successful sync persists the spec hash alongside the revision"
+        );
         assert_eq!(outcome.reason, REASON_SYNC_SUCCEEDED);
         assert_eq!(
             outcome.requeue,
@@ -2125,6 +2584,7 @@ mod tests {
             Arc::new(FakeApplier {
                 cluster: cluster.clone(),
             }),
+            Arc::new(FakeDryRun::default()),
         );
         assert_eq!(pipeline.url_policy(), RepoUrlPolicy::Production);
 
@@ -2260,6 +2720,803 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // Phase 07 diff gate (T07.5)
+    // ---------------------------------------------------------------------
+
+    /// `/status` writer that records patches instead of calling the API server.
+    #[derive(Default)]
+    struct RecordingStatus {
+        patches: StdMutex<Vec<ApplicationStatus>>,
+    }
+
+    impl RecordingStatus {
+        fn last(&self) -> Option<ApplicationStatus> {
+            self.patches.lock().unwrap().last().cloned()
+        }
+    }
+
+    impl StatusWriter for RecordingStatus {
+        fn patch<'a>(
+            &'a self,
+            _app: &'a Application,
+            status: ApplicationStatus,
+        ) -> BoxFuture<'a, Result<(), ReconcileError>> {
+            Box::pin(async move {
+                self.patches.lock().unwrap().push(status);
+                Ok(())
+            })
+        }
+    }
+
+    /// Runs one full reconcile the way the controller does.
+    ///
+    /// The real [`apply_once`] wrapper is used (so the always-update-status contract, the
+    /// `lastSynced*` merge and the failure-path inventory persistence are all exercised), the
+    /// just-applied objects become live (modelling the API server write), and the persisted
+    /// `/status` becomes `app.status` for the next pass.
+    async fn reconcile_pass(
+        fixture: &Fixture,
+        app: &mut Application,
+    ) -> (Option<ReconcileError>, Option<ApplicationStatus>) {
+        let writer = RecordingStatus::default();
+        let result = apply_once(app, &fixture.pipeline, &writer).await;
+        fixture.cluster.seed_applied();
+        let status = writer.last();
+        app.status = status.clone();
+        (result.err(), status)
+    }
+
+    /// The `Ready` condition of a persisted status.
+    fn ready(status: &Option<ApplicationStatus>) -> Condition {
+        status
+            .as_ref()
+            .expect("the pass must persist /status")
+            .condition(CONDITION_READY)
+            .expect("every reconcile sets Ready")
+            .clone()
+    }
+
+    /// The `sync` block of a persisted status.
+    fn sync_state(status: &Option<ApplicationStatus>) -> SyncState {
+        status
+            .as_ref()
+            .expect("the pass must persist /status")
+            .sync
+            .clone()
+            .expect("the pass must persist status.sync")
+    }
+
+    /// A desired `ConfigMap` for the pure selection tests.
+    fn desired_configmap(name: &str) -> DesiredResource {
+        DesiredResource {
+            key: ResourceKey::new("", "ConfigMap", Some("payments".to_owned()), name),
+            gvk: GroupVersionKind::parse("v1", "ConfigMap").unwrap(),
+            object: config_map(name, None),
+            source_file: "configmap.yaml".to_owned(),
+        }
+    }
+
+    fn operation_annotation() -> BTreeMap<String, String> {
+        BTreeMap::from([(
+            annotations::OPERATION.to_owned(),
+            r#"{"sync":{"revision":"main"}}"#.to_owned(),
+        )])
+    }
+
+    /// **Trap guard** (`applyOutOfSyncOnly`): a resource the diff classified `Synced` is never
+    /// selected for an apply, and a skipped pass selects nothing at all.
+    #[test]
+    fn apply_out_of_sync_only_skips_synced_resources() {
+        let settings = desired_configmap("settings");
+        let extra = desired_configmap("extra");
+        let resources = vec![settings.clone(), extra.clone()];
+
+        let statuses = BTreeMap::from([
+            (settings.key.clone(), DiffStatus::Synced),
+            (extra.key.clone(), DiffStatus::OutOfSync),
+        ]);
+        let execute = SyncDecision::Execute(SyncTrigger::DriftDetected);
+
+        assert_eq!(
+            apply_selection(execute, &statuses, &resources, true),
+            BTreeSet::from([extra.key.clone()]),
+            "only the out-of-sync resource may be patched"
+        );
+        assert_eq!(
+            apply_selection(execute, &statuses, &resources, false),
+            BTreeSet::from([settings.key.clone(), extra.key.clone()]),
+            "applyOutOfSyncOnly: false applies the whole desired set"
+        );
+        for skip in [
+            SkipReason::AutomatedDisabled,
+            SkipReason::SelfHealDisabled,
+            SkipReason::AlreadySynced,
+        ] {
+            assert!(
+                apply_selection(SyncDecision::Skip(skip), &statuses, &resources, false).is_empty(),
+                "a skip decision must never select an apply ({skip})"
+            );
+        }
+
+        // A `Missing` resource needs a create, an orphan needs nothing.
+        let mixed = BTreeMap::from([
+            (settings.key.clone(), DiffStatus::Missing),
+            (extra.key.clone(), DiffStatus::Orphaned),
+        ]);
+        assert_eq!(
+            apply_selection(execute, &mixed, &resources, true),
+            BTreeSet::from([settings.key.clone()])
+        );
+
+        // A resource the diff never classified must not be patched blind.
+        assert!(
+            apply_selection(execute, &BTreeMap::new(), &resources, true).is_empty(),
+            "an unclassified resource must never be applied"
+        );
+    }
+
+    /// Manual-operation detection is one pure helper (T07.4's `manual_op` input).
+    #[test]
+    fn manual_operations_are_detected_from_the_operation_annotation() {
+        let mut app = application("https://example.com/repo.git", ".", "payments");
+        assert!(
+            !manual_operation(&app),
+            "no annotation, no manual operation"
+        );
+
+        app.metadata.annotations = Some(BTreeMap::from([(
+            annotations::REFRESH.to_owned(),
+            "1712345678".to_owned(),
+        )]));
+        assert!(
+            !manual_operation(&app),
+            "a refresh only asks for a reconcile; the diff gate still decides"
+        );
+
+        app.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(annotations::OPERATION.to_owned(), "   ".to_owned());
+        assert!(
+            !manual_operation(&app),
+            "a blank operation is not a request"
+        );
+
+        app.metadata.annotations.as_mut().unwrap().insert(
+            annotations::OPERATION.to_owned(),
+            r#"{"sync":{}}"#.to_owned(),
+        );
+        assert!(manual_operation(&app));
+    }
+
+    /// The headline T07.5 invariant: an already-synced `Application` performs **zero** mutating
+    /// `Patch` calls, while the diff still dry-runs every present resource.
+    #[tokio::test]
+    async fn a_second_reconcile_of_a_synced_application_performs_zero_applies() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let sha = fixture.commit(&[
+            ("configmap.yaml", CONFIGMAP),
+            ("deployment.yaml", DEPLOYMENT),
+        ]);
+        let mut app = fixture.app(".");
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "first pass must sync: {err:?}");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec![CONFIGMAP_KEY.to_owned(), DEPLOYMENT_KEY.to_owned()],
+            "a first pass creates the whole desired set in tier order"
+        );
+        let sync = sync_state(&status);
+        assert_eq!(sync.status, SyncStatus::Synced);
+        assert_eq!(sync.last_synced_revision.as_deref(), Some(sha.as_str()));
+        let spec_hash = source_spec_hash(&app.spec).expect("spec hash");
+        assert_eq!(
+            sync.last_synced_spec_hash.as_deref(),
+            Some(spec_hash.as_str())
+        );
+        assert!(sync.last_synced_at.is_some());
+        assert_eq!(ready(&status).reason, REASON_SYNC_SUCCEEDED);
+
+        // Second reconcile: the cluster already matches Git, so nothing may be patched.
+        let applies_before = fixture.cluster.applies().len();
+        let mutating_before = fixture.pipeline.mutating_applies();
+        let dry_runs_before = fixture.dry_run.calls().len();
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "the second pass must succeed: {err:?}");
+
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            applies_before,
+            "an already-synced Application must issue zero mutating Patch calls"
+        );
+        assert_eq!(
+            fixture.pipeline.mutating_applies(),
+            mutating_before,
+            "the pipeline must not count (or issue) a mutating apply"
+        );
+        assert!(
+            fixture.dry_run.calls().len() > dry_runs_before,
+            "the diff still dry-runs every present resource (dryRun PATCHes are expected)"
+        );
+        assert!(
+            fixture
+                .dry_run
+                .calls()
+                .iter()
+                .any(|key| key == CONFIGMAP_KEY),
+            "the ConfigMap must have been classified: {:?}",
+            fixture.dry_run.calls()
+        );
+
+        let condition = ready(&status);
+        assert_eq!(condition.reason, REASON_SYNC_SKIPPED);
+        assert!(
+            condition.message.contains("already matches Git"),
+            "{}",
+            condition.message
+        );
+        let sync = sync_state(&status);
+        assert_eq!(sync.status, SyncStatus::Synced);
+        assert_eq!(
+            sync.last_synced_revision.as_deref(),
+            Some(sha.as_str()),
+            "a skipped pass must not move the last successful sync markers"
+        );
+        assert_eq!(
+            sync.last_synced_spec_hash.as_deref(),
+            Some(spec_hash.as_str())
+        );
+    }
+
+    /// Drift is healed, and only the drifted resource is re-applied (`applyOutOfSyncOnly`).
+    #[tokio::test]
+    async fn drift_heals_only_the_drifted_resource() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[
+            ("configmap.yaml", CONFIGMAP),
+            ("deployment.yaml", DEPLOYMENT),
+        ]);
+        let mut app = fixture.app(".");
+        let (err, _) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+
+        // Somebody edits the live ConfigMap: live state no longer matches Git.
+        fixture.cluster.drift(CONFIGMAP_KEY, |object| {
+            object.data["data"]["key"] = json!("tampered");
+        });
+        let applies_before = fixture.cluster.applies().len();
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            fixture.cluster.applies()[applies_before..],
+            [CONFIGMAP_KEY.to_owned()],
+            "only the drifted ConfigMap may be re-applied, never the synced Deployment"
+        );
+        let condition = ready(&status);
+        assert_eq!(condition.reason, REASON_SYNC_SUCCEEDED);
+        assert!(
+            condition.message.contains("driftDetected"),
+            "the trigger must be reported: {}",
+            condition.message
+        );
+        assert!(
+            condition.message.contains("applied 1 of 2"),
+            "{}",
+            condition.message
+        );
+        assert_eq!(sync_state(&status).status, SyncStatus::Synced);
+    }
+
+    /// `selfHeal: false` + unchanged `(revision, spec hash)` ⇒ `Skip(SelfHealDisabled)`, zero
+    /// applies, and the drift is still reported as `OutOfSync`.
+    #[tokio::test]
+    async fn self_heal_disabled_skips_drift_without_applying() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let sha = fixture.commit(&[
+            ("configmap.yaml", CONFIGMAP),
+            ("deployment.yaml", DEPLOYMENT),
+        ]);
+        let mut app = fixture.app(".");
+        app.spec.sync_policy = Some(source_only_policy());
+
+        // The first pass has no `lastSyncedRevision`, so it syncs (source "changed").
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            sync_state(&status).last_synced_revision.as_deref(),
+            Some(sha.as_str())
+        );
+
+        fixture.cluster.drift(CONFIGMAP_KEY, |object| {
+            object.data["data"]["key"] = json!("tampered");
+        });
+        let applies_before = fixture.cluster.applies().len();
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            applies_before,
+            "selfHeal: false must never apply drift"
+        );
+        let condition = ready(&status);
+        assert_eq!(condition.reason, REASON_SYNC_SKIPPED);
+        assert!(
+            condition.message.contains("self-heal is disabled"),
+            "{}",
+            condition.message
+        );
+        let sync = sync_state(&status);
+        assert_eq!(
+            sync.status,
+            SyncStatus::OutOfSync,
+            "a skipped-but-drifting application must be reported OutOfSync"
+        );
+        assert_eq!(
+            sync.revision.as_deref(),
+            Some(sha.as_str()),
+            "the observed revision is still recorded"
+        );
+        assert_eq!(
+            sync.last_synced_revision.as_deref(),
+            Some(sha.as_str()),
+            "a skip must not move the last successful sync"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Findings H1/H2: what `/status` says about ignored pointers and orphans
+    // ---------------------------------------------------------------------
+
+    /// Finding H1: an `ignoreDifferences` pointer that is not valid RFC 6901 is never applied
+    /// (a typo must not fail a reconcile), so it must be *visible* in `Application.status` —
+    /// otherwise the operator believes a field is ignored while it keeps reporting drift.
+    #[tokio::test]
+    async fn an_invalid_ignore_pointer_is_reported_in_the_ready_message() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("configmap.yaml", CONFIGMAP_WITH_DATA)]);
+        let mut app = fixture.app(".");
+        let (err, _) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+
+        // `spec/replicaz` has no leading `/`, so it is not an RFC 6901 pointer at all. The second
+        // entry *is* valid and simply names a field this object does not have: that is the
+        // documented no-op, so it must not be counted as invalid.
+        app.spec.ignore_differences = vec![ferriscd_crd::IgnoreDifference {
+            kind: "ConfigMap".to_owned(),
+            json_pointers: vec!["spec/replicaz".to_owned(), "/spec/replicaz".to_owned()],
+            ..ferriscd_crd::IgnoreDifference::default()
+        }];
+        fixture.cluster.drift(CONFIGMAP_KEY, |object| {
+            object.data["data"]["key"] = json!("tampered");
+        });
+        let applies_before = fixture.cluster.applies().len();
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+
+        let condition = ready(&status);
+        assert!(
+            condition
+                .message
+                .contains("1 invalid ignoreDifferences pointer ignored"),
+            "the ignored typo must be visible on the CR: {}",
+            condition.message
+        );
+        assert_eq!(
+            fixture.cluster.applies()[applies_before..],
+            [CONFIGMAP_KEY.to_owned()],
+            "the typo must not suppress the drift it names (it is not applied)"
+        );
+
+        // A valid pointer really is honoured, so the count is about validity, not about the
+        // pointer happening not to resolve.
+        app.spec.ignore_differences = vec![ferriscd_crd::IgnoreDifference {
+            kind: "ConfigMap".to_owned(),
+            json_pointers: vec!["/data/key".to_owned()],
+            ..ferriscd_crd::IgnoreDifference::default()
+        }];
+        fixture.cluster.drift(CONFIGMAP_KEY, |object| {
+            object.data["data"]["key"] = json!("tampered-again");
+        });
+        let applies_before = fixture.cluster.applies().len();
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            applies_before,
+            "the ignored field must not be re-applied"
+        );
+        assert!(
+            !ready(&status).message.contains("invalid ignoreDifferences"),
+            "a valid pointer must not be reported as invalid: {}",
+            ready(&status).message
+        );
+    }
+
+    /// Finding H2 (a): a `Skip` pass with `prune: false` must reach the same verdict as the
+    /// executing pass before it — `Synced` — while still naming the retained orphan. Otherwise
+    /// removing a resource from Git with pruning disabled pins `OutOfSync` forever (T06 contract).
+    #[tokio::test]
+    async fn a_skip_pass_with_prune_disabled_reports_retained_orphans_as_synced() {
+        let orphan = config_map(
+            "removed",
+            Some("ferriscd-system/payments:/ConfigMap:payments/removed"),
+        );
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(orphan),
+        );
+        let sha = fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+        app.spec.sync_policy = Some(source_only_policy());
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(sync_state(&status).status, SyncStatus::Synced);
+
+        // Git no longer declares a tracked resource; `prune: false` means it stays.
+        app.status
+            .as_mut()
+            .expect("the first pass persists /status")
+            .inventory
+            .push(ferriscd_crd::InventoryEntry::new(
+                "/ConfigMap/payments/removed",
+                "v1",
+            ));
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+
+        let sync = sync_state(&status);
+        assert_eq!(
+            sync.status,
+            SyncStatus::Synced,
+            "a retained orphan must never pin OutOfSync when pruning is disabled"
+        );
+        assert_eq!(
+            sync.last_synced_revision.as_deref(),
+            Some(sha.as_str()),
+            "a skipped pass must not move the markers"
+        );
+        let condition = ready(&status);
+        assert_eq!(condition.reason, REASON_SYNC_SKIPPED);
+        assert!(
+            condition.message.contains("1 orphan(s) retained"),
+            "the retained orphan must be visible: {}",
+            condition.message
+        );
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "a skipped pass issues no deletes"
+        );
+    }
+
+    /// Finding H2 (b): with pruning **enabled** the engine reading stands — the orphan is a prune
+    /// that is still due, so the skip pass reports `OutOfSync`. It still deletes nothing: only an
+    /// executing pass prunes (M1).
+    #[tokio::test]
+    async fn a_skip_pass_with_prune_enabled_reports_an_orphan_out_of_sync_without_deleting() {
+        let orphan = config_map(
+            "removed",
+            Some("ferriscd-system/payments:/ConfigMap:payments/removed"),
+        );
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(orphan),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+        app.spec.sync_policy = Some(SyncPolicy {
+            automated: Some(AutomatedSyncPolicy {
+                prune: true,
+                self_heal: false,
+            }),
+            sync_options: None,
+            retry: None,
+        });
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(sync_state(&status).status, SyncStatus::Synced);
+
+        app.status
+            .as_mut()
+            .expect("the first pass persists /status")
+            .inventory
+            .push(ferriscd_crd::InventoryEntry::new(
+                "/ConfigMap/payments/removed",
+                "v1",
+            ));
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+
+        assert_eq!(
+            sync_state(&status).status,
+            SyncStatus::OutOfSync,
+            "with pruning enabled an orphan is a prune that is still due"
+        );
+        assert_eq!(ready(&status).reason, REASON_SYNC_SKIPPED);
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "a skip decision must never issue a delete, even with prune enabled"
+        );
+    }
+
+    /// Finding H2 (c): the existing T06 contract on an executing pass — `prune: false` plus a
+    /// live orphan reports `Synced` *and* names the retained orphan.
+    #[tokio::test]
+    async fn an_executing_pass_with_prune_disabled_reports_retained_orphans_as_synced() {
+        let orphan = config_map(
+            "removed",
+            Some("ferriscd-system/payments:/ConfigMap:payments/removed"),
+        );
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(orphan),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+        assert!(app.spec.sync_policy.as_ref().is_some_and(|policy| {
+            policy
+                .automated
+                .as_ref()
+                .is_some_and(|automated| !automated.prune)
+        }));
+
+        let (err, _) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+
+        app.status
+            .as_mut()
+            .expect("the first pass persists /status")
+            .inventory
+            .push(ferriscd_crd::InventoryEntry::new(
+                "/ConfigMap/payments/removed",
+                "v1",
+            ));
+        // Something must still need applying, otherwise the gate would skip (H2 a).
+        fixture.cluster.drift(CONFIGMAP_KEY, |object| {
+            object.data["data"]["key"] = json!("tampered");
+        });
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            sync_state(&status).status,
+            SyncStatus::Synced,
+            "an executing pass that finished every resource reports Synced"
+        );
+        assert!(
+            ready(&status).message.contains("1 orphan(s) retained"),
+            "the retained orphan must be reported: {}",
+            ready(&status).message
+        );
+        assert!(fixture.cluster.deletes().is_empty());
+    }
+
+    /// Finding H7: a `spec.source.git.path` edit produces no new commit, so `selfHeal: false`
+    /// must key off `lastSyncedSpecHash` and sync anyway.
+    #[tokio::test]
+    async fn a_spec_path_edit_with_an_unchanged_revision_executes_a_sync() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let sha = fixture.commit(&[
+            ("deploy/deployment.yaml", DEPLOYMENT),
+            ("config/configmap.yaml", CONFIGMAP),
+        ]);
+        let mut app = fixture.app("deploy");
+        app.spec.sync_policy = Some(source_only_policy());
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec![DEPLOYMENT_KEY.to_owned()],
+            "only the deploy/ directory is desired by the first pass"
+        );
+        let old_hash = sync_state(&status)
+            .last_synced_spec_hash
+            .expect("the first pass persists the spec hash");
+
+        // The operator points the Application at a different directory in the *same* commit.
+        app.spec.source.git.path = "config".to_owned();
+        let new_hash = source_spec_hash(&app.spec).expect("spec hash");
+        assert_ne!(old_hash, new_hash, "a path edit must change the hash");
+
+        let applies_before = fixture.cluster.applies().len();
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            fixture.cluster.applies()[applies_before..],
+            [CONFIGMAP_KEY.to_owned()],
+            "the newly desired ConfigMap must be applied"
+        );
+        let condition = ready(&status);
+        assert_eq!(condition.reason, REASON_SYNC_SUCCEEDED);
+        assert!(
+            condition.message.contains("sourceChanged"),
+            "the spec hash change is the trigger: {}",
+            condition.message
+        );
+        let sync = sync_state(&status);
+        assert_eq!(
+            sync.revision.as_deref(),
+            Some(sha.as_str()),
+            "the commit SHA did not change; only the spec did"
+        );
+        assert_eq!(
+            sync.last_synced_spec_hash.as_deref(),
+            Some(new_hash.as_str())
+        );
+        assert_eq!(sync.status, SyncStatus::Synced);
+    }
+
+    /// `automated: None` reports drift but never applies it; a manual operation overrides it.
+    #[tokio::test]
+    async fn a_manual_operation_annotation_executes_a_manual_sync() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+        app.spec.sync_policy = None;
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "automated: None must never apply automatically"
+        );
+        let condition = ready(&status);
+        assert_eq!(condition.reason, REASON_SYNC_SKIPPED);
+        assert!(
+            condition.message.contains("automated sync is disabled"),
+            "{}",
+            condition.message
+        );
+        let sync = sync_state(&status);
+        assert_eq!(sync.status, SyncStatus::OutOfSync);
+        assert!(
+            sync.last_synced_revision.is_none(),
+            "nothing was deployed, so no sync marker may be written"
+        );
+
+        // The CLI/API requests a sync through the operation annotation.
+        app.metadata.annotations = Some(operation_annotation());
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec![CONFIGMAP_KEY.to_owned()],
+            "a manual operation bypasses `automated: None`"
+        );
+        let condition = ready(&status);
+        assert_eq!(condition.reason, REASON_SYNC_SUCCEEDED);
+        assert!(
+            condition.message.contains("manual"),
+            "the trigger must be reported: {}",
+            condition.message
+        );
+        let sync = sync_state(&status);
+        assert_eq!(sync.status, SyncStatus::Synced);
+        assert!(sync.last_synced_revision.is_some());
+        assert!(sync.last_synced_spec_hash.is_some());
+    }
+
+    /// `applyOutOfSyncOnly: false` re-applies resources the diff already considers synced.
+    #[tokio::test]
+    async fn apply_out_of_sync_only_false_applies_synced_resources_too() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[
+            ("configmap.yaml", CONFIGMAP),
+            ("deployment.yaml", DEPLOYMENT),
+        ]);
+        let mut app = fixture.app(".");
+        let (err, _) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+
+        // Default (`applyOutOfSyncOnly: true`) + a manual operation: nothing needs an apply.
+        app.metadata.annotations = Some(operation_annotation());
+        let applies_before = fixture.cluster.applies().len();
+        let (err, _) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            applies_before,
+            "an executed pass still skips synced resources by default"
+        );
+
+        // Opting out re-applies the whole desired set, in tier order.
+        app.spec.sync_policy = Some(SyncPolicy {
+            automated: Some(AutomatedSyncPolicy {
+                prune: false,
+                self_heal: true,
+            }),
+            sync_options: Some(SyncOptions {
+                apply_out_of_sync_only: false,
+                ..SyncOptions::default()
+            }),
+            retry: None,
+        });
+        let applies_before = fixture.cluster.applies().len();
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            fixture.cluster.applies()[applies_before..],
+            [CONFIGMAP_KEY.to_owned(), DEPLOYMENT_KEY.to_owned()],
+            "applyOutOfSyncOnly: false must patch every desired resource"
+        );
+        assert_eq!(sync_state(&status).status, SyncStatus::Synced);
+    }
+
+    /// Trap T10 / finding M4: an ownership conflict applies nothing, reports `OutOfSync`, and is
+    /// terminal so it can never become a self-heal loop.
+    #[tokio::test]
+    async fn an_ownership_conflict_applies_nothing_and_reports_out_of_sync() {
+        let foreign = config_map(
+            "settings",
+            Some("ferriscd-system/other:/ConfigMap:payments/settings"),
+        );
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(foreign),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        let err = err.expect("a foreign owner must fail the reconcile");
+        assert!(
+            matches!(err, ReconcileError::OwnershipConflict { .. }),
+            "the conflict must be classified: {err}"
+        );
+        assert_eq!(
+            err.failure_class(),
+            crate::FailureClass::Terminal,
+            "no apply can fix a foreign owner, so retrying must not loop"
+        );
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "nothing may be applied when a foreign owner is detected"
+        );
+        assert!(
+            fixture.dry_run.calls().is_empty(),
+            "a doomed pass must not even dry-run the bundle"
+        );
+        assert_eq!(fixture.pipeline.mutating_applies(), 0);
+
+        let persisted = status
+            .as_ref()
+            .expect("the failure path must patch /status");
+        assert_eq!(
+            persisted.sync.as_ref().map(|sync| sync.status),
+            Some(SyncStatus::OutOfSync),
+            "an ownership conflict must surface as OutOfSync"
+        );
+        let condition = ready(&status);
+        assert_eq!(condition.status, ConditionStatus::False);
+        assert_eq!(condition.reason, REASON_OWNERSHIP_CONFLICT);
+        assert!(
+            condition.message.contains("another Application"),
+            "{}",
+            condition.message
+        );
+
+        // A second pass is not a loop: still terminal, still zero applies.
+        app.status = status;
+        let (err, _) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_some_and(|err| err.failure_class() == crate::FailureClass::Terminal));
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    // ---------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------
 
@@ -2285,15 +3542,27 @@ mod tests {
     fn a_pending_outcome_is_not_synced_and_requeues_fast() {
         let mut app = application("https://example.com/repo.git", ".", "payments");
         app.spec.requeue_after_seconds = 600;
+        let execute = SyncDecision::Execute(ferriscd_engine::diff::SyncTrigger::SourceChanged);
+        // A first pass: nothing exists yet, so everything is `Missing`.
+        let summary = DiffSummary {
+            total: 3,
+            missing: 3,
+            ..DiffSummary::default()
+        };
 
         let pending = build_outcome(
             &app,
+            execute,
+            &summary,
+            HASH,
             SyncCounts {
                 desired: 3,
                 applied: 1,
                 pruned: 0,
                 retained_orphans: 0,
                 pending: 2,
+                invalid_ignore_pointers: 0,
+                prune_enabled: false,
             },
             "0123456789abcdef0123456789abcdef01234567".to_owned(),
             Inventory::new(),
@@ -2303,16 +3572,25 @@ mod tests {
         let sync = pending.sync.unwrap();
         assert_eq!(sync.status, SyncStatus::OutOfSync);
         assert!(sync.last_synced_revision.is_none());
+        assert!(
+            sync.last_synced_spec_hash.is_none(),
+            "a pending resource means the spec hash is not yet synced"
+        );
         assert!(sync.last_synced_at.is_none());
 
         let complete = build_outcome(
             &app,
+            execute,
+            &summary,
+            HASH,
             SyncCounts {
                 desired: 3,
                 applied: 3,
                 pruned: 1,
                 retained_orphans: 0,
                 pending: 0,
+                invalid_ignore_pointers: 0,
+                prune_enabled: false,
             },
             "0123456789abcdef0123456789abcdef01234567".to_owned(),
             Inventory::new(),
@@ -2323,19 +3601,27 @@ mod tests {
             Some(Duration::from_secs(600)),
             "a settled sync honors spec.requeueAfterSeconds"
         );
-        assert_eq!(complete.sync.as_ref().unwrap().status, SyncStatus::Synced);
-        assert!(
-            complete
-                .sync
-                .as_ref()
-                .unwrap()
-                .last_synced_revision
-                .is_some()
+        let sync = complete.sync.as_ref().unwrap();
+        assert_eq!(sync.status, SyncStatus::Synced);
+        assert_eq!(
+            sync.last_synced_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
         );
+        assert_eq!(
+            sync.last_synced_spec_hash.as_deref(),
+            Some(HASH),
+            "finding H7: a successful sync persists the spec hash with the revision"
+        );
+        assert!(sync.last_synced_at.is_some());
         assert!(complete.message.contains("0123456"), "{}", complete.message);
         assert!(
             complete.message.contains("pruned 1"),
             "{}",
+            complete.message
+        );
+        assert!(
+            complete.message.contains("sourceChanged"),
+            "the trigger must be visible: {}",
             complete.message
         );
         assert!(
@@ -2347,12 +3633,17 @@ mod tests {
         // A stuck orphan must be visible in `/status`, not only in a log line.
         let retained = build_outcome(
             &app,
+            execute,
+            &summary,
+            HASH,
             SyncCounts {
                 desired: 1,
                 applied: 1,
                 pruned: 0,
                 retained_orphans: 1,
                 pending: 0,
+                invalid_ignore_pointers: 0,
+                prune_enabled: false,
             },
             "0123456789abcdef0123456789abcdef01234567".to_owned(),
             Inventory::new(),
@@ -2363,6 +3654,223 @@ mod tests {
             retained.message
         );
         assert_eq!(retained.reason, REASON_SYNC_SUCCEEDED);
+    }
+
+    /// A skipped pass never claims `Synced` for a drifting cluster and never advances the
+    /// `lastSynced*` markers (that is what `selfHeal: false` relies on).
+    #[test]
+    fn a_skipped_outcome_reports_the_diff_status_and_keeps_the_markers_unset() {
+        let app = application("https://example.com/repo.git", ".", "payments");
+        let drifting = DiffSummary {
+            total: 2,
+            synced: 1,
+            out_of_sync: 1,
+            ..DiffSummary::default()
+        };
+        let outcome = build_outcome(
+            &app,
+            SyncDecision::Skip(ferriscd_engine::diff::SkipReason::SelfHealDisabled),
+            &drifting,
+            HASH,
+            SyncCounts {
+                desired: 2,
+                applied: 0,
+                pruned: 0,
+                retained_orphans: 0,
+                pending: 0,
+                invalid_ignore_pointers: 0,
+                prune_enabled: false,
+            },
+            "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            Inventory::new(),
+        );
+
+        assert_eq!(outcome.reason, REASON_SYNC_SKIPPED);
+        assert!(
+            outcome.message.contains("self-heal is disabled"),
+            "the skip reason must be explained: {}",
+            outcome.message
+        );
+        assert_eq!(
+            outcome.requeue,
+            Some(Duration::from_secs(u64::from(
+                DEFAULT_REQUEUE_AFTER_SECONDS
+            ))),
+            "a skipped pass requeues on the spec interval, not the pending one"
+        );
+        let sync = outcome.sync.expect("sync state");
+        assert_eq!(
+            sync.status,
+            SyncStatus::OutOfSync,
+            "a skipped-but-drifting application is still out of sync"
+        );
+        assert!(sync.last_synced_revision.is_none());
+        assert!(sync.last_synced_spec_hash.is_none());
+        assert!(sync.last_synced_at.is_none());
+
+        // An already-synced cluster that the gate skipped reports `Synced` without pretending a
+        // sync happened (`lastSynced*` stays `None`, so `merge_sync_state` keeps the previous
+        // values instead of moving them).
+        let settled = build_outcome(
+            &app,
+            SyncDecision::Skip(ferriscd_engine::diff::SkipReason::AlreadySynced),
+            &DiffSummary {
+                total: 2,
+                synced: 2,
+                ..DiffSummary::default()
+            },
+            HASH,
+            SyncCounts {
+                desired: 2,
+                applied: 0,
+                pruned: 0,
+                retained_orphans: 0,
+                pending: 0,
+                invalid_ignore_pointers: 0,
+                prune_enabled: false,
+            },
+            "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            Inventory::new(),
+        );
+        let sync = settled.sync.expect("sync state");
+        assert_eq!(sync.status, SyncStatus::Synced);
+        assert!(sync.last_synced_revision.is_none());
+    }
+
+    /// Finding H2: the controller's orphan-free status mapping, with the engine semantic intact.
+    #[test]
+    fn the_orphan_free_status_mapping_only_drops_orphans() {
+        let orphan_only = DiffSummary {
+            total: 1,
+            orphaned: 1,
+            ..DiffSummary::default()
+        };
+        // The engine keeps reporting an orphan as `OutOfSync` (pinned in `types.rs`, unchanged:
+        // with pruning enabled that verdict is exactly right).
+        assert_eq!(orphan_only.sync_status(), SyncStatus::OutOfSync);
+        assert_eq!(
+            sync_status_without_orphans(&orphan_only),
+            SyncStatus::Synced
+        );
+        assert_eq!(
+            sync_status_without_orphans(&DiffSummary::default()),
+            SyncStatus::Synced,
+            "an empty pass is trivially in sync"
+        );
+
+        // Drift and ownership conflicts still count: only orphans are filtered.
+        for summary in [
+            DiffSummary {
+                total: 2,
+                orphaned: 1,
+                out_of_sync: 1,
+                ..DiffSummary::default()
+            },
+            DiffSummary {
+                total: 2,
+                orphaned: 1,
+                missing: 1,
+                ..DiffSummary::default()
+            },
+            DiffSummary {
+                total: 2,
+                orphaned: 1,
+                ownership_conflicts: 1,
+                ..DiffSummary::default()
+            },
+        ] {
+            assert_eq!(
+                sync_status_without_orphans(&summary),
+                SyncStatus::OutOfSync,
+                "{summary:?}"
+            );
+        }
+    }
+
+    /// Findings H1/H2: the `Ready` message carries the counts a log line cannot.
+    #[test]
+    fn retained_orphans_and_invalid_pointers_reach_the_ready_message() {
+        let mut app = application("https://example.com/repo.git", ".", "payments");
+        app.spec.sync_policy = Some(source_only_policy());
+        let revision = "0123456789abcdef0123456789abcdef01234567".to_owned();
+        let orphan_summary = DiffSummary {
+            total: 1,
+            orphaned: 1,
+            ..DiffSummary::default()
+        };
+        let counts = SyncCounts {
+            desired: 0,
+            applied: 0,
+            pruned: 0,
+            retained_orphans: 1,
+            pending: 0,
+            invalid_ignore_pointers: 1,
+            prune_enabled: false,
+        };
+
+        let skipped = build_outcome(
+            &app,
+            SyncDecision::Skip(ferriscd_engine::diff::SkipReason::SelfHealDisabled),
+            &orphan_summary,
+            HASH,
+            counts,
+            revision.clone(),
+            Inventory::new(),
+        );
+        assert_eq!(skipped.reason, REASON_SYNC_SKIPPED);
+        assert_eq!(
+            skipped.sync.as_ref().map(|sync| sync.status),
+            Some(SyncStatus::Synced),
+            "prune: false means the retained orphan cannot pin OutOfSync"
+        );
+        assert!(
+            skipped.message.contains("1 orphan(s) retained"),
+            "{}",
+            skipped.message
+        );
+        assert!(
+            skipped
+                .message
+                .contains("1 invalid ignoreDifferences pointer ignored"),
+            "{}",
+            skipped.message
+        );
+
+        // The same message renders a plural count, and stays empty when there is nothing to say.
+        let plural = build_outcome(
+            &app,
+            SyncDecision::Skip(ferriscd_engine::diff::SkipReason::SelfHealDisabled),
+            &orphan_summary,
+            HASH,
+            SyncCounts {
+                invalid_ignore_pointers: 3,
+                ..counts
+            },
+            revision.clone(),
+            Inventory::new(),
+        );
+        assert!(
+            plural
+                .message
+                .contains("3 invalid ignoreDifferences pointers ignored"),
+            "{}",
+            plural.message
+        );
+
+        let clean = build_outcome(
+            &app,
+            SyncDecision::Skip(ferriscd_engine::diff::SkipReason::AlreadySynced),
+            &DiffSummary::default(),
+            HASH,
+            SyncCounts::default(),
+            revision,
+            Inventory::new(),
+        );
+        assert!(
+            !clean.message.contains("retained") && !clean.message.contains("ignoreDifferences"),
+            "{}",
+            clean.message
+        );
     }
 
     #[test]
