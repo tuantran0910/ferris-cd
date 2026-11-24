@@ -10,6 +10,7 @@ description = "Pure GitOps reconciliation engine, manifest renderer, diff, and s
 workspace = true
 
 [dependencies]
+dashmap.workspace = true
 ferriscd-crd.workspace = true
 gix.workspace = true
 k8s-openapi.workspace = true

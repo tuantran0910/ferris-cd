@@ -3,6 +3,7 @@
 //! This module defines the backend-agnostic [`GitClient`] trait so the GitOps engine
 //! and tests never depend directly on `gix` types.
 
+pub mod cache;
 pub mod error;
 pub mod gix_client;
 pub mod types;
@@ -10,6 +11,7 @@ pub mod types;
 use std::future::Future;
 use std::pin::Pin;
 
+pub use cache::{RepoCache, RepoCacheConfig, RepoCacheGcReport};
 pub use error::RepoError;
 pub use gix_client::{GixGitClient, GixGitClientConfig};
 pub use types::{
