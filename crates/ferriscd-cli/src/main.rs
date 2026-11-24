@@ -13,6 +13,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Apply a Git repository's manifests via Server-Side Apply.
+    Apply(commands::apply::ApplyArgs),
     /// Apply a single Kubernetes YAML manifest via Server-Side Apply.
     ApplyFile(commands::apply_file::ApplyFileArgs),
     /// Generate or verify the committed FerrisCD CustomResourceDefinition manifests.
@@ -31,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     match cli.command {
+        Commands::Apply(args) => commands::apply::run(args).await,
         Commands::ApplyFile(args) => commands::apply_file::run(args).await,
         Commands::Crd(args) => commands::crd::run(args).await,
     }
@@ -54,6 +57,31 @@ mod tests {
             Commands::ApplyFile(args) => args,
             other => panic!("expected apply-file command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_parses_apply_command() {
+        let cli = Cli::try_parse_from([
+            "ferriscd",
+            "apply",
+            "--repo",
+            "https://github.com/example/payment-service.git",
+            "--rev",
+            "main",
+            "--path",
+            "deploy/production",
+            "--namespace",
+            "payments",
+        ])
+        .expect("should parse `apply`");
+        let args = match cli.command {
+            Commands::Apply(args) => args,
+            other => panic!("expected apply command, got {other:?}"),
+        };
+        assert_eq!(args.repo, "https://github.com/example/payment-service.git");
+        assert_eq!(args.rev, "main");
+        assert_eq!(args.path, "deploy/production");
+        assert_eq!(args.namespace, "payments");
     }
 
     #[test]
