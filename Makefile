@@ -1,4 +1,4 @@
-.PHONY: fmt fmt-check lint test kind-up kind-down test-integration
+.PHONY: fmt fmt-check lint test gate gate-fast kind-up kind-down test-integration
 
 KIND_CLUSTER_NAME := ferriscd-dev
 KIND_CONTEXT := kind-$(KIND_CLUSTER_NAME)
@@ -14,6 +14,17 @@ lint:
 
 test:
 	cargo test --workspace
+
+# Single pre-review gate: mirrors the CI workflow exactly.
+gate:
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo test --workspace
+
+# Fast inner-loop check: formatting + lints only (no test run).
+gate-fast:
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets -- -D warnings
 
 kind-up:
 	@if ! kind get clusters | grep -qx '$(KIND_CLUSTER_NAME)'; then \
