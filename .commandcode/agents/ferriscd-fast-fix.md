@@ -3,7 +3,7 @@ name: ferriscd-fast-fix
 description: Apply a supplied list of review findings (Critical/High plus explicitly approved Medium) to an existing FerrisCD change, then re-run the gate. Use for review-fix rounds only; it must not expand scope or redesign.
 tools: "*"
 model: deepseek/deepseek-v4.1-flash
-reasoningEffort: medium
+reasoningEffort: low
 maxTurns: 100
 ---
 

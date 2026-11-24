@@ -18,17 +18,18 @@ Project subagents are committed in `.commandcode/agents/` and load on the next t
 |---|---|---|
 | `ferriscd-researcher` | Read-only API/library research (exact signatures, feature flags) | `deepseek/deepseek-v4.1-flash` / medium |
 | `ferriscd-implementer` | Scoped implementation + tests, runs the gate | `deepseek/deepseek-v4.1-flash` / high |
-| `ferriscd-fast-fix` | Applies a supplied review-findings list only | `deepseek/deepseek-v4.1-flash` / medium |
+| `ferriscd-fast-fix` | Applies a supplied review-findings list only | `deepseek/deepseek-v4.1-flash` / low |
 | `ferriscd-reviewer` | Read-only adversarial review | `deepseek/deepseek-v4.1-flash` / high |
 
-**Model ids are exact.** `flash` = `deepseek/deepseek-v4.1-flash`; `pro` = `deepseek/deepseek-v4-pro`. Never put the aliases `"flash"`/`"pro"` in an agent `model:` field. Pass a one-off `model` override for high-risk tasks (the high-risk list below) when the Coordinator wants `pro`; the agent files pin `flash` for speed.
+**Model policy: use only `deepseek/deepseek-v4.1-flash`.** Vary `reasoningEffort` instead of switching models: `high` for implementers and reviewers, `medium` for research, `low` for narrow fix rounds. Do not use `deepseek/deepseek-v4-pro` or the aliases `"flash"`/`"pro"`.
 
 The **main agent is the Coordinator**. For any non-trivial roadmap task (`TXX.Y`), follow the `ferriscd-task-cycle` skill:
 
 1. **Coordinator (Main Agent):** Owns roadmap state, cross-crate invariants, user alignment, short task briefs, and final acceptance. Handles trivial edits (<30 lines of glue/docs/typos) directly without subagents.
 2. **Research:** Delegate to `ferriscd-researcher` only when a crate API (`kube 5.1`, `gix`, `serde-saphyr`, `utoipa`) or Kubernetes edge case is uncertain. Ask for exact signatures and flags, not tutorials.
 3. **Implementer:** Delegate to `ferriscd-implementer` with a compact brief — task ID, spec path, outputs, Trap Guard, branch, and any research facts. The agent reads the spec itself, writes tests, runs `make gate`, and self-reviews. Do not paste the whole spec into the prompt.
-   - Default `flash` for standard work. Override to `deepseek/deepseek-v4-pro` for high-risk / subtle tasks: `gix` cloning/locking/SSH (`T02.2–T02.5`), YAML budgets & normalizer (`T03.2`, `T03.4`), watch predicates/finalizers/`DiscoveryCache` (`T05.1–T05.4`), GKNN inventory & SSA dry-run diff/redaction (`T06.2`, `T07.1–T07.4`, `T08.3–T08.5`), re-entrant wave/hook state machine & rollback (`T10.1–T10.5`), renderer sandboxing/SSRF & multi-tenancy/impersonation (`T11.2–T11.3`, `T12.1–T12.3`), native Lease HA & webhook/RBAC security (`T13.2`, `T14.2–T14.4`).
+   - Use `deepseek/deepseek-v4.1-flash` with `reasoningEffort: high` for all tasks, including the high-risk list below; raise the effort (not the model) when a task is subtle. If a high-risk task still struggles, split it into smaller tasks rather than switching models.
+   - High-risk tasks: `gix` cloning/locking/SSH (`T02.2–T02.7`), YAML budgets & normalizer (`T03.2`, `T03.4`), watch predicates/finalizers/`DiscoveryCache` (`T05.1–T05.4`), GKNN inventory & SSA dry-run diff/redaction (`T06.2`, `T07.1–T07.4`, `T08.3–T08.5`), re-entrant wave/hook state machine & rollback (`T10.1–T10.5`), renderer sandboxing/SSRF & multi-tenancy/impersonation (`T11.2–T11.3`, `T12.1–T12.3`), native Lease HA & webhook/RBAC security (`T13.2`, `T14.2–T14.4`).
    - If running two Implementers in parallel, use a git worktree or strictly disjoint crates/files.
 4. **Gate:** Require `make gate` (fmt + clippy + test) green before review. Never review code that does not compile, lint, or pass tests.
 5. **Reviewer:** Delegate to `ferriscd-reviewer`, read-only and fresh-context, scoped to the task diff plus untracked files. First pass is exhaustive; fix-round confirmations audit only the new hunks.
