@@ -1,7 +1,7 @@
 # FerrisCD — Master Roadmap & Task Index
 
 > **Version:** 2.0 (Post Adversarial Review Loop & Design Alignment)  
-> **Scope:** 16 Phases · 82 Atomic Tasks · 6 Milestones (`v0.1` -> `v1.0`) · 16 Phase Lessons  
+> **Scope:** 16 Phases · 83 Atomic Tasks · 6 Milestones (`v0.1` -> `v1.0`) · 16 Phase Lessons  
 > **Task Sizing Rule:** Every task is scoped to **2–6 hours** of focused engineering work with explicit **Why**, **Detailed Requirements**, **Outputs**, **Verification**, and **Trap Guard**.
 
 ---
@@ -54,7 +54,7 @@ Each track file below contains **full specifications for every atomic task** (`W
 
 ### [Track A: Walking Skeleton & Core Controller (Phases 01–06)](file:///Users/tranngoctuan0910/Workspaces/PersonalRepo/ferris-cd/docs/roadmap/track-a-core.md)
 - **Phase 01** (`T01.1`–`T01.5`): Workspace Scaffold, CI, ADRs & Walking Skeleton *(5 tasks)*
-- **Phase 02** (`T02.1`–`T02.6`): Git Repository Engine (`gix`, locking cache, SSH/`known_hosts`, worktree symlink sanitizer) *(6 tasks)*
+- **Phase 02** (`T02.1`–`T02.7`): Git Repository Engine (`gix`, locking cache, SSH/`known_hosts`, worktree symlink sanitizer, persistent per-URL mirror) *(7 tasks)*
 - **Phase 03** (`T03.1`–`T03.6`): Manifest Engine (GKNN keys, `serde-saphyr` + budgets, `v1/List`, offline normalizer, minimal tier sort, `v0.1` CLI) *(6 tasks)*
 - **Phase 04** (`T04.1`–`T04.4`): Declarative CRDs (`Application`, compact status/inventory/operationState, `AppProject`, CRD generator) *(4 tasks)*
 - **Phase 05** (`T05.1`–`T05.5`): Controller Runtime (`DiscoveryCache`, composite watch predicate, finalizers + escape hatch, cluster-aware scope normalizer, graceful shutdown) *(5 tasks)*

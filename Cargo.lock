@@ -780,6 +780,7 @@ dependencies = [
 name = "ferriscd-engine"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "ferriscd-crd",
  "gix",
  "k8s-openapi",

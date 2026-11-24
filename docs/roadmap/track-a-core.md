@@ -97,6 +97,7 @@
 - **Outputs:** `crates/ferriscd-engine/src/repo/cache.rs`.
 - **Verification:** Concurrency test spawning 16 simultaneous Tokio tasks fetching the same repo at 3 different commits—zero corruption, zero panics, cache hit verified on repeat checkout.
 - **Trap Guard:** Never delete a cached commit directory while another reconcile task holds a handle to it.
+- **Follow-up:** The persistent per-URL bare mirror/object store is tracked as `T02.7`; this task delivers the per-repo async lock and commit-keyed worktree cache only.
 
 ### `T02.4` — Implement HTTPS Token Auth & SSH Key Transport with `known_hosts`
 - **Why:** Production GitOps repositories are private; SSH auth via `gix` spawns `/usr/bin/ssh` and requires strict host-key verification and safe temporary key handling.
@@ -126,6 +127,17 @@
 - **Outputs:** `crates/ferriscd-engine/src/repo/fake.rs`, `docs/lessons/02-git-internals-and-repo-caching.md`.
 - **Verification:** Unit tests verifying `FakeGitClient` revision switching and simulated outage injection.
 - **Trap Guard:** Expose `FakeGitClient` under a `test-utils` Cargo feature so downstream crates (`ferriscd-controller`, `tests/integration`) can reuse it cleanly.
+
+### `T02.7` — Persistent Per-URL Bare Mirror / Object Store *(Follow-up to `T02.3`)*
+- **Why:** `RepoCache` serializes acquisition per normalized `repo_url` but delegates each materialization to a `GitClient` that re-fetches into a fresh temporary bare repository; monorepos resolving many commits re-download shared objects. A persistent per-URL bare mirror makes the per-repo lock pay off and cuts network/disk churn.
+- **Detailed Requirements:**
+  - Extend `GitClient`/`GixGitClient` so a checkout can be materialized from a persistent bare repository keyed by normalized `repo_url` under `work_root/mirrors/<repo_hash>`, while keeping `gix` types out of public trait signatures.
+  - Initialize/fetch the mirror once per `(repo_url, credential generation)`; preserve the existing shallow-then-fallback behavior and annotated-tag peeling.
+  - Serialize mirror updates under the existing per-repo async lock; never run blocking `gix` I/O on Tokio workers.
+  - Define mirror reclamation (unused mirrors, size bounds) and keep the commit-keyed worktree cache crash-safe.
+- **Outputs:** `crates/ferriscd-engine/src/repo/mirror.rs`, updates to `gix_client.rs`, `cache.rs`, and `GitClient` trait docs.
+- **Verification:** Integration test resolving/checking out 3 commits from one repository performs exactly one network fetch, reuses the mirror, and preserves T02.2 ref/tag/fallback behavior; the T02.3 concurrency test still passes.
+- **Trap Guard:** Do not leak `gix` repo structs through the `GitClient` abstraction; keep all blocking mirror I/O inside `spawn_blocking`; a failed mirror update must never delete a usable existing mirror.
 
 ---
 
