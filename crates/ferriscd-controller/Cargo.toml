@@ -1,0 +1,20 @@
+[package]
+name = "ferriscd-controller"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Kubernetes controller runtime, watch predicates, discovery cache, and leader election for FerrisCD"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ferriscd-crd.workspace = true
+ferriscd-engine.workspace = true
+k8s-openapi = { workspace = true, features = ["v1_35"] }
+kube.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
