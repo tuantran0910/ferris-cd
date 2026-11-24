@@ -896,7 +896,13 @@ fn fetch_sha_shallow_then_fallback(
             }
         }
         Err(FetchStageError::ConnectOrRefMap(err)) => return Err(err),
-        Err(FetchStageError::Receive(err)) if is_fatal_without_fallback(&err) => return Err(err),
+        // A server rejecting an unadvertised SHA-in-want may close the pipe mid-request
+        // (racy "Broken pipe"); treat that as a recoverable shallow failure, not fatal.
+        Err(FetchStageError::Receive(err))
+            if is_fatal_without_fallback(&err) && !is_broken_pipe_network_error(&err) =>
+        {
+            return Err(err);
+        }
         Err(FetchStageError::MissingRequiredMapping | FetchStageError::Receive(_)) => {}
     }
 
@@ -1000,6 +1006,10 @@ fn materialize_commit_worktree(
     }
 
     Ok(checkout_dir)
+}
+
+fn is_broken_pipe_network_error(err: &RepoError) -> bool {
+    matches!(err, RepoError::Network { message } if message.contains("Broken pipe"))
 }
 
 fn is_fatal_without_fallback(err: &RepoError) -> bool {
