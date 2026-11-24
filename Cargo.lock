@@ -746,6 +746,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "serde-saphyr",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -772,6 +773,7 @@ dependencies = [
  "kube",
  "schemars",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "thiserror",
 ]

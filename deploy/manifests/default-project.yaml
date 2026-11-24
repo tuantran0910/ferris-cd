@@ -1,0 +1,42 @@
+# Canonical `default` AppProject.
+#
+# Every Application that does not name a project references this one, so it must exist
+# before any Application can reconcile. It is intentionally permissive: it allows every
+# source repository, every destination namespace, and every GroupKind, matching the
+# `PermissivePolicy` stub used through Phase 11.
+#
+# This is only appropriate for a single-tenant cluster. Before enabling
+# Apps-in-any-namespace (Phase 12) replace it with least-privilege projects that narrow
+# `sourceRepos`, `destinations`, `clusterResourceWhitelist`, `namespaceResourceWhitelist`,
+# and `allowedServiceAccounts`.
+#
+# `sourceNamespaces` is deliberately omitted: the schema default is `["ferriscd-system"]`,
+# so widening it is always an explicit, reviewable change.
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: ferriscd-system
+  labels:
+    app.kubernetes.io/name: ferriscd
+    app.kubernetes.io/component: appproject
+    app.kubernetes.io/managed-by: ferriscd
+spec:
+  description: >-
+    Default FerrisCD project used when an Application does not name a project.
+    Permits every source repository, destination, GroupKind, and ServiceAccount;
+    it is only appropriate for single-tenant clusters.
+  sourceRepos:
+    - "*"
+  destinations:
+    - cluster: in-cluster
+      namespace: "*"
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  namespaceResourceBlacklist: []
+  allowedServiceAccounts:
+    - "*"

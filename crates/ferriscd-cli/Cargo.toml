@@ -24,3 +24,6 @@ kube.workspace = true
 serde-saphyr.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

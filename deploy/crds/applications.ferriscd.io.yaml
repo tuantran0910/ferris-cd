@@ -1,0 +1,553 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: applications.ferriscd.io
+spec:
+  group: ferriscd.io
+  names:
+    kind: Application
+    plural: applications
+    shortNames:
+    - app
+    - apps
+    singular: application
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Current sync status (Synced, OutOfSync, Unknown)
+      jsonPath: .status.sync.status
+      name: SYNC
+      type: string
+    - description: Aggregated health of the managed resources
+      jsonPath: .status.health.status
+      name: HEALTH
+      type: string
+    - description: Git revision currently deployed
+      jsonPath: .status.sync.revision
+      name: REVISION
+      type: string
+    - description: Age of the Application
+      jsonPath: .metadata.creationTimestamp
+      name: AGE
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: "Declarative GitOps application: render a Git source and sync it to a destination cluster namespace"
+        properties:
+          spec:
+            description: |-
+              `Application` custom resource (`ferriscd.io/v1alpha1`).
+
+              The generated `CustomResourceDefinition` carries the `status` subresource plus the
+              `SYNC` / `HEALTH` / `REVISION` / `AGE` printer columns.
+            properties:
+              destination:
+                description: Target cluster and namespace.
+                properties:
+                  cluster:
+                    default: in-cluster
+                    description: "Target cluster: `in-cluster` or a FerrisCD cluster Secret name."
+                    type: string
+                  namespace:
+                    description: Namespace injected onto namespaced resources that do not set one explicitly.
+                    type: string
+                required:
+                - namespace
+                type: object
+              ignoreDifferences:
+                default: []
+                description: Field-level drift suppressions applied before diffing.
+                items:
+                  description: >-
+                    Field-level drift suppression for one Group/Kind (optionally narrowed by
+                    name/namespace).
+                  properties:
+                    group:
+                      description: API group (`""` for the core group); omitted means "any group".
+                      nullable: true
+                      type: string
+                    jsonPointers:
+                      default: []
+                      description: RFC 6901 JSON Pointers whose live/desired values are ignored during diffing.
+                      items:
+                        type: string
+                      type: array
+                    kind:
+                      description: Kind the suppression applies to.
+                      type: string
+                    managedFieldsManagers:
+                      default: []
+                      description: Field managers whose owned fields are ignored during diffing.
+                      items:
+                        type: string
+                      type: array
+                    name:
+                      description: Resource name the suppression applies to; omitted means "any name".
+                      nullable: true
+                      type: string
+                    namespace:
+                      description: Resource namespace the suppression applies to; omitted means "any namespace".
+                      nullable: true
+                      type: string
+                  required:
+                  - kind
+                  type: object
+                type: array
+              project:
+                default: default
+                description: |-
+                  `AppProject` this application belongs to; checked on every rendered resource.
+
+                  Defaults to [`DEFAULT_PROJECT_NAME`].
+                type: string
+              requeueAfterSeconds:
+                default: 180
+                description: >-
+                  Periodic reconcile interval in seconds (default
+                  [`DEFAULT_REQUEUE_AFTER_SECONDS`]).
+                format: uint32
+                maximum: 86400.0
+                minimum: 1.0
+                type: integer
+              revisionHistoryLimit:
+                default: 10
+                description: |-
+                  Hard cap on `status.history` entries, validated to `1..=20`
+                  (default [`DEFAULT_REVISION_HISTORY_LIMIT`]).
+                format: int32
+                maximum: 20.0
+                minimum: 1.0
+                type: integer
+              serviceAccountName:
+                description: |-
+                  ServiceAccount (in the destination namespace) used for impersonation.
+
+                  Only honored when the referenced `AppProject` lists it in `allowedServiceAccounts`.
+                nullable: true
+                type: string
+              source:
+                description: Where the desired manifests come from and how they are rendered.
+                properties:
+                  git:
+                    description: Git repository, revision, and manifest sub-path.
+                    properties:
+                      path:
+                        default: ""
+                        description: Relative sub-directory inside the repository (`""` means repository root).
+                        type: string
+                      repoURL:
+                        description: >-
+                          Repository clone URL (`https://`, `ssh://`, SCP-style SSH, or a local test
+                          path).
+                        type: string
+                      targetRevision:
+                        default: HEAD
+                        description: Branch, tag, `HEAD`, or full 40-character commit SHA.
+                        type: string
+                    required:
+                    - repoURL
+                    type: object
+                  renderer:
+                    default:
+                      auto: {}
+                    description: Renderer used to turn the checked-out path into Kubernetes manifests.
+                    oneOf:
+                    - required:
+                      - auto
+                    - required:
+                      - plainYaml
+                    - required:
+                      - kustomize
+                    - required:
+                      - helm
+                    properties:
+                      auto:
+                        description: Automatic renderer detection based on the files present in the source path.
+                        type: object
+                      helm:
+                        description: Helm chart rendering (CRDs are not installed unless `includeCRDs` is set).
+                        properties:
+                          includeCRDs:
+                            default: false
+                            description: Install CRDs shipped in the chart's `crds/` directory (default `false`).
+                            type: boolean
+                          releaseName:
+                            description: Release name used for rendering; defaults to the `Application` name.
+                            nullable: true
+                            type: string
+                          valueFiles:
+                            default: []
+                            description: Additional values files, relative to `spec.source.git.path`.
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      kustomize:
+                        description: Kustomize overlay (remote resources are rejected).
+                        properties:
+                          images:
+                            default: []
+                            description: Image overrides applied to the rendered output (`name=newImage:tag`).
+                            items:
+                              type: string
+                            type: array
+                          kustomizationPath:
+                            description: >-
+                              Overlay directory (relative to `spec.source.git.path`); defaults to the source
+                              path.
+                            nullable: true
+                            type: string
+                        type: object
+                      plainYaml:
+                        description: Literal multi-document YAML/JSON manifests.
+                        properties:
+                          recursive:
+                            default: true
+                            description: Recurse into sub-directories of `spec.source.git.path` (default `true`).
+                            type: boolean
+                        type: object
+                    type: object
+                required:
+                - git
+                type: object
+              syncPolicy:
+                description: |-
+                  Automated sync policy, sync options, and retry behaviour.
+
+                  Omitted entirely for manual-only sync.
+                nullable: true
+                properties:
+                  automated:
+                    description: |-
+                      Automated sync policy.
+
+                      `None` means manual-only sync. Because this is an `Option` of a struct, the
+                      invalid combination `automated: false` + `selfHeal: true` cannot be expressed.
+                    nullable: true
+                    properties:
+                      prune:
+                        default: false
+                        description: >-
+                          Prune resources removed from Git (never CRDs/Namespaces unless explicitly opted
+                          in).
+                        type: boolean
+                      selfHeal:
+                        default: false
+                        description: Re-apply live drift automatically.
+                        type: boolean
+                    type: object
+                  retry:
+                    description: Bounded retry policy for failed sync operations.
+                    nullable: true
+                    properties:
+                      backoff:
+                        description: Exponential backoff parameters.
+                        nullable: true
+                        properties:
+                          durationSeconds:
+                            default: 5
+                            description: Initial backoff duration in seconds.
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
+                          factor:
+                            default: 2
+                            description: Multiplier applied after every failed attempt.
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
+                          maxDurationSeconds:
+                            default: 180
+                            description: Upper bound for a single backoff duration in seconds.
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
+                        type: object
+                      limit:
+                        default: 5
+                        description: Maximum number of retry attempts (default [`DEFAULT_RETRY_LIMIT`]).
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                    type: object
+                  syncOptions:
+                    description: "Sync options applied to every sync (safe defaults: no forced apply, no CRD/namespace pruning)."
+                    nullable: true
+                    properties:
+                      applyOutOfSyncOnly:
+                        default: true
+                        description: Only apply resources that are actually out of sync (default `true`).
+                        type: boolean
+                      createNamespace:
+                        default: false
+                        description: Create `spec.destination.namespace` when it does not exist.
+                        type: boolean
+                      pruneCRDs:
+                        default: false
+                        description: "Allow pruning `CustomResourceDefinition` objects (safety rail: default `false`)."
+                        type: boolean
+                      pruneLast:
+                        default: true
+                        description: Apply pruning last, after every other resource converged.
+                        type: boolean
+                      pruneNamespaces:
+                        default: false
+                        description: "Allow pruning `Namespace` objects (safety rail: default `false`)."
+                        type: boolean
+                      serverSideForce:
+                        default: false
+                        description: "Send `force: true` in Server-Side Apply patches (default `false`)."
+                        type: boolean
+                      takeoverFieldManagers:
+                        default: []
+                        description: Field managers whose ownership FerrisCD may take over (brownfield adoption).
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                type: object
+            required:
+            - destination
+            - source
+            type: object
+          status:
+            description: "`Application` `/status` subresource."
+            nullable: true
+            properties:
+              conditions:
+                description: Standard conditions (`Ready`, ...).
+                items:
+                  description: |-
+                    Wire-compatible mirror of `metav1.Condition`.
+
+                    Field names and values match the Kubernetes API so `kubectl wait --for=condition=Ready`
+                    and `kubectl describe` behave exactly as for built-in resources.
+                  properties:
+                    lastTransitionTime:
+                      description: When `status` last changed. Preserved while `status` is unchanged.
+                      format: date-time
+                      type: string
+                    message:
+                      default: ""
+                      description: >-
+                        Human-readable message; always present on the wire for `metav1.Condition`
+                        parity.
+                      type: string
+                    observedGeneration:
+                      description: "`metadata.generation` observed when the condition was computed."
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      description: CamelCase machine-readable reason for the current status.
+                      type: string
+                    status:
+                      description: Whether the condition currently holds.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: Condition type (e.g. [`CONDITION_READY`]).
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              health:
+                description: Aggregated health.
+                nullable: true
+                properties:
+                  message:
+                    description: Short human-readable explanation (never contains secret values).
+                    nullable: true
+                    type: string
+                  status:
+                    description: Aggregated health status.
+                    enum:
+                    - Healthy
+                    - Progressing
+                    - Degraded
+                    - Suspended
+                    - Missing
+                    - Unknown
+                    type: string
+                required:
+                - status
+                type: object
+              history:
+                description: Bounded deployment history (newest first, at most [`MAX_HISTORY_ENTRIES`]).
+                items:
+                  description: Metadata-only deployment history entry (never stores manifest content).
+                  properties:
+                    deployedAt:
+                      description: When the revision was deployed.
+                      format: date-time
+                      type: string
+                    id:
+                      description: Monotonic deployment id.
+                      format: int64
+                      type: integer
+                    revision:
+                      description: Revision (commit SHA) that was deployed.
+                      nullable: true
+                      type: string
+                  required:
+                  - deployedAt
+                  - id
+                  type: object
+                type: array
+              inventory:
+                description: >-
+                  Crash-safe, version-agnostic inventory of every resource owned by this
+                  application.
+                items:
+                  description: |-
+                    Version-agnostic inventory entry keyed by GKNN (`<group>/<kind>/<namespace>/<name>`),
+                    with the API version stored separately as a non-key hint.
+
+                    Keying on Group/Kind/Namespace/Name only is what prevents an API version upgrade
+                    (`v1beta1` -> `v1`) from turning the live object into an orphan and self-pruning it
+                    (review finding C2 / ADR-003).
+                  properties:
+                    key:
+                      description: |-
+                        Canonical GKNN string: `<group>/<kind>/<namespace>/<name>` (empty namespace for
+                        cluster-scoped resources, empty group for the core group). Never contains a version.
+                      type: string
+                    version:
+                      default: ""
+                      description: API version hint (`v1`, `apps/v1`, ...). Not part of resource identity.
+                      type: string
+                  required:
+                  - key
+                  type: object
+                type: array
+              observedGeneration:
+                description: "`metadata.generation` observed by the last reconcile."
+                format: int64
+                nullable: true
+                type: integer
+              operationState:
+                description: Persisted operation state (multi-wave / hook / rollback progress).
+                nullable: true
+                properties:
+                  currentWave:
+                    default: 0
+                    description: Sync wave currently being applied (default `0`).
+                    format: int32
+                    type: integer
+                  finishedAt:
+                    description: When the operation finished (`None` while `phase` is `Running`).
+                    format: date-time
+                    nullable: true
+                    type: string
+                  message:
+                    description: Bounded human-readable progress/error message.
+                    nullable: true
+                    type: string
+                  phase:
+                    description: Current phase.
+                    enum:
+                    - Running
+                    - Succeeded
+                    - Failed
+                    - Error
+                    type: string
+                  revision:
+                    description: Revision being operated on.
+                    nullable: true
+                    type: string
+                  startedAt:
+                    description: When the operation started.
+                    format: date-time
+                    type: string
+                required:
+                - phase
+                - startedAt
+                type: object
+              resources:
+                description: Bounded per-resource health summaries (at most [`MAX_RESOURCE_STATUSES`]).
+                items:
+                  description: Bounded per-resource status summary.
+                  properties:
+                    health:
+                      description: Health of this single resource.
+                      enum:
+                      - Healthy
+                      - Progressing
+                      - Degraded
+                      - Suspended
+                      - Missing
+                      - Unknown
+                      type: string
+                    key:
+                      description: GKNN key of the resource (same shape as [`InventoryEntry::key`]).
+                      type: string
+                    message:
+                      default: ""
+                      description: Bounded human-readable message (truncated to [`MAX_STATUS_MESSAGE_CHARS`]).
+                      type: string
+                    version:
+                      default: ""
+                      description: API version hint of the resource.
+                      type: string
+                  required:
+                  - health
+                  - key
+                  type: object
+                type: array
+              resourcesOmitted:
+                description: Number of per-resource summaries dropped because of [`MAX_RESOURCE_STATUSES`].
+                format: uint32
+                minimum: 0.0
+                type: integer
+              sync:
+                description: Sync observability.
+                nullable: true
+                properties:
+                  lastSyncedAt:
+                    description: When the last successful sync finished.
+                    format: date-time
+                    nullable: true
+                    type: string
+                  lastSyncedRevision:
+                    description: Last revision that was successfully synced.
+                    nullable: true
+                    type: string
+                  lastSyncedSpecHash:
+                    description: |-
+                      Hash of `spec.source` at the last successful sync.
+
+                      Guards `selfHeal: false` against spec edits that do not produce a new commit
+                      (finding H7).
+                    nullable: true
+                    type: string
+                  revision:
+                    description: Revision (commit SHA) currently deployed.
+                    nullable: true
+                    type: string
+                  status:
+                    description: Current sync status.
+                    enum:
+                    - Synced
+                    - OutOfSync
+                    - Unknown
+                    type: string
+                required:
+                - status
+                type: object
+            type: object
+        required:
+        - spec
+        title: Application
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

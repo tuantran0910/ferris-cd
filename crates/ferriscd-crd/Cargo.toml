@@ -10,9 +10,12 @@ description = "Kubernetes Custom Resource Definitions and status schemas for Fer
 workspace = true
 
 [dependencies]
+# NOTE: never enable a `k8s-openapi` version feature here; the binary crate decides.
 k8s-openapi.workspace = true
 kube.workspace = true
 schemars.workspace = true
+# YAML (de)serialization for CRD manifest generation and spec round-trip tests.
+serde-saphyr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
