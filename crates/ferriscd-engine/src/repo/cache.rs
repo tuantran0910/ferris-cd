@@ -9,6 +9,10 @@
 //! * **commit-keyed immutable worktrees** materialized with an atomic
 //!   *write-to-temp-directory* + *rename* sequence, so a concurrent reader can never
 //!   observe a partially written checkout,
+//! * **verification before publication**: a renamed tree is sanitized by
+//!   [`sanitize_worktree`] while the cache entry is still unpublished (`Materializing`), and
+//!   only a verified tree ever becomes `Ready`, so no lock-free cache hit can lease an
+//!   un-sanitized tree,
 //! * **RAII ref-counted leases** so garbage collection never deletes a directory that
 //!   is still held by an in-flight reconcile, and
 //! * **bounded LRU / TTL garbage collection** (`max_entries`, `max_age`).
@@ -49,6 +53,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use super::GitClient;
 use super::error::RepoError;
+use super::sanitize::{WorktreeLimits, sanitize_worktree};
 use super::types::{
     GitSource, RepoCheckout, RepoCredentials, ResolvedRevision, validate_commit_sha,
 };
@@ -104,6 +109,9 @@ pub struct RepoCacheConfig {
     /// from its creation, so a worktree that keeps being acquired never expires.
     /// [`Duration::ZERO`] therefore evicts every unleased entry on the next pass.
     pub max_age: Duration,
+    /// Symlink / resource budgets enforced on every materialized worktree before it is
+    /// published into the cache. Defaults to [`WorktreeLimits::default`].
+    pub worktree_limits: WorktreeLimits,
 }
 
 impl RepoCacheConfig {
@@ -115,6 +123,7 @@ impl RepoCacheConfig {
             work_root: work_root.into(),
             max_entries: DEFAULT_MAX_ENTRIES,
             max_age: DEFAULT_MAX_AGE,
+            worktree_limits: WorktreeLimits::default(),
         }
     }
 
@@ -129,6 +138,13 @@ impl RepoCacheConfig {
     #[must_use]
     pub fn with_max_age(mut self, max_age: Duration) -> Self {
         self.max_age = max_age;
+        self
+    }
+
+    /// Sets the symlink / resource budgets enforced on every materialized worktree.
+    #[must_use]
+    pub fn with_worktree_limits(mut self, worktree_limits: WorktreeLimits) -> Self {
+        self.worktree_limits = worktree_limits;
         self
     }
 }
@@ -147,12 +163,15 @@ pub struct RepoCacheGcReport {
 /// Lifecycle of one tracked worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryState {
-    /// The directory is being written by the checkout that reserved this key.
+    /// The directory is being written — and then verified — by the checkout that reserved this
+    /// key.
     ///
-    /// Readers treat this as a miss (they wait on the per-repository lock and re-check) so
-    /// a half-written tree is never leased, and garbage collection leaves it alone.
+    /// Readers treat this as a miss (they wait on the per-repository lock and re-check) so a
+    /// half-written or not-yet-sanitized tree is never leased, and garbage collection leaves it
+    /// alone. The entry only becomes [`EntryState::Ready`] after
+    /// [`sanitize_worktree`] accepted the directory.
     Materializing,
-    /// The directory is complete and may be handed out as a cache hit.
+    /// The directory is complete **and verified** and may be handed out as a cache hit.
     Ready,
 }
 
@@ -320,6 +339,11 @@ impl RepoCache {
     /// Concurrent calls for the same repository are serialized by a per-repository async mutex
     /// and the cache is re-checked after the lock is acquired, so a commit is materialized at
     /// most once per process even under heavy contention.
+    ///
+    /// A freshly materialized tree is sanitized with
+    /// [`RepoCacheConfig::worktree_limits`] **before** the cache entry becomes visible
+    /// (`EntryState::Ready`), so a concurrent caller can never lease an unverified checkout; a
+    /// rejected tree is deleted and the terminal error propagated.
     pub async fn checkout(
         &self,
         src: &GitSource,
@@ -366,15 +390,17 @@ impl RepoCache {
 
         let temp_root = materialized.root_dir().to_path_buf();
         let work_root = self.config.work_root.clone();
+        let worktree_limits = self.config.worktree_limits;
         let state = Arc::clone(&self.state);
         let repo_hash_owned = repo_hash.clone();
         let sha_owned = sha.to_owned();
         let dest = cached_root.clone();
         let active_for_blocking = Arc::clone(&active);
 
-        // All recursive filesystem work (create_dir_all, stale-target removal, rename) runs on
-        // the blocking pool; the client handle is moved in and dropped there because its
-        // temporary directory has been renamed away.
+        // All recursive filesystem work (create_dir_all, stale-target removal, rename), the
+        // worktree sanitization and the final publish run on the blocking pool; the client
+        // handle is moved in and dropped there because its temporary directory has been
+        // renamed away.
         let materialize_result = tokio::task::spawn_blocking(move || {
             let result = materialize(
                 &work_root,
@@ -386,7 +412,35 @@ impl RepoCache {
                 &active_for_blocking,
             );
             drop(materialized);
-            result
+            result?;
+
+            // The entry is still `Materializing` here, so the lock-free `try_cache_hit` fast
+            // path reports a miss and no caller can lease the tree before it is verified.
+            // Only a verified tree may ever become `Ready`.
+            //
+            // This re-walks a tree that a `gix`-backed client already sanitized in its own
+            // `checkout`; the duplicate walk is intentional: the cache cannot know which
+            // backend materialized the tree (or whether it sanitized at all), so the cache
+            // path is the one place where every materialization is guaranteed to be checked.
+            if let Err(err) = sanitize_worktree(&dest, &worktree_limits) {
+                // Never publish an unverified tree: remove the just-renamed directory and
+                // return the terminal error. The `ReservationGuard` (not yet published) then
+                // drops the cache entry, so no entry and no directory are left behind.
+                if let Err(cleanup_err) = remove_path(&dest) {
+                    tracing::warn!(
+                        path = %dest.display(),
+                        error = %cleanup_err,
+                        "failed to remove rejected checkout directory after sanitization"
+                    );
+                }
+                return Err(err);
+            }
+
+            mark_ready(
+                &state,
+                &entry_key(&repo_hash_owned, &sha_owned),
+                &active_for_blocking,
+            )
         })
         .await
         .map_err(|join_err| RepoError::RepositoryError {
@@ -795,6 +849,10 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
 }
 
 /// Publishes a client-materialized worktree into its final cache location (blocking).
+///
+/// Returns as soon as the tree has been renamed into place. The cache entry deliberately stays
+/// [`EntryState::Materializing`]: the caller must sanitize the destination and only then call
+/// [`mark_ready`], so no [`EntryState::Ready`] entry can exist before verification.
 fn materialize(
     work_root: &Path,
     state: &Mutex<CacheState>,
@@ -839,10 +897,15 @@ fn materialize(
         }
     }
 
-    mark_ready(state, &key, active)
+    // Deliberately *not* marked ready: the caller sanitizes `dest` first and only then calls
+    // `mark_ready`, so the entry stays unleased (`Materializing`) until it is verified.
+    Ok(())
 }
 
-/// Marks a reservation as fully materialized.
+/// Marks a reservation as fully materialized and verified.
+///
+/// This is the only place an entry may become [`EntryState::Ready`]; it must be called after
+/// [`sanitize_worktree`] accepted the directory, never before.
 fn mark_ready(
     state: &Mutex<CacheState>,
     key: &str,
@@ -1019,6 +1082,9 @@ mod tests {
     /// detectable byte-for-byte.
     struct StubClient {
         work_root: PathBuf,
+        /// Extra regular files written next to the standard fixture files, so tests can push a
+        /// benign tree past a configured `WorktreeLimits::max_files`.
+        extra_files: usize,
         checkouts: AtomicUsize,
         seq: AtomicUsize,
     }
@@ -1027,8 +1093,16 @@ mod tests {
         fn new(work_root: PathBuf) -> Self {
             Self {
                 work_root,
+                extra_files: 0,
                 checkouts: AtomicUsize::new(0),
                 seq: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_extra_files(work_root: PathBuf, extra_files: usize) -> Self {
+            Self {
+                extra_files,
+                ..Self::new(work_root)
             }
         }
     }
@@ -1081,6 +1155,7 @@ mod tests {
                 let sha_owned = sha.to_owned();
                 let readme = stub_readme(sha);
                 let deployment = stub_deployment(sha);
+                let extra_files = self.extra_files;
                 tokio::task::spawn_blocking(move || {
                     std::fs::create_dir_all(&work_root)
                         .map_err(stub_io("creating stub work_root"))?;
@@ -1092,6 +1167,10 @@ mod tests {
                         .map_err(stub_io("writing stub README.md"))?;
                     std::fs::write(temp.join("apps/base/deployment.yaml"), deployment)
                         .map_err(stub_io("writing stub deployment.yaml"))?;
+                    for index in 0..extra_files {
+                        std::fs::write(temp.join(format!("extra-{index}.txt")), "x")
+                            .map_err(stub_io("writing stub extra file"))?;
+                    }
                     Ok(RepoCheckout::new(temp, sha_owned))
                 })
                 .await
@@ -1821,5 +1900,301 @@ mod tests {
         // Trailing slashes normalize to the same key, so this is a cache hit.
         assert_eq!(a.root_dir(), b.root_dir());
         assert_eq!(cache.len(), 1);
+    }
+
+    /// [`GitClient`] that materializes a worktree containing a symlink escaping to
+    /// `/etc/passwd`, so tests can prove the cache rejects it before publishing an entry.
+    ///
+    /// `filler_files` writes extra regular files into the tree purely to make the post-rename
+    /// verification window wide enough for the concurrency regression test to hit it.
+    #[cfg(unix)]
+    struct MaliciousSymlinkClient {
+        work_root: PathBuf,
+        filler_files: usize,
+        checkouts: AtomicUsize,
+        seq: AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    impl MaliciousSymlinkClient {
+        fn new(work_root: PathBuf, filler_files: usize) -> Self {
+            Self {
+                work_root,
+                filler_files,
+                checkouts: AtomicUsize::new(0),
+                seq: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl GitClient for MaliciousSymlinkClient {
+        fn resolve_revision<'a>(
+            &'a self,
+            _src: &'a GitSource,
+            _creds: &'a RepoCredentials,
+        ) -> crate::repo::RepoFuture<'a, ResolvedRevision> {
+            Box::pin(async move {
+                Err(RepoError::RepositoryError {
+                    message: "malicious stub does not resolve revisions".to_owned(),
+                })
+            })
+        }
+
+        fn checkout<'a>(
+            &'a self,
+            _src: &'a GitSource,
+            sha: &'a str,
+            _creds: &'a RepoCredentials,
+        ) -> crate::repo::RepoFuture<'a, RepoCheckout> {
+            self.checkouts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                validate_commit_sha(sha)?;
+                let work_root = self.work_root.clone();
+                let sha_owned = sha.to_owned();
+                let filler_files = self.filler_files;
+                let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+                tokio::task::spawn_blocking(move || {
+                    std::fs::create_dir_all(&work_root)
+                        .map_err(stub_io("creating malicious stub work_root"))?;
+                    // Unique per call: the concurrency regression test materializes the same
+                    // commit from several tasks, so a fixed name would collide.
+                    let temp =
+                        work_root.join(format!("ferriscd-evil-{}-{seq}", std::process::id()));
+                    std::fs::create_dir_all(&temp)
+                        .map_err(stub_io("creating malicious stub worktree"))?;
+                    std::fs::write(temp.join("README.md"), "safe\n")
+                        .map_err(stub_io("writing malicious stub README"))?;
+                    for index in 0..filler_files {
+                        std::fs::write(temp.join(format!("filler-{index}.txt")), "x")
+                            .map_err(stub_io("writing malicious stub filler file"))?;
+                    }
+                    std::os::unix::fs::symlink("/etc/passwd", temp.join("evil-link"))
+                        .map_err(stub_io("creating malicious symlink"))?;
+                    Ok(RepoCheckout::new(temp, sha_owned))
+                })
+                .await
+                .map_err(|join_err| RepoError::RepositoryError {
+                    message: format!("malicious stub checkout task failed: {join_err}"),
+                })?
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cache_checkout_with_malicious_symlink_fails_and_leaves_no_entry() {
+        let work_root = tempfile::tempdir().expect("create cache work root");
+        let client = Arc::new(MaliciousSymlinkClient::new(
+            work_root.path().to_path_buf(),
+            0,
+        ));
+        let cache = RepoCache::new(
+            Arc::clone(&client) as Arc<dyn GitClient>,
+            RepoCacheConfig::new(work_root.path()),
+        );
+        let src = GitSource::new("https://example.test/ferris-cd/evil.git", "main", "");
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        let err = cache
+            .checkout(&src, sha, &RepoCredentials::Anonymous)
+            .await
+            .expect_err("malicious symlink must be rejected before returning");
+
+        assert!(
+            matches!(err, RepoError::UnsafeSymlink { .. }),
+            "expected UnsafeSymlink, got {err:?}"
+        );
+        assert!(!err.is_retryable());
+
+        // No cache entry may be observable, and the published directory must be gone.
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        let dest = work_root
+            .path()
+            .join(WORKTREE_DIR)
+            .join(repo_hash(&normalize_repo_url(&src.repo_url)))
+            .join(sha);
+        assert!(
+            !dest.exists(),
+            "rejected checkout directory must be removed: {}",
+            dest.display()
+        );
+    }
+
+    /// Regression test for the publish-before-verify window (Trap Guard C7 bypass).
+    ///
+    /// `EntryState::Ready` must not become observable until [`sanitize_worktree`] accepted the
+    /// tree. The stub materializes a tree containing an escaping symlink plus enough filler
+    /// files to widen the rename→verify window, and many callers race on the same commit. If
+    /// the entry were published before verification, one of the lock-free `try_cache_hit`
+    /// probes would lease the un-sanitized tree and return `Ok` (and a later failure could then
+    /// delete the directory under that lease).
+    ///
+    /// Two kinds of task run concurrently for every round:
+    ///
+    /// * **callers** issue real [`RepoCache::checkout`] calls for the same sha and must never
+    ///   receive `Ok`, and
+    /// * **observers** hammer the private, lock-free `try_cache_hit` fast path for the whole
+    ///   duration of the materialization; they never issue a checkout, so they are not parked
+    ///   behind the per-repository lock and can actually land inside the rename→verify window
+    ///   instead of at a materialization boundary.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unverified_tree_is_never_leased_by_a_concurrent_checkout() {
+        const CALLERS: usize = 4;
+        const OBSERVERS: usize = 2;
+        const ITERATIONS: usize = 3;
+        const ROUNDS: usize = 2;
+
+        let work_root = tempfile::tempdir().expect("create cache work root");
+        let client = Arc::new(MaliciousSymlinkClient::new(
+            work_root.path().to_path_buf(),
+            1000,
+        ));
+        let cache = Arc::new(RepoCache::new(
+            Arc::clone(&client) as Arc<dyn GitClient>,
+            RepoCacheConfig::new(work_root.path()),
+        ));
+        let src = Arc::new(GitSource::new(
+            "https://example.test/ferris-cd/evil.git",
+            "main",
+            "",
+        ));
+        let repo_hash = repo_hash(&normalize_repo_url(&src.repo_url));
+        let repo_dir = work_root.path().join(WORKTREE_DIR).join(&repo_hash);
+
+        for round in 1..=ROUNDS {
+            let sha = format!("{round:040x}");
+
+            let done = Arc::new(AtomicBool::new(false));
+            let mut observers = JoinSet::new();
+            for _ in 0..OBSERVERS {
+                let cache = Arc::clone(&cache);
+                let repo_hash = repo_hash.clone();
+                let sha = sha.clone();
+                let done = Arc::clone(&done);
+                observers.spawn(async move {
+                    let mut probes = 0usize;
+                    while !done.load(Ordering::SeqCst) {
+                        if let Ok(Some(lease)) = cache.try_cache_hit(&repo_hash, &sha) {
+                            panic!(
+                                "a cache hit was served for sha {sha} before its tree was \
+                                 verified; leased {}",
+                                lease.root_dir().display()
+                            );
+                        }
+                        probes += 1;
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(probes > 0, "the observer never probed the cache");
+                    probes
+                });
+            }
+
+            let mut callers = JoinSet::new();
+            for _ in 0..CALLERS {
+                let cache = Arc::clone(&cache);
+                let src = Arc::clone(&src);
+                let sha = sha.clone();
+                callers.spawn(async move {
+                    for iteration in 0..ITERATIONS {
+                        let result = cache
+                            .checkout(&src, &sha, &RepoCredentials::Anonymous)
+                            .await;
+                        match result {
+                            Ok(checkout) => panic!(
+                                "no checkout call may ever succeed for an un-sanitized tree \
+                                 (iteration {iteration}, sha {sha}): leaked {}",
+                                checkout.root_dir().display()
+                            ),
+                            Err(err) => {
+                                assert!(
+                                    matches!(err, RepoError::UnsafeSymlink { .. }),
+                                    "expected a terminal UnsafeSymlink, got {err:?}"
+                                );
+                                assert!(!err.is_retryable(), "must be terminal: {err}");
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                });
+            }
+
+            while let Some(result) = callers.join_next().await {
+                result.expect("checkout task must not panic");
+            }
+            done.store(true, Ordering::SeqCst);
+            while let Some(result) = observers.join_next().await {
+                result.expect("observer task must not panic");
+            }
+
+            assert!(cache.is_empty(), "round {round} leaked a cache entry");
+            assert_eq!(cache.len(), 0);
+            let dest = repo_dir.join(&sha);
+            assert!(
+                !dest.exists(),
+                "round {round} left the rejected directory behind: {}",
+                dest.display()
+            );
+        }
+
+        // No leased directory and no entry may survive any of the failed materializations.
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        match std::fs::read_dir(&repo_dir) {
+            Ok(entries) => assert_eq!(
+                entries.count(),
+                0,
+                "rejected materializations must not leave directories in {}",
+                repo_dir.display()
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("reading {}: {err}", repo_dir.display()),
+        }
+        // Non-vacuity: the window was actually exercised, many times over.
+        assert!(
+            client.checkouts.load(Ordering::SeqCst) >= CALLERS * ITERATIONS,
+            "the race must have driven repeated materializations"
+        );
+    }
+
+    /// The configurable budgets must be enforced by the cache end-to-end, and a rejected tree
+    /// must never be published.
+    #[tokio::test]
+    async fn worktree_limits_reject_a_benign_tree_without_publishing_an_entry() {
+        let work_root = tempfile::tempdir().expect("create cache work root");
+        let client = Arc::new(StubClient::with_extra_files(
+            work_root.path().to_path_buf(),
+            1,
+        ));
+        let config = RepoCacheConfig::new(work_root.path())
+            .with_worktree_limits(WorktreeLimits::new().with_max_files(1));
+        let cache = RepoCache::new(Arc::clone(&client) as Arc<dyn GitClient>, config);
+        let src = GitSource::new("https://example.test/ferris-cd/stub.git", "main", "apps");
+        let sha = format!("{:040x}", 1);
+
+        let err = cache
+            .checkout(&src, &sha, &RepoCredentials::Anonymous)
+            .await
+            .expect_err("a tree over the configured max_files budget must be rejected");
+        assert!(
+            matches!(err, RepoError::CheckoutLimitExceeded { .. }),
+            "expected CheckoutLimitExceeded, got {err:?}"
+        );
+        assert!(!err.is_retryable(), "a budget violation must be terminal");
+
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        let dest = work_root
+            .path()
+            .join(WORKTREE_DIR)
+            .join(repo_hash(&normalize_repo_url(&src.repo_url)))
+            .join(&sha);
+        assert!(
+            !dest.exists(),
+            "a rejected checkout directory must be removed: {}",
+            dest.display()
+        );
     }
 }

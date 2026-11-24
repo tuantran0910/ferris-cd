@@ -7,6 +7,7 @@ pub(crate) mod auth;
 pub mod cache;
 pub mod error;
 pub mod gix_client;
+pub mod sanitize;
 pub mod types;
 
 use std::future::Future;
@@ -15,6 +16,7 @@ use std::pin::Pin;
 pub use cache::{RepoCache, RepoCacheConfig, RepoCacheGcReport};
 pub use error::RepoError;
 pub use gix_client::{GixGitClient, GixGitClientConfig};
+pub use sanitize::{WorktreeLimits, sanitize_worktree};
 pub use types::{
     GitSource, RepoCheckout, RepoCredentials, RepoUrlPolicy, ResolvedRevision, validate_commit_sha,
     validate_repo_url,

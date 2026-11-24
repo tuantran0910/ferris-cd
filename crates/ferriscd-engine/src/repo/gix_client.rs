@@ -12,6 +12,7 @@ use tempfile::TempDir;
 
 use super::auth::AuthContext;
 use super::error::RepoError;
+use super::sanitize::{WorktreeLimits, sanitize_worktree};
 use super::types::{
     GitSource, RepoCheckout, RepoCredentials, RepoUrlPolicy, ResolvedRevision, validate_commit_sha,
 };
@@ -61,6 +62,9 @@ pub struct GixGitClientConfig {
     /// (and embedded environments) can inject a recording/fake program without mutating the
     /// process-wide `PATH` or `GIT_SSH_COMMAND` environment.
     pub ssh_program: Option<PathBuf>,
+    /// Symlink / resource budgets enforced on every materialized worktree before it is
+    /// returned. Defaults to [`WorktreeLimits::default`].
+    pub worktree_limits: WorktreeLimits,
 }
 
 impl GixGitClientConfig {
@@ -103,6 +107,13 @@ impl GixGitClientConfig {
         self
     }
 
+    /// Sets the symlink / resource budgets enforced on every materialized worktree.
+    #[must_use]
+    pub fn with_worktree_limits(mut self, worktree_limits: WorktreeLimits) -> Self {
+        self.worktree_limits = worktree_limits;
+        self
+    }
+
     /// Snapshot of the owned inputs needed by the blocking layer.
     fn blocking_options(&self) -> BlockingOptions {
         BlockingOptions {
@@ -110,6 +121,7 @@ impl GixGitClientConfig {
             work_root: self.work_root.clone(),
             allow_missing_known_hosts: self.allow_missing_known_hosts,
             ssh_program: self.ssh_program.clone(),
+            worktree_limits: self.worktree_limits,
         }
     }
 }
@@ -121,6 +133,7 @@ struct BlockingOptions {
     work_root: Option<PathBuf>,
     allow_missing_known_hosts: bool,
     ssh_program: Option<PathBuf>,
+    worktree_limits: WorktreeLimits,
 }
 
 impl BlockingOptions {
@@ -890,6 +903,11 @@ fn checkout_blocking(
     let root_tree_id = verify_local_commit(&active_repo, target_oid, &sha)?;
     let checkout_dir = materialize_commit_worktree(&active_repo, root_tree_id, ctx.work_root)?;
     let checkout_path = checkout_dir.path().to_path_buf();
+
+    // Defend every renderer (Plain YAML, Kustomize, Helm) against symlink escapes by
+    // sanitizing the materialized worktree before handing it back. This runs on the blocking
+    // pool; on failure the `TempDir` checkout lease is dropped, deleting the worktree.
+    sanitize_worktree(&checkout_path, &options.worktree_limits)?;
 
     Ok(RepoCheckout::with_lease(
         checkout_path,
@@ -1932,6 +1950,153 @@ mod tests {
                 .expect("read work_root")
                 .count(),
             0
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkout_sanitizes_symlinks_and_cleans_up_on_rejection() {
+        let root = tempfile::tempdir().expect("create fixture root");
+        let work = root.path().join("work");
+        let bare = root.path().join("remote.git");
+        std::fs::create_dir_all(&work).expect("mkdir work");
+
+        git_cmd(&work, &["init", "--initial-branch=main"]);
+        std::fs::write(work.join("README.md"), "hello\n").expect("write README");
+        // (a) a valid intra-repo relative symlink.
+        std::os::unix::fs::symlink("README.md", work.join("valid-link")).expect("valid symlink");
+        git_cmd(&work, &["add", "."]);
+        git_cmd(&work, &["commit", "-m", "valid symlink commit"]);
+        let valid_sha = git_cmd(&work, &["rev-parse", "HEAD"]);
+
+        // (b) a symlink escaping to /etc/passwd in a later commit.
+        std::os::unix::fs::symlink("/etc/passwd", work.join("evil-link")).expect("evil symlink");
+        git_cmd(&work, &["add", "."]);
+        git_cmd(&work, &["commit", "-m", "evil symlink commit"]);
+        let evil_sha = git_cmd(&work, &["rev-parse", "HEAD"]);
+
+        // (c) a chained relative escape (`../../../`), proving verification (c) at the git layer
+        // too: the link resolves to an *existing* file just outside the checkout root, so it is
+        // the containment check (not a dangling target) that rejects it. The evil link is
+        // removed first so every commit carries exactly one malicious symlink and the expected
+        // path is deterministic regardless of directory-walk order.
+        std::fs::remove_file(work.join("evil-link")).expect("remove evil symlink");
+        std::fs::create_dir_all(work.join("sub")).expect("mkdir sub");
+        std::os::unix::fs::symlink("../../../outside/secret.txt", work.join("sub/esc-link"))
+            .expect("chained escape symlink");
+        git_cmd(&work, &["add", "-A"]);
+        git_cmd(&work, &["commit", "-m", "chained escape symlink commit"]);
+        let chain_sha = git_cmd(&work, &["rev-parse", "HEAD"]);
+
+        git_cmd(
+            root.path(),
+            &[
+                "clone",
+                "--bare",
+                work.to_str().expect("utf8 path"),
+                bare.to_str().expect("utf8 path"),
+            ],
+        );
+
+        // The checkout root is `<client_work_root>/ferriscd-git-XXXX`, so `../../../` from
+        // `<checkout>/sub` lands exactly on the scratch root, where `outside/secret.txt` lives.
+        let scratch = tempfile::tempdir().expect("create client scratch root");
+        let client_work_root = scratch.path().join("client-work");
+        std::fs::create_dir_all(&client_work_root).expect("mkdir client work_root");
+        std::fs::create_dir_all(scratch.path().join("outside")).expect("mkdir outside");
+        std::fs::write(scratch.path().join("outside/secret.txt"), "secret\n")
+            .expect("write outside secret");
+
+        let client = local_client(Some(client_work_root.clone()));
+        let repo_str = bare.to_str().expect("utf8 path");
+        let creds = RepoCredentials::Anonymous;
+
+        // The valid commit must checkout and the symlink must resolve within the worktree.
+        let valid = client
+            .checkout(&GitSource::new(repo_str, "main", ""), &valid_sha, &creds)
+            .await
+            .expect("valid intra-repo symlink checkout must succeed");
+        assert_eq!(
+            std::fs::read_to_string(valid.root_dir().join("valid-link")).expect("read link"),
+            "hello\n"
+        );
+
+        // The malicious commits must fail cleanly with a terminal, non-retryable error.
+        let err = client
+            .checkout(&GitSource::new(repo_str, "main", ""), &evil_sha, &creds)
+            .await
+            .expect_err("symlink to /etc/passwd must be rejected");
+        assert!(
+            matches!(err, RepoError::UnsafeSymlink { .. }),
+            "expected UnsafeSymlink, got {err:?}"
+        );
+        assert!(!err.is_retryable());
+        match &err {
+            RepoError::UnsafeSymlink { reason, .. } => {
+                assert!(reason.contains("escapes"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected UnsafeSymlink, got {other:?}"),
+        }
+
+        let chain_err = client
+            .checkout(&GitSource::new(repo_str, "main", ""), &chain_sha, &creds)
+            .await
+            .expect_err("chained relative symlink escape must be rejected");
+        assert!(!chain_err.is_retryable(), "escape must be terminal");
+        match &chain_err {
+            RepoError::UnsafeSymlink {
+                path,
+                target,
+                reason,
+            } => {
+                assert!(path.ends_with("sub/esc-link"), "unexpected path: {path:?}");
+                assert_eq!(target, &PathBuf::from("../../../outside/secret.txt"));
+                assert!(reason.contains("escapes"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected UnsafeSymlink, got {other:?}"),
+        }
+
+        // Drop the successful checkout to release its temp dir, then assert the failing
+        // checkouts left no materialized worktree (or bare repo) behind.
+        drop(valid);
+        assert_eq!(
+            std::fs::read_dir(&client_work_root)
+                .expect("read client work_root")
+                .count(),
+            0,
+            "temp checkout and bare repo must be cleaned up after a rejected checkout"
+        );
+    }
+
+    /// The configurable byte budget is enforced by [`GixGitClient`] itself, against a real
+    /// commit, and a rejected worktree is not left behind.
+    #[tokio::test]
+    async fn checkout_enforces_configured_byte_budget_on_a_real_commit() {
+        let fx = build_fixture();
+        let client_work_root = tempfile::tempdir().expect("create client work_root");
+        let client = GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::AllowLocal)
+                .with_work_root(client_work_root.path().to_path_buf())
+                .with_worktree_limits(WorktreeLimits::new().with_max_bytes(8)),
+        );
+        let src = GitSource::new(fx.bare_path.to_str().expect("utf8 path"), "main", "");
+
+        let err = client
+            .checkout(&src, &fx.c1, &RepoCredentials::Anonymous)
+            .await
+            .expect_err("the commit's regular-file content exceeds the 8-byte budget");
+        assert!(
+            matches!(err, RepoError::CheckoutLimitExceeded { .. }),
+            "expected CheckoutLimitExceeded, got {err:?}"
+        );
+        assert!(!err.is_retryable(), "a budget violation must be terminal");
+        assert_eq!(
+            std::fs::read_dir(client_work_root.path())
+                .expect("read client work_root")
+                .count(),
+            0,
+            "a rejected checkout must not leave its worktree or bare repo behind"
         );
     }
 
