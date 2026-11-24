@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
-# FerrisCD local commit-msg hook — enforces Conventional Commits 1.0.0.
+# FerrisCD local commit-msg hook — enforces Conventional Commits 1.0.0
+# with strict workspace/component scopes.
 # Enable once per clone with: git config core.hooksPath .githooks
 
 set -eu
@@ -27,15 +28,22 @@ if [ "$HEADER_LEN" -gt "$MAX_LEN" ]; then
     exit 1
 fi
 
-PATTERN='^(feat|fix|docs|refactor|perf|test|build|ci|chore|style|revert)(\([a-z0-9._,-]+\))?!?: [a-z0-9].*[^.]$'
+TYPES='feat|fix|docs|refactor|perf|test|build|ci|chore|style|revert'
+SCOPES='workspace|crd|engine|controller|cli|server|web|deploy|examples|adr|lessons|docs|ci|deps|repo'
+PATTERN="^(${TYPES})(\((${SCOPES})\))?!?: [a-z0-9].*[^.]$"
+
 if ! printf '%s\n' "$HEADER" | grep -Eq "$PATTERN"; then
     cat >&2 <<EOF
 ERROR: Commit message does not follow FerrisCD Conventional Commits format:
   $HEADER
 
 Expected: <type>(<scope>): <imperative lowercase summary without trailing period>
-Allowed types: feat, fix, docs, refactor, perf, test, build, ci, chore, style, revert
-Example: feat(t02.1): define GitClient trait and redacted RepoCredentials
+Allowed types:  feat, fix, docs, refactor, perf, test, build, ci, chore, style, revert
+Allowed scopes: workspace, crd, engine, controller, cli, server, web,
+                deploy, examples, adr, lessons, docs, ci, deps, repo
+Note: Put roadmap task IDs (e.g. "Tasks: T02.1") in the commit body, not in <scope>.
+
+Example: feat(engine): define GitClient trait and redacted RepoCredentials
 
 See CONTRIBUTING.md for details.
 EOF

@@ -28,7 +28,9 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           ruby -e '
-            pattern = /\A(feat|fix|docs|refactor|perf|test|build|ci|chore|style|revert)(\([a-z0-9._,-]+\))?!?: [a-z0-9].*[^.]\z/
+            types = %w[feat fix docs refactor perf test build ci chore style revert].join("|")
+            scopes = %w[workspace crd engine controller cli server web deploy examples adr lessons docs ci deps repo].join("|")
+            pattern = /\A(#{types})(\((#{scopes})\))?!?: [a-z0-9].*[^.]\z/
             max_len = 100
             errors = []
 
@@ -52,11 +54,13 @@ jobs:
             end
 
             if errors.empty?
-              puts "OK: PR title and all commit headers follow Conventional Commits."
+              puts "OK: PR title and all commit headers follow FerrisCD Conventional Commits."
             else
               warn errors.join("\n")
               warn "\nExpected: <type>(<scope>): <imperative lowercase summary without trailing period>"
-              warn "Allowed types: feat, fix, docs, refactor, perf, test, build, ci, chore, style, revert"
+              warn "Allowed types:  feat, fix, docs, refactor, perf, test, build, ci, chore, style, revert"
+              warn "Allowed scopes: workspace, crd, engine, controller, cli, server, web, deploy, examples, adr, lessons, docs, ci, deps, repo"
+              warn "Note: Put roadmap task IDs (e.g. Tasks: T02.1) in the commit body, not in <scope>."
               exit 1
             end
           '

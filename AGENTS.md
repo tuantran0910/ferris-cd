@@ -55,9 +55,12 @@ Every commit message and Pull Request title MUST follow **Conventional Commits 1
 
 - **Header format:** `<type>(<scope>): <summary>` (scope optional; append `!` before `:` for breaking changes).
 - **Allowed `<type>`:** `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `style`, `revert`.
-- **Recommended `<scope>` (lowercase `[a-z0-9._,-]+`):** roadmap task/phase (`t02.1`, `phase-02`), crate/module (`crd`, `engine`, `controller`, `cli`, `server`, `web`), or domain (`adr`, `lessons`, `ci`, `deps`, `repo`, `kind`).
+- **Allowed `<scope>` (strict allow-list — never use roadmap task IDs like `t01.1` or `phase-01`):**
+  - Workspace & crates: `workspace`, `crd`, `engine`, `controller`, `cli`, `server`, `web` (use `workspace` for cross-crate changes)
+  - Infra & docs: `deploy`, `examples`, `adr`, `lessons`, `docs`, `ci`, `deps`, `repo`
+  - Reference roadmap task IDs in the commit body or PR description (e.g., `Tasks: T02.1`), not in `<scope>`.
 - **Subject rules:** imperative present tense (`add`, not `added`/`adds`), lowercase first word, no trailing period, target ≤ 72 chars (hard CI limit: 100 chars).
 - **PR & branch hygiene:**
-  - Branch naming: `<type>/<short-kebab-description>` (e.g., `feat/t02-1-git-client-trait`, `docs/t01-adrs-and-examples`, `chore/commit-convention`).
+  - Branch naming: `<type>/<short-kebab-description>` (e.g., `feat/git-client-trait`, `docs/seed-adrs-and-examples`, `ci/enforce-workspace-scopes`).
   - Keep PRs small, atomic, and stacked linearly when dependent; PR titles MUST obey the same Conventional Commits header rule so Squash & Merge preserves a clean `main` history.
   - Never bypass GPG signing (`--no-gpg-sign`) or git hooks (`--no-verify`).
