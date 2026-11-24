@@ -13,8 +13,17 @@ workspace = true
 anyhow.workspace = true
 ferriscd-crd.workspace = true
 ferriscd-engine.workspace = true
+# Stream combinators for driving `kube_runtime::Controller` and boxing the
+# pipeline/status-writer seams.
+futures.workspace = true
 k8s-openapi = { workspace = true, features = ["v1_35"] }
-kube.workspace = true
+# `unstable-runtime` is required for `Controller::for_stream`, the only kube 5.1 API
+# that accepts a pre-filtered watch stream. Without it the composite watch predicate
+# (T05.2) could only be applied *after* a reconcile had already been enqueued.
+kube = { workspace = true, features = ["unstable-runtime"] }
+# Merge-patch bodies for the always-update-status wrapper.
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true

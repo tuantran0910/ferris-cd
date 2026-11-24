@@ -67,3 +67,15 @@ An independent adversarial review pass audited `MASTER_PLAN.md` v1.0 and `ROADMA
 - [x] **Zero circular or backward phase dependencies:** Verified DAG from Phase 01 through Phase 16 (`T03.4` offline vs `T05.4` cluster-aware split; `T03.5` minimal sort feeds `v0.1`/`v0.2`; `T12.4` webhook moved to `T14.2`; `T14.1` OpenAPI feeds `T16.1` TS codegen).
 - [x] **Crate & tool versions verified against 2026 ecosystem & local machine:** `rustc 1.99.0`, `kube 5.1`, `k8s-openapi 0.29` (`v1_35` only in binaries/tests), `schemars 1`, `gix`, `serde-saphyr`, `kind 0.33.0`, `kubectl v1.35.0`, `helm v4.3.2`, `kustomize v5.8.3`.
 - [x] **Zero unaddressed critical or high traps remaining.**
+
+---
+
+## Phase 05 implementation review (`T05.1`–`T05.5`)
+
+- **T05.2 / C4 + T2:** `predicate::composite_hash` covers generation, `deletionTimestamp`, finalizers, and the four control annotations; status-only, label, and unrelated-annotation changes do not trigger. Proven by five predicate tests; the watch stream is pre-filtered via `Controller::for_stream` (`unstable-runtime`).
+- **T05.3 / T3 + C5:** finalizer releases on `404`/`410`/`NoMatchesForKind`, missing destination secret, and `force-delete`; retains on other failures; cleanup defaults to non-cascading. Both `Ok` and `Err` paths patch `/status` with `observedGeneration` + `Ready` condition, and status messages are char-boundary bounded.
+- **T05.1 / T6 + H3:** forced refresh rebuilds both the snapshot and the synchronous scope index, so a CRD installed mid-sync becomes resolvable (`forced_refresh_makes_a_newly_installed_crd_resolvable`); `kube_version()` is unknown before the first refresh. Snapshot now indexes **all served versions** (`group.versioned_resources` per version), not only the preferred one.
+- **T05.4 / H1:** scope resolution is discovery-first, in-bundle-CRD second, explicit error third; namespaced resources get the destination namespace only when absent, cluster-scoped resources are never injected and reject a stray namespace. Validation precedes mutation.
+- **T05.5:** `SIGINT`/`SIGTERM` drain through `Controller::graceful_shutdown_on` with a non-zero `DrainTimeout` failure; `reconcile` span carries app identity; `FERRISCD_LOG_FORMAT` selects JSON/pretty and rejects unknown values.
+- **Retry policy:** `408`/`409`/`425`/`429`/`5xx` and transport errors are retryable; `404`/`422`/invalid-spec/unknown-kind are terminal.
+- **Follow-ups (non-blocking):** ignored live `kind` test artifact for T05.1–T05.3, wire-level `ApiStatusWriter` test, discovery negative-refresh throttle during API-server outages, drain-timeout env var.
