@@ -15,6 +15,8 @@ struct Cli {
 enum Commands {
     /// Apply a single Kubernetes YAML manifest via Server-Side Apply.
     ApplyFile(commands::apply_file::ApplyFileArgs),
+    /// Generate or verify the committed FerrisCD CustomResourceDefinition manifests.
+    Crd(commands::crd::CrdArgs),
 }
 
 #[tokio::main]
@@ -30,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::ApplyFile(args) => commands::apply_file::run(args).await,
+        Commands::Crd(args) => commands::crd::run(args).await,
     }
 }
 
@@ -46,17 +49,21 @@ mod tests {
         assert_eq!(ferriscd_controller::controller_name(), "ferriscd");
     }
 
+    fn apply_file_args(cli: Cli) -> commands::apply_file::ApplyFileArgs {
+        match cli.command {
+            Commands::ApplyFile(args) => args,
+            other => panic!("expected apply-file command, got {other:?}"),
+        }
+    }
+
     #[test]
     fn cli_parses_apply_file_with_and_without_namespace() {
         let cli_default =
             Cli::try_parse_from(["ferriscd", "apply-file", "examples/basic/configmap.yaml"])
                 .expect("should parse without --namespace");
-        match cli_default.command {
-            Commands::ApplyFile(args) => {
-                assert_eq!(args.path, Path::new("examples/basic/configmap.yaml"));
-                assert_eq!(args.namespace, None);
-            }
-        }
+        let args = apply_file_args(cli_default);
+        assert_eq!(args.path, Path::new("examples/basic/configmap.yaml"));
+        assert_eq!(args.namespace, None);
 
         let cli_short_ns = Cli::try_parse_from([
             "ferriscd",
@@ -66,11 +73,8 @@ mod tests {
             "ferriscd-demo",
         ])
         .expect("should parse with -n");
-        match cli_short_ns.command {
-            Commands::ApplyFile(args) => {
-                assert_eq!(args.namespace.as_deref(), Some("ferriscd-demo"));
-            }
-        }
+        let args = apply_file_args(cli_short_ns);
+        assert_eq!(args.namespace.as_deref(), Some("ferriscd-demo"));
 
         let cli_long_ns = Cli::try_parse_from([
             "ferriscd",
@@ -80,10 +84,44 @@ mod tests {
             "ferriscd-demo",
         ])
         .expect("should parse with --namespace");
-        match cli_long_ns.command {
-            Commands::ApplyFile(args) => {
-                assert_eq!(args.namespace.as_deref(), Some("ferriscd-demo"));
-            }
+        let args = apply_file_args(cli_long_ns);
+        assert_eq!(args.namespace.as_deref(), Some("ferriscd-demo"));
+    }
+
+    #[test]
+    fn cli_parses_crd_generate_with_defaults_and_overrides() {
+        let default = Cli::try_parse_from(["ferriscd", "crd", "generate"])
+            .expect("should parse `crd generate`");
+        match default.command {
+            Commands::Crd(args) => match args.command {
+                commands::crd::CrdCommand::Generate(generate) => {
+                    assert_eq!(
+                        generate.output_dir,
+                        Path::new(ferriscd_crd::generate::CRD_DIRECTORY)
+                    );
+                    assert!(!generate.check);
+                }
+            },
+            other => panic!("expected crd command, got {other:?}"),
+        }
+
+        let override_args = Cli::try_parse_from([
+            "ferriscd",
+            "crd",
+            "generate",
+            "--output-dir",
+            "deploy/crds",
+            "--check",
+        ])
+        .expect("should parse `crd generate --check`");
+        match override_args.command {
+            Commands::Crd(args) => match args.command {
+                commands::crd::CrdCommand::Generate(generate) => {
+                    assert_eq!(generate.output_dir, Path::new("deploy/crds"));
+                    assert!(generate.check);
+                }
+            },
+            other => panic!("expected crd command, got {other:?}"),
         }
     }
 }
