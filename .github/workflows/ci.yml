@@ -65,6 +65,10 @@ jobs:
         if: steps.workspace.outputs.has_cargo == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Run Clippy (engine test-utils feature)
+        if: steps.workspace.outputs.has_cargo == 'true'
+        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-engine --features test-utils --all-targets -- -D warnings
+
       - name: Run tests
         if: steps.workspace.outputs.has_cargo == 'true'
         run: cargo test --workspace

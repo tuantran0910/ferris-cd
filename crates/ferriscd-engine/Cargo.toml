@@ -9,6 +9,12 @@ description = "Pure GitOps reconciliation engine, manifest renderer, diff, and s
 [lints]
 workspace = true
 
+[features]
+# Exposes the deterministic `FakeGitClient` Git test harness (`repo::fake`) to downstream
+# crates such as `ferriscd-controller` and integration-test targets. Never enabled in
+# production builds; it is always compiled for this crate's own tests.
+test-utils = []
+
 [dependencies]
 dashmap.workspace = true
 ferriscd-crd.workspace = true
