@@ -4,12 +4,14 @@
 //! and tests never depend directly on `gix` types.
 
 pub mod error;
+pub mod gix_client;
 pub mod types;
 
 use std::future::Future;
 use std::pin::Pin;
 
 pub use error::RepoError;
+pub use gix_client::{GixGitClient, GixGitClientConfig};
 pub use types::{
     GitSource, RepoCheckout, RepoCredentials, RepoUrlPolicy, ResolvedRevision, validate_commit_sha,
     validate_repo_url,
