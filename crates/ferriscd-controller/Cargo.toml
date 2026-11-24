@@ -27,3 +27,11 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# `test-utils` exposes the deterministic `FakeGitClient`, so the wired `v0.2` pipeline is
+# exercised end to end (Git -> manifests -> scope -> live state -> apply) without a cluster
+# and without ever invoking `git`.
+ferriscd-engine = { workspace = true, features = ["test-utils"] }
+# Scratch directories for the fake Git work root and the repo cache.
+tempfile.workspace = true

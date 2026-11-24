@@ -10,21 +10,31 @@ use kube::{Api, Client, ResourceExt};
 
 pub mod controller;
 pub mod discovery;
+pub mod live_state;
 pub mod predicate;
 pub mod reconcile;
 pub mod scope;
+pub mod sync;
 
 pub use controller::{
     BackoffTracker, ConfigError, ControllerConfig, DEFAULT_CONCURRENCY, DEFAULT_DRAIN_TIMEOUT,
     FailureClass, RETRY_BASE_DELAY, RETRY_MAX_DELAY, TERMINAL_DELAY,
 };
 pub use discovery::{CachedDiscovery, DiscoveryCache, DiscoveryError, ScopeLookup};
+pub use live_state::{
+    ClusterStateReader, DynamicApiSource, FetchRequest, LiveObjectSource, LiveState,
+    LiveStateError, TrackingOwner,
+};
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
 pub use reconcile::{
     ApiStatusWriter, ApplyOutcome, CleanupDisposition, CleanupMode, CleanupOutcome,
     ControllerError, FINALIZER, ReconcileContext, ReconcileError, StatusWriter, SyncPipeline,
 };
 pub use scope::{ClusterNamespacePolicy, InBundleCrd, ScopeError, normalize_scopes};
+pub use sync::{
+    Applier, ApplyRequest, DeleteOutcome, DeleteRequest, DynamicApiApplier, InventorySyncPipeline,
+    PENDING_REQUEUE,
+};
 
 /// Environment variable selecting the log format (`json` or `pretty`).
 pub const LOG_FORMAT_ENV: &str = "FERRISCD_LOG_FORMAT";
@@ -35,19 +45,45 @@ pub fn controller_name() -> &'static str {
     ferriscd_engine::default_field_manager()
 }
 
-/// Runs the controller loop entrypoint.
+/// Runtime options for [`run_with`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Namespace whose `Application` objects this controller owns.
+    ///
+    /// `None` falls back to `FERRISCD_NAMESPACE`, then `ferriscd-system`.
+    pub namespace: Option<String>,
+
+    /// Accept `file://` URLs and local filesystem paths as Git sources.
+    ///
+    /// Off by default: production only allows `https://`/`ssh://`/SCP-style remotes, so an
+    /// `Application` can never read the controller pod's filesystem. Tests and local `kind`
+    /// demos must opt in explicitly (see `docs/lessons/06-inventory-tracking-and-live-state.md`).
+    pub allow_local_repos: bool,
+
+    /// Directory holding the Git mirror cache and materialized worktrees.
+    ///
+    /// `None` uses `<system temp dir>/ferriscd-repos`. In a cluster this should be an
+    /// `emptyDir` mounted by the Deployment.
+    pub work_root: Option<std::path::PathBuf>,
+}
+
+/// Runs the controller loop entrypoint with default [`RunOptions`].
 ///
-/// The Kubernetes-native runtime (discovery cache, predicate, finalizer, status wrapper) is
-/// complete as of Phase 05; the diff/sync pipeline itself is still
-/// [`reconcile::UnwiredSyncPipeline`] until Phases 07–08 land, so applications report
-/// `Ready=False` instead of a false `Ready=True`.
+/// # Errors
+///
+/// See [`run_with`].
+pub async fn run() -> anyhow::Result<()> {
+    run_with(RunOptions::default()).await
+}
+
+/// Runs the `v0.2` controller: watch `Application` objects, resolve Git, render manifests,
+/// normalize scopes, read live state, apply with SSA and persist a crash-safe inventory.
 ///
 /// # Errors
 ///
 /// Fails when the log format is invalid, the namespace configuration is invalid, the
-/// Kubernetes client cannot be configured, or in-flight reconciles outlive the drain
-/// timeout.
-pub async fn run() -> anyhow::Result<()> {
+/// Kubernetes client cannot be configured, or in-flight reconciles outlive the drain timeout.
+pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     let log_format = init_logging()?;
@@ -55,12 +91,16 @@ pub async fn run() -> anyhow::Result<()> {
         controller = controller_name(),
         api_group = ferriscd_crd::api_group(),
         log_format = log_format.as_str(),
+        allow_local_repos = options.allow_local_repos,
         "ferriscd-controller starting"
     );
 
-    let namespace_env = std::env::var(controller::NAMESPACE_ENV).ok();
+    let namespace_value = match options.namespace.as_deref() {
+        Some(namespace) => Some(namespace.to_owned()),
+        None => std::env::var(controller::NAMESPACE_ENV).ok(),
+    };
     let config = ControllerConfig {
-        namespace: controller::namespace_from_env_value(namespace_env.as_deref())?,
+        namespace: controller::namespace_from_env_value(namespace_value.as_deref())?,
         ..ControllerConfig::default()
     };
     let client = Client::try_default()
@@ -69,11 +109,43 @@ pub async fn run() -> anyhow::Result<()> {
 
     let apps_api = Api::<Application>::namespaced(client.clone(), &config.namespace);
     let status = Arc::new(ApiStatusWriter::new(apps_api.clone()));
-    let ctx = Arc::new(ReconcileContext::new(
-        apps_api,
-        Arc::new(reconcile::UnwiredSyncPipeline),
-        status,
+
+    // Git: one scratch root backs both the gix worktrees and the repo cache, so publishing a
+    // checkout is a same-filesystem atomic rename.
+    let work_root = options
+        .work_root
+        .clone()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("ferriscd-repos");
+    let url_policy = if options.allow_local_repos {
+        tracing::warn!(
+            "allowing local and file:// Git repositories (--allow-local-repos); never use this \
+             in production"
+        );
+        ferriscd_engine::repo::RepoUrlPolicy::AllowLocal
+    } else {
+        ferriscd_engine::repo::RepoUrlPolicy::Production
+    };
+    let git = ferriscd_engine::repo::GixGitClient::new(
+        ferriscd_engine::repo::GixGitClientConfig::new()
+            .with_url_policy(url_policy)
+            .with_work_root(&work_root),
+    );
+    let repos = Arc::new(ferriscd_engine::repo::RepoCache::new(
+        Arc::new(git),
+        ferriscd_engine::repo::RepoCacheConfig::new(&work_root),
     ));
+
+    let pipeline = Arc::new(
+        sync::InventorySyncPipeline::new(
+            repos,
+            DiscoveryCache::new(client.clone()),
+            Arc::new(DynamicApiSource::new(client.clone())),
+            Arc::new(DynamicApiApplier::new(client.clone())),
+        )
+        .with_url_policy(url_policy),
+    );
+    let ctx = Arc::new(ReconcileContext::new(apps_api, pipeline, status));
 
     controller::run(client, config, ctx).await?;
     Ok(())
