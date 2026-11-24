@@ -11,12 +11,21 @@ license = "Apache-2.0"
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+gix = { version = "0.90", default-features = false, features = [
+    "sha1",
+    "max-performance",
+    "blocking-http-transport-reqwest-rust-tls",
+    "worktree-mutation",
+    "revision",
+    "credentials",
+] }
 k8s-openapi = { version = "0.29", features = ["schemars"] }
 kube = { version = "5.1", features = ["runtime", "derive", "client", "rustls-tls"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-saphyr = "2.2"
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
