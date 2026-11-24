@@ -65,9 +65,14 @@ All commit messages and Pull Request titles follow **[Conventional Commits 1.0.0
 | `style` | Formatting-only changes (`cargo fmt`) |
 | `revert` | Reverting a previous commit |
 
-### Recommended Scopes
+### Allowed Scopes
 
-Use lowercase scopes (`[a-z0-9._,-]+`) matching the roadmap task/phase (`t02.1`, `phase-02`), crate (`crd`, `engine`, `controller`, `cli`, `server`, `web`), or domain (`adr`, `lessons`, `ci`, `deps`, `repo`, `kind`).
+When a scope is provided, it **must** match one of the workspace crates or repository domains below (enforced locally and in CI). Do **not** put roadmap task IDs (`t02.1`, `phase-02`) in `<scope>`—place them in the commit body or PR description (e.g., `Tasks: T02.1`).
+
+| Category | Allowed Scopes |
+|---|---|
+| Workspace & Crates | `workspace` (multi-crate/root), `crd`, `engine`, `controller`, `cli`, `server`, `web` |
+| Infra & Docs | `deploy`, `examples`, `adr`, `lessons`, `docs`, `ci`, `deps`, `repo` |
 
 ### Subject Rules
 
@@ -79,8 +84,14 @@ Use lowercase scopes (`[a-z0-9._,-]+`) matching the roadmap task/phase (`t02.1`,
 ### Examples
 
 ```text
-feat(t02.1): define GitClient trait and redacted RepoCredentials
-fix(diff): redact Secret.stringData before rendering dry-run diff
+feat(engine): define GitClient trait and redacted RepoCredentials
+
+Tasks: T02.1
+```
+
+```text
+feat(workspace): configure shared lint policy and kind scripts
+fix(engine): redact Secret.stringData before rendering dry-run diff
 docs(adr): add ADR-0003 for GKNN inventory and tracking-id
 ci(deps): bump actions/checkout from 4 to 5
 ```
