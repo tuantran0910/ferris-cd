@@ -19,6 +19,7 @@ test:
 gate:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-engine --features test-utils --all-targets -- -D warnings
 	cargo test --workspace
 
 # Fast inner-loop check: formatting + lints only (no test run).

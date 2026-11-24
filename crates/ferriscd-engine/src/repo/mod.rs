@@ -6,6 +6,8 @@
 pub(crate) mod auth;
 pub mod cache;
 pub mod error;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod fake;
 pub mod gix_client;
 pub mod sanitize;
 pub mod types;
@@ -15,6 +17,8 @@ use std::pin::Pin;
 
 pub use cache::{RepoCache, RepoCacheConfig, RepoCacheGcReport};
 pub use error::RepoError;
+#[cfg(any(test, feature = "test-utils"))]
+pub use fake::{FakeGitClient, FakeGitClientConfig, FakeHead, FakeStage};
 pub use gix_client::{GixGitClient, GixGitClientConfig};
 pub use sanitize::{WorktreeLimits, sanitize_worktree};
 pub use types::{
