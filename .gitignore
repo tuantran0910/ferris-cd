@@ -1,0 +1,18 @@
+# Rust build artifacts (Cargo.lock MUST remain tracked for reproducible binary builds)
+/target
+**/*.rs.bk
+
+# Environment & secrets
+.env
+.env.*
+
+# Editor & OS metadata
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local scratch & tool caches
+.ferriscd-cache/
+.cache/
+.tmp/
