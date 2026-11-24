@@ -157,6 +157,20 @@ impl CachedDiscovery {
             .map(|resource| (resource.api_resource.clone(), resource.capabilities.clone()))
     }
 
+    /// Resolves the first resource matching `group` + `kind`, ignoring the API version.
+    ///
+    /// Scope and identity are version-independent in FerrisCD (ADR-003), so this is the
+    /// lookup used when only a version-agnostic GKNN key is available.
+    #[must_use]
+    pub fn lookup_kind(&self, group: &str, kind: &str) -> Option<(ApiResource, ApiCapabilities)> {
+        self.resources
+            .iter()
+            .find(|resource| {
+                resource.api_resource.group == group && resource.api_resource.kind == kind
+            })
+            .map(|resource| (resource.api_resource.clone(), resource.capabilities.clone()))
+    }
+
     fn replace(&mut self, snapshot: &DiscoverySnapshot, fetched_at: Instant) {
         self.resources.clone_from(&snapshot.resources);
         self.fetched_at = Some(fetched_at);
@@ -414,6 +428,33 @@ impl DiscoveryCache {
             })
     }
 
+    /// Resolves the first served resource for `group` + `kind`, ignoring the version.
+    ///
+    /// Resource identity in FerrisCD is version-agnostic GKNN (ADR-003), so a key whose
+    /// recorded version hint is no longer served must still be readable through whatever
+    /// version the cluster serves. The first match in snapshot order wins, which keeps the
+    /// answer deterministic for a given snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`DiscoveryError::Refresh`] when the snapshot is stale, the refresh fails, and the
+    /// (stale) snapshot does not know the kind either.
+    pub async fn resolve_kind(
+        &self,
+        group: &str,
+        kind: &str,
+    ) -> Result<Option<(ApiResource, ApiCapabilities)>, DiscoveryError> {
+        if self.is_stale().await
+            && let Err(err) = self.ensure_fresh().await
+        {
+            return match self.lookup_kind(group, kind).await {
+                Some(found) => Ok(Some(found)),
+                None => Err(err),
+            };
+        }
+        Ok(self.lookup_kind(group, kind).await)
+    }
+
     /// Refreshes only when the cached snapshot is older than the TTL.
     ///
     /// # Errors
@@ -457,6 +498,12 @@ impl DiscoveryCache {
     async fn lookup(&self, gvk: &GroupVersionKind) -> Option<(ApiResource, ApiCapabilities)> {
         let state = self.state.read().await;
         state.resolve(gvk)
+    }
+
+    /// Version-agnostic lookup: first resource whose group + kind match, in snapshot order.
+    async fn lookup_kind(&self, group: &str, kind: &str) -> Option<(ApiResource, ApiCapabilities)> {
+        let state = self.state.read().await;
+        state.lookup_kind(group, kind)
     }
 
     async fn is_stale(&self) -> bool {
@@ -773,6 +820,73 @@ mod tests {
             "the synchronous scope index must be rebuilt without a version key"
         );
         assert_eq!(source.fetches(), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_kind_ignores_the_version_and_is_deterministic() {
+        // A CRD serving two versions: identity is group + kind, so a version-agnostic lookup
+        // must find it and always answer with the same (first-in-snapshot) entry.
+        let mut snapshot = DiscoverySnapshot::new("v1.35.0");
+        append_all_versions(&mut snapshot, ["v1beta1", "v1"], |version| {
+            vec![(
+                ApiResource::from_gvk(&gvk("networking.k8s.io", version, "Ingress")),
+                capabilities(Scope::Namespaced),
+            )]
+        });
+        let source = Arc::new(FakeSource::with_snapshot(snapshot));
+        let cache = DiscoveryCache::with_source(source.clone(), DEFAULT_TTL);
+
+        let found = cache
+            .resolve_kind("networking.k8s.io", "Ingress")
+            .await
+            .expect("refresh")
+            .expect("served");
+        assert_eq!(found.0.version, "v1beta1", "first served version wins");
+        assert_eq!(found.1.scope, Scope::Namespaced);
+
+        let again = cache
+            .resolve_kind("networking.k8s.io", "Ingress")
+            .await
+            .expect("cached")
+            .expect("served");
+        assert_eq!(again.0.version, found.0.version, "the answer is stable");
+        assert_eq!(source.fetches(), 1, "a warm snapshot answers without I/O");
+
+        // A fresh snapshot that does not serve the kind answers `None` (the caller decides
+        // whether that is "deferred on a CRD" or a terminal error).
+        assert!(
+            cache
+                .resolve_kind("networking.k8s.io", "IngressClass")
+                .await
+                .expect("fresh miss")
+                .is_none()
+        );
+        assert_eq!(source.fetches(), 1, "a miss must not hammer discovery");
+    }
+
+    #[tokio::test]
+    async fn resolve_kind_surfaces_a_refresh_failure_it_cannot_answer_from() {
+        let source = Arc::new(FakeSource::with_configmap());
+        let cache = DiscoveryCache::with_source(source.clone(), Duration::ZERO);
+
+        cache.ensure_fresh().await.expect("warm");
+        source.fail.store(true, Ordering::SeqCst);
+
+        // The stale snapshot still knows the kind: graceful degradation.
+        assert!(
+            cache
+                .resolve_kind("", "ConfigMap")
+                .await
+                .expect("stale snapshot answers")
+                .is_some()
+        );
+
+        // A kind it does not know must surface the refresh error, not a silent `None`.
+        let err = cache
+            .resolve_kind("", "Unheard")
+            .await
+            .expect_err("refresh failure must not be swallowed");
+        assert!(matches!(err, DiscoveryError::Refresh { .. }), "{err}");
     }
 
     #[tokio::test]

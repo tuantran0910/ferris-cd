@@ -314,10 +314,16 @@
 
 ---
 
-## Phase 06: Inventory & Live State Engine — *Milestone `v0.2` Complete*
+## Phase 06: Inventory & Live State Engine — *Milestone `v0.2` (code complete; live `kind` verification pending)*
 
 **Phase Goal:** Track every resource owned by an `Application` using crash-safe GKNN inventory + `tracking-id` annotations, fetch true live state (`desired ∪ prev_inventory`), and complete the `v0.2` Kubernetes-native controller.  
 **Knowledge Base Lesson (`docs/lessons/06-inventory-tracking-and-live-state.md`):** Why `desired`-only live fetching breaks pruning, GKNN vs. GVKNN version upgrades, and ownership tracking defense against cross-app hijacking.
+
+> **`v0.2` is not declared complete** until `make test-integration` (the `#[ignore]`d test in
+> `tests/integration/v0_2_controller.rs`) has run on a `kind` cluster and passed. The hermetic
+> suite covers the same logic, but the union fetch + `OwnedBySelf` classification of a
+> Git-removed resource is only proven end to end against a real API server. Expected assertions
+> are recorded in `docs/lessons/06-inventory-tracking-and-live-state.md` §8.
 
 ### `T06.1` — Implement `ferriscd.io/tracking-id` Stamper & Ownership Classifier
 - **Why:** Without an ownership marker on live Kubernetes objects, two `Application` CRs pointing at the same resource will fight infinitely and potentially prune each other's workloads.
@@ -344,8 +350,8 @@
 ### `T06.3` — Implement Union Live State Fetcher (`ClusterStateReader`)
 - **Why:** Query Kubernetes for the exact live state of all desired + previously managed resources with bounded concurrency and graceful handling of missing resources, missing namespaces, and uninstalled CRDs.
 - **Detailed Requirements:**
-  - Implement `ClusterStateReader::fetch_live(to_fetch, &discovery, &in_bundle_crds, &in_bundle_namespaces, create_namespace)` using `futures::stream::iter(...).buffer_unordered(16)`.
-  - Classify each key into `LiveState`: `Present(DynamicObject, Ownership)`, `Missing`, `DeferredPendingCrd` (GVK absent from `Discovery` but defined by a CRD in `desired`), `DeferredPendingNamespace` (namespace `404` but `create_namespace` or `Namespace` manifest is in `desired`), or `OrphanGvkGone` (orphan's CRD was already deleted).
+  - Implement `ClusterStateReader::fetch_live(to_fetch, &discovery, &in_bundle_crds, &in_bundle_namespaces, &owner)` using `futures::stream::iter(...).buffer_unordered(16)`.
+  - Classify each key into `LiveState`: `Present(DynamicObject, Ownership)`, `Missing`, `DeferredPendingCrd` (GVK absent from `Discovery` but defined by a CRD in `desired`), `DeferredPendingNamespace` (namespace `404` but a `Namespace` manifest in `desired` declares it; `syncOptions.createNamespace` is rejected until `T08.3`), or `OrphanGvkGone` (orphan's CRD was already deleted).
 - **Outputs:** `crates/ferriscd-controller/src/live_state.rs`.
 - **Verification:** Live `kind` integration test: apply 2 ConfigMaps, remove 1 from Git, confirm `ClusterStateReader` still fetches the removed ConfigMap via `status.inventory` and returns `Present(..., OwnedBySelf)`.
 - **Trap Guard:** Fixes Trap T1 (`desired`-only fetch) and prepares clean inputs for Finding C3 (deferred dry-run).
@@ -357,5 +363,5 @@
   - Add `ferriscd controller` subcommand to `ferriscd-cli`.
   - Write `docs/lessons/06-inventory-tracking-and-live-state.md`.
 - **Outputs:** End-to-end `v0.2` controller runnable via `cargo run -p ferriscd-cli -- controller`, `tests/integration/v0_2_controller.rs`, `docs/lessons/06-inventory-tracking-and-live-state.md`.
-- **Verification:** Live `kind` integration test: apply `Application` CR pointing at local Git repo -> workloads created, `status.sync.revision` and `status.inventory` populated -> push new Git commit -> controller reconciles update automatically. **Milestone `v0.2` Complete.**
+- **Verification:** Live `kind` integration test: apply `Application` CR pointing at local Git repo -> workloads created, `status.sync.revision` and `status.inventory` populated -> push new Git commit -> controller reconciles update automatically -> enable `automated.prune` and confirm the Git-removed resource is pruned. **Milestone `v0.2` stays open until that `#[ignore]`d live test has actually run on `kind`.**
 - **Trap Guard:** Reject applying onto an existing resource whose `tracking-id` belongs to another `Application`.

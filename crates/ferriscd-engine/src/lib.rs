@@ -2,6 +2,7 @@
 //! GKNN inventory tracking, SSA diffing, sync wave planning, and health evaluation.
 
 pub mod graph;
+pub mod inventory;
 pub mod manifest;
 pub mod repo;
 

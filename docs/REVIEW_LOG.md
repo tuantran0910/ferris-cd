@@ -79,3 +79,14 @@ An independent adversarial review pass audited `MASTER_PLAN.md` v1.0 and `ROADMA
 - **T05.5:** `SIGINT`/`SIGTERM` drain through `Controller::graceful_shutdown_on` with a non-zero `DrainTimeout` failure; `reconcile` span carries app identity; `FERRISCD_LOG_FORMAT` selects JSON/pretty and rejects unknown values.
 - **Retry policy:** `408`/`409`/`425`/`429`/`5xx` and transport errors are retryable; `404`/`422`/invalid-spec/unknown-kind are terminal.
 - **Follow-ups (non-blocking):** ignored live `kind` test artifact for T05.1–T05.3, wire-level `ApiStatusWriter` test, discovery negative-refresh throttle during API-server outages, drain-timeout env var.
+
+---
+
+## Phase 06 implementation review (`T06.1`–`T06.4`)
+
+- **T06.1 / T10 + C2:** `tracking-id` is version-agnostic `<app-ns>/<app-name>:<group>/<kind>:<res-ns>/<res-name>`; stamping preserves other annotations and skips hooks; the parser rejects malformed/blank segments; `classify_ownership` treats missing/whitespace as unmanaged and any padded/malformed look-alike as foreign. Proven by parser, stamping, cluster-scoped, and all-three-state tests.
+- **T06.2 / C1 + C2 + T8:** `next_inventory = (prev \ pruned_ok) ∪ applied_ok`; failed apply preserves an existing entry, failed prune preserves an orphan, `v1beta1→v1` changes only the version hint with zero orphans, and ordering is deterministic. Covered by the algebra/property suite.
+- **T06.3 / T1:** `ClusterStateReader` fetches the union `desired ∪ prev_inventory` with `buffer_unordered(16)`, one namespace probe per namespace per pass, and classifies `Present`/`Missing`/`DeferredPendingCrd`/`DeferredPendingNamespace`/`OrphanGvkGone`; ownership is checked against the owning Application.
+- **T06.4 / T10:** basic SSA apply uses `force(false)` + the FerrisCD field manager, strips `.status`, rejects `OwnedByForeign` before any mutation, requeues pending dependencies instead of erroring, persists partial inventory on failure (C1), and refuses `syncOptions.createNamespace` until `T08.3` instead of livelocking. A pre-delete GET re-verifies ownership (TOCTOU).
+- **Milestone `v0.2`:** code-complete; **not declared complete** until `make test-integration` runs the ignored `kind` test and its output is recorded (lesson §8).
+- **Follow-ups (non-blocking):** live `kind` run, namespace creation (`T08.3`), orphan accounting in `sync.status`, crash-window inventory persistence, auto-apply gating (`T07.5`), cleanup-path ownership recheck parity (`T08.5`).

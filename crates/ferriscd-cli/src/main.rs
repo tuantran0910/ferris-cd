@@ -19,6 +19,8 @@ enum Commands {
     ApplyFile(commands::apply_file::ApplyFileArgs),
     /// Generate or verify the committed FerrisCD CustomResourceDefinition manifests.
     Crd(commands::crd::CrdArgs),
+    /// Run the Kubernetes controller (watch `Application` CRs and sync them).
+    Controller(commands::controller::ControllerArgs),
 }
 
 #[tokio::main]
@@ -36,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Apply(args) => commands::apply::run(args).await,
         Commands::ApplyFile(args) => commands::apply_file::run(args).await,
         Commands::Crd(args) => commands::crd::run(args).await,
+        Commands::Controller(args) => commands::controller::run(args).await,
     }
 }
 

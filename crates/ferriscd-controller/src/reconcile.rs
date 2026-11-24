@@ -22,8 +22,12 @@ use std::time::Duration;
 
 use ferriscd_crd::status::{
     ApplicationStatus, Condition, ConditionStatus, MAX_STATUS_MESSAGE_CHARS, REASON_SYNC_ERROR,
+    SyncState, SyncStatus,
 };
 use ferriscd_crd::{Application, annotations};
+use ferriscd_engine::inventory::Inventory;
+use ferriscd_engine::manifest::ManifestError;
+use ferriscd_engine::repo::RepoError;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
@@ -35,6 +39,7 @@ use tracing::Instrument;
 
 use crate::controller::{BackoffTracker, FailureClass, object_key};
 use crate::discovery::DiscoveryError;
+use crate::live_state::LiveStateError;
 use crate::scope::ScopeError;
 
 /// Finalizer owned by FerrisCD; deleting an `Application` runs the cleanup branch.
@@ -55,6 +60,13 @@ pub const REASON_INVALID_SPEC: &str = "InvalidSpec";
 /// Condition reason recorded when the finalizer is released without a full cleanup.
 pub const REASON_CLEANUP_SKIPPED: &str = "CleanupSkipped";
 
+/// Condition reason recorded when a sync is waiting on a CRD or namespace creation.
+///
+/// This is a `Ready=True` reason, not a failure: the resources that *can* be applied were
+/// applied, and the deferred ones are retried on a short requeue
+/// ([`crate::sync::PENDING_REQUEUE`]) instead of failing the reconcile.
+pub const REASON_PENDING: &str = "PendingDependencies";
+
 /// Whether a deletion cascades through `status.inventory`.
 ///
 /// Defaulting to [`CleanupMode::Orphan`] means deleting an `Application` never silently
@@ -69,6 +81,11 @@ pub enum CleanupMode {
 }
 
 /// Outcome of a successful apply (diff + sync) pass.
+///
+/// Beyond the condition text it carries everything the pipeline learned that must be persisted
+/// on `/status`: the crash-safe inventory and the sync state. Both stay `None` for a pipeline
+/// that has nothing to report (e.g. [`UnwiredSyncPipeline`]), in which case `apply_once` leaves
+/// the corresponding status fields untouched instead of clearing them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
     /// `Ready=True` reason (e.g. `SyncSucceeded`).
@@ -77,16 +94,22 @@ pub struct ApplyOutcome {
     pub message: String,
     /// Optional requeue override (persisted operation state may need a follow-up pass).
     pub requeue: Option<Duration>,
+    /// Crash-safe inventory to persist in `status.inventory` (`None` = leave untouched).
+    pub inventory: Option<Inventory>,
+    /// Sync observability to persist in `status.sync` (`None` = leave untouched).
+    pub sync: Option<SyncState>,
 }
 
 impl ApplyOutcome {
-    /// Builds a successful outcome.
+    /// Builds a successful outcome without status fields.
     #[must_use]
     pub fn ready(reason: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
             message: message.into(),
             requeue: None,
+            inventory: None,
+            sync: None,
         }
     }
 
@@ -94,6 +117,20 @@ impl ApplyOutcome {
     #[must_use]
     pub fn with_requeue(mut self, delay: Duration) -> Self {
         self.requeue = Some(delay);
+        self
+    }
+
+    /// Attaches the crash-safe inventory to persist.
+    #[must_use]
+    pub fn with_inventory(mut self, inventory: Inventory) -> Self {
+        self.inventory = Some(inventory);
+        self
+    }
+
+    /// Attaches the sync state to persist.
+    #[must_use]
+    pub fn with_sync(mut self, sync: SyncState) -> Self {
+        self.sync = Some(sync);
         self
     }
 }
@@ -142,6 +179,53 @@ pub enum ReconcileError {
     #[error(transparent)]
     Scope(#[from] ScopeError),
 
+    /// Reading live state failed.
+    #[error(transparent)]
+    Live(#[from] LiveStateError),
+
+    /// Git resolution, caching or worktree sanitization failed.
+    #[error(transparent)]
+    Repo(#[from] RepoError),
+
+    /// Manifest loading, parsing or normalization failed.
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+
+    /// A Server-Side Apply call failed for a specific resource.
+    #[error("server-side apply failed for {resource}: {source}")]
+    Apply {
+        /// Canonical GKNN key of the offending resource.
+        resource: String,
+        /// Underlying API error.
+        #[source]
+        source: kube::Error,
+    },
+
+    /// A delete call failed for a specific resource.
+    #[error("delete failed for {resource}: {source}")]
+    Delete {
+        /// Canonical GKNN key of the offending resource.
+        resource: String,
+        /// Underlying API error.
+        #[source]
+        source: kube::Error,
+    },
+
+    /// The sync ran but stopped after at least one resource failed.
+    ///
+    /// Carries the inventory that is already true (every confirmed apply/prune so far) so
+    /// `apply_once` can still persist it: a create that succeeded must never become an
+    /// untracked orphan just because a later resource failed (finding C1).
+    #[error("{message}")]
+    PartialSync {
+        /// Actionable, secret-free description of the failure.
+        message: String,
+        /// Crash-safe inventory confirming everything that succeeded before the failure.
+        inventory: Inventory,
+        /// The revision that was being synced.
+        revision: Option<String>,
+    },
+
     /// The desired state is invalid and retrying cannot help (terminal).
     #[error("{message}")]
     Invalid {
@@ -158,12 +242,14 @@ impl ReconcileError {
     #[must_use]
     pub fn is_already_deleted(&self) -> bool {
         match self {
-            Self::Api(err) => match err {
-                kube::Error::Api(status) => status.code == 404 || status.code == 410,
-                _ => false,
-            },
+            Self::Api(err) | Self::Apply { source: err, .. } | Self::Delete { source: err, .. } => {
+                is_absent(err)
+            }
             Self::Discovery(err) => err.is_no_matches_for_kind(),
-            Self::Scope(_) | Self::Invalid { .. } => false,
+            Self::Scope(_) | Self::Invalid { .. } | Self::PartialSync { .. } => false,
+            // A kind nobody serves means nothing is left to clean up.
+            Self::Live(err) => matches!(err, LiveStateError::UnknownKind { .. }),
+            Self::Repo(_) | Self::Manifest(_) => false,
         }
     }
 
@@ -174,20 +260,70 @@ impl ReconcileError {
             // `code == 0` is an unpopulated status: assume transient and retry.
             // 408/409/425/429 are transient API conditions (SSA field-ownership and
             // resourceVersion conflicts in particular must back off, not wait 10 minutes).
-            Self::Api(kube::Error::Api(status)) => {
-                if matches!(status.code, 0 | 408 | 409 | 425 | 429) || status.code >= 500 {
+            Self::Api(err) | Self::Apply { source: err, .. } | Self::Delete { source: err, .. } => {
+                classify_api_error(err)
+            }
+            Self::Discovery(DiscoveryError::NoMatchesForKind { .. }) => FailureClass::Terminal,
+            Self::Discovery(DiscoveryError::Refresh { .. }) => FailureClass::Retryable,
+            Self::Scope(_) | Self::Invalid { .. } => FailureClass::Terminal,
+            Self::Live(err) => {
+                if err.is_retryable() {
                     FailureClass::Retryable
                 } else {
                     FailureClass::Terminal
                 }
             }
-            // Transport/timeout/decode failures: retry.
-            Self::Api(_) => FailureClass::Retryable,
-            Self::Discovery(DiscoveryError::NoMatchesForKind { .. }) => FailureClass::Terminal,
-            Self::Discovery(DiscoveryError::Refresh { .. }) => FailureClass::Retryable,
-            Self::Scope(_) | Self::Invalid { .. } => FailureClass::Terminal,
+            Self::Repo(err) => classify_engine_error(err.is_retryable()),
+            Self::Manifest(err) => classify_engine_error(err.is_retryable()),
+            // A partially applied sync is retried: the next pass converges from live state.
+            Self::PartialSync { .. } => FailureClass::Retryable,
         }
     }
+
+    /// The inventory and revision a partially applied sync already confirms.
+    ///
+    /// `apply_once` persists these on the failure path so the crash-safe inventory property
+    /// holds even when the reconcile fails half-way.
+    #[must_use]
+    pub fn partial_status(&self) -> Option<(&Inventory, Option<&String>)> {
+        match self {
+            Self::PartialSync {
+                inventory,
+                revision,
+                ..
+            } => Some((inventory, revision.as_ref())),
+            _ => None,
+        }
+    }
+}
+
+/// Maps an engine error's `is_retryable` verdict onto the controller's backoff classification.
+fn classify_engine_error(retryable: bool) -> FailureClass {
+    if retryable {
+        FailureClass::Retryable
+    } else {
+        FailureClass::Terminal
+    }
+}
+
+/// Classifies a `kube` error for the backoff policy.
+fn classify_api_error(err: &kube::Error) -> FailureClass {
+    match err {
+        kube::Error::Api(status) => {
+            if matches!(status.code, 0 | 408 | 409 | 425 | 429) || status.code >= 500 {
+                FailureClass::Retryable
+            } else {
+                FailureClass::Terminal
+            }
+        }
+        // Transport/timeout/decode failures: retry.
+        _ => FailureClass::Retryable,
+    }
+}
+
+/// Returns whether a `kube` error reports an absent object (`404`/`410`).
+fn is_absent(err: &kube::Error) -> bool {
+    matches!(err, kube::Error::Api(status) if status.code == 404 || status.code == 410)
 }
 
 /// The diff/sync pipeline seam implemented in Phases 07–08.
@@ -406,15 +542,21 @@ pub fn cleanup_disposition(
 /// Condition reason for a reconcile error.
 #[must_use]
 pub fn failure_reason(err: &ReconcileError) -> &'static str {
-    match err {
-        err if err.is_already_deleted() => match err {
+    if err.is_already_deleted() {
+        return match err {
             ReconcileError::Discovery(DiscoveryError::NoMatchesForKind { .. }) => {
                 REASON_NO_MATCHES_FOR_KIND
             }
             _ => REASON_NOT_FOUND,
-        },
-        ReconcileError::Api(_) | ReconcileError::Discovery(_) => REASON_SYNC_ERROR,
-        ReconcileError::Scope(_) | ReconcileError::Invalid { .. } => REASON_INVALID_SPEC,
+        };
+    }
+    match err {
+        // Deterministic input problems: retrying cannot help, the spec must change.
+        ReconcileError::Scope(_)
+        | ReconcileError::Invalid { .. }
+        | ReconcileError::Live(LiveStateError::UnknownKind { .. })
+        | ReconcileError::Live(LiveStateError::ScopeMismatch { .. }) => REASON_INVALID_SPEC,
+        _ => REASON_SYNC_ERROR,
     }
 }
 
@@ -496,6 +638,10 @@ pub fn record_failure(
 /// This is the unit-testable core of the finalizer's `Event::Apply` branch: it performs no
 /// API calls of its own beyond the injected [`StatusWriter`].
 ///
+/// The failure path still persists everything the pipeline already confirmed
+/// ([`ReconcileError::partial_status`]), so a create that succeeded before a later resource
+/// failed stays in `status.inventory` instead of leaking as an untracked orphan (finding C1).
+///
 /// # Errors
 ///
 /// Returns the pipeline error after the status patch was attempted, or the status-patch
@@ -511,11 +657,27 @@ pub async fn apply_once(
     match pipeline.apply(app).await {
         Ok(outcome) => {
             record_success(&mut status, generation, &outcome, now());
+            apply_outcome_status(&mut status, &outcome);
             status_writer.patch(app, status).await?;
             Ok(Action::requeue(outcome.requeue.unwrap_or(DEFAULT_REQUEUE)))
         }
         Err(err) => {
             record_failure(&mut status, generation, &err, now());
+            // Crash safety: a sync that half applied still persists the inventory it confirms,
+            // so a create that succeeded can never become an untracked orphan (finding C1).
+            if let Some((inventory, revision)) = err.partial_status() {
+                status.set_inventory(ferriscd_engine::inventory::to_status_entries(inventory));
+                merge_sync_state(
+                    &mut status,
+                    SyncState {
+                        status: SyncStatus::OutOfSync,
+                        revision: revision.cloned(),
+                        last_synced_revision: None,
+                        last_synced_spec_hash: None,
+                        last_synced_at: None,
+                    },
+                );
+            }
             // Best effort: the reconcile error is the one the caller must see.
             if let Err(patch_err) = status_writer.patch(app, status).await {
                 tracing::warn!(
@@ -528,6 +690,46 @@ pub async fn apply_once(
             Err(err)
         }
     }
+}
+
+/// Persists the pipeline-reported inventory and sync state on `status`.
+///
+/// Only fields the pipeline actually reported are written: an outcome without them (for
+/// example [`UnwiredSyncPipeline`]) must never clear state owned by another pass, and
+/// `lastSynced*` markers are preserved by [`merge_sync_state`].
+pub fn apply_outcome_status(status: &mut ApplicationStatus, outcome: &ApplyOutcome) {
+    if let Some(inventory) = &outcome.inventory {
+        status.set_inventory(ferriscd_engine::inventory::to_status_entries(inventory));
+    }
+    if let Some(sync) = &outcome.sync {
+        merge_sync_state(status, sync.clone());
+    }
+}
+
+/// Merges `next` into `status.sync`, preserving `lastSynced*` markers it did not set.
+///
+/// A reconcile that reports "still out of sync" reports only the revision it just read; the
+/// last successful sync markers belong to an earlier (successful) pass and must survive, or
+/// `selfHeal: false` drift detection would forget what it already deployed (finding H7).
+pub fn merge_sync_state(status: &mut ApplicationStatus, next: SyncState) {
+    let previous = status.sync.take();
+    let mut merged = next;
+    if merged.last_synced_revision.is_none() {
+        merged.last_synced_revision = previous
+            .as_ref()
+            .and_then(|previous| previous.last_synced_revision.clone());
+    }
+    if merged.last_synced_spec_hash.is_none() {
+        merged.last_synced_spec_hash = previous
+            .as_ref()
+            .and_then(|previous| previous.last_synced_spec_hash.clone());
+    }
+    if merged.last_synced_at.is_none() {
+        merged.last_synced_at = previous
+            .as_ref()
+            .and_then(|previous| previous.last_synced_at.clone());
+    }
+    status.sync = Some(merged);
 }
 
 /// Runs the cleanup pipeline through the finalizer gate.
@@ -710,11 +912,15 @@ mod tests {
     use ferriscd_crd::application::{
         DEFAULT_REQUEUE_AFTER_SECONDS, DEFAULT_REVISION_HISTORY_LIMIT,
     };
-    use ferriscd_crd::status::CONDITION_READY;
+    use ferriscd_crd::status::{
+        CONDITION_READY, HealthState, HealthStatus, RevisionHistoryEntry, SyncState, SyncStatus,
+    };
     use ferriscd_crd::{
         ApplicationSpec, DEFAULT_PROJECT_NAME, DestinationSpec, GitSourceSpec, RendererSpec,
         SourceSpec,
     };
+    use ferriscd_engine::inventory::{Inventory, InventoryEntry};
+    use ferriscd_engine::manifest::ResourceKey;
     use kube::core::Status;
 
     use super::*;
@@ -1212,6 +1418,224 @@ mod tests {
             "{}",
             condition.message
         );
+    }
+
+    /// Builds an inventory with one Deployment entry.
+    fn sample_inventory() -> Inventory {
+        let mut inventory = Inventory::new();
+        inventory.insert(
+            ResourceKey::new("apps", "Deployment", Some("payments".to_owned()), "api"),
+            InventoryEntry::new("v1"),
+        );
+        inventory
+    }
+
+    fn inventory_status() -> ApplicationStatus {
+        ApplicationStatus {
+            inventory: vec![ferriscd_crd::InventoryEntry::new(
+                "apps/Deployment/payments/old",
+                "v1",
+            )],
+            sync: Some(SyncState {
+                status: SyncStatus::Synced,
+                revision: Some("oldsha".to_owned()),
+                last_synced_revision: Some("oldsha".to_owned()),
+                last_synced_spec_hash: Some("spec-hash".to_owned()),
+                last_synced_at: Some(now()),
+            }),
+            health: Some(HealthState::new(HealthStatus::Healthy)),
+            history: vec![RevisionHistoryEntry::new(
+                1,
+                Some("oldsha".to_owned()),
+                now(),
+            )],
+            ..ApplicationStatus::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_outcome_persists_inventory_and_sync_and_keeps_other_fields() {
+        let mut app = application(&[]);
+        app.status = Some(inventory_status());
+
+        let outcome = ApplyOutcome::ready("SyncSucceeded", "applied 1 resource")
+            .with_inventory(sample_inventory())
+            .with_sync(SyncState {
+                status: SyncStatus::OutOfSync,
+                revision: Some("newsha".to_owned()),
+                // The pipeline did not set the markers; the previous pass owns them.
+                last_synced_revision: None,
+                last_synced_spec_hash: None,
+                last_synced_at: None,
+            });
+        let pipeline = FakePipeline {
+            apply: Box::new(move || Ok(outcome.clone())),
+            ..FakePipeline::ready()
+        };
+        let writer = RecordingStatusWriter::default();
+
+        apply_once(&app, &pipeline, &writer)
+            .await
+            .expect("apply must succeed");
+
+        let status = &writer.patches()[0];
+        assert_eq!(
+            status
+                .inventory
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["apps/Deployment/payments/api"]
+        );
+        let sync = status.sync.as_ref().expect("sync must be persisted");
+        assert_eq!(sync.revision.as_deref(), Some("newsha"));
+        assert_eq!(
+            sync.last_synced_revision.as_deref(),
+            Some("oldsha"),
+            "lastSynced markers must survive a pass that did not refresh them"
+        );
+        assert_eq!(sync.last_synced_spec_hash.as_deref(), Some("spec-hash"));
+        assert!(sync.last_synced_at.is_some());
+        assert_eq!(
+            status.health.as_ref().map(|health| health.status),
+            Some(HealthStatus::Healthy),
+            "fields owned by other phases must survive"
+        );
+        assert_eq!(status.history.len(), 1);
+        assert!(status.is_ready());
+    }
+
+    #[tokio::test]
+    async fn a_partial_sync_persists_the_inventory_it_already_confirms() {
+        let mut app = application(&[]);
+        app.status = Some(inventory_status());
+
+        let pipeline = FakePipeline::failing(|| ReconcileError::PartialSync {
+            message: "applying apps/Deployment/payments/api failed".to_owned(),
+            inventory: sample_inventory(),
+            revision: Some("newsha".to_owned()),
+        });
+        let writer = RecordingStatusWriter::default();
+
+        let err = apply_once(&app, &pipeline, &writer)
+            .await
+            .expect_err("a partial sync is still a failure");
+        assert_eq!(err.failure_class(), FailureClass::Retryable);
+        assert!(err.partial_status().is_some());
+
+        let patches = writer.patches();
+        assert_eq!(
+            patches.len(),
+            1,
+            "the failure path must still patch /status"
+        );
+        let status = &patches[0];
+        assert!(
+            !status.is_ready(),
+            "a partial sync must report Ready=False even though it persisted state"
+        );
+        assert_eq!(
+            status
+                .inventory
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["apps/Deployment/payments/api"],
+            "the confirmed inventory must survive the failure (finding C1)"
+        );
+        let sync = status.sync.as_ref().expect("sync must be persisted");
+        assert_eq!(sync.status, SyncStatus::OutOfSync);
+        assert_eq!(sync.revision.as_deref(), Some("newsha"));
+        assert_eq!(
+            sync.last_synced_revision.as_deref(),
+            Some("oldsha"),
+            "a failure must never move the last successful sync markers"
+        );
+        assert_eq!(status.history.len(), 1);
+        assert!(
+            status
+                .condition(CONDITION_READY)
+                .is_some_and(|condition| condition.message.contains("failed")),
+            "the failure reason must be actionable"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_unwired_pipeline_still_reports_not_ready_and_writes_no_state() {
+        let mut app = application(&[]);
+        app.status = Some(inventory_status());
+        let writer = RecordingStatusWriter::default();
+
+        let err = apply_once(&app, &UnwiredSyncPipeline, &writer)
+            .await
+            .expect_err("the unwired pipeline must never report success");
+        assert!(err.to_string().contains("not wired"), "{err}");
+
+        let status = &writer.patches()[0];
+        assert!(!status.is_ready());
+        assert_eq!(
+            status.inventory.len(),
+            1,
+            "a pipeline that reports no inventory must not clear the existing one"
+        );
+        assert_eq!(
+            status
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.revision.as_deref()),
+            Some("oldsha"),
+            "a pipeline that reports no sync state must not clear it"
+        );
+    }
+
+    #[test]
+    fn sync_state_merge_only_fills_the_missing_last_synced_markers() {
+        let mut status = inventory_status();
+        merge_sync_state(
+            &mut status,
+            SyncState {
+                status: SyncStatus::Synced,
+                revision: Some("newsha".to_owned()),
+                last_synced_revision: Some("newsha".to_owned()),
+                last_synced_spec_hash: None,
+                last_synced_at: None,
+            },
+        );
+        let sync = status.sync.expect("merged");
+        assert_eq!(sync.last_synced_revision.as_deref(), Some("newsha"));
+        assert_eq!(
+            sync.last_synced_spec_hash.as_deref(),
+            Some("spec-hash"),
+            "an unset marker keeps the previous value"
+        );
+
+        // No previous sync at all: nothing to preserve, no panic.
+        let mut empty = ApplicationStatus::default();
+        merge_sync_state(&mut empty, SyncState::new(SyncStatus::Synced, None));
+        assert!(empty.sync.expect("merged").last_synced_revision.is_none());
+    }
+
+    #[test]
+    fn partial_sync_errors_expose_their_inventory_only() {
+        let partial = ReconcileError::PartialSync {
+            message: "boom".to_owned(),
+            inventory: sample_inventory(),
+            revision: Some("sha".to_owned()),
+        };
+        let (inventory, revision) = partial.partial_status().expect("partial status");
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(revision.map(String::as_str), Some("sha"));
+        assert!(!partial.is_already_deleted());
+        assert_eq!(failure_reason(&partial), REASON_SYNC_ERROR);
+
+        for err in [
+            ReconcileError::Invalid {
+                message: "bad".to_owned(),
+            },
+            ReconcileError::Api(api_error(500)),
+        ] {
+            assert!(err.partial_status().is_none());
+        }
     }
 
     #[test]
