@@ -15,10 +15,12 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 ferriscd-controller.workspace = true
 ferriscd-crd.workspace = true
 ferriscd-engine.workspace = true
 k8s-openapi = { workspace = true, features = ["v1_35"] }
 kube.workspace = true
+serde-saphyr.workspace = true
 tokio.workspace = true
 tracing.workspace = true
