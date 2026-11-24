@@ -22,9 +22,16 @@
 //!    is no longer in Git at all, so the controller can only have learned about it from
 //!    `status.inventory` and can only have deleted it after classifying the live object
 //!    `OwnedBySelf` from its `tracking-id`. Every other resource must survive.
+//! 5. **T07.5:** a second reconcile of the already-synced `Application` issues **zero** mutating
+//!    `Patch` calls. `metadata.resourceVersion` of the managed objects is the observable: an
+//!    apply always bumps it, while a `dryRun=All` diff does not persist anything. A control leg
+//!    hand-edits the ConfigMap and waits for self-heal, proving the same observation *does*
+//!    detect a write (otherwise "version unchanged" would be vacuous).
 //!
 //! Hermetic coverage of the same classification (no cluster) lives in
-//! `crates/ferriscd-controller/src/live_state.rs`.
+//! `crates/ferriscd-controller/src/live_state.rs`; the hermetic proof that an already-synced
+//! `Application` performs zero mutating applies (counted at the `Applier` seam) lives in
+//! `crates/ferriscd-controller/src/sync.rs`.
 //!
 //! # Prerequisites (manual)
 //!
@@ -159,7 +166,63 @@ fn controller_reconciles_an_application_and_keeps_the_inventory_of_a_removed_res
         "the Application must stay Ready=True after a prune, got: {}",
         status_jsonpath("{.status.conditions}")
     );
+
+    // ---------------------------------------------------------------------
+    // T07.5: an already-synced Application performs zero mutating Patch calls
+    // ---------------------------------------------------------------------
+    // `resourceVersion` is bumped by every persisted write and is *not* touched by a
+    // `dryRun=All` PATCH, so an unchanged pair of versions across a completed reconcile is the
+    // live proof that the diff gate issued no mutating apply.
+    let versions_before =
+        managed_resource_versions().expect("the managed objects must report a resourceVersion");
+
+    // Force a full pass that is guaranteed to start after this point: bumping
+    // `spec.requeueAfterSeconds` raises `metadata.generation`, and `status.observedGeneration`
+    // only reaches that value once a reconcile that observed it has finished its apply phase.
+    // It is not part of `source_spec_hash`, so the gate must skip (nothing drifted).
+    let generation = bump_requeue_seconds_and_get_generation();
+    wait_for(
+        Duration::from_secs(240),
+        "the diff gate to skip the already-synced Application",
+        || {
+            observed_generation() == Some(generation)
+                && ready_reason().as_deref() == Some(REASON_SYNC_SKIPPED)
+        },
+    );
+    assert_eq!(
+        managed_resource_versions().as_ref(),
+        Some(&versions_before),
+        "an already-synced Application must perform zero mutating Patch calls (resourceVersion \
+         moved, so something was written)"
+    );
+    assert_eq!(
+        status_jsonpath("{.status.sync.status}"),
+        "Synced",
+        "a skipped, already-synced pass must still report Synced"
+    );
+
+    // Control: the same observation must detect a write, otherwise "unchanged" proves nothing.
+    assert!(configmap_exists(KEPT_CONFIGMAP));
+    assert_eq!(
+        configmap_data_key(KEPT_CONFIGMAP).as_deref(),
+        Some("value"),
+        "the fixture ConfigMap starts with the value from Git"
+    );
+    patch_configmap_data_key(KEPT_CONFIGMAP, "drifted");
+    wait_for(
+        Duration::from_secs(600),
+        "self-heal to restore the drifted ConfigMap",
+        || configmap_data_key(KEPT_CONFIGMAP).as_deref() == Some("value"),
+    );
+    assert_ne!(
+        managed_resource_versions().as_ref(),
+        Some(&versions_before),
+        "healing drift must bump resourceVersion, which is what the zero-write assertion detects"
+    );
 }
+
+/// Condition reason the diff gate reports when it deliberately applied nothing.
+const REASON_SYNC_SKIPPED: &str = "SyncSkipped";
 
 /// Deletes the resources this test creates.
 struct ClusterCleanup;
@@ -348,6 +411,10 @@ fn ensure_namespace(namespace: &str) {
 }
 
 /// Applies the `Application` CR that points at the local fixture repository.
+///
+/// `automated: { selfHeal: true }` is required since T07.5: the diff gate refuses to apply
+/// anything for `automated: None` (manual-only) and, with `selfHeal: false`, only on a source
+/// change. Pruning stays off so the "removed from Git is kept" leg remains observable.
 fn apply_application(repo_path: &str) {
     let manifest = format!(
         "apiVersion: ferriscd.io/v1alpha1\n\
@@ -364,6 +431,10 @@ fn apply_application(repo_path: &str) {
          \x20 destination:\n\
          \x20   cluster: in-cluster\n\
          \x20   namespace: {TARGET_NAMESPACE}\n\
+         \x20 syncPolicy:\n\
+         \x20   automated:\n\
+         \x20     prune: false\n\
+         \x20     selfHeal: true\n\
          \x20 requeueAfterSeconds: 15\n"
     );
     let output = kubectl_with_stdin(&["apply", "-f", "-"], &manifest);
@@ -489,6 +560,124 @@ fn inventory_contains(key: &str) -> bool {
     status_jsonpath("{.status.inventory[*].key}")
         .split_whitespace()
         .any(|entry| entry == key)
+}
+
+/// `(resourceVersion of the target Namespace, resourceVersion of the kept ConfigMap)`.
+///
+/// Both objects are managed by the `Application`, so any mutating apply during a reconcile
+/// bumps one of them. A `dryRun=All` PATCH never persists, so it cannot move these values.
+fn managed_resource_versions() -> Option<(String, String)> {
+    let namespace = kubectl_jsonpath(&[
+        "get",
+        "namespace",
+        TARGET_NAMESPACE,
+        "-o",
+        "jsonpath={.metadata.resourceVersion}",
+    ])?;
+    let configmap = kubectl_jsonpath(&[
+        "get",
+        "configmap",
+        KEPT_CONFIGMAP,
+        "-n",
+        TARGET_NAMESPACE,
+        "-o",
+        "jsonpath={.metadata.resourceVersion}",
+    ])?;
+    Some((namespace, configmap))
+}
+
+/// `metadata.generation` of the `Application`.
+fn generation() -> Option<i64> {
+    status_jsonpath("{.metadata.generation}").parse().ok()
+}
+
+/// `status.observedGeneration` of the `Application`.
+fn observed_generation() -> Option<i64> {
+    status_jsonpath("{.status.observedGeneration}").parse().ok()
+}
+
+/// Reason of the `Ready` condition.
+fn ready_reason() -> Option<String> {
+    let reason = status_jsonpath("{.status.conditions[?(@.type==\"Ready\")].reason}");
+    if reason.is_empty() {
+        None
+    } else {
+        Some(reason)
+    }
+}
+
+/// Bumps `spec.requeueAfterSeconds` by one and returns the resulting `metadata.generation`.
+///
+/// `requeueAfterSeconds` is deliberately **not** part of `source_spec_hash`, so the bump forces a
+/// full reconcile while the diff gate still decides to skip — and the new generation is the
+/// "this pass started after my snapshot" signal the zero-write assertion needs.
+fn bump_requeue_seconds_and_get_generation() -> i64 {
+    let current: i64 = status_jsonpath("{.spec.requeueAfterSeconds}")
+        .parse()
+        .unwrap_or(15);
+    let patch = format!(
+        r#"{{"spec":{{"requeueAfterSeconds":{}}}}}"#,
+        current.saturating_add(1)
+    );
+    let output = kubectl(&[
+        "patch",
+        "application",
+        APPLICATION_NAME,
+        "-n",
+        CONTROL_NAMESPACE,
+        "--type=merge",
+        "-p",
+        &patch,
+    ]);
+    assert!(
+        output.status.success(),
+        "bumping spec.requeueAfterSeconds failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    generation().expect("the Application must report metadata.generation")
+}
+
+/// Reads `.data.key` of a fixture ConfigMap.
+fn configmap_data_key(name: &str) -> Option<String> {
+    kubectl_jsonpath(&[
+        "get",
+        "configmap",
+        name,
+        "-n",
+        TARGET_NAMESPACE,
+        "-o",
+        "jsonpath={.data.key}",
+    ])
+}
+
+/// Edits `.data.key` of a fixture ConfigMap (drift injection).
+fn patch_configmap_data_key(name: &str, value: &str) {
+    let patch = format!(r#"{{"data":{{"key":"{value}"}}}}"#);
+    let output = kubectl(&[
+        "patch",
+        "configmap",
+        name,
+        "-n",
+        TARGET_NAMESPACE,
+        "--type=merge",
+        "-p",
+        &patch,
+    ]);
+    assert!(
+        output.status.success(),
+        "drifting ConfigMap {name} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Runs `kubectl` and returns its trimmed stdout, or `None` on failure.
+fn kubectl_jsonpath(args: &[&str]) -> Option<String> {
+    let output = kubectl(args);
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn synced_revision() -> Option<String> {

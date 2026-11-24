@@ -1,6 +1,7 @@
 //! FerrisCD core GitOps engine: repository acquisition, manifest rendering,
 //! GKNN inventory tracking, SSA diffing, sync wave planning, and health evaluation.
 
+pub mod diff;
 pub mod graph;
 pub mod inventory;
 pub mod manifest;

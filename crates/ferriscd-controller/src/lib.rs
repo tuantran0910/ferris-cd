@@ -10,6 +10,7 @@ use kube::{Api, Client, ResourceExt};
 
 pub mod controller;
 pub mod discovery;
+pub mod dry_run;
 pub mod live_state;
 pub mod predicate;
 pub mod reconcile;
@@ -21,6 +22,10 @@ pub use controller::{
     FailureClass, RETRY_BASE_DELAY, RETRY_MAX_DELAY, TERMINAL_DELAY,
 };
 pub use discovery::{CachedDiscovery, DiscoveryCache, DiscoveryError, ScopeLookup};
+pub use dry_run::{
+    DRY_RUN_CONCURRENCY, DryRunApi, DryRunError, DryRunEvaluator, DryRunFuture, DryRunOutcome,
+    DryRunTarget, DynamicDryRunApi, MAX_FIELD_CONFLICTS, parse_conflict_status,
+};
 pub use live_state::{
     ClusterStateReader, DynamicApiSource, FetchRequest, LiveObjectSource, LiveState,
     LiveStateError, TrackingOwner,
@@ -142,6 +147,8 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
             DiscoveryCache::new(client.clone()),
             Arc::new(DynamicApiSource::new(client.clone())),
             Arc::new(DynamicApiApplier::new(client.clone())),
+            // The dry-run half of drift detection (T07.1): `dryRun=All` PATCHes per resource.
+            Arc::new(DynamicDryRunApi::new(client.clone())),
         )
         .with_url_policy(url_policy),
     );
