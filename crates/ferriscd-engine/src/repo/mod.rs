@@ -9,6 +9,7 @@ pub mod error;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod fake;
 pub mod gix_client;
+pub(crate) mod mirror;
 pub mod sanitize;
 pub mod types;
 
@@ -20,6 +21,7 @@ pub use error::RepoError;
 #[cfg(any(test, feature = "test-utils"))]
 pub use fake::{FakeGitClient, FakeGitClientConfig, FakeHead, FakeStage};
 pub use gix_client::{GixGitClient, GixGitClientConfig};
+pub use mirror::{MirrorGcReport, MirrorLimits};
 pub use sanitize::{WorktreeLimits, sanitize_worktree};
 pub use types::{
     GitSource, RepoCheckout, RepoCredentials, RepoUrlPolicy, ResolvedRevision, validate_commit_sha,
@@ -31,6 +33,12 @@ pub type RepoFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, RepoError>> +
 
 /// Asynchronous, object-safe interface for resolving Git revisions and checking out
 /// immutable worktrees.
+///
+/// The trait is deliberately free of `gix` types: backends (and fakes) implement it with any
+/// transport or object store. [`GixGitClient`] additionally maintains a **persistent per-URL bare
+/// mirror / object store** (see [`mirror`]) behind these two methods so that materializing many
+/// commits from one repository does not re-fetch shared history; that optimization is entirely
+/// internal to the backend and is not part of this contract.
 pub trait GitClient: Send + Sync {
     /// Resolves `src.target_revision` (branch, tag, `HEAD`, or commit SHA) into a
     /// canonical 40-character lowercase hex commit SHA.

@@ -3,30 +3,30 @@
 //! All `gix` types stay private to this module so the engine API remains
 //! completely decoupled from the underlying Git implementation.
 
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tempfile::TempDir;
 
 use super::auth::AuthContext;
+use super::cache::{normalize_repo_url, repo_hash};
 use super::error::RepoError;
+use super::mirror::{
+    MirrorGcReport, MirrorLimits, MirrorStore, make_tree_private, mirror_dir, mirror_root,
+    touch_last_used,
+};
 use super::sanitize::{WorktreeLimits, sanitize_worktree};
 use super::types::{
     GitSource, RepoCheckout, RepoCredentials, RepoUrlPolicy, ResolvedRevision, validate_commit_sha,
 };
 use super::{GitClient, RepoFuture};
 
-/// Broad refspecs used when querying the full remote ref advertisement.
-const ALL_REFS_LIST_SPECS: &[&str] = &[
-    "HEAD",
-    "+refs/heads/*:refs/remotes/origin/*",
-    "+refs/tags/*:refs/tags/*",
-];
-
 /// Maximum tag-peeling hops allowed before rejecting a cyclic or pathological tag chain.
 const MAX_TAG_PEEL_DEPTH: usize = 64;
+
+/// Monotonic sequence making quarantined `.broken-*` mirror paths unique.
+static BROKEN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Configuration for [`GixGitClient`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -34,8 +34,18 @@ pub struct GixGitClientConfig {
     /// Policy controlling which repository URL schemes are allowed.
     /// Defaults to [`RepoUrlPolicy::Production`].
     pub url_policy: RepoUrlPolicy,
-    /// Optional parent directory for temporary bare repositories and checked-out worktrees.
-    /// When `None`, the operating system's temporary directory is used.
+    /// Optional parent directory for temporary bare repositories, checked-out worktrees, and the
+    /// persistent mirror layout (`<work_root>/mirrors`). When `None`, a **process-private** `0700`
+    /// directory is created lazily and used for mirrors, and the operating system's temporary
+    /// directory is used for ephemeral worktrees.
+    ///
+    /// # Ownership
+    ///
+    /// **Exactly one [`GixGitClient`] instance (or its clones, which share one mirror-lock map)
+    /// may own a given `work_root`.** A second, independently-constructed [`GixGitClient`] pointed
+    /// at the same `work_root` has its own per-mirror mutex map, so two such clients can race on
+    /// the same mirror directory. Sharing a `work_root` between independent clients or processes
+    /// is unsupported.
     pub work_root: Option<PathBuf>,
     /// Permits SSH key credentials without a `known_hosts` entry (**insecure; tests only**).
     ///
@@ -65,6 +75,9 @@ pub struct GixGitClientConfig {
     /// Symlink / resource budgets enforced on every materialized worktree before it is
     /// returned. Defaults to [`WorktreeLimits::default`].
     pub worktree_limits: WorktreeLimits,
+    /// Bounds for the persistent per-URL bare mirror reclamation. Defaults to
+    /// [`MirrorLimits::default`].
+    pub mirror_limits: MirrorLimits,
 }
 
 impl GixGitClientConfig {
@@ -111,6 +124,13 @@ impl GixGitClientConfig {
     #[must_use]
     pub fn with_worktree_limits(mut self, worktree_limits: WorktreeLimits) -> Self {
         self.worktree_limits = worktree_limits;
+        self
+    }
+
+    /// Sets the bounds for persistent mirror reclamation.
+    #[must_use]
+    pub fn with_mirror_limits(mut self, mirror_limits: MirrorLimits) -> Self {
+        self.mirror_limits = mirror_limits;
         self
     }
 
@@ -179,22 +199,61 @@ struct BlockingContext<'a> {
 /// key material is confined to an ephemeral `0600` file inside a [`super::auth::TempKeyGuard`]
 /// scratch directory that is zeroized and deleted when the blocking operation ends. See
 /// [`super::auth`] for the full transport-hardening design.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GixGitClient {
     config: GixGitClientConfig,
+    store: Arc<MirrorStore>,
+}
+
+impl Default for GixGitClient {
+    fn default() -> Self {
+        Self::new(GixGitClientConfig::default())
+    }
 }
 
 impl GixGitClient {
     /// Creates a new [`GixGitClient`] with the supplied configuration.
     #[must_use]
     pub fn new(config: GixGitClientConfig) -> Self {
-        Self { config }
+        Self {
+            store: Arc::new(MirrorStore::new(config.mirror_limits)),
+            config,
+        }
     }
 
     /// Returns the active client configuration.
     #[must_use]
     pub fn config(&self) -> &GixGitClientConfig {
         &self.config
+    }
+
+    /// Returns how many first-time persistent mirrors this client created.
+    ///
+    /// Useful for tests (and observability) to prove that a monorepo materialized many times
+    /// performs exactly one mirror initialization.
+    #[must_use]
+    pub fn mirror_initializations(&self) -> usize {
+        self.store.initializations()
+    }
+
+    /// Returns how many remote fetches were performed into persistent mirrors.
+    #[must_use]
+    pub fn mirror_fetches(&self) -> usize {
+        self.store.fetches()
+    }
+
+    /// Reclaims unused mirrors subject to [`GixGitClientConfig::mirror_limits`].
+    ///
+    /// Only mirrors that are not currently in use (no active fetch/materialize operation holds
+    /// their blocking lock) are considered; in-use mirrors are always retained.
+    pub async fn collect_mirror_garbage(&self) -> Result<MirrorGcReport, RepoError> {
+        let work_root = self.config.work_root.clone();
+        let store = Arc::clone(&self.store);
+        run_blocking("collect_mirror_garbage", move || {
+            let root = mirror_root(work_root.as_deref())?;
+            Ok(store.collect_garbage(&root))
+        })
+        .await
     }
 }
 
@@ -209,11 +268,20 @@ impl GitClient for GixGitClient {
 
             let url = parse_gix_url(&src.repo_url, self.config.url_policy)?;
             let target_revision = src.target_revision.clone();
+            let mirror_key = repo_hash(&normalize_repo_url(&src.repo_url));
             let options = self.config.blocking_options();
             let creds = creds.clone();
+            let store = Arc::clone(&self.store);
 
             run_blocking("resolve_revision", move || {
-                resolve_revision_blocking(url, target_revision, &creds, &options)
+                resolve_revision_blocking(
+                    url,
+                    target_revision,
+                    mirror_key,
+                    &creds,
+                    &options,
+                    &store,
+                )
             })
             .await
         })
@@ -230,25 +298,22 @@ impl GitClient for GixGitClient {
             validate_commit_sha(sha)?;
 
             let url = parse_gix_url(&src.repo_url, self.config.url_policy)?;
-            let target_oid = gix::ObjectId::from_hex(sha.as_bytes()).map_err(|err| {
-                RepoError::InvalidRevision {
-                    revision: sha.to_owned(),
-                    reason: format!("invalid commit SHA '{sha}': {err}"),
-                }
-            })?;
             let target_revision = src.target_revision.clone();
+            let mirror_key = repo_hash(&normalize_repo_url(&src.repo_url));
             let sha_owned = sha.to_owned();
             let options = self.config.blocking_options();
             let creds = creds.clone();
+            let store = Arc::clone(&self.store);
 
             run_blocking("checkout", move || {
                 checkout_blocking(
                     url,
                     target_revision,
+                    mirror_key,
                     sha_owned,
-                    target_oid,
                     &creds,
                     &options,
+                    &store,
                 )
             })
             .await
@@ -365,23 +430,7 @@ fn init_isolated_bare_repo(
     dir: &Path,
     ctx: &BlockingContext<'_>,
 ) -> Result<gix::Repository, RepoError> {
-    let mut overrides: Vec<gix::bstr::BString> = vec![
-        "protocol.allow=never".into(),
-        "protocol.https.allow=always".into(),
-        // SSH is a production transport (key + strict host key verification enforced by
-        // `AuthContext`), so it is always allowed. `protocol.git://` stays disabled.
-        "protocol.ssh.allow=always".into(),
-        "http.followRedirects=false".into(),
-    ];
-    if matches!(ctx.url_policy, RepoUrlPolicy::AllowLocal) {
-        overrides.push("protocol.file.allow=always".into());
-    }
-    // `core.sshCommand` is the configuration equivalent of `GIT_SSH_COMMAND`; applying it as a
-    // per-repository override keeps secret key paths out of `.git/config` on disk and out of
-    // the process environment.
-    overrides.extend(ctx.auth.config_overrides());
-
-    let open_options = gix::open::Options::isolated().config_overrides(overrides);
+    let open_options = isolated_open_options(ctx);
     gix::ThreadSafeRepository::init_opts(
         dir,
         gix::create::Kind::Bare,
@@ -390,6 +439,46 @@ fn init_isolated_bare_repo(
     )
     .map(Into::into)
     .map_err(map_gix_error)
+}
+
+fn open_isolated_bare_repo(
+    dir: &Path,
+    ctx: &BlockingContext<'_>,
+) -> Result<gix::Repository, RepoError> {
+    gix::open_opts(dir, isolated_open_options(ctx)).map_err(map_gix_error)
+}
+
+/// Builds the `gix` open options applied to every mirror/scratch repository.
+///
+/// The transport hardening (`protocol.allow=never`, HTTPS/SSH allow-lists, no HTTP redirects,
+/// and the `core.sshCommand` / `ssh.variant` overrides for SSH key credentials) is identical for
+/// freshly initialized and re-opened persistent mirrors. The overrides are applied at open time
+/// (never written into the on-disk `.git/config`), so secret key paths never persist in a mirror.
+fn isolated_open_options(ctx: &BlockingContext<'_>) -> gix::open::Options {
+    let mut overrides: Vec<gix::bstr::BString> = vec![
+        "protocol.allow=never".into(),
+        "protocol.https.allow=always".into(),
+        // SSH is a production transport (key + strict host key verification enforced by
+        // `AuthContext`), so it is always allowed.
+        "protocol.ssh.allow=always".into(),
+        // Explicit per-protocol denials beat a hostile on-disk `config` that sets a specific
+        // `protocol.<name>.allow=always`: `gix` prefers the specific key over `protocol.allow`,
+        // so relying on the generic `never` alone would let a reopened mirror re-enable these.
+        "protocol.http.allow=never".into(),
+        "protocol.git.allow=never".into(),
+        "http.followRedirects=false".into(),
+    ];
+    if matches!(ctx.url_policy, RepoUrlPolicy::AllowLocal) {
+        overrides.push("protocol.file.allow=always".into());
+    } else {
+        overrides.push("protocol.file.allow=never".into());
+    }
+    // `core.sshCommand` is the configuration equivalent of `GIT_SSH_COMMAND`; applying it as a
+    // per-repository override keeps secret key paths out of `.git/config` on disk and out of
+    // the process environment.
+    overrides.extend(ctx.auth.config_overrides());
+
+    gix::open::Options::isolated().config_overrides(overrides)
 }
 
 fn open_remote<'repo>(
@@ -423,7 +512,7 @@ fn fetch_ref_map(
 
 #[derive(Debug)]
 enum FetchStageError {
-    /// Failed during connect / handshake / ls-refs (do not mask with fallback).
+    /// Failed during connect / handshake / ls-refs (propagated to the caller as-is).
     ConnectOrRefMap(RepoError),
     /// Remote had no matching refs for the requested explicit refspecs.
     MissingRequiredMapping,
@@ -463,14 +552,13 @@ fn fetch_with_refspecs(
 fn resolve_revision_blocking(
     url: gix::Url,
     target_revision: String,
+    mirror_key: String,
     creds: &RepoCredentials,
     options: &BlockingOptions,
+    store: &MirrorStore,
 ) -> Result<ResolvedRevision, RepoError> {
     let auth = options.auth_context(&url, creds)?;
     let ctx = options.context(&auth);
-
-    let bare_dir = create_temp_dir(ctx.work_root)?;
-    let repo = init_isolated_bare_repo(bare_dir.path(), &ctx)?;
 
     if validate_commit_sha(&target_revision).is_ok() {
         let target_oid = gix::ObjectId::from_hex(target_revision.as_bytes()).map_err(|err| {
@@ -479,34 +567,237 @@ fn resolve_revision_blocking(
                 reason: format!("invalid commit SHA: {err}"),
             }
         })?;
-        return resolve_sha_revision(&repo, url, target_revision, target_oid, &ctx);
+        return with_mirror(&mirror_key, &ctx, store, |repo| {
+            resolve_sha_revision(repo, url, target_revision, target_oid, &ctx, store)
+        });
     }
 
-    let branch_candidate = format!("refs/heads/{target_revision}");
-    let tag_candidate = format!("refs/tags/{target_revision}");
-    let refspecs: Vec<&str> = if target_revision == "HEAD" {
-        vec!["HEAD"]
-    } else if target_revision.starts_with("refs/") {
-        vec![target_revision.as_str()]
-    } else {
-        vec![branch_candidate.as_str(), tag_candidate.as_str()]
+    with_mirror(&mirror_key, &ctx, store, |repo| {
+        let branch_candidate = format!("refs/heads/{target_revision}");
+        let tag_candidate = format!("refs/tags/{target_revision}");
+        let refspecs: Vec<&str> = if target_revision == "HEAD" {
+            vec!["HEAD"]
+        } else if target_revision.starts_with("refs/") {
+            vec![target_revision.as_str()]
+        } else {
+            vec![branch_candidate.as_str(), tag_candidate.as_str()]
+        };
+
+        let ref_map = fetch_ref_map(repo, url.clone(), &refspecs, &ctx)?;
+        let matched =
+            find_matching_remote_ref(&ref_map.remote_refs, &target_revision).ok_or_else(|| {
+                RepoError::RevisionNotFound {
+                    revision: target_revision.clone(),
+                }
+            })?;
+
+        let commit_sha = resolve_matched_ref(repo, url, matched, &target_revision, &ctx, store)?;
+        validate_commit_sha(&commit_sha)?;
+
+        Ok(ResolvedRevision {
+            commit_sha,
+            requested_ref: target_revision,
+        })
+    })
+}
+
+/// Runs `f` against the persistent mirror for `mirror_key`, holding that mirror's blocking lock.
+///
+/// * A first-time mirror is initialized into a temporary directory and only renamed into place by
+///   [`MirrorLease::publish`] after `f` succeeds, so a crash or failure can never leave a partial
+///   mirror behind.
+/// * An existing mirror is opened in place; `f`'s failure never deletes it.
+/// * The blocking mutex is held for the entire call (which is itself synchronous and runs inside
+///   `spawn_blocking`), so concurrent clients never interleave fetches into the same mirror.
+fn with_mirror<T>(
+    mirror_key: &str,
+    ctx: &BlockingContext<'_>,
+    store: &MirrorStore,
+    f: impl FnOnce(&gix::Repository) -> Result<T, RepoError>,
+) -> Result<T, RepoError> {
+    let lock = store.lock_for(mirror_key);
+    let _guard = lock.lock().map_err(|_| RepoError::RepositoryError {
+        message: "mirror lock was poisoned".to_owned(),
+    })?;
+
+    let mut mirror = open_or_init_mirror(mirror_key, ctx)?;
+    let result = f(mirror.repo());
+    match result {
+        Ok(value) => {
+            mirror.publish(store)?;
+            // Reclamation runs while the current mirror's lock is still held, so it can never
+            // evict the mirror this operation just used (see [`MirrorStore::try_remove_mirror`]).
+            maybe_collect_mirror_garbage(ctx, store);
+            Ok(value)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Runs opportunistic mirror reclamation after every [`super::mirror::MIRROR_GC_INTERVAL`]
+/// successful publishes. This runs synchronously on the blocking pool (inside `with_mirror`), so
+/// no blocking filesystem work ever reaches a Tokio worker.
+fn maybe_collect_mirror_garbage(ctx: &BlockingContext<'_>, store: &MirrorStore) {
+    if !store.record_publish() {
+        return;
+    }
+
+    let root = match mirror_root(ctx.work_root) {
+        Ok(root) => root,
+        Err(err) => {
+            tracing::warn!(error = %err, "skipping opportunistic mirror reclamation");
+            return;
+        }
     };
 
-    let ref_map = fetch_ref_map(&repo, url.clone(), &refspecs, &ctx)?;
-    let matched =
-        find_matching_remote_ref(&ref_map.remote_refs, &target_revision).ok_or_else(|| {
-            RepoError::RevisionNotFound {
-                revision: target_revision.clone(),
+    let report = store.collect_garbage(&root);
+    if !report.failures.is_empty() {
+        tracing::warn!(
+            removed_entries = report.removed_entries,
+            remaining_entries = report.remaining_entries,
+            failures = ?report.failures,
+            "opportunistic mirror reclamation could not delete every mirror directory"
+        );
+    }
+}
+
+/// A handle to a persistent bare mirror for the duration of one blocking operation.
+struct MirrorLease {
+    repo: gix::Repository,
+    dest: PathBuf,
+    /// Present only when this is a first-time creation that has not been published yet.
+    pending: Option<TempDir>,
+}
+
+impl MirrorLease {
+    fn repo(&self) -> &gix::Repository {
+        &self.repo
+    }
+
+    /// Publishes a first-time mirror (atomic rename), tightens its permissions, and refreshes the
+    /// last-use marker.
+    ///
+    /// If the destination already exists (e.g. a concurrent process published first), the pending
+    /// temporary directory is discarded and the existing mirror is left untouched.
+    fn publish(&mut self, store: &MirrorStore) -> Result<(), RepoError> {
+        if let Some(temp) = self.pending.take() {
+            let parent = self
+                .dest
+                .parent()
+                .ok_or_else(|| RepoError::RepositoryError {
+                    message: format!(
+                        "mirror path '{}' has no parent directory",
+                        self.dest.display()
+                    ),
+                })?;
+            std::fs::create_dir_all(parent).map_err(|source| RepoError::Io {
+                context: format!("creating mirror directory '{}'", parent.display()),
+                source,
+            })?;
+            match std::fs::rename(temp.path(), &self.dest) {
+                Ok(()) => {
+                    store.record_initialization();
+                    make_tree_private(&self.dest)?;
+                }
+                Err(_) if self.dest.exists() => {
+                    // Another process won the race: reuse its mirror and discard our work.
+                }
+                Err(source) => {
+                    return Err(RepoError::Io {
+                        context: format!(
+                            "publishing mirror '{}' from '{}'",
+                            self.dest.display(),
+                            temp.path().display()
+                        ),
+                        source,
+                    });
+                }
             }
-        })?;
+            // `temp` is dropped here: after a successful rename its old path no longer exists
+            // (cleanup is a no-op); after a failed publication it deletes the temporary directory.
+        }
 
-    let commit_sha = resolve_matched_ref(&repo, url, matched, &target_revision, &ctx)?;
-    validate_commit_sha(&commit_sha)?;
+        // A last-use marker write failure must never fail the checkout that just succeeded: the
+        // marker only affects reclamation ordering, not correctness.
+        if let Err(err) = touch_last_used(&self.dest) {
+            tracing::warn!(
+                path = %self.dest.display(),
+                error = %err,
+                "failed to write mirror last-used marker"
+            );
+        }
+        Ok(())
+    }
+}
 
-    Ok(ResolvedRevision {
-        commit_sha,
-        requested_ref: target_revision,
+/// Opens the existing mirror for `mirror_key`, or creates a new one in a temporary directory.
+///
+/// A directory that exists but cannot be opened as a bare repository is quarantined to a
+/// `.broken-<ts>` sibling and re-initialized once, under the mirror lock.
+fn open_or_init_mirror(
+    mirror_key: &str,
+    ctx: &BlockingContext<'_>,
+) -> Result<MirrorLease, RepoError> {
+    let dest = mirror_dir(ctx.work_root, mirror_key)?;
+    match std::fs::symlink_metadata(&dest) {
+        Ok(metadata) if metadata.is_dir() => match open_isolated_bare_repo(&dest, ctx) {
+            Ok(repo) => Ok(MirrorLease {
+                repo,
+                dest,
+                pending: None,
+            }),
+            Err(open_err) => {
+                let quarantine = quarantine_mirror_path(&dest);
+                std::fs::rename(&dest, &quarantine).map_err(|source| RepoError::Io {
+                    context: format!(
+                        "quarantining unopenable mirror '{}' to '{}'",
+                        dest.display(),
+                        quarantine.display()
+                    ),
+                    source,
+                })?;
+                tracing::warn!(
+                    path = %dest.display(),
+                    quarantine = %quarantine.display(),
+                    error = %open_err,
+                    "quarantined an unopenable mirror and will re-initialize it"
+                );
+                new_mirror_lease(ctx, dest)
+            }
+        },
+        Ok(_) => Err(RepoError::RepositoryError {
+            message: format!("mirror path '{}' is not a directory", dest.display()),
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => new_mirror_lease(ctx, dest),
+        Err(source) => Err(RepoError::Io {
+            context: format!("inspecting mirror path '{}'", dest.display()),
+            source,
+        }),
+    }
+}
+
+/// Initializes a first-time mirror into a temporary directory, ready to be published.
+fn new_mirror_lease(ctx: &BlockingContext<'_>, dest: PathBuf) -> Result<MirrorLease, RepoError> {
+    let temp = create_temp_dir(ctx.work_root)?;
+    let repo = init_isolated_bare_repo(temp.path(), ctx)?;
+    Ok(MirrorLease {
+        repo,
+        dest,
+        pending: Some(temp),
     })
+}
+
+/// Builds a unique sibling path for a mirror that failed to open.
+fn quarantine_mirror_path(dest: &Path) -> PathBuf {
+    let seq = BROKEN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let name = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!(".{name}.broken-{ts}-{seq}"))
 }
 
 fn find_matching_remote_ref<'a>(
@@ -549,6 +840,7 @@ fn resolve_matched_ref(
     matched: &gix::protocol::handshake::Ref,
     requested_revision: &str,
     ctx: &BlockingContext<'_>,
+    store: &MirrorStore,
 ) -> Result<String, RepoError> {
     use gix::bstr::ByteSlice;
     use gix::protocol::handshake::Ref;
@@ -572,7 +864,15 @@ fn resolve_matched_ref(
                             "remote ref name for '{requested_revision}' is not valid UTF-8"
                         ),
                     })?;
-                fetch_ref_and_peel_to_commit(repo, url, ref_name, *object, requested_revision, ctx)
+                fetch_ref_and_peel_to_commit(
+                    repo,
+                    url,
+                    ref_name,
+                    *object,
+                    requested_revision,
+                    ctx,
+                    store,
+                )
             }
         }
         Ref::Symbolic {
@@ -602,6 +902,7 @@ fn resolve_matched_ref(
                     start_oid,
                     requested_revision,
                     ctx,
+                    store,
                 )
             }
         }
@@ -620,44 +921,104 @@ fn resolve_matched_ref(
                         "remote ref name for '{requested_revision}' is not valid UTF-8"
                     ),
                 })?;
-            fetch_ref_and_peel_to_commit(repo, url, ref_name, *tag, requested_revision, ctx)
+            fetch_ref_and_peel_to_commit(repo, url, ref_name, *tag, requested_revision, ctx, store)
         }
     }
 }
 
-fn fetch_ref_with_shallow_fallback(
+/// Fetches `refspecs` into `repo` (a persistent mirror) unless `want_oid` is already present.
+///
+/// The fetch always uses [`gix::remote::fetch::Shallow::NoChange`]: a shared mirror must never
+/// accumulate `.git/shallow` boundaries, which would suppress the very historical ancestors the
+/// mirror exists to cache. One full-history fetch therefore preserves every T02.2 observable
+/// behavior (branch/tag/HEAD resolution, historical-SHA resolution, annotated-tag peeling) while
+/// trading a single full download for many cheap local materializations.
+fn ensure_object_fetched(
     repo: &gix::Repository,
     url: gix::Url,
-    ref_name: &str,
-    requested_revision: &str,
+    refspecs: &[&str],
+    want_oid: gix::ObjectId,
+    revision_label: &str,
     ctx: &BlockingContext<'_>,
-) -> Result<Option<(TempDir, gix::Repository)>, RepoError> {
-    let shallow = gix::remote::fetch::Shallow::DepthAtRemote(NonZeroU32::MIN);
-    match fetch_with_refspecs(repo, url.clone(), &[ref_name], shallow, ctx) {
-        Ok(()) => Ok(None),
-        Err(FetchStageError::ConnectOrRefMap(err)) => Err(err),
-        Err(FetchStageError::MissingRequiredMapping) => Err(RepoError::RevisionNotFound {
-            revision: requested_revision.to_owned(),
-        }),
-        Err(FetchStageError::Receive(err)) => {
-            if is_fatal_without_fallback(&err) {
-                return Err(err);
-            }
-            // Some servers reject `deepen 1` on non-commit targets (e.g. tag -> blob/tree);
-            // fall back on a clean bare repo with `Shallow::NoChange` so we can inspect the object kind.
-            let fallback_dir = create_temp_dir(ctx.work_root)?;
-            let fallback_repo = init_isolated_bare_repo(fallback_dir.path(), ctx)?;
-            fetch_with_refspecs(
-                &fallback_repo,
-                url,
-                &[ref_name],
-                gix::remote::fetch::Shallow::NoChange,
-                ctx,
-            )
-            .map_err(fetch_stage_error_into_repo_error(requested_revision))?;
-            Ok(Some((fallback_dir, fallback_repo)))
+    store: &MirrorStore,
+) -> Result<(), RepoError> {
+    if repo
+        .try_find_object(want_oid)
+        .map_err(map_gix_error)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    fetch_with_refspecs(
+        repo,
+        url,
+        refspecs,
+        gix::remote::fetch::Shallow::NoChange,
+        ctx,
+    )
+    .map_err(fetch_stage_error_into_repo_error(revision_label))?;
+    store.record_fetch();
+    Ok(())
+}
+
+/// Fetches `want_oid` into the mirror: a broad full-history fetch first, then a targeted
+/// want-by-id fetch for a commit SHA that is reachable but not advertised through
+/// branches/tags/HEAD.
+///
+/// The broad fetch brings every advertised reachable commit, so historical SHAs normally resolve
+/// with one fetch. The targeted second attempt preserves the T02.2 "unadvertised SHA" path for
+/// servers that honor `uploadpack.allowReachableSHA1InWant`; when the server refuses it, the
+/// caller's [`verify_local_commit`] reports a terminal [`RepoError::RevisionNotFound`].
+fn fetch_object_into_mirror(
+    repo: &gix::Repository,
+    url: gix::Url,
+    target_revision: &str,
+    want_oid: gix::ObjectId,
+    revision_label: &str,
+    ctx: &BlockingContext<'_>,
+    store: &MirrorStore,
+) -> Result<(), RepoError> {
+    let broad_specs = build_broad_refspecs(target_revision);
+    let broad_refs: Vec<&str> = broad_specs.iter().map(String::as_str).collect();
+    ensure_object_fetched(
+        repo,
+        url.clone(),
+        &broad_refs,
+        want_oid,
+        revision_label,
+        ctx,
+        store,
+    )?;
+
+    if repo
+        .try_find_object(want_oid)
+        .map_err(map_gix_error)?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    if validate_commit_sha(revision_label).is_ok() {
+        // A refused want-by-id fetch is non-fatal here: the caller's `verify_local_commit` below
+        // turns the missing object into a terminal `RevisionNotFound`. Log the cause for
+        // diagnostics instead of silently dropping it.
+        if let Err(err) = ensure_object_fetched(
+            repo,
+            url,
+            &[revision_label],
+            want_oid,
+            revision_label,
+            ctx,
+            store,
+        ) {
+            tracing::debug!(
+                revision = revision_label,
+                error = %err,
+                "targeted want-by-id fetch failed; will fall through to local verification"
+            );
         }
     }
+    Ok(())
 }
 
 fn fetch_ref_and_peel_to_commit(
@@ -667,24 +1028,18 @@ fn fetch_ref_and_peel_to_commit(
     start_oid: gix::ObjectId,
     requested_revision: &str,
     ctx: &BlockingContext<'_>,
+    store: &MirrorStore,
 ) -> Result<String, RepoError> {
-    let fallback = fetch_ref_with_shallow_fallback(repo, url, ref_name, requested_revision, ctx)?;
-    let active_repo = fallback.as_ref().map_or(repo, |(_, r)| r);
-    peel_local_object_to_commit(active_repo, start_oid, requested_revision)
-}
-
-fn fetch_ref_and_verify_exact_commit(
-    repo: &gix::Repository,
-    url: gix::Url,
-    ref_name: &str,
-    target_oid: gix::ObjectId,
-    requested_revision: &str,
-    ctx: &BlockingContext<'_>,
-) -> Result<String, RepoError> {
-    let fallback = fetch_ref_with_shallow_fallback(repo, url, ref_name, requested_revision, ctx)?;
-    let active_repo = fallback.as_ref().map_or(repo, |(_, r)| r);
-    verify_local_commit(active_repo, target_oid, requested_revision)?;
-    Ok(requested_revision.to_owned())
+    ensure_object_fetched(
+        repo,
+        url,
+        &[ref_name],
+        start_oid,
+        requested_revision,
+        ctx,
+        store,
+    )?;
+    peel_local_object_to_commit(repo, start_oid, requested_revision)
 }
 
 fn peel_local_object_to_commit(
@@ -729,135 +1084,25 @@ fn resolve_sha_revision(
     target_revision: String,
     target_oid: gix::ObjectId,
     ctx: &BlockingContext<'_>,
+    store: &MirrorStore,
 ) -> Result<ResolvedRevision, RepoError> {
-    use gix::bstr::ByteSlice;
-    use gix::protocol::handshake::Ref;
-
-    let ref_map = fetch_ref_map(repo, url.clone(), ALL_REFS_LIST_SPECS, ctx)?;
     if target_oid.is_null() {
         return Err(RepoError::RevisionNotFound {
             revision: target_revision,
         });
     }
 
-    for remote_ref in &ref_map.remote_refs {
-        match remote_ref {
-            Ref::Peeled {
-                full_ref_name,
-                tag,
-                object,
-            } => {
-                if *tag == target_oid {
-                    return Err(RepoError::InvalidRevision {
-                        revision: target_revision,
-                        reason: "revision refers to an annotated tag object, not a commit"
-                            .to_owned(),
-                    });
-                }
-                if *object == target_oid {
-                    let ref_name =
-                        full_ref_name
-                            .to_str()
-                            .map_err(|_| RepoError::RepositoryError {
-                                message: "advertised remote ref name is not valid UTF-8".to_owned(),
-                            })?;
-                    let sha = fetch_ref_and_verify_exact_commit(
-                        repo,
-                        url,
-                        ref_name,
-                        *object,
-                        &target_revision,
-                        ctx,
-                    )?;
-                    return Ok(ResolvedRevision {
-                        commit_sha: sha,
-                        requested_ref: target_revision,
-                    });
-                }
-            }
-            Ref::Direct {
-                full_ref_name,
-                object,
-            } if *object == target_oid => {
-                if full_ref_name.starts_with(b"refs/heads/") {
-                    return Ok(ResolvedRevision {
-                        commit_sha: target_revision.clone(),
-                        requested_ref: target_revision,
-                    });
-                }
-                let ref_name = full_ref_name
-                    .to_str()
-                    .map_err(|_| RepoError::RepositoryError {
-                        message: "advertised remote ref name is not valid UTF-8".to_owned(),
-                    })?;
-                let sha = fetch_ref_and_verify_exact_commit(
-                    repo,
-                    url,
-                    ref_name,
-                    *object,
-                    &target_revision,
-                    ctx,
-                )?;
-                return Ok(ResolvedRevision {
-                    commit_sha: sha,
-                    requested_ref: target_revision,
-                });
-            }
-            Ref::Symbolic {
-                full_ref_name,
-                target,
-                tag,
-                object,
-            } => {
-                if tag.as_ref() == Some(&target_oid) {
-                    return Err(RepoError::InvalidRevision {
-                        revision: target_revision,
-                        reason: "revision refers to an annotated tag object, not a commit"
-                            .to_owned(),
-                    });
-                }
-                if *object == target_oid {
-                    if tag.is_none() && target.starts_with(b"refs/heads/") {
-                        return Ok(ResolvedRevision {
-                            commit_sha: target_revision.clone(),
-                            requested_ref: target_revision,
-                        });
-                    }
-                    let ref_name =
-                        full_ref_name
-                            .to_str()
-                            .map_err(|_| RepoError::RepositoryError {
-                                message: "advertised remote ref name is not valid UTF-8".to_owned(),
-                            })?;
-                    let sha = fetch_ref_and_verify_exact_commit(
-                        repo,
-                        url,
-                        ref_name,
-                        *object,
-                        &target_revision,
-                        ctx,
-                    )?;
-                    return Ok(ResolvedRevision {
-                        commit_sha: sha,
-                        requested_ref: target_revision,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Historical SHA path: try shallow fetch of the SHA first, then fall back to full fetch.
-    let (_active_dir, active_repo) = fetch_sha_shallow_then_fallback(
+    fetch_object_into_mirror(
+        repo,
         url,
         &target_revision,
-        &target_revision,
-        &[target_revision.as_str()],
         target_oid,
+        &target_revision,
         ctx,
+        store,
     )?;
 
-    verify_local_commit(&active_repo, target_oid, &target_revision)?;
+    verify_local_commit(repo, target_oid, &target_revision)?;
     Ok(ResolvedRevision {
         commit_sha: target_revision.clone(),
         requested_ref: target_revision,
@@ -867,56 +1112,45 @@ fn resolve_sha_revision(
 fn checkout_blocking(
     url: gix::Url,
     target_revision: String,
+    mirror_key: String,
     sha: String,
-    target_oid: gix::ObjectId,
     creds: &RepoCredentials,
     options: &BlockingOptions,
+    store: &MirrorStore,
 ) -> Result<RepoCheckout, RepoError> {
     let auth = options.auth_context(&url, creds)?;
     let ctx = options.context(&auth);
+    let target_oid =
+        gix::ObjectId::from_hex(sha.as_bytes()).map_err(|err| RepoError::InvalidRevision {
+            revision: sha.clone(),
+            reason: format!("invalid commit SHA '{sha}': {err}"),
+        })?;
 
     if target_oid.is_null() {
         return Err(RepoError::RevisionNotFound { revision: sha });
     }
 
-    let branch_candidate = format!("refs/heads/{target_revision}");
-    let tag_candidate = format!("refs/tags/{target_revision}");
-    let shallow_refspecs: Vec<&str> = if validate_commit_sha(&target_revision).is_ok() {
-        vec![sha.as_str()]
-    } else if target_revision == "HEAD" {
-        vec!["HEAD"]
-    } else if target_revision.starts_with("refs/") {
-        vec![target_revision.as_str()]
-    } else {
-        vec![branch_candidate.as_str(), tag_candidate.as_str()]
-    };
+    with_mirror(&mirror_key, &ctx, store, |repo| {
+        fetch_object_into_mirror(repo, url, &target_revision, target_oid, &sha, &ctx, store)?;
+        let root_tree_id = verify_local_commit(repo, target_oid, &sha)?;
+        let checkout_dir = materialize_commit_worktree(repo, root_tree_id, ctx.work_root)?;
+        let checkout_path = checkout_dir.path().to_path_buf();
 
-    let (_bare_dir, active_repo) = fetch_sha_shallow_then_fallback(
-        url,
-        &target_revision,
-        &sha,
-        &shallow_refspecs,
-        target_oid,
-        &ctx,
-    )?;
+        // Defend every renderer (Plain YAML, Kustomize, Helm) against symlink escapes by
+        // sanitizing the materialized worktree before handing it back. This runs on the blocking
+        // pool; on failure the `TempDir` checkout lease is dropped, deleting the worktree.
+        sanitize_worktree(&checkout_path, &options.worktree_limits)?;
 
-    let root_tree_id = verify_local_commit(&active_repo, target_oid, &sha)?;
-    let checkout_dir = materialize_commit_worktree(&active_repo, root_tree_id, ctx.work_root)?;
-    let checkout_path = checkout_dir.path().to_path_buf();
-
-    // Defend every renderer (Plain YAML, Kustomize, Helm) against symlink escapes by
-    // sanitizing the materialized worktree before handing it back. This runs on the blocking
-    // pool; on failure the `TempDir` checkout lease is dropped, deleting the worktree.
-    sanitize_worktree(&checkout_path, &options.worktree_limits)?;
-
-    Ok(RepoCheckout::with_lease(
-        checkout_path,
-        sha,
-        Arc::new(checkout_dir),
-    ))
+        Ok(RepoCheckout::with_lease(
+            checkout_path,
+            sha.clone(),
+            Arc::new(checkout_dir),
+        ))
+    })
 }
 
-fn build_fallback_refspecs(target_revision: &str) -> Vec<String> {
+/// Builds the broad refspecs used by the persistent mirror's full-history fetch.
+fn build_broad_refspecs(target_revision: &str) -> Vec<String> {
     let mut specs = vec![
         "+refs/heads/*:refs/remotes/origin/*".to_owned(),
         "+refs/tags/*:refs/tags/*".to_owned(),
@@ -932,69 +1166,6 @@ fn build_fallback_refspecs(target_revision: &str) -> Vec<String> {
         ));
     }
     specs
-}
-
-/// Attempts a shallow (`depth = 1`) fetch using `shallow_refspecs`, returning the active bare
-/// repository handle containing `target_oid`. If the shallow fetch fails with a non-fatal error
-/// or does not bring in `target_oid`, creates a fresh isolated bare repository and performs a full
-/// fallback fetch (`Shallow::NoChange`) across branches, tags, and `target_revision` (when `HEAD`
-/// or a custom ref).
-fn fetch_sha_shallow_then_fallback(
-    url: gix::Url,
-    target_revision: &str,
-    revision_label: &str,
-    shallow_refspecs: &[&str],
-    target_oid: gix::ObjectId,
-    ctx: &BlockingContext<'_>,
-) -> Result<(TempDir, gix::Repository), RepoError> {
-    let shallow_dir = create_temp_dir(ctx.work_root)?;
-    let shallow_repo = init_isolated_bare_repo(shallow_dir.path(), ctx)?;
-
-    match fetch_with_refspecs(
-        &shallow_repo,
-        url.clone(),
-        shallow_refspecs,
-        gix::remote::fetch::Shallow::DepthAtRemote(NonZeroU32::MIN),
-        ctx,
-    ) {
-        Ok(()) => {
-            if shallow_repo
-                .try_find_object(target_oid)
-                .map_err(map_gix_error)?
-                .is_some()
-            {
-                return Ok((shallow_dir, shallow_repo));
-            }
-        }
-        Err(FetchStageError::ConnectOrRefMap(err)) => return Err(err),
-        // A server rejecting an unadvertised SHA-in-want may close the pipe mid-request
-        // (racy "Broken pipe"); treat that as a recoverable shallow failure, not fatal.
-        Err(FetchStageError::Receive(err))
-            if is_fatal_without_fallback(&err) && !is_broken_pipe_network_error(&err) =>
-        {
-            return Err(err);
-        }
-        Err(FetchStageError::MissingRequiredMapping | FetchStageError::Receive(_)) => {}
-    }
-
-    // Drop the shallow repo before fallback so its `.git/shallow` boundary cannot suppress ancestors.
-    drop(shallow_repo);
-    drop(shallow_dir);
-
-    let fallback_dir = create_temp_dir(ctx.work_root)?;
-    let fallback_repo = init_isolated_bare_repo(fallback_dir.path(), ctx)?;
-    let fallback_specs = build_fallback_refspecs(target_revision);
-    let fallback_spec_refs: Vec<&str> = fallback_specs.iter().map(String::as_str).collect();
-    fetch_with_refspecs(
-        &fallback_repo,
-        url,
-        &fallback_spec_refs,
-        gix::remote::fetch::Shallow::NoChange,
-        ctx,
-    )
-    .map_err(fetch_stage_error_into_repo_error(revision_label))?;
-
-    Ok((fallback_dir, fallback_repo))
 }
 
 fn fetch_stage_error_into_repo_error(
@@ -1078,28 +1249,6 @@ fn materialize_commit_worktree(
     }
 
     Ok(checkout_dir)
-}
-
-fn is_broken_pipe_network_error(err: &RepoError) -> bool {
-    matches!(err, RepoError::Network { message } if message.contains("Broken pipe"))
-}
-
-fn is_fatal_without_fallback(err: &RepoError) -> bool {
-    matches!(
-        err,
-        RepoError::InvalidUrl { .. }
-            | RepoError::InvalidSource { .. }
-            | RepoError::InvalidRevision { .. }
-            | RepoError::AuthFailed { .. }
-            | RepoError::HostKeyVerificationFailed { .. }
-            | RepoError::TaskCancelled { .. }
-            | RepoError::Network { .. }
-            | RepoError::Timeout { .. }
-            | RepoError::RemoteServerError {
-                status: Some(_),
-                ..
-            }
-    )
 }
 
 fn format_gix_error_chain(err: &gix::Error) -> String {
@@ -1453,7 +1602,8 @@ mod tests {
                 bare.to_str().expect("utf8 path"),
             ],
         );
-        // Ensure default bare repo does NOT enable arbitrary SHA-in-want (tests fallback path!)
+        // Ensure default bare repo does NOT enable arbitrary SHA-in-want (exercises the targeted
+        // want-by-id path for a SHA that is not reachable from any advertised branch/tag/HEAD).
         git_cmd(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         TestRepoFixture {
@@ -1524,7 +1674,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_and_checkout_head_and_branches() {
         let fx = build_fixture();
-        let client: Arc<dyn GitClient> = Arc::new(local_client(None));
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client: Arc<dyn GitClient> =
+            Arc::new(local_client(Some(work_root.path().to_path_buf())));
         let repo_str = fx.bare_path.to_str().expect("utf8 path");
         let creds = RepoCredentials::Anonymous;
 
@@ -1593,10 +1745,593 @@ mod tests {
         }
     }
 
+    /// T02.7 verification: three commits from one repository perform exactly one mirror
+    /// initialization and exactly one remote fetch, then reuse the mirror for the remaining two.
+    #[tokio::test]
+    async fn three_commits_from_one_url_use_exactly_one_mirror_initialization_and_fetch() {
+        let fx = build_fixture();
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::AllowLocal)
+                .with_work_root(work_root.path().to_path_buf()),
+        );
+        let repo_str = fx.bare_path.to_str().expect("utf8 path");
+        let creds = RepoCredentials::Anonymous;
+        let src = GitSource::new(repo_str, "main", "");
+
+        let resolved = client
+            .resolve_revision(&src, &creds)
+            .await
+            .expect("resolve main");
+        assert_eq!(resolved.commit_sha, fx.c3);
+
+        for (sha, expected_readme) in [
+            (fx.c1.as_str(), "version=c1\n"),
+            (fx.c2.as_str(), "version=c2\n"),
+            (fx.c3.as_str(), "version=c3\n"),
+        ] {
+            let co = client
+                .checkout(&src, sha, &creds)
+                .await
+                .expect("checkout commit");
+            assert_eq!(co.commit_sha(), sha);
+            let readme =
+                std::fs::read_to_string(co.root_dir().join("README.md")).expect("read README");
+            assert_eq!(readme, expected_readme, "wrong content for {sha}");
+        }
+
+        assert_eq!(
+            client.mirror_initializations(),
+            1,
+            "three commits from one URL must initialize the mirror exactly once"
+        );
+        assert_eq!(
+            client.mirror_fetches(),
+            1,
+            "exactly one full-history mirror fetch must populate all three commits from one URL"
+        );
+
+        let mirror_path = crate::repo::mirror::mirror_dir(
+            Some(work_root.path()),
+            &crate::repo::cache::repo_hash(&crate::repo::cache::normalize_repo_url(repo_str)),
+        )
+        .expect("mirror path");
+        assert!(
+            mirror_path.is_dir(),
+            "the mirror must persist on disk at {}",
+            mirror_path.display()
+        );
+    }
+
+    /// T02.7 verification: a failed mirror update never deletes a usable existing mirror.
+    #[tokio::test]
+    async fn failed_mirror_update_leaves_existing_mirror_usable() {
+        let fx = build_fixture();
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::AllowLocal)
+                .with_work_root(work_root.path().to_path_buf()),
+        );
+        let repo_str = fx.bare_path.to_str().expect("utf8 path");
+        let creds = RepoCredentials::Anonymous;
+        let src = GitSource::new(repo_str, "main", "");
+
+        // Populate the mirror with the full history of `main` (c1, c2, c3).
+        let first = client
+            .checkout(&src, &fx.c1, &creds)
+            .await
+            .expect("populate mirror");
+
+        // Advance the remote to a new commit c4, then make the remote vanish.
+        std::fs::write(fx.work_path.join("FOURTH.md"), "fourth\n").expect("write FOURTH");
+        git_cmd(&fx.work_path, &["add", "."]);
+        git_cmd(&fx.work_path, &["commit", "-m", "commit c4"]);
+        let c4 = git_cmd(&fx.work_path, &["rev-parse", "HEAD"]);
+        git_cmd(
+            &fx.bare_path,
+            &[
+                "fetch",
+                fx.work_path.to_str().expect("utf8 work path"),
+                "refs/heads/main:refs/heads/main",
+            ],
+        );
+        std::fs::remove_dir_all(&fx.bare_path).expect("remove remote");
+
+        // A checkout that needs a fetch now fails (the remote is gone)...
+        let update_err = client
+            .checkout(&src, &c4, &creds)
+            .await
+            .expect_err("checkout of a never-fetched commit must fail when the remote is gone");
+        assert!(!update_err.to_string().contains("panic"), "{update_err}");
+
+        // ...but previously fetched commits still materialize from the mirror without network.
+        let second = client
+            .checkout(&src, &fx.c2, &creds)
+            .await
+            .expect("previously fetched commit must remain usable");
+        assert_eq!(second.commit_sha(), fx.c2);
+        assert_eq!(
+            std::fs::read_to_string(second.root_dir().join("README.md")).expect("read README"),
+            "version=c2\n"
+        );
+        drop(first);
+        drop(second);
+
+        assert_eq!(
+            client.mirror_initializations(),
+            1,
+            "the failed update must not have re-initialized the mirror"
+        );
+        let mirror_path = crate::repo::mirror::mirror_dir(
+            Some(work_root.path()),
+            &crate::repo::cache::repo_hash(&crate::repo::cache::normalize_repo_url(repo_str)),
+        )
+        .expect("mirror path");
+        assert!(
+            mirror_path.is_dir(),
+            "the existing mirror must survive a failed update"
+        );
+    }
+
+    /// T02.7 reclamation, exercised end-to-end through [`GixGitClient`].
+    #[tokio::test]
+    async fn collect_mirror_garbage_removes_an_unused_mirror() {
+        let fx = build_fixture();
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::AllowLocal)
+                .with_work_root(work_root.path().to_path_buf())
+                .with_mirror_limits(
+                    crate::repo::mirror::MirrorLimits::new()
+                        .with_max_age(std::time::Duration::ZERO),
+                ),
+        );
+        let repo_str = fx.bare_path.to_str().expect("utf8 path");
+        let src = GitSource::new(repo_str, "main", "");
+        let creds = RepoCredentials::Anonymous;
+
+        let co = client
+            .checkout(&src, &fx.c1, &creds)
+            .await
+            .expect("create mirror");
+        let mirror_path = crate::repo::mirror::mirror_dir(
+            Some(work_root.path()),
+            &crate::repo::cache::repo_hash(&crate::repo::cache::normalize_repo_url(repo_str)),
+        )
+        .expect("mirror path");
+        assert!(mirror_path.is_dir());
+        drop(co);
+
+        // With `max_age = ZERO` the (now unused) mirror is eligible for reclamation.
+        let report = client.collect_mirror_garbage().await.expect("gc");
+        assert_eq!(report.removed_entries, 1);
+        assert_eq!(report.remaining_entries, 0);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(
+            !mirror_path.exists(),
+            "an unused mirror must be removed by reclamation"
+        );
+    }
+
+    /// The per-mirror blocking mutex must serialize concurrent *direct* [`GixGitClient`] calls
+    /// (clones share one [`MirrorStore`]); separate clients/processes do not share these locks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_direct_clients_serialize_on_one_mirror() {
+        let fx = build_fixture();
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = Arc::new(GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::AllowLocal)
+                .with_work_root(work_root.path().to_path_buf()),
+        ));
+        let repo_str = Arc::new(fx.bare_path.to_str().expect("utf8 path").to_owned());
+        let main_sha = fx.c3.clone();
+        let commits = [
+            (fx.c1.clone(), "version=c1\n".to_owned()),
+            (fx.c2.clone(), "version=c2\n".to_owned()),
+            (fx.c3.clone(), "version=c3\n".to_owned()),
+        ];
+
+        let mut tasks = Vec::with_capacity(8);
+        for index in 0..8 {
+            let (sha, expected) = commits[index % commits.len()].clone();
+            let client = Arc::clone(&client);
+            let repo_str = Arc::clone(&repo_str);
+            let main_sha = main_sha.clone();
+            tasks.push(tokio::spawn(async move {
+                let creds = RepoCredentials::Anonymous;
+                let src = GitSource::new(repo_str.as_str(), "main", "");
+                let resolved = client
+                    .resolve_revision(&src, &creds)
+                    .await
+                    .expect("resolve main under concurrency");
+                assert_eq!(resolved.commit_sha, main_sha);
+                let checkout = client
+                    .checkout(&src, &sha, &creds)
+                    .await
+                    .expect("checkout under concurrency");
+                assert_eq!(checkout.commit_sha(), sha);
+                let readme = std::fs::read_to_string(checkout.root_dir().join("README.md"))
+                    .expect("read README");
+                assert_eq!(readme, expected, "wrong content for {sha}");
+            }));
+        }
+
+        for task in tasks {
+            task.await.expect("direct client task must not panic");
+        }
+
+        assert_eq!(
+            client.mirror_initializations(),
+            1,
+            "one mirror must be initialized across concurrent direct clients"
+        );
+        assert_eq!(
+            client.mirror_fetches(),
+            1,
+            "one full-history fetch must serve every concurrent direct client"
+        );
+    }
+
+    /// A successful checkout-driven publish triggers opportunistic reclamation, which evicts an
+    /// old unused mirror while retaining the just-used one (whose lock is still held).
+    #[tokio::test]
+    async fn checkout_driven_reclamation_evicts_old_mirror_and_retains_just_used() {
+        let fx = build_fixture();
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::AllowLocal)
+                .with_work_root(work_root.path().to_path_buf())
+                .with_mirror_limits(
+                    crate::repo::mirror::MirrorLimits::new()
+                        .with_max_age(std::time::Duration::ZERO),
+                ),
+        );
+
+        let repo_a = fx.bare_path.to_str().expect("utf8 path").to_owned();
+        let second_bare = fx._root.path().join("second.git");
+        git_cmd(
+            fx._root.path(),
+            &[
+                "clone",
+                "--bare",
+                fx.work_path.to_str().expect("utf8 work path"),
+                second_bare.to_str().expect("utf8 second bare"),
+            ],
+        );
+        let repo_b = second_bare.to_str().expect("utf8 second bare").to_owned();
+        let creds = RepoCredentials::Anonymous;
+        let sha = fx.c3.clone();
+
+        let mirror_a = crate::repo::mirror::mirror_dir(
+            Some(work_root.path()),
+            &crate::repo::cache::repo_hash(&crate::repo::cache::normalize_repo_url(&repo_a)),
+        )
+        .expect("mirror a path");
+        let mirror_b = crate::repo::mirror::mirror_dir(
+            Some(work_root.path()),
+            &crate::repo::cache::repo_hash(&crate::repo::cache::normalize_repo_url(&repo_b)),
+        )
+        .expect("mirror b path");
+
+        // Publish mirror A `MIRROR_GC_INTERVAL - 1` times; the next publish triggers the pass.
+        for _ in 0..(crate::repo::mirror::MIRROR_GC_INTERVAL - 1) {
+            let checkout = client
+                .checkout(&GitSource::new(repo_a.as_str(), "main", ""), &sha, &creds)
+                .await
+                .expect("populate mirror a");
+            drop(checkout);
+        }
+        assert!(mirror_a.is_dir(), "mirror a must exist before the gc pass");
+        assert!(!mirror_b.exists(), "mirror b must not exist yet");
+
+        // The interval-th publish is a checkout of B, so B's lock is held during reclamation.
+        let checkout_b = client
+            .checkout(&GitSource::new(repo_b.as_str(), "main", ""), &sha, &creds)
+            .await
+            .expect("checkout mirror b triggers reclamation");
+
+        assert_eq!(checkout_b.commit_sha(), sha);
+        assert!(
+            !mirror_a.exists(),
+            "the old unused mirror must be evicted by the checkout-driven pass"
+        );
+        assert!(
+            mirror_b.is_dir(),
+            "the just-used mirror must be retained while its lock is held"
+        );
+
+        drop(checkout_b);
+        assert!(
+            mirror_b.is_dir(),
+            "the just-used mirror must survive after its checkout handle is dropped"
+        );
+    }
+
+    /// A failed first-time fetch must never count as a mirror initialization.
+    #[tokio::test]
+    async fn failed_first_time_fetch_does_not_count_initialization() {
+        let fx = build_fixture();
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::AllowLocal)
+                .with_work_root(work_root.path().to_path_buf()),
+        );
+        let repo_str = fx.bare_path.to_str().expect("utf8 path").to_owned();
+        std::fs::remove_dir_all(&fx.bare_path).expect("remove remote");
+
+        let src = GitSource::new(repo_str.as_str(), "main", "");
+        let err = client
+            .checkout(&src, &fx.c1, &RepoCredentials::Anonymous)
+            .await
+            .expect_err("a first-time fetch against a missing remote must fail");
+
+        assert!(
+            !matches!(err, RepoError::RevisionNotFound { .. }),
+            "the failure must be transport/io, not a clean revision miss: {err:?}"
+        );
+        assert_eq!(
+            client.mirror_initializations(),
+            0,
+            "a failed first-time publish must not count as an initialization"
+        );
+        assert_eq!(client.mirror_fetches(), 0);
+
+        let mirror_path = crate::repo::mirror::mirror_dir(
+            Some(work_root.path()),
+            &crate::repo::cache::repo_hash(&crate::repo::cache::normalize_repo_url(&repo_str)),
+        )
+        .expect("mirror path");
+        assert!(
+            !mirror_path.exists(),
+            "a failed first-time operation must not leave a mirror behind"
+        );
+    }
+
+    /// A corrupt/unopenable on-disk mirror is quarantined to a `.broken-*` sibling and re-initialized
+    /// once, under the mirror lock.
+    #[tokio::test]
+    async fn corrupt_mirror_is_quarantined_and_reinitialized() {
+        let fx = build_fixture();
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::AllowLocal)
+                .with_work_root(work_root.path().to_path_buf()),
+        );
+        let repo_str = fx.bare_path.to_str().expect("utf8 path").to_owned();
+        let creds = RepoCredentials::Anonymous;
+        let src = GitSource::new(repo_str.as_str(), "main", "");
+
+        let first = client
+            .checkout(&src, &fx.c1, &creds)
+            .await
+            .expect("populate mirror");
+        drop(first);
+
+        let repo_hash =
+            crate::repo::cache::repo_hash(&crate::repo::cache::normalize_repo_url(&repo_str));
+        let mirror_path = crate::repo::mirror::mirror_dir(Some(work_root.path()), &repo_hash)
+            .expect("mirror path");
+
+        // Corrupt the mirror so `gix` cannot open it: remove HEAD and make `config` invalid.
+        std::fs::remove_file(mirror_path.join("HEAD")).expect("remove HEAD");
+        std::fs::write(mirror_path.join("config"), b"broken\0config").expect("corrupt config");
+
+        let second = client
+            .checkout(&src, &fx.c1, &creds)
+            .await
+            .expect("corrupt mirror must self-heal and re-initialize");
+        assert_eq!(second.commit_sha(), fx.c1);
+        assert_eq!(
+            std::fs::read_to_string(second.root_dir().join("README.md")).expect("read README"),
+            "version=c1\n"
+        );
+        drop(second);
+
+        let mirror_root = mirror_path.parent().expect("mirror root");
+        let broken_count = std::fs::read_dir(mirror_root)
+            .expect("read mirror root")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&format!(".{repo_hash}.broken-")))
+            })
+            .count();
+        assert_eq!(
+            broken_count, 1,
+            "the corrupt mirror must be quarantined exactly once"
+        );
+        assert!(
+            mirror_path.is_dir(),
+            "a fresh mirror must be re-initialized"
+        );
+    }
+
+    /// A reopened mirror with hostile on-disk `config` must still be governed by the in-memory
+    /// transport hardening overrides, and the overrides must never persist secrets into `config`.
+    #[test]
+    fn reopened_mirror_hardening_overrides_hostile_on_disk_config() {
+        let root = tempfile::tempdir().expect("create fixture root");
+        let dir = root.path().join("hostile.git");
+        git_cmd(
+            root.path(),
+            &[
+                "init",
+                "--bare",
+                dir.to_str().expect("utf8 hostile git path"),
+            ],
+        );
+        std::fs::write(
+            dir.join("config"),
+            "[protocol]\n\tallow = always\n[protocol \"file\"]\n\tallow = always\n\
+             [http]\n\tfollowRedirects = true\n[core]\n\tsshCommand = /bin/false\n",
+        )
+        .expect("write hostile config");
+
+        let url =
+            gix::url::parse(b"ssh://git@example.invalid/org/repo.git".as_slice()).expect("url");
+        let creds = RepoCredentials::SshKey {
+            private_key_pem:
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRET_KEY_BODY\n-----END OPENSSH PRIVATE KEY-----"
+                    .to_owned(),
+            passphrase: None,
+            known_hosts: Some("example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKEY".to_owned()),
+        };
+        let auth = AuthContext::new(&creds, &url, false, None).expect("auth context");
+        let repo = open_isolated_bare_repo(
+            dir.as_path(),
+            &blocking_ctx(&auth, RepoUrlPolicy::Production),
+        )
+        .expect("reopen hostile bare repo");
+
+        let cfg = repo.config_snapshot();
+        assert_eq!(
+            cfg.string("protocol.allow"),
+            Some(gix::bstr::BString::from("never"))
+        );
+        assert_eq!(
+            cfg.string("protocol.file.allow"),
+            Some(gix::bstr::BString::from("never"))
+        );
+        assert_eq!(
+            cfg.string("protocol.http.allow"),
+            Some(gix::bstr::BString::from("never"))
+        );
+        assert_eq!(
+            cfg.string("protocol.git.allow"),
+            Some(gix::bstr::BString::from("never"))
+        );
+        assert_eq!(cfg.boolean("http.followRedirects"), Some(false));
+
+        let ssh_command = cfg
+            .string("core.sshCommand")
+            .map(|value| value.to_string())
+            .expect("core.sshCommand must be overridden in memory");
+        assert!(ssh_command.contains("-i "), "{ssh_command}");
+        assert!(
+            ssh_command.contains("StrictHostKeyChecking=yes"),
+            "{ssh_command}"
+        );
+        assert!(!ssh_command.contains("/bin/false"), "{ssh_command}");
+        assert!(!ssh_command.contains("SECRET_KEY_BODY"), "{ssh_command}");
+
+        // The overrides are applied at open time, never written back to disk.
+        let on_disk = std::fs::read_to_string(dir.join("config")).expect("read on-disk config");
+        assert!(on_disk.contains("/bin/false"), "{on_disk}");
+        assert!(!on_disk.contains("SECRET_KEY_BODY"), "{on_disk}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn published_mirror_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = build_fixture();
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::AllowLocal)
+                .with_work_root(work_root.path().to_path_buf()),
+        );
+        let repo_str = fx.bare_path.to_str().expect("utf8 path");
+        let src = GitSource::new(repo_str, "main", "");
+
+        let checkout = client
+            .checkout(&src, &fx.c1, &RepoCredentials::Anonymous)
+            .await
+            .expect("publish mirror");
+        drop(checkout);
+
+        let mirror_path = crate::repo::mirror::mirror_dir(
+            Some(work_root.path()),
+            &crate::repo::cache::repo_hash(&crate::repo::cache::normalize_repo_url(repo_str)),
+        )
+        .expect("mirror path");
+
+        let mode = std::fs::metadata(&mirror_path)
+            .expect("stat mirror")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "published mirror must be owner-only: {mode:#o}"
+        );
+
+        let objects_mode = std::fs::metadata(mirror_path.join("objects"))
+            .expect("stat objects")
+            .permissions()
+            .mode();
+        assert_eq!(
+            objects_mode & 0o077,
+            0,
+            "published mirror subdirs must be owner-only: {objects_mode:#o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn last_used_marker_write_failure_does_not_fail_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fx = build_fixture();
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = GixGitClient::new(
+            GixGitClientConfig::new()
+                .with_url_policy(RepoUrlPolicy::AllowLocal)
+                .with_work_root(work_root.path().to_path_buf()),
+        );
+        let repo_str = fx.bare_path.to_str().expect("utf8 path");
+        let src = GitSource::new(repo_str, "main", "");
+        let creds = RepoCredentials::Anonymous;
+
+        let first = client
+            .checkout(&src, &fx.c1, &creds)
+            .await
+            .expect("populate mirror");
+        drop(first);
+
+        let mirror_path = crate::repo::mirror::mirror_dir(
+            Some(work_root.path()),
+            &crate::repo::cache::repo_hash(&crate::repo::cache::normalize_repo_url(repo_str)),
+        )
+        .expect("mirror path");
+
+        // Make the mirror directory read-only so the last-use marker write fails on reopen.
+        let mut perms = std::fs::metadata(&mirror_path)
+            .expect("stat mirror")
+            .permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&mirror_path, perms).expect("chmod mirror read-only");
+
+        let second = client
+            .checkout(&src, &fx.c2, &creds)
+            .await
+            .expect("a marker write failure must never fail an otherwise successful checkout");
+        assert_eq!(second.commit_sha(), fx.c2);
+        drop(second);
+
+        // Restore write access so the test tempdir can be removed cleanly.
+        let mut restore = std::fs::metadata(&mirror_path)
+            .expect("stat mirror")
+            .permissions();
+        restore.set_mode(0o700);
+        std::fs::set_permissions(&mirror_path, restore).expect("restore mirror permissions");
+    }
+
     #[tokio::test]
     async fn resolve_and_checkout_lightweight_annotated_and_nested_tags() {
         let fx = build_fixture();
-        let client = local_client(None);
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = local_client(Some(work_root.path().to_path_buf()));
         let repo_str = fx.bare_path.to_str().expect("utf8 path");
         let creds = RepoCredentials::Anonymous;
 
@@ -1675,14 +2410,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_and_checkout_historical_commit_sha_via_fallback_and_fast_path() {
+    async fn resolve_and_checkout_historical_commit_sha_with_full_history_fetch() {
         let fx = build_fixture();
-        let client = local_client(None);
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = local_client(Some(work_root.path().to_path_buf()));
         let repo_str = fx.bare_path.to_str().expect("utf8 path");
         let creds = RepoCredentials::Anonymous;
 
-        // 6a. Historical SHA c1 (NOT a branch tip, and allowReachableSHA1InWant is NOT set):
-        // triggers shallow SHA-in-want failure -> fallback full fetch -> c1 found & checked out!
+        // 6a. Historical SHA c1 is reachable from `main`, so the persistent mirror's full-history
+        // fetch brings it without ever recording a shallow boundary.
         let src_c1 = GitSource::new(repo_str, &fx.c1, "");
         let res_c1 = client
             .resolve_revision(&src_c1, &creds)
@@ -1702,7 +2438,7 @@ mod tests {
         assert!(!tree_c1.contains_key("apps/overlays/prod/kustomization.yaml"));
         assert!(!tree_c1.contains_key("CHANGELOG.md"));
 
-        // 6b. Branch tip SHA c3 via fast path
+        // 6b. Branch tip SHA c3 resolves from the same full mirror without another fetch.
         let src_c3 = GitSource::new(repo_str, &fx.c3, "");
         let res_c3 = client
             .resolve_revision(&src_c3, &creds)
@@ -1710,7 +2446,8 @@ mod tests {
             .expect("resolve tip sha c3");
         assert_eq!(res_c3.commit_sha, fx.c3);
 
-        // 6c. Also test when uploadpack.allowReachableSHA1InWant=true (shallow SHA-in-want succeeds directly)
+        // 6c. `uploadpack.allowReachableSHA1InWant=true` remains supported for an unadvertised
+        // SHA, but the mirror still fetched full history rather than a shallow tip.
         git_cmd(
             &fx.bare_path,
             &["config", "uploadpack.allowReachableSHA1InWant", "true"],
@@ -1730,7 +2467,8 @@ mod tests {
     #[tokio::test]
     async fn nonexistent_revisions_return_revision_not_found() {
         let fx = build_fixture();
-        let client = local_client(None);
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = local_client(Some(work_root.path().to_path_buf()));
         let repo_str = fx.bare_path.to_str().expect("utf8 path");
         let creds = RepoCredentials::Anonymous;
 
@@ -1764,7 +2502,8 @@ mod tests {
     #[tokio::test]
     async fn non_commit_oids_and_blob_tags_are_rejected_cleanly() {
         let fx = build_fixture();
-        let client = local_client(None);
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = local_client(Some(work_root.path().to_path_buf()));
         let repo_str = fx.bare_path.to_str().expect("utf8 path");
         let creds = RepoCredentials::Anonymous;
 
@@ -1820,7 +2559,8 @@ mod tests {
             empty_dir.path(),
             &["init", "--bare", "--initial-branch=main"],
         );
-        let client = local_client(None);
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = local_client(Some(work_root.path().to_path_buf()));
         let creds = RepoCredentials::Anonymous;
         let empty_url = empty_dir.path().to_str().expect("utf8");
 
@@ -1896,7 +2636,8 @@ mod tests {
             assert!(matches!(co_err, RepoError::InvalidUrl { .. }));
         }
 
-        let local = local_client(None);
+        let work_root = tempfile::tempdir().expect("create work root");
+        let local = local_client(Some(work_root.path().to_path_buf()));
         for url in [
             raw_path,
             file_triple_slash.as_str(),
@@ -1944,13 +2685,19 @@ mod tests {
             !worktree_path.exists(),
             "dropping RepoCheckout must delete checked-out directory"
         );
-        // Temporary bare repo should also have been cleaned up, leaving work_root empty.
-        assert_eq!(
-            std::fs::read_dir(custom_work_root.path())
-                .expect("read work_root")
-                .count(),
-            0
-        );
+        // The temporary checkout directory is gone; the only thing left under `work_root` is the
+        // persistent mirror layout (T02.7), which survives by design.
+        let remaining: Vec<String> = std::fs::read_dir(custom_work_root.path())
+            .expect("read work_root")
+            .map(|entry| {
+                entry
+                    .expect("work_root entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(remaining, vec![crate::repo::mirror::MIRROR_DIR.to_owned()]);
     }
 
     #[cfg(unix)]
@@ -2057,14 +2804,23 @@ mod tests {
         }
 
         // Drop the successful checkout to release its temp dir, then assert the failing
-        // checkouts left no materialized worktree (or bare repo) behind.
+        // checkouts left no materialized worktree behind. Only the persistent mirror (created by
+        // the first, valid checkout) survives.
         drop(valid);
+        let remaining: Vec<String> = std::fs::read_dir(&client_work_root)
+            .expect("read client work_root")
+            .map(|entry| {
+                entry
+                    .expect("client work_root entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
         assert_eq!(
-            std::fs::read_dir(&client_work_root)
-                .expect("read client work_root")
-                .count(),
-            0,
-            "temp checkout and bare repo must be cleaned up after a rejected checkout"
+            remaining,
+            vec![crate::repo::mirror::MIRROR_DIR.to_owned()],
+            "rejected checkouts must not leave worktrees or scratch bare repos behind"
         );
     }
 
@@ -2105,7 +2861,8 @@ mod tests {
         // A local (`file://`) fixture can never be authenticated: HTTPS credentials and SSH keys
         // are rejected as terminal misconfiguration before any transport is spawned.
         let fx = build_fixture();
-        let client = local_client(None);
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = local_client(Some(work_root.path().to_path_buf()));
         let src = GitSource::new(fx.bare_path.to_str().expect("utf8"), "main", "");
 
         let secrets = [
@@ -2188,8 +2945,12 @@ mod tests {
         // process is spawned (and before any known_hosts/key material exists).
         let creds = RepoCredentials::Anonymous;
         let sha = "0123456789abcdef0123456789abcdef01234567";
+        let work_root = tempfile::tempdir().expect("create work root");
 
-        for client in [GixGitClient::default(), local_client(None)] {
+        for client in [
+            GixGitClient::default(),
+            local_client(Some(work_root.path().to_path_buf())),
+        ] {
             for url in [
                 "ssh://git@github.com/org/repo.git",
                 "SSH://git@github.com:2222/org/repo.git",
@@ -2413,10 +3174,17 @@ exit 255
             prod_cfg.string("protocol.ssh.allow"),
             Some(gix::bstr::BString::from("always"))
         );
-        assert!(prod_cfg.string("protocol.http.allow").is_none());
-        assert!(prod_cfg.string("protocol.file.allow").is_none());
-        assert!(
-            prod_cfg.string("protocol.git.allow").is_none(),
+        assert_eq!(
+            prod_cfg.string("protocol.http.allow"),
+            Some(gix::bstr::BString::from("never"))
+        );
+        assert_eq!(
+            prod_cfg.string("protocol.file.allow"),
+            Some(gix::bstr::BString::from("never"))
+        );
+        assert_eq!(
+            prod_cfg.string("protocol.git.allow"),
+            Some(gix::bstr::BString::from("never")),
             "the unauthenticated git:// protocol must stay disabled"
         );
         assert!(prod_cfg.string("core.sshCommand").is_none());
@@ -2437,7 +3205,14 @@ exit 255
             local_cfg.string("protocol.ssh.allow"),
             Some(gix::bstr::BString::from("always"))
         );
-        assert!(local_cfg.string("protocol.git.allow").is_none());
+        assert_eq!(
+            local_cfg.string("protocol.http.allow"),
+            Some(gix::bstr::BString::from("never"))
+        );
+        assert_eq!(
+            local_cfg.string("protocol.git.allow"),
+            Some(gix::bstr::BString::from("never"))
+        );
     }
 
     #[test]
@@ -2554,19 +3329,21 @@ exit 255
     }
 
     #[tokio::test]
-    async fn checkout_falls_back_when_branch_moved_past_target_sha() {
+    async fn checkout_historical_sha_when_branch_moved_past_target_sha() {
         let fx = build_fixture();
-        let client = local_client(None);
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = local_client(Some(work_root.path().to_path_buf()));
         let repo_str = fx.bare_path.to_str().expect("utf8");
         let creds = RepoCredentials::Anonymous;
 
-        // target_revision is "main" (tip = c3), so depth=1 shallow fetch only gets c3;
-        // fallback must fetch full history and materialize historical commit c1.
+        // target_revision is "main" (tip = c3), but the persistent mirror performs a full-history
+        // fetch, so the historical commit c1 is already present and materializes without a
+        // follow-up fetch.
         let src = GitSource::new(repo_str, "main", "");
         let co = client
             .checkout(&src, &fx.c1, &creds)
             .await
-            .expect("checkout older sha c1 via moved branch fallback");
+            .expect("checkout historical sha c1 when the branch tip moved past it");
         let tree = snapshot_tree(co.root_dir());
         assert_eq!(
             tree.get("README.md").map(String::as_str),
@@ -2606,7 +3383,8 @@ exit 255
             ],
         );
 
-        let client = local_client(None);
+        let client_work_root = tempfile::tempdir().expect("create client work root");
+        let client = local_client(Some(client_work_root.path().to_path_buf()));
         let creds = RepoCredentials::Anonymous;
         let repo_str = bare.to_str().expect("utf8");
 
@@ -2650,7 +3428,8 @@ exit 255
     #[tokio::test]
     async fn symbolic_head_pointing_to_tag_and_custom_ref_resolve_and_checkout() {
         let fx = build_fixture();
-        let client = local_client(None);
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = local_client(Some(work_root.path().to_path_buf()));
         let creds = RepoCredentials::Anonymous;
         let repo_str = fx.bare_path.to_str().expect("utf8");
 
@@ -2677,7 +3456,8 @@ exit 255
             .expect("resolve custom ref refs/pull/42/head");
         assert_eq!(pr_res.commit_sha, pr_sha);
 
-        // Verify fallback refspecs include custom ref when checking out a different/older SHA or forced fallback
+        // Verify the broad full-history refspecs include the custom ref so an unadvertised PR head
+        // can still be fetched into the mirror.
         let pr_co = client
             .checkout(&pr_src, &pr_sha, &creds)
             .await
@@ -2687,7 +3467,7 @@ exit 255
             "pr-42\n"
         );
         assert!(
-            build_fallback_refspecs("refs/pull/42/head")
+            build_broad_refspecs("refs/pull/42/head")
                 .iter()
                 .any(|s| s == "+refs/pull/42/head:refs/remotes/origin/custom-target")
         );
@@ -2712,9 +3492,10 @@ exit 255
     }
 
     #[tokio::test]
-    async fn null_oid_is_rejected_and_fatal_fallback_rules_hold() {
+    async fn null_oid_is_rejected() {
         let fx = build_fixture();
-        let client = local_client(None);
+        let work_root = tempfile::tempdir().expect("create work root");
+        let client = local_client(Some(work_root.path().to_path_buf()));
         let creds = RepoCredentials::Anonymous;
         let repo_str = fx.bare_path.to_str().expect("utf8");
         let null_sha = "0000000000000000000000000000000000000000";
@@ -2735,38 +3516,6 @@ exit 255
             validate_resolved_oid(gix::ObjectId::null(gix::hash::Kind::Sha1), "HEAD")
                 .expect_err("null object id helper must reject");
         assert!(matches!(null_oid_err, RepoError::RevisionNotFound { .. }));
-
-        // Fatal vs fallback truth table
-        assert!(is_fatal_without_fallback(&RepoError::AuthFailed {
-            reason: "401".into()
-        }));
-        assert!(is_fatal_without_fallback(&RepoError::Network {
-            message: "reset".into()
-        }));
-        assert!(is_fatal_without_fallback(&RepoError::Timeout {
-            message: "timed out".into()
-        }));
-        assert!(is_fatal_without_fallback(&RepoError::RemoteServerError {
-            status: Some(503),
-            message: "unavailable".into()
-        }));
-        assert!(is_fatal_without_fallback(&RepoError::TaskCancelled {
-            message: "cancelled".into()
-        }));
-        assert!(is_fatal_without_fallback(&RepoError::InvalidUrl {
-            url: "https://example.com".into(),
-            reason: "bad".into()
-        }));
-        assert!(!is_fatal_without_fallback(&RepoError::RevisionNotFound {
-            revision: "main".into()
-        }));
-        assert!(!is_fatal_without_fallback(&RepoError::RepositoryError {
-            message: "not our ref".into()
-        }));
-        assert!(!is_fatal_without_fallback(&RepoError::RemoteServerError {
-            status: None,
-            message: "transient".into()
-        }));
     }
 
     #[test]
