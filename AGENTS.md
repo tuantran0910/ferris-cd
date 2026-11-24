@@ -46,3 +46,18 @@ The **main agent is the Coordinator**. For any non-trivial roadmap task (`TXX.Y`
 - **Secret hygiene:** Redact all `Secret` `.data`/`.stringData` values in diffs/logs; redact `RepoCredentials` in `Debug`/`Display`.
 - **Untrusted repo defense:** Sanitize symlinks across the entire checked-out worktree before running any renderer; configure `serde-saphyr` parser budgets; block Kustomize remote URLs and clear subprocess env.
 - **Safe `kind` testing:** Before running any live Kubernetes integration test, assert `kubectl config current-context` starts with `kind-`. Never touch a non-`kind` cluster.
+
+---
+
+## Git, Branch & Commit Convention (Strictly Enforced)
+
+Every commit message and Pull Request title MUST follow **Conventional Commits 1.0.0** (enforced locally by `.githooks/commit-msg` and in CI by `.github/workflows/commit-lint.yml`):
+
+- **Header format:** `<type>(<scope>): <summary>` (scope optional; append `!` before `:` for breaking changes).
+- **Allowed `<type>`:** `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `style`, `revert`.
+- **Recommended `<scope>` (lowercase `[a-z0-9._,-]+`):** roadmap task/phase (`t02.1`, `phase-02`), crate/module (`crd`, `engine`, `controller`, `cli`, `server`, `web`), or domain (`adr`, `lessons`, `ci`, `deps`, `repo`, `kind`).
+- **Subject rules:** imperative present tense (`add`, not `added`/`adds`), lowercase first word, no trailing period, target ≤ 72 chars (hard CI limit: 100 chars).
+- **PR & branch hygiene:**
+  - Branch naming: `<type>/<short-kebab-description>` (e.g., `feat/t02-1-git-client-trait`, `docs/t01-adrs-and-examples`, `chore/commit-convention`).
+  - Keep PRs small, atomic, and stacked linearly when dependent; PR titles MUST obey the same Conventional Commits header rule so Squash & Merge preserves a clean `main` history.
+  - Never bypass GPG signing (`--no-gpg-sign`) or git hooks (`--no-verify`).

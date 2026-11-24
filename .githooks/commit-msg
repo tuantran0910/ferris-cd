@@ -1,0 +1,43 @@
+#!/usr/bin/env sh
+# FerrisCD local commit-msg hook — enforces Conventional Commits 1.0.0.
+# Enable once per clone with: git config core.hooksPath .githooks
+
+set -eu
+
+MSG_FILE="${1:-}"
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
+    echo "commit-msg: missing commit message file argument" >&2
+    exit 1
+fi
+
+HEADER=$(sed -n '1p' "$MSG_FILE" | tr -d '\r')
+
+# Allow git-generated merge, revert, fixup, and squash commits.
+case "$HEADER" in
+    Merge\ *|Revert\ \"*|fixup!*\ |squash!*\ )
+        exit 0
+        ;;
+esac
+
+MAX_LEN=100
+HEADER_LEN=${#HEADER}
+if [ "$HEADER_LEN" -gt "$MAX_LEN" ]; then
+    echo "ERROR: Commit header is ${HEADER_LEN} chars (max ${MAX_LEN}):" >&2
+    echo "  $HEADER" >&2
+    exit 1
+fi
+
+PATTERN='^(feat|fix|docs|refactor|perf|test|build|ci|chore|style|revert)(\([a-z0-9._,-]+\))?!?: [a-z0-9].*[^.]$'
+if ! printf '%s\n' "$HEADER" | grep -Eq "$PATTERN"; then
+    cat >&2 <<EOF
+ERROR: Commit message does not follow FerrisCD Conventional Commits format:
+  $HEADER
+
+Expected: <type>(<scope>): <imperative lowercase summary without trailing period>
+Allowed types: feat, fix, docs, refactor, perf, test, build, ci, chore, style, revert
+Example: feat(t02.1): define GitClient trait and redacted RepoCredentials
+
+See CONTRIBUTING.md for details.
+EOF
+    exit 1
+fi

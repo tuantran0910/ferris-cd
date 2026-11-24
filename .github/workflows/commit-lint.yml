@@ -1,0 +1,62 @@
+name: Commit Lint
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conventional-commits:
+    name: Conventional Commits (PR Title & Commits)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate PR title and commit headers
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          ruby -e '
+            pattern = /\A(feat|fix|docs|refactor|perf|test|build|ci|chore|style|revert)(\([a-z0-9._,-]+\))?!?: [a-z0-9].*[^.]\z/
+            max_len = 100
+            errors = []
+
+            validate = lambda do |label, header|
+              next if header.start_with?("Merge ", "Revert \"")
+              if header.length > max_len
+                errors << "#{label} exceeds #{max_len} chars (#{header.length}): #{header}"
+              end
+              unless pattern.match?(header)
+                errors << "#{label} violates Conventional Commits: #{header}"
+              end
+            end
+
+            validate.call("PR title", ENV.fetch("PR_TITLE"))
+
+            commits = IO.popen(["git", "log", "--format=%h %s", "#{ENV.fetch("BASE_SHA")}..#{ENV.fetch("HEAD_SHA")}"], &:read)
+            commits.each_line do |line|
+              sha, subject = line.chomp.split(" ", 2)
+              next if sha.nil? || subject.nil?
+              validate.call("Commit #{sha}", subject)
+            end
+
+            if errors.empty?
+              puts "OK: PR title and all commit headers follow Conventional Commits."
+            else
+              warn errors.join("\n")
+              warn "\nExpected: <type>(<scope>): <imperative lowercase summary without trailing period>"
+              warn "Allowed types: feat, fix, docs, refactor, perf, test, build, ci, chore, style, revert"
+              exit 1
+            end
+          '
