@@ -1,6 +1,8 @@
 //! FerrisCD core GitOps engine: repository acquisition, manifest rendering,
 //! GKNN inventory tracking, SSA diffing, sync wave planning, and health evaluation.
 
+pub mod repo;
+
 /// Returns the default Server-Side Apply field manager identity for FerrisCD.
 #[must_use]
 pub fn default_field_manager() -> &'static str {
