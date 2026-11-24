@@ -82,7 +82,7 @@
 - **Detailed Requirements:**
   - Implement `GixGitClient` supporting `https://` (via `rustls`) and local paths (for tests).
   - Resolve branches (`refs/heads/*`), tags (`refs/tags/*`, including annotated tags peeled to commit OIDs), `HEAD`, and full 40-char commit SHAs into canonical 40-char hex `commit_sha`.
-  - Support shallow fetch (`depth = 1`) for branch/tag tips with fallback fetch for specific commit SHAs.
+  - Support shallow fetch (`depth = 1`) for branch/tag tips with fallback fetch for specific commit SHAs. *(Superseded by `T02.7`: the persistent per-URL mirror always fetches full history, because a shared mirror must not carry `.git/shallow` boundaries; see the T02.7 bullet.)*
   - Wrap all blocking `gix` disk/network operations inside `tokio::task::spawn_blocking`.
 - **Outputs:** `crates/ferriscd-engine/src/repo/gix_client.rs`.
 - **Verification:** Integration test initializing a temp bare Git repo with branches, lightweight/annotated tags, and multiple commits; verifies resolution and checkout of each ref type.
@@ -132,11 +132,12 @@
 - **Why:** `RepoCache` serializes acquisition per normalized `repo_url` but delegates each materialization to a `GitClient` that re-fetches into a fresh temporary bare repository; monorepos resolving many commits re-download shared objects. A persistent per-URL bare mirror makes the per-repo lock pay off and cuts network/disk churn.
 - **Detailed Requirements:**
   - Extend `GitClient`/`GixGitClient` so a checkout can be materialized from a persistent bare repository keyed by normalized `repo_url` under `work_root/mirrors/<repo_hash>`, while keeping `gix` types out of public trait signatures.
-  - Initialize/fetch the mirror once per `(repo_url, credential generation)`; preserve the existing shallow-then-fallback behavior and annotated-tag peeling.
+  - Initialize/fetch the mirror once per `repo_url`; the persistent mirror **always performs a full-history fetch** (a shared mirror must never carry `.git/shallow` boundaries, because those would suppress the historical ancestors that make arbitrary commit reuse possible), accepting a one-time first-fetch cost. Annotated-tag peeling and historical-SHA resolution semantics are unchanged.
+  - Key mirrors by normalized `repo_url` only (no credential-generation component): mirror reuse is content-addressed (Git objects are immutable and addressed by SHA), no credentials are ever persisted into a mirror, and any missing object is re-fetched with the credentials supplied to the current operation.
   - Serialize mirror updates under the existing per-repo async lock; never run blocking `gix` I/O on Tokio workers.
-  - Define mirror reclamation (unused mirrors, size bounds) and keep the commit-keyed worktree cache crash-safe.
+  - Define mirror reclamation: count bound (`max_entries`) and idle-age bound (`max_age`); no byte budget, because a single monorepo mirror legitimately grows to its full-history size. Keep the commit-keyed worktree cache crash-safe.
 - **Outputs:** `crates/ferriscd-engine/src/repo/mirror.rs`, updates to `gix_client.rs`, `cache.rs`, and `GitClient` trait docs.
-- **Verification:** Integration test resolving/checking out 3 commits from one repository performs exactly one network fetch, reuses the mirror, and preserves T02.2 ref/tag/fallback behavior; the T02.3 concurrency test still passes.
+- **Verification:** Integration test resolving/checking out 3 commits from one repository performs exactly one network fetch, reuses the mirror, and preserves T02.2 ref/tag/historical-SHA behavior; the T02.3 concurrency test still passes.
 - **Trap Guard:** Do not leak `gix` repo structs through the `GitClient` abstraction; keep all blocking mirror I/O inside `spawn_blocking`; a failed mirror update must never delete a usable existing mirror.
 
 ---

@@ -20,18 +20,18 @@
 //! The cache delegates the actual Git work to an injected [`GitClient`]; it only owns
 //! the lock, the directory layout, and the refcounting.
 //!
-//! # Scope note: there is no persistent per-URL bare mirror here (yet)
+//! # Scope note: the persistent per-URL bare mirror lives in the client, not here
 //!
 //! [`RepoCache`] provides exactly two things: the per-repository async lock and the
-//! commit-keyed worktree cache. The injected [`GitClient`] currently re-fetches from the
-//! remote for **every** materialization (see [`super::GixGitClient`]), so a persistent
-//! per-URL bare mirror / object store that would make repeat materializations cheap is
-//! **not** implemented. Closing that gap is a follow-up that requires changing the
-//! [`GitClient`] contract (for example an explicit `ensure_mirror(&self, src, creds)`
-//! step) plus its `GixGitClient` implementation; it cannot be added inside this module
-//! without widening that trait. Do not assume mirror-level deduplication — the only
-//! deduplication provided today is "one materialized worktree per `(repo, commit)`" plus
-//! the per-repository fetch serialization.
+//! commit-keyed worktree cache. The injected [`GitClient`] owns the acquisition backend; the
+//! `gix`-backed [`super::GixGitClient`] maintains a **persistent per-URL bare mirror / object
+//! store** (see [`super::mirror`]) so repeat materializations of one monorepo do not re-fetch
+//! shared history. That mirror lives under the client's own work root (in `mirrors/<repo_hash>`),
+//! while [`RepoCache`] owns `worktrees/<repo_hash>/<sha>`; the two layouts are disjoint.
+//!
+//! Do not assume the mirror deduplicates worktrees: the worktree-level deduplication provided
+//! here is "one materialized worktree per `(repo, commit)`" plus per-repository fetch
+//! serialization. The mirror reduces network/disk churn *across* those per-commit worktrees.
 //!
 //! # Blocking I/O policy
 //!
@@ -985,7 +985,7 @@ fn entry_key(repo_hash: &str, sha: &str) -> String {
 /// Only whitespace and redundant trailing separators are removed: rewriting anything else
 /// (case, `.git` suffix, percent-encoding) risks collapsing two distinct repositories onto
 /// the same lock and directory, which is far worse than missing a cache hit.
-fn normalize_repo_url(repo_url: &str) -> String {
+pub(crate) fn normalize_repo_url(repo_url: &str) -> String {
     let trimmed = repo_url.trim();
     let stripped = trimmed.trim_end_matches('/');
     if stripped.is_empty() {
@@ -1000,7 +1000,7 @@ fn normalize_repo_url(repo_url: &str) -> String {
 /// Implemented with FNV-1a 64 over two independent seeds so no additional hashing crate is
 /// required. The output contains only `[0-9a-f]`, so it can never introduce `..` or absolute
 /// path components into the cache layout.
-fn repo_hash(normalized_url: &str) -> String {
+pub(crate) fn repo_hash(normalized_url: &str) -> String {
     let bytes = normalized_url.as_bytes();
     format!(
         "{:016x}{:016x}",
