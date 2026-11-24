@@ -36,8 +36,8 @@ Delegate to **`ferriscd-implementer`** with the compact brief. The agent:
 - self-reviews the diff before reporting.
 
 Run Implementers in parallel only on strictly disjoint crates/files (or git
-worktrees). Override the model to `deepseek/deepseek-v4-pro` for the high-risk
-list in `AGENTS.md`.
+worktrees). Use only `deepseek/deepseek-v4.1-flash`; raise `reasoningEffort`
+(high) for subtle tasks rather than switching models.
 
 ## Step 4: Hard gate (no review before this)
 Require the Implementer's `make gate` output:
