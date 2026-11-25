@@ -38,7 +38,7 @@ pub use reconcile::{
 pub use scope::{ClusterNamespacePolicy, InBundleCrd, ScopeError, normalize_scopes};
 pub use sync::{
     Applier, ApplyRequest, DeleteOutcome, DeleteRequest, DynamicApiApplier, InventorySyncPipeline,
-    PENDING_REQUEUE,
+    PENDING_REQUEUE, PROGRESSING_REQUEUE,
 };
 
 /// Environment variable selecting the log format (`json` or `pretty`).
