@@ -443,6 +443,12 @@ pub enum SpecValidationError {
     /// `spec.destination.namespace` was empty.
     #[error("spec.destination.namespace must not be empty")]
     EmptyDestinationNamespace,
+    /// `spec.destination.cluster` was present but blank.
+    #[error(
+        "spec.destination.cluster must not be blank: omit the field to mean `in-cluster`, or name \
+         a registered cluster"
+    )]
+    EmptyDestinationCluster,
     /// `spec.source.git.repoURL` was empty.
     #[error("spec.source.git.repoURL must not be empty")]
     EmptyRepoUrl,
@@ -471,6 +477,12 @@ impl ApplicationSpec {
         }
         if self.destination.namespace.trim().is_empty() {
             return Err(SpecValidationError::EmptyDestinationNamespace);
+        }
+        // A *blank* cluster is not the default: `serde(default)` only applies when the field is
+        // absent, so `cluster: "  "` is a typo that would otherwise be silently read as
+        // `in-cluster` by some call paths (which trim) and as `""` by others (finding M11).
+        if self.destination.cluster.trim().is_empty() {
+            return Err(SpecValidationError::EmptyDestinationCluster);
         }
         if self.source.git.repo_url.trim().is_empty() {
             return Err(SpecValidationError::EmptyRepoUrl);
@@ -770,6 +782,24 @@ spec:
         assert_eq!(
             empty_ns.validate(),
             Err(SpecValidationError::EmptyDestinationNamespace)
+        );
+
+        // A blank cluster is refused; an *omitted* one already defaulted to `in-cluster`, so this
+        // can only be a typo (`destination.cluster: "  "`), never the safe default (finding M11).
+        let mut blank_cluster = spec.clone();
+        blank_cluster.destination.cluster = "   ".to_owned();
+        assert_eq!(
+            blank_cluster.validate(),
+            Err(SpecValidationError::EmptyDestinationCluster)
+        );
+        // A registered cluster name, padded or not, is accepted: callers trim consistently.
+        let mut remote = spec.clone();
+        remote.destination.cluster = "  prod-eu  ".to_owned();
+        assert!(remote.validate().is_ok());
+        assert_eq!(
+            parse(MINIMAL_APPLICATION).spec.destination.cluster,
+            DEFAULT_DESTINATION_CLUSTER,
+            "omitting the field still means `in-cluster`"
         );
 
         let mut empty_url = spec.clone();

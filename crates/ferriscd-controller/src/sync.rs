@@ -26,7 +26,7 @@
 //! | Tenancy policy | `ferriscd_engine::policy::AppProjectPolicy`: the referenced `AppProject` is read from the control-plane namespace and enforced **before** the repository is resolved, then re-checked on **every** rendered resource after scope normalization (`T12.1`) |
 //! | Application namespaces | `--application-namespaces` widens the watch (`T12.2`), and a tenant `Application` is refused unless its project lists its namespace and it names its own authorized `serviceAccountName` |
 //! | Impersonation | `crate::impersonation` (`T12.3`): an `Application` with `spec.serviceAccountName` deploys as that ServiceAccount in `spec.destination.namespace` — live reads, `dryRun=All` diffs, applies, deletes/hooks and the cascade cleanup all run as it — while the `Application`'s own `/status` and finalizer stay with the controller |
-//! | Destination clusters | `in-cluster` only; anything else is rejected (remote clusters and their per-cluster credentials are `T13.1`/`T12.4`) |
+//! | Destination clusters | `crate::cluster_manager` (`T13.1`): `in-cluster` uses the controller's own seams, any other name resolves through the `ClusterManager` registry, and **every** workload call of the pass (live reads, `dryRun=All` diffs, applies, deletes, hooks, prune, cascade) runs over that cluster's client and discovery — while the `Application`'s `/status` and finalizer stay on the control plane |
 //! | Git credentials | `ferriscd.io/secret-type=repository` Secrets in the control-plane namespace (`T12.4`): exact URL or longest-prefix match, one scoped label-filtered list per resolve, no match is anonymous |
 //! | Health | evaluated from the pass-level live read on **every** pass (including a `Skip`), into `status.health` + `status.resources`, and it is what the wave gate waits on (`T09.5`, `T10.2`) |
 //!
@@ -82,7 +82,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ferriscd_crd::application::DEFAULT_DESTINATION_CLUSTER;
 use ferriscd_crd::status::{
     ApplicationStatus, HealthState, OperationPhase, OperationState, REASON_SYNC_SUCCEEDED,
     ResourceStatus, RevisionHistoryEntry, SyncPhase, SyncState, SyncStatus,
@@ -114,6 +113,7 @@ use kube::ResourceExt;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
 use tracing::warn;
 
+use crate::cluster_manager::{ClusterError, ClusterSource, ClusterTarget};
 use crate::controller::FailureClass;
 use crate::credentials::CredentialSource;
 use crate::discovery::DiscoveryCache;
@@ -159,8 +159,11 @@ pub const PROGRESSING_REQUEUE: Duration = Duration::from_secs(10);
 /// happened".
 pub const REASON_SYNC_IN_PROGRESS: &str = "SyncInProgress";
 
-/// The only destination cluster this milestone can talk to.
-pub const IN_CLUSTER: &str = DEFAULT_DESTINATION_CLUSTER;
+/// The destination cluster name that means "the cluster the controller runs in".
+///
+/// Every other name is resolved through the [`ClusterSource`] registry (`T13.1`); this one is
+/// always available and never goes through a `Secret`.
+pub const IN_CLUSTER: &str = crate::cluster_manager::IN_CLUSTER;
 
 /// Opt-in switch for syncing an **empty** desired set over a non-empty inventory.
 ///
@@ -490,6 +493,9 @@ struct PassRequest<'a> {
     /// The cluster access this pass acts through (`T12.3`): the pipeline's own seams for a
     /// controller-identity `Application`, the pooled impersonated client for a tenant one.
     access: ClusterAccess,
+    /// The destination cluster's discovery cache (`T13.1`): a remote cluster's API surface is not
+    /// the control plane's, so nothing in the pass may fall back to it.
+    discovery: &'a DiscoveryCache,
     owner: &'a TrackingOwner,
     revision: &'a str,
     bundle: &'a BundleWaves,
@@ -611,6 +617,10 @@ pub struct InventorySyncPipeline {
     /// public repositories, which is why a missing source is not an error (unlike a missing
     /// [`ProjectSource`], which would disable multi-tenancy).
     credentials: Option<Arc<dyn CredentialSource>>,
+    /// `T13.1`: how `spec.destination.cluster` is resolved to a client and a discovery cache.
+    /// `None` means only `in-cluster` is addressable, and any other name is a terminal error —
+    /// never a silent fallback to the control plane, which would deploy into the wrong cluster.
+    clusters: Option<Arc<dyn ClusterSource>>,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -627,6 +637,7 @@ impl std::fmt::Debug for InventorySyncPipeline {
             .field("application_scope", &self.application_scope)
             .field("impersonation", &self.impersonation.is_some())
             .field("credentials", &self.credentials.is_some())
+            .field("clusters", &self.clusters.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -663,6 +674,7 @@ impl InventorySyncPipeline {
             application_scope: ApplicationScope::default(),
             impersonation: None,
             credentials: None,
+            clusters: None,
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -742,6 +754,21 @@ impl InventorySyncPipeline {
         self
     }
 
+    /// Wires the remote-cluster registry (`T13.1`).
+    ///
+    /// Without one, only `spec.destination.cluster: in-cluster` is addressable and any other name
+    /// is a **terminal** [`ReconcileError::Cluster`]: silently deploying a remote `Application`
+    /// into the control plane would apply manifests to the wrong cluster. The production
+    /// controller always wires a [`ClusterManager`](crate::cluster_manager::ClusterManager), which
+    /// answers every registered name from the matching `ferriscd.io/secret-type=cluster` `Secret`;
+    /// `in-cluster` is answered here, from the pipeline's own seams, and never goes through the
+    /// registry.
+    #[must_use]
+    pub fn with_cluster_source(mut self, source: Arc<dyn ClusterSource>) -> Self {
+        self.clusters = Some(source);
+        self
+    }
+
     /// Resolves the credentials one repository is cloned with (`T12.4`).
     ///
     /// The lookup happens **after** the `AppProject` policy has authorized the repository URL
@@ -767,30 +794,82 @@ impl InventorySyncPipeline {
         Ok(credentials)
     }
 
+    /// Resolves the destination cluster of `app` to the seams this pass uses (`T13.1`).
+    ///
+    /// Called **after** [`AppProjectPolicy::check_application`] authorized
+    /// `(spec.destination.cluster, spec.destination.namespace)`, so a tenant can only ever probe
+    /// cluster names its own project lists. `in-cluster` never consults the registry: it is the
+    /// controller's own applier, live source, dry-run source and discovery cache, i.e. exactly the
+    /// wiring Phases 05–12 had. Any other name resolves through the [`ClusterSource`]; a name
+    /// nothing registers is a **terminal** [`ReconcileError::Cluster`] — never a silent fallback to
+    /// the control plane, which would apply the manifests into the wrong cluster.
+    ///
+    /// # Errors
+    ///
+    /// [`ReconcileError::Cluster`] (`NotFound`) when the cluster is not registered, and any
+    /// registry error (an unusable `Secret` is reported too).
+    fn target_for(&self, app: &Application) -> Result<ClusterTarget, ReconcileError> {
+        // The name is compared **trimmed**, consistently with `AppProjectPolicy` (which trims both
+        // the `Application`'s destination and the project's entries). A blank name is a typo, never
+        // an implicit `in-cluster`: `serde(default)` already covers the omitted field (finding M11).
+        let cluster = app.spec.destination.cluster.trim();
+        if cluster.is_empty() {
+            return Err(ReconcileError::Cluster(ClusterError::InvalidName {
+                name: app.spec.destination.cluster.clone(),
+                reason: format!(
+                    "a destination cluster must not be blank: omit the field to mean \
+                     {IN_CLUSTER:?}, or name a registered cluster"
+                ),
+            }));
+        }
+        if cluster == IN_CLUSTER {
+            return Ok(ClusterTarget::new(
+                IN_CLUSTER,
+                self.discovery.clone(),
+                ClusterAccess::new(
+                    ClusterIdentity::Controller,
+                    self.applier.clone(),
+                    self.reader.source().clone(),
+                    self.dry_run.clone(),
+                ),
+                self.impersonation.clone(),
+            ));
+        }
+        let Some(clusters) = self.clusters.as_deref() else {
+            return Err(ReconcileError::Cluster(ClusterError::NotFound {
+                cluster: cluster.to_owned(),
+                namespace: self.application_scope.control_plane().to_owned(),
+            }));
+        };
+        clusters.target(cluster)
+    }
+
     /// Resolves the cluster access one `Application` deploys through (`T12.3`).
     ///
     /// The `ServiceAccount` is resolved in `spec.destination.namespace` — never in the
     /// `Application`'s own namespace (ADR-007) — and only after the caller has run
     /// [`AppProjectPolicy::check_application`], i.e. after the project has authorized the
-    /// destination *and* the `ServiceAccount` name.
+    /// destination *and* the `ServiceAccount` name. The identity is resolved **on the target
+    /// cluster**: a remote `Application` is impersonated with the remote cluster's own pool
+    /// (`T13.1`), so a tenant never inherits the control plane's connector.
     ///
     /// # Errors
     ///
     /// [`ReconcileError::Impersonation`] for an invalid name, a forbidden group, or an
     /// `Application` that asks for impersonation when none is wired. Every variant is terminal:
     /// the alternative (falling back to the controller's identity) is a privilege escalation.
-    fn access_for(&self, app: &Application) -> Result<ClusterAccess, ReconcileError> {
+    fn access_for(
+        &self,
+        app: &Application,
+        target: &ClusterTarget,
+    ) -> Result<ClusterAccess, ReconcileError> {
         let Some(impersonation) = Impersonation::for_application(app)? else {
-            // No `serviceAccountName`: the controller's own identity. `ClusterAccess::new` is two
-            // `Arc` clones, so the non-impersonated path is exactly what it was before `T12.3`.
-            return Ok(ClusterAccess::new(
-                ClusterIdentity::Controller,
-                self.applier.clone(),
-                self.reader.source().clone(),
-                self.dry_run.clone(),
-            ));
+            // No `serviceAccountName`: the target cluster's credential (the controller's own
+            // identity in-cluster). Cloning a `ClusterAccess` is four `Arc` clones, so the
+            // non-impersonated path costs what it did before `T12.3`.
+            return Ok(target.access().clone());
         };
-        let Some(source) = self.impersonation.as_deref() else {
+        let Some(source) = target.impersonation() else {
             return Err(ReconcileError::Impersonation(
                 ImpersonationError::NotWired {
                     service_account: impersonation.user().to_owned(),
@@ -902,16 +981,6 @@ impl InventorySyncPipeline {
         app.spec.validate().map_err(|err| ReconcileError::Invalid {
             message: err.to_string(),
         })?;
-        if app.spec.destination.cluster != IN_CLUSTER {
-            return Err(ReconcileError::Invalid {
-                message: format!(
-                    "spec.destination.cluster '{}' is not supported yet: only '{IN_CLUSTER}' can \
-                     be synced (remote destination clusters arrive with the cluster registry and \
-                     per-cluster credentials in T13.1)",
-                    app.spec.destination.cluster
-                ),
-            });
-        }
         let options = app.spec.sync_options();
         let owner = TrackingOwner::for_application(app).ok_or_else(|| ReconcileError::Invalid {
             message: "the Application has no metadata.namespace, so no ferriscd.io/tracking-id \
@@ -926,11 +995,14 @@ impl InventorySyncPipeline {
         // terminal denial, never an implicit "allow".
         let policy = self.load_project_policy(app).await?;
         policy.check_application(app, &self.application_scope)?;
-        // `T12.3`: the project has now authorized `(destination.cluster,
-        // destination.namespace)` *and* the `serviceAccountName`, so this is the first point at
-        // which the ServiceAccount may be resolved — in the destination namespace, never in the
-        // `Application`'s own namespace.
-        let access = self.access_for(app)?;
+        // `T13.1`: the project has authorized `(destination.cluster, destination.namespace)`, so
+        // this is the first point at which the cluster registry may be consulted — a tenant can
+        // therefore only probe cluster names its project lists.
+        let target = self.target_for(app)?;
+        // `T12.3`: the project has also authorized the `serviceAccountName`, so this is the first
+        // point at which the identity may be resolved — in the destination namespace, never in the
+        // `Application`'s own namespace, and on the destination **cluster**.
+        let access = self.access_for(app, &target)?;
 
         let prev_inventory = status_inventory(app)?;
         let previous_status = app.status.clone().unwrap_or_default();
@@ -957,9 +1029,15 @@ impl InventorySyncPipeline {
             );
         }
 
-        let (revision, mut resources) = self.fetch_desired(app, pinned_revision.as_deref()).await?;
+        let (revision, mut resources) = self
+            .fetch_desired(app, pinned_revision.as_deref(), target.discovery())
+            .await?;
         let (in_bundle_crds, in_bundle_namespaces) = self
-            .prepare(&mut resources, &app.spec.destination.namespace)
+            .prepare(
+                &mut resources,
+                &app.spec.destination.namespace,
+                target.discovery(),
+            )
             .await?;
 
         // `T12.1`: re-check **every** rendered resource on its *actual* scope. Scope normalization
@@ -1009,7 +1087,10 @@ impl InventorySyncPipeline {
             .reader()
             .fetch_live(
                 &requests,
-                &self.discovery,
+                // The destination cluster's snapshot: a remote cluster resolves the same GKNN to a
+                // different plural/scope (or not at all), so the control plane's cache must never
+                // answer for it (`T13.1`).
+                target.discovery(),
                 &in_bundle_crds,
                 &in_bundle_namespaces,
                 &owner,
@@ -1039,6 +1120,7 @@ impl InventorySyncPipeline {
         let diffs = self
             .evaluate_diff(
                 &access,
+                target.discovery(),
                 bundle.hooks.permanent(),
                 &orphan_keys,
                 &live,
@@ -1077,6 +1159,7 @@ impl InventorySyncPipeline {
         let request = PassRequest {
             app,
             access,
+            discovery: target.discovery(),
             owner: &owner,
             revision: &revision,
             bundle: &bundle,
@@ -1232,6 +1315,7 @@ impl InventorySyncPipeline {
         let (plan, execution) = self
             .execute_plan(
                 &request.access,
+                request.discovery,
                 request.bundle.hooks.permanent(),
                 request.decision,
                 request.statuses,
@@ -1321,6 +1405,7 @@ impl InventorySyncPipeline {
         let hook_cluster = PassHooks {
             pipeline: self,
             access: &request.access,
+            discovery: request.discovery,
         };
         let hook_step = hooks::run_step(
             &hook_cluster,
@@ -1410,6 +1495,7 @@ impl InventorySyncPipeline {
             let (plan, execution) = self
                 .execute_plan(
                     &request.access,
+                    request.discovery,
                     &wave.resources,
                     forced_execute(request.decision),
                     request.statuses,
@@ -1433,7 +1519,7 @@ impl InventorySyncPipeline {
             if request.bundle.plan.contains_crd(target.wave) {
                 // A refresh failure stops the pass, but not the state: the wave that was just
                 // applied (and any hook record) must survive the requeue (finding H-NEW).
-                if let Err(error) = self.discovery.invalidate_and_refresh().await {
+                if let Err(error) = request.discovery.invalidate_and_refresh().await {
                     let inventory =
                         inventory::next_inventory(request.prev_inventory, &pass.confirmed(), &[]);
                     return Err(mid_operation_error(
@@ -1461,6 +1547,7 @@ impl InventorySyncPipeline {
             let (plan, execution) = self
                 .execute_plan(
                     &request.access,
+                    request.discovery,
                     &[],
                     SyncDecision::Execute(SyncTrigger::PruneRequired),
                     request.statuses,
@@ -1490,6 +1577,7 @@ impl InventorySyncPipeline {
     async fn execute_plan(
         &self,
         access: &ClusterAccess,
+        discovery: &DiscoveryCache,
         desired: &[DesiredResource],
         decision: SyncDecision,
         statuses: &BTreeMap<ResourceKey, DiffStatus>,
@@ -1514,7 +1602,7 @@ impl InventorySyncPipeline {
         let pruner = OwnershipVerifiedPruner::new(
             access.applier(),
             access.reader(),
-            &self.discovery,
+            discovery,
             owner,
             options,
         );
@@ -1522,7 +1610,7 @@ impl InventorySyncPipeline {
             access.applier(),
             &pruner,
             access.reader(),
-            &self.discovery,
+            discovery,
             &crd_status,
             owner,
             &policy,
@@ -1651,6 +1739,7 @@ impl InventorySyncPipeline {
     async fn evaluate_diff(
         &self,
         access: &ClusterAccess,
+        discovery: &DiscoveryCache,
         resources: &[DesiredResource],
         orphans: &[ResourceKey],
         live: &LiveStateMap,
@@ -1659,7 +1748,7 @@ impl InventorySyncPipeline {
         // The `dryRun=All` predictions run as the pass's identity (`T12.3`): a tenant's diff must
         // be rejected by the API server exactly like its applies would be, or the controller would
         // report `Synced` for a resource it cannot actually write.
-        DryRunEvaluator::with_api(access.dry_run_arc(), self.discovery.clone())
+        DryRunEvaluator::with_api(access.dry_run_arc(), discovery.clone())
             .evaluate(resources, orphans, live, rules)
             .await
             .map_err(ReconcileError::Diff)
@@ -1716,6 +1805,7 @@ impl InventorySyncPipeline {
         &self,
         app: &Application,
         pinned: Option<&str>,
+        discovery: &DiscoveryCache,
     ) -> Result<(String, Vec<DesiredResource>), ReconcileError> {
         let source = GitSource::new(
             app.spec.source.git.repo_url.clone(),
@@ -1740,13 +1830,14 @@ impl InventorySyncPipeline {
 
         // Helm's `.Capabilities.KubeVersion` must match the destination cluster, so the discovery
         // snapshot has to be populated *before* the render. This is TTL-gated: an already-fresh
-        // snapshot costs no API call.
-        self.discovery.ensure_fresh().await?;
+        // snapshot costs no API call. For a remote cluster this is that cluster's snapshot, so a
+        // chart templated with `.Capabilities.KubeVersion` renders the version it will meet.
+        discovery.ensure_fresh().await?;
 
         let context = RenderContext::for_application(
             checkout.root_dir().to_path_buf(),
             app,
-            &self.discovery.kube_version(),
+            &discovery.kube_version(),
         )
         .with_commit_sha(resolved.commit_sha.clone())
         .with_loader_config(self.loader.clone())
@@ -1766,6 +1857,7 @@ impl InventorySyncPipeline {
         &self,
         resources: &mut [DesiredResource],
         destination_namespace: &str,
+        discovery: &DiscoveryCache,
     ) -> Result<(Vec<InBundleCrd>, Vec<String>), ReconcileError> {
         for resource in resources.iter() {
             reject_unsupported(resource)?;
@@ -1783,16 +1875,11 @@ impl InventorySyncPipeline {
         // waiting for the 5-minute TTL, otherwise a `DeferredPendingCrd` resource would spin on
         // a stale snapshot for minutes before its kind resolves.
         if in_bundle_crds.is_empty() {
-            self.discovery.ensure_fresh().await?;
+            discovery.ensure_fresh().await?;
         } else {
-            self.discovery.invalidate_and_refresh().await?;
+            discovery.invalidate_and_refresh().await?;
         }
-        scope::normalize_scopes(
-            resources,
-            destination_namespace,
-            &self.discovery,
-            &in_bundle_crds,
-        )?;
+        scope::normalize_scopes(resources, destination_namespace, discovery, &in_bundle_crds)?;
         // Namespace injection can create GKNN collisions that were absent in the raw set. Hooks are
         // excluded: a `generateName` hook has no name at all, so two of them legitimately share a
         // GKNN — they are distinguishable only by their rendered id (`T10.3`, finding H2).
@@ -1858,16 +1945,31 @@ impl InventorySyncPipeline {
         // Finding H1: authorize the identity *before* resolving it. With no `serviceAccountName`
         // this is a no-op (the controller identity the cascade has always used).
         self.check_cascade_service_account(app).await?;
+        // `T13.1` finding C5 + finding M-new-1: a destination cluster that cannot be resolved — its
+        // `Secret` was deleted (or it was never registered), or `spec.destination.cluster` is blank
+        // (a spec typo: `serde(default)` covers only the omitted field) — is reported as
+        // `TargetUnavailable`, which releases the finalizer with a warning instead of wedging the
+        // `Application` in `Terminating` forever: there is nothing left to delete with, and the
+        // objects died with the cluster or its credentials.
+        let target = match self.target_for(app) {
+            Ok(target) => target,
+            Err(ReconcileError::Cluster(err)) if err.blocks_cleanup() => {
+                return Ok(CleanupOutcome::TargetUnavailable {
+                    message: err.to_string(),
+                });
+            }
+            Err(err) => return Err(err),
+        };
         // `T12.3`: the cascade runs as the *Application's* identity, like the sync that created
         // the objects — a tenant `Application` must not be able to use the controller's privileges
         // to delete (or to fail to delete) its own namespace's resources. `access_for` is the same
         // resolution the sync path uses, so an unusable ServiceAccount fails here too (retaining
         // the finalizer, with `ferriscd.io/force-delete` as the documented escape hatch).
-        let access = self.access_for(app)?;
+        let access = self.access_for(app, &target)?;
         let pruner = OwnershipVerifiedPruner::new(
             access.applier(),
             access.reader(),
-            &self.discovery,
+            target.discovery(),
             &owner,
             &options,
         );
@@ -1963,6 +2065,9 @@ impl SyncPipeline for InventorySyncPipeline {
 struct PassHooks<'a> {
     pipeline: &'a InventorySyncPipeline,
     access: &'a ClusterAccess,
+    /// The destination cluster's discovery cache (`T13.1`): a hook kind is resolved on the cluster
+    /// the hook is created on.
+    discovery: &'a DiscoveryCache,
 }
 
 impl HookCluster for PassHooks<'_> {
@@ -1976,7 +2081,7 @@ impl HookCluster for PassHooks<'_> {
                 &resource.gvk.version,
                 &resource.gvk.kind,
             );
-            let (api_resource, _) = self.pipeline.discovery.resolve(&gvk).await?;
+            let (api_resource, _) = self.discovery.resolve(&gvk).await?;
             self.access
                 .applier()
                 .create(CreateRequest {
@@ -1996,7 +2101,7 @@ impl HookCluster for PassHooks<'_> {
         Box::pin(async move {
             let api_resource = self
                 .pipeline
-                .resolve_hook_resource(key, version_hint)
+                .resolve_hook_resource(self.discovery, key, version_hint)
                 .await?;
             self.access
                 .applier()
@@ -2017,7 +2122,7 @@ impl HookCluster for PassHooks<'_> {
         Box::pin(async move {
             let api_resource = self
                 .pipeline
-                .resolve_hook_resource(key, version_hint)
+                .resolve_hook_resource(self.discovery, key, version_hint)
                 .await?;
             let object = self
                 .access
@@ -2043,10 +2148,11 @@ impl InventorySyncPipeline {
     /// comes from discovery rather than from the rendered manifest.
     async fn resolve_hook_resource(
         &self,
+        discovery: &DiscoveryCache,
         key: &ResourceKey,
         version_hint: &str,
     ) -> Result<ApiResource, ReconcileError> {
-        self.discovery
+        discovery
             .resolve_kind(&key.group, &key.kind)
             .await?
             .map(|(api_resource, _)| api_resource)
@@ -2752,11 +2858,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::cluster_manager::ClusterError;
     use crate::credentials::CredentialError;
     use crate::discovery::{DiscoveryError, DiscoveryFuture, DiscoverySnapshot, DiscoverySource};
     use crate::dry_run::{DryRunFuture, DryRunOutcome, DryRunTarget};
     use crate::live_state::{FetchTarget, LiveFuture};
-    use crate::reconcile::{REASON_OWNERSHIP_CONFLICT, StatusWriter, apply_once};
+    use crate::reconcile::{
+        CleanupDisposition, REASON_OWNERSHIP_CONFLICT, StatusWriter, apply_once,
+    };
 
     // ---------------------------------------------------------------------
     // Fixtures
@@ -3733,6 +3842,142 @@ spec:
         }
     }
 
+    /// Scripted `T13.1` registry: answers registered targets and records every lookup.
+    ///
+    /// The lookup recorder is what proves the **order** of the pass: the `AppProject` policy is
+    /// enforced before the registry is consulted, so a tenant can never probe cluster names its
+    /// project does not list.
+    #[derive(Default)]
+    struct FakeClusterSource {
+        targets: StdMutex<BTreeMap<String, ClusterTarget>>,
+        lookups: StdMutex<Vec<String>>,
+    }
+
+    impl FakeClusterSource {
+        fn with_target(self, name: &str, target: ClusterTarget) -> Self {
+            self.targets.lock().unwrap().insert(name.to_owned(), target);
+            self
+        }
+
+        fn lookups(&self) -> Vec<String> {
+            self.lookups.lock().unwrap().clone()
+        }
+    }
+
+    impl ClusterSource for FakeClusterSource {
+        fn target(&self, name: &str) -> Result<ClusterTarget, ReconcileError> {
+            self.lookups.lock().unwrap().push(name.to_owned());
+            self.targets
+                .lock()
+                .unwrap()
+                .get(name)
+                .cloned()
+                .ok_or_else(|| {
+                    ReconcileError::Cluster(ClusterError::NotFound {
+                        cluster: name.to_owned(),
+                        namespace: "ferriscd-system".to_owned(),
+                    })
+                })
+        }
+    }
+
+    /// The seams a registered remote cluster contributes, over a scripted cluster.
+    ///
+    /// Deliberately a **different** [`FakeCluster`] (and a different [`FakeDiscovery`]) from the
+    /// control plane's, so "the pass really used the remote client" is observable instead of being
+    /// indistinguishable from `in-cluster`.
+    fn remote_target(
+        name: &str,
+        cluster: Arc<FakeCluster>,
+        discovery: Arc<FakeDiscovery>,
+    ) -> ClusterTarget {
+        remote_target_with_impersonation(name, cluster, discovery, None)
+    }
+
+    /// The same seams, with the remote cluster's own impersonation pool (`T13.1` + `T12.3`).
+    fn remote_target_with_impersonation(
+        name: &str,
+        cluster: Arc<FakeCluster>,
+        discovery: Arc<FakeDiscovery>,
+        impersonation: Option<Arc<dyn ImpersonationSource>>,
+    ) -> ClusterTarget {
+        let applier: Arc<dyn Applier> = Arc::new(FakeApplier {
+            cluster: cluster.clone(),
+            discovery: discovery.clone(),
+            crd_mode: CrdMode::Establish,
+        });
+        let live: Arc<dyn LiveObjectSource> = cluster;
+        ClusterTarget::new(
+            name,
+            cache(discovery),
+            ClusterAccess::new(
+                ClusterIdentity::Controller,
+                applier,
+                live,
+                Arc::new(FakeDryRun::default()),
+            ),
+            impersonation,
+        )
+    }
+
+    /// A project that authorizes the remote `prod` cluster and nothing else.
+    fn remote_project() -> AppProject {
+        serde_saphyr::from_str(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - "*"
+  sourceNamespaces:
+    - ferriscd-system
+  destinations:
+    - cluster: prod
+      namespace: payments
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+"#,
+        )
+        .expect("the remote project must parse")
+    }
+
+    /// [`remote_project`] plus the ServiceAccount a remote tenant `Application` impersonates.
+    fn remote_project_with_service_account() -> AppProject {
+        serde_saphyr::from_str(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - "*"
+  sourceNamespaces:
+    - ferriscd-system
+  destinations:
+    - cluster: prod
+      namespace: payments
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  allowedServiceAccounts:
+    - payments/deployer
+"#,
+        )
+        .expect("the remote project with a ServiceAccount must parse")
+    }
+
     /// Whether a fixture wires the `T12.3` impersonation seam.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ImpersonationWiring {
@@ -3768,6 +4013,7 @@ spec:
             None,
             ImpersonationWiring::Wired,
             None,
+            None,
         )
     }
 
@@ -3780,6 +4026,7 @@ spec:
             default_project_source(),
             None,
             ImpersonationWiring::Wired,
+            None,
             None,
         )
     }
@@ -3809,6 +4056,7 @@ spec:
             Some(scope),
             wiring,
             None,
+            None,
         )
     }
 
@@ -3825,9 +4073,29 @@ spec:
             None,
             ImpersonationWiring::Wired,
             Some(source as Arc<dyn CredentialSource>),
+            None,
         )
     }
 
+    /// A fixture whose pipeline resolves remote clusters through `source` (`T13.1`).
+    fn fixture_with_clusters(
+        cluster: FakeCluster,
+        projects: FakeProjectSource,
+        source: Arc<FakeClusterSource>,
+    ) -> Fixture {
+        build_fixture(
+            cluster,
+            FakeDryRun::default(),
+            RendererBinaries::default(),
+            projects,
+            None,
+            ImpersonationWiring::Wired,
+            None,
+            Some(source as Arc<dyn ClusterSource>),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn build_fixture(
         cluster: FakeCluster,
         dry_run: FakeDryRun,
@@ -3836,6 +4104,7 @@ spec:
         scope: Option<ApplicationScope>,
         wiring: ImpersonationWiring,
         credentials: Option<Arc<dyn CredentialSource>>,
+        clusters: Option<Arc<dyn ClusterSource>>,
     ) -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let git = Arc::new(FakeGitClient::with_config(FakeGitClientConfig {
@@ -3895,6 +4164,12 @@ spec:
         // cares about credentials does too; the rest keep the anonymous default on purpose.
         let pipeline = match &credentials {
             Some(source) => pipeline.with_credential_source(source.clone()),
+            None => pipeline,
+        };
+        // `T13.1`: the production controller always wires the registry, so a fixture that cares
+        // about remote clusters does too; the rest keep `in-cluster` only.
+        let pipeline = match &clusters {
+            Some(source) => pipeline.with_cluster_source(source.clone()),
             None => pipeline,
         };
         let repo_url = temp.path().join("repo.git").display().to_string();
@@ -4956,16 +5231,396 @@ spec:
         assert!(cluster.applies().is_empty());
     }
 
+    /// A remote destination that nothing registers is a **terminal** error naming the cluster: it
+    /// must never fall back to the control plane, which would apply the manifests into the wrong
+    /// cluster (`T13.1`).
+    ///
+    /// The fixture wires an **empty** registry rather than none — the same answer both paths give,
+    /// and the shape a control plane whose cluster `Secret`s are all absent has.
     #[tokio::test]
-    async fn a_remote_destination_cluster_is_rejected() {
-        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+    async fn an_unregistered_remote_destination_cluster_is_terminal() {
+        // The project authorizes `prod`, so the refusal can only come from the registry.
+        let projects = FakeProjectSource::default().with_project(remote_project());
+        let fixture = fixture_with_clusters(
+            FakeCluster::default().with_namespace("payments"),
+            projects,
+            Arc::default(),
+        );
         fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
         let mut app = fixture.app(".");
-        app.spec.destination.cluster = "prod-cluster".to_owned();
+        app.spec.destination.cluster = "prod".to_owned();
 
         let err = fixture.pipeline.apply(&app).await.expect_err("rejected");
-        assert!(err.to_string().contains("prod-cluster"), "{err}");
+        assert!(matches!(err, ReconcileError::Cluster(_)), "{err:?}");
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert!(err.to_string().contains("\"prod\""), "{err}");
+        assert!(
+            err.to_string().contains("not registered"),
+            "the operator must be told what to create: {err}"
+        );
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "nothing may be applied to the control plane for a remote destination"
+        );
+        assert!(
+            fixture.cluster.app_patches().is_empty(),
+            "nothing may be written to the control plane's objects either"
+        );
+    }
+
+    /// **Finding M11:** `destination.cluster` is normalized one way everywhere — trimmed for the
+    /// comparison, and a **blank** value is a terminal refusal rather than a silent `in-cluster`.
+    #[tokio::test]
+    async fn the_destination_cluster_is_normalized_consistently() {
+        // A blank name is a typo. `serde(default)` only covers the omitted field, so accepting
+        // `"  "` would make the meaning depend on which call path read it first.
+        let strict = fixture(FakeCluster::default().with_namespace("payments"));
+        strict.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut blank = strict.app(".");
+        blank.spec.destination.cluster = "   ".to_owned();
+        let err = strict
+            .pipeline
+            .apply(&blank)
+            .await
+            .expect_err("a blank destination cluster must be refused");
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert!(
+            err.to_string().contains("destination.cluster"),
+            "the operator must be told which field: {err}"
+        );
+        assert!(strict.cluster.applies().is_empty());
+        assert_eq!(
+            strict.git.resolve_calls(),
+            0,
+            "nothing may be read from Git"
+        );
+
+        // A *padded* name is the same cluster: the policy trims it and so does the registry
+        // lookup, so `"  in-cluster  "` syncs exactly like `in-cluster`.
+        let padded_fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        padded_fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut padded = padded_fixture.app(".");
+        padded.spec.destination.cluster = "  in-cluster  ".to_owned();
+        padded_fixture
+            .pipeline
+            .apply(&padded)
+            .await
+            .expect("a padded in-cluster name must still resolve");
+        assert_eq!(
+            padded_fixture.cluster.applies(),
+            vec![CONFIGMAP_KEY.to_owned()],
+            "the trimmed name addresses the control plane"
+        );
+    }
+
+    /// **Finding M10:** a remote `Application` that names a `serviceAccountName` is impersonated
+    /// with the **remote cluster's** pool, never with the control plane's connector.
+    ///
+    /// The remote cluster's credential may not even be allowed to impersonate: silently using the
+    /// control-plane pool would deploy as an identity the remote API server never authorized, or —
+    /// worse — inherit a connector with the control plane's trust.
+    #[tokio::test]
+    async fn a_remote_application_is_impersonated_through_the_remote_cluster() {
+        let local = FakeCluster::default().with_namespace("payments");
+        let remote = Arc::new(FakeCluster::default().with_namespace("payments"));
+        let remote_discovery = Arc::new(FakeDiscovery::with_cluster_kinds());
+        // The remote cluster's own pool: a separate recorder, so "which connector resolved the
+        // identity" is observable instead of implied.
+        let remote_pool = Arc::new(FakeImpersonationSource {
+            applier: Arc::new(FakeApplier {
+                cluster: remote.clone(),
+                discovery: remote_discovery.clone(),
+                crd_mode: CrdMode::Establish,
+            }),
+            live: remote.clone(),
+            dry_run: Arc::new(FakeDryRun::default()),
+            identities: StdMutex::new(Vec::new()),
+        });
+        let source = Arc::new(FakeClusterSource::default().with_target(
+            "prod",
+            remote_target_with_impersonation(
+                "prod",
+                remote.clone(),
+                remote_discovery,
+                Some(remote_pool.clone()),
+            ),
+        ));
+        let projects =
+            FakeProjectSource::default().with_project(remote_project_with_service_account());
+        let fixture = fixture_with_clusters(local, projects, source);
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+
+        let mut app = fixture.app(".");
+        app.spec.destination.cluster = "prod".to_owned();
+        app.spec.service_account_name = Some("deployer".to_owned());
+
+        fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a remote Application with a ServiceAccount must sync");
+        assert_eq!(
+            remote_pool.identities(),
+            vec!["system:serviceaccount:payments:deployer".to_owned(),],
+            "the identity must be resolved on the remote cluster"
+        );
+        assert!(
+            fixture.identities().is_empty(),
+            "the control plane's pool must never resolve a remote identity: {:?}",
+            fixture.identities()
+        );
+        assert_eq!(
+            remote.applies(),
+            vec![CONFIGMAP_KEY.to_owned()],
+            "the workload must land on the remote cluster, as the impersonated identity"
+        );
         assert!(fixture.cluster.applies().is_empty());
+    }
+
+    /// **The remote apply path:** live reads, the `dryRun=All` diff, the applies and the discovery
+    /// snapshot all come from the registered cluster, and the control plane's own seams stay
+    /// untouched.
+    #[tokio::test]
+    async fn a_remote_application_applies_through_the_remote_cluster() {
+        let local = FakeCluster::default().with_namespace("payments");
+        let remote = Arc::new(FakeCluster::default().with_namespace("payments"));
+        let remote_discovery = Arc::new(FakeDiscovery::with_cluster_kinds());
+        let source = Arc::new(FakeClusterSource::default().with_target(
+            "prod",
+            remote_target("prod", remote.clone(), remote_discovery.clone()),
+        ));
+        let projects = FakeProjectSource::default().with_project(remote_project());
+        let fixture = fixture_with_clusters(local, projects, source.clone());
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+
+        let mut app = fixture.app(".");
+        app.spec.destination.cluster = "prod".to_owned();
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a registered remote cluster must sync");
+        assert_eq!(
+            remote.applies(),
+            vec![CONFIGMAP_KEY.to_owned()],
+            "the apply must go to the remote cluster"
+        );
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "the control plane must never receive the workload: {:?}",
+            fixture.cluster.applies()
+        );
+        assert!(
+            remote_discovery.fetches() > 0,
+            "the pass must have discovered the *remote* API surface"
+        );
+        assert_eq!(
+            fixture.discovery.fetches(),
+            0,
+            "not one discovery round trip may hit the control plane for a remote pass: live reads, \
+             the diff and the applies all resolve against the remote cluster's snapshot"
+        );
+        assert_eq!(source.lookups(), vec!["prod".to_owned()]);
+        assert_eq!(
+            outcome
+                .sync
+                .as_ref()
+                .map(|sync| sync.status)
+                .expect("sync state"),
+            SyncStatus::Synced
+        );
+        let inventory = outcome.inventory.expect("inventory");
+        assert!(inventory.keys().any(|key| key.canonical() == CONFIGMAP_KEY));
+    }
+
+    /// **The `AppProject` stays the boundary:** a project that does not list the remote cluster
+    /// refuses the `Application` *before* the registry is consulted, so a tenant cannot use a
+    /// denied `Application` to probe which clusters exist (`T13.1` + `T12.1`).
+    #[tokio::test]
+    async fn the_project_must_list_the_remote_cluster_before_the_registry_is_consulted() {
+        let local = FakeCluster::default().with_namespace("payments");
+        let remote = Arc::new(FakeCluster::default().with_namespace("payments"));
+        let source = Arc::new(FakeClusterSource::default().with_target(
+            "prod",
+            remote_target(
+                "prod",
+                remote.clone(),
+                Arc::new(FakeDiscovery::with_cluster_kinds()),
+            ),
+        ));
+        // The shipped `default` project authorizes `in-cluster` only.
+        let fixture = fixture_with_clusters(local, default_project_source(), source.clone());
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+
+        let mut app = fixture.app(".");
+        app.spec.destination.cluster = "prod".to_owned();
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("the project does not authorize the prod destination");
+        assert!(matches!(err, ReconcileError::Policy(_)), "{err:?}");
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert!(
+            source.lookups().is_empty(),
+            "the cluster registry must not be probed for a destination the project denies: {:?}",
+            source.lookups()
+        );
+        assert!(remote.applies().is_empty());
+    }
+
+    /// The `/status` subresource (and every spec patch) stays on the **control plane**, even when
+    /// the pass deployed into a remote cluster (`T13.1`): the remote credential may not even serve
+    /// the FerrisCD CRs.
+    #[tokio::test]
+    async fn a_remote_sync_keeps_status_and_spec_patches_on_the_control_plane() {
+        #[derive(Default)]
+        struct RecordingStatusWriter {
+            statuses: StdMutex<Vec<ApplicationStatus>>,
+        }
+
+        impl StatusWriter for RecordingStatusWriter {
+            fn patch<'a>(
+                &'a self,
+                _app: &'a Application,
+                status: ApplicationStatus,
+            ) -> futures::future::BoxFuture<'a, Result<(), ReconcileError>> {
+                self.statuses.lock().unwrap().push(status);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let local = FakeCluster::default().with_namespace("payments");
+        let remote = Arc::new(FakeCluster::default().with_namespace("payments"));
+        let source = Arc::new(FakeClusterSource::default().with_target(
+            "prod",
+            remote_target(
+                "prod",
+                remote.clone(),
+                Arc::new(FakeDiscovery::with_cluster_kinds()),
+            ),
+        ));
+        let projects = FakeProjectSource::default().with_project(remote_project());
+        let fixture = fixture_with_clusters(local, projects, source);
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+
+        let mut app = fixture.app(".");
+        app.spec.destination.cluster = "prod".to_owned();
+        let writer = RecordingStatusWriter::default();
+
+        apply_once(&app, &fixture.pipeline, &writer)
+            .await
+            .expect("the remote reconcile must succeed");
+
+        let statuses = writer.statuses.lock().unwrap().clone();
+        assert_eq!(statuses.len(), 1, "exactly one /status patch");
+        assert_eq!(
+            statuses[0].sync.as_ref().map(|sync| sync.status),
+            Some(SyncStatus::Synced),
+            "the status records the remote sync"
+        );
+        assert_eq!(
+            remote.applies(),
+            vec![CONFIGMAP_KEY.to_owned()],
+            "the workload landed remotely"
+        );
+        assert!(
+            remote.app_patches().is_empty(),
+            "the remote cluster must never receive an Application patch: {:?}",
+            remote.app_patches()
+        );
+    }
+
+    /// **Finding C5:** deleting an `Application` whose destination cluster `Secret` is gone releases
+    /// the finalizer with a warning instead of wedging the object in `Terminating` forever.
+    #[tokio::test]
+    async fn deleting_an_application_whose_cluster_disappeared_releases_the_finalizer() {
+        let local = FakeCluster::default().with_namespace("payments");
+        // The registry knows no `prod` (its Secret was deleted).
+        let fixture = fixture_with_clusters(local, default_project_source(), Arc::default());
+        let mut app = fixture.app(".");
+        app.spec.destination.cluster = "prod".to_owned();
+        auto_prune(&mut app);
+        app.status = Some(status_with_inventory(&[CONFIGMAP_KEY]));
+
+        let outcome = fixture
+            .pipeline
+            .cleanup(&app, CleanupMode::Cascade)
+            .await
+            .expect("a vanished destination is not a cleanup failure");
+        match &outcome {
+            CleanupOutcome::TargetUnavailable { message } => {
+                assert!(message.contains("prod"), "{message}");
+                assert!(
+                    message.contains("not registered"),
+                    "the operator must be told the cluster is not registered: {message}"
+                );
+            }
+            other => panic!("expected TargetUnavailable, got {other:?}"),
+        }
+
+        let disposition = crate::reconcile::cleanup_disposition(&app, Ok(outcome));
+        match disposition {
+            CleanupDisposition::Release { warning } => {
+                let warning = warning.expect("releasing without pruning must warn");
+                assert!(warning.contains("unavailable"), "{warning}");
+                assert!(warning.contains("prod"), "{warning}");
+            }
+            CleanupDisposition::Retain { error } => {
+                panic!("the finalizer must be released, not retained: {error}");
+            }
+        }
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "nothing may be deleted from the control plane for a remote destination"
+        );
+    }
+
+    /// **Finding M-new-1:** a blank `spec.destination.cluster` is a spec typo, not a registration.
+    /// Cleanup must treat it like a missing cluster — finalizer released with a warning — instead of
+    /// wedging the deleted `Application` in `Terminating` on an `InvalidName` (which is not
+    /// `is_not_found`).
+    #[tokio::test]
+    async fn deleting_an_application_with_a_blank_destination_cluster_releases_the_finalizer() {
+        let fixture = fixture_with_clusters(
+            FakeCluster::default().with_namespace("payments"),
+            default_project_source(),
+            // A registry that registers nothing: a blank name is never registered anywhere.
+            Arc::default(),
+        );
+        let mut app = fixture.app(".");
+        app.spec.destination.cluster = "   ".to_owned();
+        auto_prune(&mut app);
+        app.status = Some(status_with_inventory(&[CONFIGMAP_KEY]));
+
+        let outcome = fixture
+            .pipeline
+            .cleanup(&app, CleanupMode::Cascade)
+            .await
+            .expect("a blank destination is a spec typo, not a cleanup failure");
+        match &outcome {
+            CleanupOutcome::TargetUnavailable { message } => {
+                assert!(message.contains("destination cluster"), "{message}");
+                assert!(message.contains("must not be blank"), "{message}");
+            }
+            other => panic!("expected TargetUnavailable, got {other:?}"),
+        }
+
+        match crate::reconcile::cleanup_disposition(&app, Ok(outcome)) {
+            CleanupDisposition::Release { warning } => {
+                let warning = warning.expect("releasing without pruning must warn");
+                assert!(warning.contains("unavailable"), "{warning}");
+            }
+            CleanupDisposition::Retain { error } => {
+                panic!("the finalizer must be released, not retained: {error}");
+            }
+        }
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "a blank destination names no cluster, so nothing may be deleted"
+        );
     }
 
     /// `T10.3`: a lifecycle hook is created **once** with `Api::create`, tracked in

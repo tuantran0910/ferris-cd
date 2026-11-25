@@ -59,6 +59,59 @@ pub(crate) fn parse_options() -> serde_saphyr::Options {
     }
 }
 
+/// Why an operator-supplied YAML document was refused by [`parse_document`].
+///
+/// Deliberately **content-free**: the document may itself be a credential (the kubeconfig of a
+/// `ferriscd.io/secret-type=cluster` `Secret`, `T13.1`), and a YAML parser error routinely quotes
+/// the offending line — which would be the token or the private key.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum YamlGuardError {
+    /// A whole-document parser budget (aliases, anchors, nodes, depth, bytes, documents) was
+    /// exceeded. The breached limit is named; the document is not.
+    #[error("the document exceeds a YAML parser budget: {limit}")]
+    Budget {
+        /// Which budget was breached.
+        limit: String,
+    },
+
+    /// The document is not valid YAML for the requested type.
+    #[error("the document is not valid YAML for the requested type")]
+    Parse,
+}
+
+/// Parses a **single** YAML document into `T` under FerrisCD's own parser budgets.
+///
+/// This is the guarded entry point for YAML that does not come from a rendered manifest but is
+/// still written by whoever can create an object in the cluster — today the kubeconfig carried by
+/// a `ferriscd.io/secret-type=cluster` `Secret` (`T13.1`). It applies exactly the defenses the
+/// render pipeline applies: the whole-stream [`serde_saphyr::budget::check_yaml_budget`] pass plus
+/// [`parse_options`] (duplicate-key rejection, YAML 1.2 scalars, and the alias-replay limits). A
+/// billion-laughs bomb in a `Secret` would otherwise expand on the controller's watch task and
+/// exhaust its memory — the same trap `T03.2` guards a rendered manifest against.
+///
+/// # Errors
+///
+/// [`YamlGuardError`] — never a message quoting the document, because the input may be a
+/// credential.
+pub fn parse_document<T>(document: &str) -> Result<T, YamlGuardError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let report = serde_saphyr::budget::check_yaml_budget(
+        document,
+        whole_stream_budget(),
+        serde_saphyr::budget::EnforcingPolicy::AllContent,
+    )
+    .map_err(|_| YamlGuardError::Parse)?;
+    if let Some(breach) = report.breached {
+        return Err(YamlGuardError::Budget {
+            limit: format!("{breach:?}"),
+        });
+    }
+    serde_saphyr::from_str_with_options(document, parse_options())
+        .map_err(|_| YamlGuardError::Parse)
+}
+
 /// Parses a single manifest file into zero or more validated [`DesiredResource`]s.
 ///
 /// # Errors
@@ -673,6 +726,52 @@ data:
             matches!(err, ManifestError::YamlBudget { .. }),
             "expected a budget-specific error, got: {err:?}"
         );
+    }
+
+    /// **`T13.1` finding M4:** operator-supplied YAML (a cluster-registration kubeconfig) goes
+    /// through the same budgets and alias-replay limits as a rendered manifest, and a refusal
+    /// never quotes the document.
+    #[test]
+    fn the_guarded_single_document_parser_enforces_budgets_without_quoting_the_document() {
+        let value: Value = parse_document("apiVersion: v1\nkind: ConfigMap\n")
+            .expect("a valid single document parses");
+        assert_eq!(value["kind"], "ConfigMap");
+
+        // `parse_options` rejects duplicate keys.
+        let err = parse_document::<Value>("kind: a\nkind: b\n")
+            .expect_err("a duplicate key must be refused");
+        assert_eq!(err, YamlGuardError::Parse);
+        assert!(
+            !err.to_string().contains("kind: b"),
+            "a refusal must never quote the document: {err}"
+        );
+
+        // The whole-stream document budget is reported as such (and names only the limit).
+        let mut stream = String::new();
+        for _ in 0..1_025 {
+            stream.push_str("---\na: 1\n");
+        }
+        let err = parse_document::<Value>(&stream).expect_err("the document budget must trip");
+        assert!(
+            matches!(err, YamlGuardError::Budget { .. }),
+            "expected a budget breach, got: {err:?}"
+        );
+
+        // The alias-replay limit is what stops a billion-laughs bomb here; without it the
+        // controller would expand it while watching cluster `Secret`s.
+        let bomb = r#"
+a: &a ["lol", "lol", "lol", "lol", "lol", "lol", "lol", "lol", "lol"]
+b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a]
+c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b]
+d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c]
+e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d]
+f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e]
+g: &g [*f, *f, *f, *f, *f, *f, *f, *f, *f]
+h: &h [*g, *g, *g, *g, *g, *g, *g, *g, *g]
+"#;
+        let err = parse_document::<Value>(bomb).expect_err("an alias bomb must be refused");
+        assert_eq!(err, YamlGuardError::Parse);
+        assert!(!err.to_string().contains("lol"), "{err}");
     }
 
     #[test]
