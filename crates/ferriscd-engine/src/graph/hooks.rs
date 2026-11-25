@@ -330,6 +330,17 @@ impl HookPartition {
         &self.permanent
     }
 
+    /// The permanent desired set, mutably.
+    ///
+    /// The controller stamps `ferriscd.io/tracking-id` onto the permanent set only — a hook is
+    /// created imperatively and must never look prunable — and [`Self::permanent_inventory`] builds
+    /// the inventory from the partition, so the stamp has to reach the *partitioned* slice. A
+    /// `&mut [T]` cannot change length, so the partition itself (and the wave plan derived from it
+    /// by [`Self::wave_plan`]) stays valid.
+    pub fn permanent_mut(&mut self) -> &mut [DesiredResource] {
+        &mut self.permanent
+    }
+
     /// The resources excluded from the sync by `ferriscd.io/hook: Skip`.
     #[must_use]
     pub fn skipped(&self) -> &[DesiredResource] {
@@ -1322,5 +1333,60 @@ mod tests {
         .expect("a fully valid skipped item is not an error");
         assert!(partition.hooks().is_empty());
         assert_eq!(partition.skipped().len(), 1);
+    }
+
+    /// The controller stamps `ferriscd.io/tracking-id` onto the permanent half only, through the
+    /// same partition it plans waves from. A hook must never be stamped: a stamped hook would look
+    /// prunable to the pruner even though its lifetime belongs to its delete policy.
+    #[test]
+    fn stamping_the_permanent_set_never_touches_a_hook() {
+        let mut partition = partition(vec![
+            hook("Job", "migrate", "PreSync"),
+            plain("ConfigMap", "settings"),
+        ])
+        .expect("valid bundle");
+
+        for resource in partition.permanent_mut() {
+            crate::inventory::stamp_tracking_id(resource, "ferriscd-system", "demo-app")
+                .expect("a plain annotation stamp never fails");
+        }
+
+        let stamped = &partition.permanent()[0];
+        assert_eq!(
+            stamped
+                .object
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|map| map.get(annotations::TRACKING_ID))
+                .map(String::as_str),
+            Some("ferriscd-system/demo-app:/ConfigMap:payments/settings"),
+            "the permanent resource carries the ownership marker"
+        );
+        for hook in partition.hooks() {
+            assert!(
+                hook.resource()
+                    .object
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .is_none_or(|map| !map.contains_key(annotations::TRACKING_ID)),
+                "a hook must never be stamped as prunable inventory"
+            );
+            assert!(
+                !partition.permanent_inventory().contains_key(hook.key()),
+                "no hook may enter the permanent inventory"
+            );
+        }
+
+        // The wave plan is still the plan of the permanent half, stamps included.
+        let plan = partition.wave_plan().expect("valid waves");
+        assert_eq!(
+            plan.keys()
+                .iter()
+                .map(ResourceKey::canonical)
+                .collect::<Vec<_>>(),
+            vec!["/ConfigMap/payments/settings".to_owned()]
+        );
     }
 }

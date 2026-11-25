@@ -1,4 +1,4 @@
-.PHONY: fmt fmt-check lint test gate gate-fast kind-up kind-down test-integration
+.PHONY: fmt fmt-check lint test gate gate-fast kind-up kind-down test-integration test-integration-twice
 
 KIND_CLUSTER_NAME := ferriscd-dev
 KIND_CONTEXT := kind-$(KIND_CLUSTER_NAME)
@@ -43,4 +43,16 @@ kind-down:
 
 test-integration:
 	kubectl config current-context | grep -q '^kind-' || { echo "ABORT: non-kind context!"; exit 1; }
+	cargo test --workspace -- --ignored
+
+# The `T10.6` trap guard: the live suite must pass TWICE back-to-back on the same cluster.
+# Each test still starts from its own `ClusterCleanup`, which deletes the `Application` and blocks
+# on the target namespace delete, so the second run does NOT converge from the first run's
+# `/status`. What this proves is idempotency against the leftovers that cleanup cannot remove — the
+# CRDs (and any namespace the delete could not finish) — and that no test depends on a pristine
+# cluster: a timing or ordering assumption that only holds on a first run shows up as a red second
+# run.
+test-integration-twice:
+	kubectl config current-context | grep -q '^kind-' || { echo "ABORT: non-kind context!"; exit 1; }
+	cargo test --workspace -- --ignored
 	cargo test --workspace -- --ignored

@@ -113,6 +113,53 @@ impl WavePlan {
         self.waves.iter().find(|entry| entry.wave == wave)
     }
 
+    /// Returns whether `wave` contains a `CustomResourceDefinition`.
+    ///
+    /// This is the `T10.2` trap guard as a pure predicate. Applying a CRD registers its kinds only
+    /// after the API server establishes it, so the discovery snapshot taken at the start of the
+    /// pass does not serve them yet: the controller must call
+    /// `DiscoveryCache::invalidate_and_refresh()` **after** the wave that carries the CRD and
+    /// before the next wave, exactly like `T08.3` does inside one wave. A wave that is not part of
+    /// the plan (a wave that disappeared between requeues) contains no CRD.
+    #[must_use]
+    pub fn contains_crd(&self, wave: i32) -> bool {
+        self.wave(wave).is_some_and(wave_has_crd)
+    }
+
+    /// Returns whether any wave contains a `CustomResourceDefinition`.
+    #[must_use]
+    pub fn has_crd(&self) -> bool {
+        self.waves.iter().any(wave_has_crd)
+    }
+
+    /// The wave numbers whose resources include a `CustomResourceDefinition`, ascending.
+    #[must_use]
+    pub fn crd_waves(&self) -> Vec<i32> {
+        self.waves
+            .iter()
+            .filter(|wave| wave_has_crd(wave))
+            .map(|wave| wave.wave)
+            .collect()
+    }
+
+    /// Returns whether `wave` is the **last** wave of the plan (where pruning happens).
+    #[must_use]
+    pub fn is_last_wave(&self, wave: i32) -> bool {
+        self.waves.last().is_some_and(|last| last.wave == wave)
+    }
+
+    /// The last (highest-numbered) wave of the plan, if any.
+    #[must_use]
+    pub fn last_wave(&self) -> Option<i32> {
+        self.waves.last().map(|wave| wave.wave)
+    }
+
+    /// The number of waves in the plan.
+    #[must_use]
+    pub fn wave_count(&self) -> usize {
+        self.waves.len()
+    }
+
     /// Returns the identities of the resources of `wave` (empty when the wave does not exist).
     ///
     /// A wave that is not part of the plan is a normal, non-error situation: the desired set of a
@@ -227,6 +274,13 @@ fn group_by_wave(resources: Vec<DesiredResource>) -> Result<Vec<SyncWave>, Manif
         wave.resources = sort_by_tier(resources);
     }
     Ok(waves)
+}
+
+/// Returns whether one wave carries a `CustomResourceDefinition`.
+fn wave_has_crd(wave: &SyncWave) -> bool {
+    wave.resources
+        .iter()
+        .any(|resource| crate::graph::order::is_crd_key(&resource.key))
 }
 
 /// Builds the terminal, actionable error for a malformed control annotation.
@@ -500,5 +554,55 @@ mod tests {
         let err = sync_wave(&blank).expect_err("blank wave must be rejected");
         assert!(err.to_string().contains("is blank"), "{err}");
         assert!(err.to_string().contains("omit the annotation"), "{err}");
+    }
+
+    /// `T10.2` trap guard: a wave that carries a CRD must be visible as such, so the controller can
+    /// refresh discovery before the next wave instead of resolving the CR's kind against a stale
+    /// snapshot.
+    #[test]
+    fn contains_crd_identifies_the_waves_that_need_a_discovery_refresh() {
+        let plan = partition(vec![
+            resource("CustomResourceDefinition", "widgets", Some("-1")),
+            resource("ConfigMap", "settings", Some("-1")),
+            resource("Widget", "one", Some("0")),
+            resource("CustomResourceDefinition", "gadgets", Some("0")),
+            resource("Deployment", "api", Some("1")),
+        ])
+        .expect("valid waves");
+
+        assert!(plan.contains_crd(-1), "wave -1 defines a CRD");
+        assert!(plan.contains_crd(0), "wave 0 defines a CRD");
+        assert!(
+            !plan.contains_crd(1),
+            "wave 1 carries no CRD, so no refresh is needed after it"
+        );
+        assert_eq!(plan.crd_waves(), vec![-1, 0]);
+        assert!(plan.has_crd());
+        assert_eq!(plan.wave_count(), 3);
+        assert_eq!(plan.last_wave(), Some(1));
+        assert!(plan.is_last_wave(1));
+        assert!(!plan.is_last_wave(0));
+
+        // A wave that is not part of the plan contains no CRD: a wave that disappeared between
+        // requeues must not force a discovery refresh.
+        assert!(!plan.contains_crd(42));
+        assert!(!plan.contains_crd(i32::MIN));
+
+        // A plan made only of non-CRD resources never asks for one.
+        let plain = partition(vec![
+            resource("ConfigMap", "settings", Some("-1")),
+            resource("Deployment", "api", None),
+        ])
+        .expect("valid waves");
+        assert!(!plain.has_crd());
+        assert!(plain.crd_waves().is_empty());
+        assert!(!plain.contains_crd(-1));
+        assert!(!plain.contains_crd(0));
+
+        // An empty plan has no last wave and no CRD.
+        let empty = partition(Vec::new()).expect("empty plan");
+        assert!(!empty.has_crd());
+        assert_eq!(empty.last_wave(), None);
+        assert_eq!(empty.wave_count(), 0);
     }
 }

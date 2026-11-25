@@ -1,0 +1,37 @@
+# The Application that syncs `examples/waves-hooks/` from a local checkout.
+#
+# The bundle exercises Phase 10's two ordering mechanisms in one commit:
+#
+#   wave -1   migrate-job.yaml    Job/migrate     (ferriscd.io/hook: PreSync)
+#   wave  0   configmap.yaml      ConfigMap/settings
+#   wave  0   deployment.yaml     Deployment/api
+#   wave  1   smoke-test.yaml     Job/smoke       (ferriscd.io/hook: PostSync)
+#
+# `--allow-local-repos` is required for the local `repoURL` below; the production URL policy
+# rejects bare paths on purpose.
+apiVersion: ferriscd.io/v1alpha1
+kind: Application
+metadata:
+  name: waves-hooks
+  namespace: ferriscd-system
+spec:
+  project: default
+  source:
+    git:
+      repoURL: /absolute/path/to/the/fixture/repository
+      targetRevision: main
+      path: .
+    renderer:
+      auto: {}
+  destination:
+    cluster: in-cluster
+    namespace: ferriscd-waves-hooks
+  syncPolicy:
+    automated:
+      prune: false
+      # selfHeal stays on: the rollback experiment at the end of the Phase 10 lesson turns it off by
+      # hand to show that a rollback is *not* immediately overwritten.
+      selfHeal: true
+    syncOptions:
+      createNamespace: true
+  requeueAfterSeconds: 15

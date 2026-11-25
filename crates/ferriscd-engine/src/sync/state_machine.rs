@@ -641,6 +641,17 @@ impl SyncMachine {
         self.requeue_after
     }
 
+    /// The step a persisted state is currently on.
+    ///
+    /// The controller needs it **before** it steps the machine: the hooks and the live health it
+    /// must feed into [`SyncMachine::step`] belong to the persisted step, not to the step the
+    /// machine is about to dispatch. Reading it through the same private [`phase_of`] mapping means
+    /// the wiring can never disagree with the machine about where an operation resumed.
+    #[must_use]
+    pub fn current_step(&self, persisted: &OperationState) -> SyncStep {
+        SyncStep::new(phase_of(persisted), persisted.current_wave)
+    }
+
     /// Starts an operation at `PreSync` and returns the state to persist.
     ///
     /// The returned action is `Execute(PreSync)`: the controller creates the `PreSync` hooks (or
@@ -1934,6 +1945,57 @@ mod tests {
             Some(reason.as_str()),
             "the terminal /status message must be the failure reason"
         );
+    }
+
+    /// The controller asks the machine where it is *before* it steps (it has to: the hooks and the
+    /// health it feeds in belong to the persisted step), so `current_step` must agree with the
+    /// private resume mapping for every shape of persisted state.
+    #[test]
+    fn current_step_matches_how_the_machine_resumes() {
+        let machine = SyncMachine::default();
+        let now = at("2026-11-24T12:00:00Z");
+
+        for (sync_phase, wave, expected) in [
+            (Some(SyncPhase::PreSync), 0, SyncStep::pre_sync()),
+            (Some(SyncPhase::Sync), -1, SyncStep::sync(-1)),
+            (Some(SyncPhase::Sync), 3, SyncStep::sync(3)),
+            (Some(SyncPhase::PostSync), 0, SyncStep::post_sync()),
+            (Some(SyncPhase::SyncFail), 2, SyncStep::sync_fail(2)),
+            // A state written before Phase 10 carries no `syncPhase`; a `Running` operation was
+            // then applying waves, so it resumes at `Sync(currentWave)`.
+            (None, 1, SyncStep::sync(1)),
+        ] {
+            let state = OperationState {
+                phase: OperationPhase::Running,
+                sync_phase,
+                current_wave: wave,
+                phase_started_at: Some(now.clone()),
+                revision: Some("rev-a".to_owned()),
+                active_hooks: Vec::new(),
+                message: None,
+                started_at: now.clone(),
+                finished_at: None,
+            };
+            assert_eq!(
+                machine.current_step(&state),
+                expected,
+                "{sync_phase:?}/{wave}"
+            );
+        }
+
+        // A terminal operation phase wins over a stale `syncPhase`, exactly like `step` does.
+        let terminal = OperationState {
+            phase: OperationPhase::Succeeded,
+            sync_phase: Some(SyncPhase::Sync),
+            current_wave: 0,
+            phase_started_at: None,
+            revision: None,
+            active_hooks: Vec::new(),
+            message: None,
+            started_at: now.clone(),
+            finished_at: Some(now.clone()),
+        };
+        assert_eq!(machine.current_step(&terminal).phase, SyncPhase::Succeeded);
     }
 
     /// Finding H-3: a commit that lands mid-operation may not contain the wave the operation is on.

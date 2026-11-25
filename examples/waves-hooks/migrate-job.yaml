@@ -1,0 +1,36 @@
+# Wave -1: the "database migration" that must finish before anything else is created.
+#
+# Two Phase 10 mechanisms meet here:
+#   * `ferriscd.io/sync-wave: "-1"` orders it before wave 0 (T10.2);
+#   * `ferriscd.io/hook: PreSync` makes it a *hook*, so it is created imperatively (`Api::create`)
+#     and never enters `status.inventory` (T10.3).
+#
+# `generateName` is exactly why a hook needs `Api::create`: the API server picks the suffix, and the
+# controller records the generated name in `status.operationState.activeHooks` so a requeue observes
+# *this* Job instead of starting a second migration (finding H2).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: migrate-
+  labels:
+    app.kubernetes.io/part-of: ferriscd-waves-hooks-example
+  annotations:
+    ferriscd.io/hook: PreSync
+    # Delete the completed Job on the next sync so the migration can run again (T10.4). Note that a
+    # `generateName` hook with neither `HookSucceeded` nor `HookFailed` is *never* reaped: it leaks
+    # one completed Job per sync, because `BeforeHookCreation` only pre-deletes hooks that have an
+    # explicit `metadata.name` (there is no prefix to delete safely). Use `HookSucceeded` here if the
+    # finished Job is not wanted for debugging.
+    ferriscd.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - 'echo "migrating: wave -1 -> done"; sleep 2'

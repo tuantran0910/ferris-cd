@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use ferriscd_crd::status::{
     ApplicationStatus, Condition, ConditionStatus, HealthState, MAX_STATUS_MESSAGE_CHARS,
-    REASON_SYNC_ERROR, ResourceStatus, SyncState, SyncStatus,
+    OperationState, REASON_SYNC_ERROR, ResourceStatus, RevisionHistoryEntry, SyncState, SyncStatus,
 };
 use ferriscd_crd::{Application, annotations};
 use ferriscd_engine::inventory::Inventory;
@@ -119,6 +119,12 @@ pub struct ApplyOutcome {
     /// When present the list is authoritative: `status.resources` is replaced, so a resource that
     /// no longer exists cannot linger in the status forever.
     pub resources: Option<Vec<ResourceStatus>>,
+    /// Wave/hook operation state to persist in `status.operationState` (`None` = leave untouched).
+    pub operation_state: Option<OperationState>,
+    /// The authoritative `status.history` list (`None` = leave untouched).
+    pub history: Option<Vec<RevisionHistoryEntry>>,
+    /// Conditions to add or refresh (the `T10.5` rollback warning).
+    pub warnings: Vec<Condition>,
 }
 
 impl ApplyOutcome {
@@ -133,6 +139,9 @@ impl ApplyOutcome {
             sync: None,
             health: None,
             resources: None,
+            operation_state: None,
+            history: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -162,6 +171,27 @@ impl ApplyOutcome {
     pub fn with_health(mut self, health: HealthState, resources: Vec<ResourceStatus>) -> Self {
         self.health = Some(health);
         self.resources = Some(resources);
+        self
+    }
+
+    /// Attaches the wave/hook operation state to persist (`T10.1`).
+    #[must_use]
+    pub fn with_operation_state(mut self, operation: Option<OperationState>) -> Self {
+        self.operation_state = operation;
+        self
+    }
+
+    /// Attaches the authoritative `status.history` list to persist (`T10.5`).
+    #[must_use]
+    pub fn with_history(mut self, history: Option<Vec<RevisionHistoryEntry>>) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// Adds a condition to the status this pass writes (the rollback warning).
+    #[must_use]
+    pub fn with_warning(mut self, condition: Condition) -> Self {
+        self.warnings.push(condition);
         self
     }
 }
@@ -277,6 +307,15 @@ pub enum ReconcileError {
         inventory: Inventory,
         /// The revision that was being synced.
         revision: Option<String>,
+        /// The wave/hook operation state the failed pass produced (`T10.3`, finding M4).
+        ///
+        /// A pass that failed *after* creating hooks must still persist their tracking records:
+        /// `status.operationState.activeHooks` is the only thing that keeps a `generateName` `Job`
+        /// from being created a second time by the next pass (a second migration).
+        ///
+        /// Boxed so carrying it does not grow every `ReconcileError` in the pass (the enum is
+        /// returned by value from every pipeline call).
+        operation: Option<Box<OperationState>>,
     },
 
     /// A planned action could not be executed and retrying cannot help (terminal).
@@ -293,6 +332,16 @@ pub enum ReconcileError {
         inventory: Inventory,
         /// The revision that could not be fully synced.
         revision: Option<String>,
+        /// The wave/hook operation state the failed pass produced (finding H-A).
+        ///
+        /// A **terminal** failure inside an operation (a rejected hook create, an immutable field)
+        /// drops nothing: the state — including `status.operationState.activeHooks` and its
+        /// `Failed` phase — must still reach `/status`, or the next terminal-backoff pass restarts
+        /// the operation with an empty hook set and creates a second `generateName` `Job` (a second
+        /// database migration).
+        ///
+        /// Boxed for the same reason as [`Self::PartialSync::operation`].
+        operation: Option<Box<OperationState>>,
     },
 
     /// A recovery step could not confirm completion inside its bounded window (retryable).
@@ -398,6 +447,22 @@ impl ReconcileError {
                 revision,
                 ..
             } => Some((inventory, revision.as_ref())),
+            _ => None,
+        }
+    }
+
+    /// The wave/hook operation state a failure already determines (finding M4, finding H-A).
+    ///
+    /// `apply_once` persists it on the failure path so a retry resumes with the hook records the
+    /// failed pass created instead of creating a second `generateName` hook object. Both failure
+    /// shapes carry it: a terminal (`SyncConflict`) failure must survive exactly like a retryable
+    /// (`PartialSync`) one, otherwise the state is dropped and the retry re-runs the migration.
+    #[must_use]
+    pub fn partial_operation(&self) -> Option<&OperationState> {
+        match self {
+            Self::PartialSync { operation, .. } | Self::SyncConflict { operation, .. } => {
+                operation.as_deref()
+            }
             _ => None,
         }
     }
@@ -864,6 +929,27 @@ pub async fn apply_once(
         Ok(outcome) => {
             record_success(&mut status, generation, &outcome, now());
             apply_outcome_status(&mut status, &outcome);
+            // Re-enabling `spec.syncPolicy.automated` is exactly what the rollback warning asks the
+            // operator to do, so the warning is cleared on the first pass that sees automation back
+            // on (finding M-4: a stale warning trains operators to ignore warnings).
+            //
+            // A pass that *emitted* the warning must never clear it (finding C1): the rollback path
+            // patches a **clone** of the spec, so `app.spec` still reports `automated` inside that
+            // very pass. Clearing unconditionally would delete the warning — and with it the pin
+            // (`pinned_rollback_revision` reads the warning) — on the pass that created it, which is
+            // exactly the rollback-vs-`selfHeal` fight the warning exists to break.
+            if outcome.warnings.is_empty()
+                && ferriscd_engine::sync::clear_rollback_warning_if_automation_reenabled(
+                    &app.spec,
+                    &mut status,
+                )
+            {
+                tracing::info!(
+                    app.namespace = %app.namespace().unwrap_or_default(),
+                    app.name = %app.name_any(),
+                    "cleared the rollback warning: spec.syncPolicy.automated is enabled again"
+                );
+            }
             status_writer.patch(app, status).await?;
             Ok(Action::requeue(outcome.requeue.unwrap_or(DEFAULT_REQUEUE)))
         }
@@ -885,6 +971,12 @@ pub async fn apply_once(
                         last_synced_at: None,
                     },
                 );
+            }
+            // Finding M4: a wave pass that failed after creating hooks still hands its
+            // `activeHooks` records over, so the retry observes the object that already exists
+            // instead of creating a second `generateName` hook (a second migration).
+            if let Some(operation) = err.partial_operation() {
+                status.operation_state = Some(operation.clone());
             }
             // Best effort: the reconcile error is the one the caller must see.
             if let Err(patch_err) = status_writer.patch(app, status).await {
@@ -926,6 +1018,21 @@ pub fn apply_outcome_status(status: &mut ApplicationStatus, outcome: &ApplyOutco
         for resource in resources {
             status.record_resource_status(resource.clone());
         }
+    }
+    // `operationState` is the crash-safe progress record of a multi-wave/hook sync (`T10.1`), so it
+    // is written on **every** pass of one — including a pass that only observed a `Progressing` wave
+    // and applied nothing. That is what makes a controller restart resume at `(phase, wave)`.
+    if let Some(operation) = &outcome.operation_state {
+        status.operation_state = Some(operation.clone());
+    }
+    // `history` is authoritative when present: the engine bounds it to
+    // `min(revisionHistoryLimit, MAX_HISTORY_ENTRIES)`, so replacing the array can never grow
+    // `/status` past its budget.
+    if let Some(history) = &outcome.history {
+        status.history = history.clone();
+    }
+    for warning in &outcome.warnings {
+        status.set_condition(warning.clone());
     }
 }
 
@@ -1136,12 +1243,12 @@ mod tests {
         DEFAULT_REQUEUE_AFTER_SECONDS, DEFAULT_REVISION_HISTORY_LIMIT,
     };
     use ferriscd_crd::status::{
-        CONDITION_READY, HealthState, HealthStatus, ResourceStatus, RevisionHistoryEntry,
-        SyncState, SyncStatus,
+        ActiveHook, CONDITION_READY, HealthState, HealthStatus, OperationPhase, ResourceStatus,
+        RevisionHistoryEntry, SyncPhase, SyncState, SyncStatus,
     };
     use ferriscd_crd::{
-        ApplicationSpec, DEFAULT_PROJECT_NAME, DestinationSpec, GitSourceSpec, RendererSpec,
-        SourceSpec,
+        ApplicationSpec, AutomatedSyncPolicy, DEFAULT_PROJECT_NAME, DestinationSpec, GitSourceSpec,
+        RendererSpec, SourceSpec, SyncPolicy,
     };
     use ferriscd_engine::inventory::{Inventory, InventoryEntry};
     use ferriscd_engine::manifest::ResourceKey;
@@ -1934,6 +2041,7 @@ mod tests {
             message: "applying apps/Deployment/payments/api failed".to_owned(),
             inventory: sample_inventory(),
             revision: Some("newsha".to_owned()),
+            operation: Some(Box::new(running_operation("newsha"))),
         });
         let writer = RecordingStatusWriter::default();
 
@@ -1978,6 +2086,201 @@ mod tests {
                 .is_some_and(|condition| condition.message.contains("failed")),
             "the failure reason must be actionable"
         );
+        // Finding M4: the hook records the failed pass produced survive the failure, so the retry
+        // observes the object that was already created instead of creating a second one.
+        let operation = status
+            .operation_state
+            .as_ref()
+            .expect("a failed wave pass must still persist its operation state");
+        assert_eq!(operation.phase, OperationPhase::Running);
+        assert_eq!(operation.active_hooks.len(), 1);
+        assert_eq!(operation.active_hooks[0].generated_name, "migrate-abcde");
+    }
+
+    /// The `Running` operation state a failed wave pass persists: one tracked `generateName` hook.
+    fn running_operation(revision: &str) -> OperationState {
+        OperationState {
+            phase: OperationPhase::Running,
+            sync_phase: Some(SyncPhase::PreSync),
+            current_wave: 0,
+            phase_started_at: Some(now()),
+            revision: Some(revision.to_owned()),
+            active_hooks: vec![ActiveHook::new(
+                SyncPhase::PreSync,
+                0,
+                "Job-.yaml#0",
+                "migrate-abcde",
+                HealthStatus::Progressing,
+            )],
+            message: Some("running PreSync hooks".to_owned()),
+            started_at: now(),
+            finished_at: None,
+        }
+    }
+
+    /// The automation the fixtures start from (`automated: { prune: false, selfHeal: true }`).
+    fn automated_policy() -> SyncPolicy {
+        SyncPolicy {
+            automated: Some(AutomatedSyncPolicy {
+                prune: false,
+                self_heal: true,
+            }),
+            sync_options: None,
+            retry: None,
+        }
+    }
+
+    /// The commit a rollback is pinned to (the revision `status.history` id 1 recorded).
+    const PINNED: &str = "1111111111111111111111111111111111111111";
+    /// `ferriscd.io/operation: {"rollback":{"id":1}}`, the request that started the rollback.
+    const ROLLBACK_REQUEST: &str = r#"{"rollback":{"id":1}}"#;
+
+    /// The outcome of a pass that reports `revision` as the commit it is following.
+    fn following(revision: &str) -> ApplyOutcome {
+        let mut operation = running_operation(revision);
+        operation.phase = OperationPhase::Succeeded;
+        operation.sync_phase = Some(SyncPhase::Succeeded);
+        operation.active_hooks.clear();
+        operation.finished_at = operation.phase_started_at.clone();
+        ApplyOutcome::ready(
+            "SyncSucceeded",
+            format!("applied the pinned commit {revision}"),
+        )
+        .with_sync(SyncState {
+            status: SyncStatus::Synced,
+            revision: Some(revision.to_owned()),
+            last_synced_revision: Some(revision.to_owned()),
+            last_synced_spec_hash: Some("spec-hash".to_owned()),
+            last_synced_at: Some(now()),
+        })
+        .with_operation_state(Some(operation))
+    }
+
+    /// **Finding C1:** the rollback warning is *not* cleared on the pass that emits it.
+    ///
+    /// The rollback path patches a **clone** of the spec, so the `Application` this pass reconciles
+    /// still reports `automated: Some(...)`. Clearing the warning unconditionally therefore deleted
+    /// it — and with it the pin `pinned_rollback_revision` derives from it — on the very pass that
+    /// created it, which is the rollback-vs-`selfHeal` fight `T10.5` exists to break.
+    #[tokio::test]
+    async fn the_rollback_warning_survives_the_pass_that_emits_it_and_pins_the_revision() {
+        // The rollback this pass honours: history id 1 recorded the pinned commit.
+        let decision = ferriscd_engine::sync::plan_rollback(
+            &ApplicationStatus {
+                history: vec![RevisionHistoryEntry::new(1, Some(PINNED.to_owned()), now())],
+                ..ApplicationStatus::default()
+            },
+            ferriscd_engine::sync::RollbackRequest { id: 1 },
+            &now(),
+        )
+        .expect("a valid rollback request");
+        assert_eq!(decision.pinned_revision(), PINNED);
+
+        // This pass's copy of the Application: the annotation asked for the rollback and the spec
+        // still carries the automation the rollback is about to remove (it patches a clone).
+        let mut app = application(&[(annotations::OPERATION, ROLLBACK_REQUEST)]);
+        app.spec.sync_policy = Some(automated_policy());
+
+        let warning = decision.condition;
+        let pipeline = FakePipeline {
+            apply: Box::new(move || Ok(following(PINNED).with_warning(warning.clone()))),
+            ..FakePipeline::ready()
+        };
+        let writer = RecordingStatusWriter::default();
+
+        apply_once(&app, &pipeline, &writer)
+            .await
+            .expect("the rollback pass must succeed");
+
+        let first = writer.patches().remove(0);
+        let condition = first
+            .condition(ferriscd_engine::sync::CONDITION_WARNING)
+            .expect("the pass that emitted the warning must persist it");
+        assert_eq!(
+            condition.reason,
+            ferriscd_engine::sync::REASON_AUTOMATED_SYNC_DISABLED_BY_ROLLBACK
+        );
+        // The pin the next pass resolves is derived from `/status`, so it must still be there.
+        assert_eq!(
+            crate::sync::pinned_rollback_revision(&first).as_deref(),
+            Some(PINNED),
+            "the warning is what pins the revision: {}",
+            condition.message
+        );
+        assert_eq!(
+            first
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.revision.as_deref()),
+            Some(PINNED)
+        );
+
+        // Pass 2: the spec patch has landed, so this pass reads a manual-only spec and follows the
+        // commit the persisted warning pins (exactly what `pinned_rollback_revision` returns).
+        let pinned = crate::sync::pinned_rollback_revision(&first).expect("the pin survives");
+        let mut second_app = app.clone();
+        second_app.spec.sync_policy = None;
+        second_app.metadata.annotations = None;
+        second_app.status = Some(first.clone());
+        let second_pipeline = FakePipeline {
+            apply: Box::new({
+                let pinned = pinned.clone();
+                move || Ok(following(&pinned))
+            }),
+            ..FakePipeline::ready()
+        };
+        let second_writer = RecordingStatusWriter::default();
+
+        apply_once(&second_app, &second_pipeline, &second_writer)
+            .await
+            .expect("a manual-only pass must succeed");
+
+        let second = second_writer.patches().remove(0);
+        assert_eq!(
+            second
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.revision.as_deref()),
+            Some(PINNED),
+            "the following pass must still report the pinned revision, not HEAD"
+        );
+        assert!(
+            second
+                .condition(ferriscd_engine::sync::CONDITION_WARNING)
+                .is_some(),
+            "a manual-only application keeps the warning: it is what holds HEAD back"
+        );
+        assert_eq!(
+            crate::sync::pinned_rollback_revision(&second).as_deref(),
+            Some(PINNED),
+            "the pin must survive every pass until automation is re-enabled"
+        );
+
+        // Pass 3: the operator reverted Git and re-enabled automation, so the warning (and the pin)
+        // are cleared — the C1 guard must not break the finding M-4 cleanup.
+        let mut third_app = second_app.clone();
+        third_app.spec.sync_policy = Some(automated_policy());
+        third_app.status = Some(second);
+        let third_writer = RecordingStatusWriter::default();
+        apply_once(
+            &third_app,
+            &FakePipeline {
+                apply: Box::new(|| Ok(following("2222222222222222222222222222222222222222"))),
+                ..FakePipeline::ready()
+            },
+            &third_writer,
+        )
+        .await
+        .expect("a re-enabled pass must succeed");
+
+        let third = third_writer.patches().remove(0);
+        assert!(
+            third
+                .condition(ferriscd_engine::sync::CONDITION_WARNING)
+                .is_none(),
+            "re-enabling spec.syncPolicy.automated must clear the stale rollback warning"
+        );
+        assert_eq!(crate::sync::pinned_rollback_revision(&third), None);
     }
 
     #[tokio::test]
@@ -2041,6 +2344,7 @@ mod tests {
             message: "boom".to_owned(),
             inventory: sample_inventory(),
             revision: Some("sha".to_owned()),
+            operation: None,
         };
         let (inventory, revision) = partial.partial_status().expect("partial status");
         assert_eq!(inventory.len(), 1);

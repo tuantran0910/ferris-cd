@@ -1,0 +1,25 @@
+# Wave 0: created only once wave -1's `PreSync` hook is `Healthy` (T10.2).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/part-of: ferriscd-waves-hooks-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: nginx:1.27-alpine
+          envFrom:
+            - configMapRef:
+                name: settings
+          ports:
+            - containerPort: 80
