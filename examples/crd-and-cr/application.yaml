@@ -1,0 +1,32 @@
+# The Application that syncs `examples/crd-and-cr/` from a local checkout.
+#
+# `createNamespace: true` is what makes this bundle self-contained on a fresh cluster: the
+# destination Namespace is created (unstamped, so never pruned) before the CRD and the `Widget`.
+#
+# `--allow-local-repos` is required for the local `repoURL` below; the production URL policy
+# rejects bare paths on purpose.
+apiVersion: ferriscd.io/v1alpha1
+kind: Application
+metadata:
+  name: crd-and-cr
+  namespace: ferriscd-system
+spec:
+  project: default
+  source:
+    git:
+      repoURL: /absolute/path/to/the/fixture/repository
+      targetRevision: main
+      path: .
+    # Auto-detection: a directory of plain YAML manifests needs no renderer selection.
+    renderer:
+      auto: {}
+  destination:
+    cluster: in-cluster
+    namespace: ferriscd-crd-and-cr
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      createNamespace: true
+  requeueAfterSeconds: 15
