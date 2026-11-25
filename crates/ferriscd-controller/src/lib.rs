@@ -11,6 +11,7 @@ use kube::{Api, Client, ResourceExt};
 pub mod controller;
 pub mod discovery;
 pub mod dry_run;
+pub mod hooks;
 pub mod live_state;
 pub mod predicate;
 pub mod prune;
@@ -19,6 +20,7 @@ pub mod scope;
 pub mod sync;
 pub mod sync_executor;
 pub mod sync_recovery;
+pub mod waves;
 
 pub use controller::{
     BackoffTracker, ConfigError, ControllerConfig, DEFAULT_CONCURRENCY, DEFAULT_DRAIN_TIMEOUT,
@@ -29,6 +31,7 @@ pub use dry_run::{
     DRY_RUN_CONCURRENCY, DryRunApi, DryRunError, DryRunEvaluator, DryRunFuture, DryRunOutcome,
     DryRunTarget, DynamicDryRunApi, MAX_FIELD_CONFLICTS, parse_conflict_status,
 };
+pub use hooks::{HookCluster, HookRun, hooks_for_step, run_step};
 pub use live_state::{
     ClusterStateReader, DynamicApiSource, FetchRequest, LiveObjectSource, LiveState,
     LiveStateError, TrackingOwner,
@@ -43,8 +46,9 @@ pub use reconcile::{
 };
 pub use scope::{ClusterNamespacePolicy, InBundleCrd, ScopeError, normalize_scopes};
 pub use sync::{
-    Applier, ApplyRequest, DeleteOutcome, DeleteRequest, DynamicApiApplier, InventorySyncPipeline,
-    PENDING_REQUEUE, PROGRESSING_REQUEUE,
+    ApplicationPatch, Applier, ApplyRequest, CreateRequest, DeleteOutcome, DeleteRequest,
+    DynamicApiApplier, InventorySyncPipeline, PENDING_REQUEUE, PROGRESSING_REQUEUE,
+    REASON_SYNC_IN_PROGRESS,
 };
 pub use sync_executor::{
     ActionFailure, CrdReadiness, CrdStatusReader, DEFAULT_CRD_ESTABLISH_TIMEOUT,
@@ -57,6 +61,7 @@ pub use sync_recovery::{
     REPLACE_ANNOTATION, REPLACE_HINT, Recovery, ReplacePolicy, ReplaceRecovery, TAKEOVER_FIELD,
     classify_apply_failure, conflicting_managers, is_immutable_field_error, log_takeover,
 };
+pub use waves::{BundleWaves, merge_hook_records, step_health};
 
 /// Environment variable selecting the log format (`json` or `pretty`).
 pub const LOG_FORMAT_ENV: &str = "FERRISCD_LOG_FORMAT";

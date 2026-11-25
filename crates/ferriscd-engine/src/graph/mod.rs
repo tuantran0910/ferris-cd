@@ -13,10 +13,19 @@
 //! ```
 //!
 //! Apply order and prune order are two views of one ordering, so a resource that had to exist
-//! first is deleted last. Sync *waves* (Phase 10) sort ascending by wave and then use this
-//! ordering inside each wave; nothing here needs to change when that lands.
+//! first is deleted last. Phase 10 adds two pure consumers of that contract:
+//!
+//! * [`waves`] — partitions the permanent desired set into ascending
+//!   `ferriscd.io/sync-wave` groups, applying [`order`] ordering inside each wave.
+//! * [`hooks`] — parses `ferriscd.io/hook` / `ferriscd.io/hook-delete-policy` and
+//!   partitions lifecycle hooks out of the permanent set so they never reach
+//!   `status.inventory` or the wave planner.
 
+pub mod hooks;
 pub mod order;
+pub mod waves;
+
+use crate::manifest::types::DesiredResource;
 
 pub use order::{
     APIEXTENSIONS_GROUP, CRD_KIND, MAX_TIER, TIER_CONFIG, TIER_CRD, TIER_CUSTOM_RESOURCE,
@@ -25,6 +34,17 @@ pub use order::{
     is_namespace_key, key_tier, sort_apply_order, sort_by_tier, sort_keys_apply_order,
     sort_keys_prune_order, sort_prune_order, tier, tier_of,
 };
+
+/// Returns the raw value of a control annotation, if the object carries it.
+pub(crate) fn annotation<'a>(resource: &'a DesiredResource, key: &str) -> Option<&'a str> {
+    resource
+        .object
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(key))
+        .map(String::as_str)
+}
 
 #[cfg(test)]
 mod tests {

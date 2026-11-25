@@ -18,11 +18,14 @@
 //! | Prune | `automated.prune` + the gate; `OwnedBySelf` only, re-verified immediately before `Delete`; `CRD`/`Namespace` need `pruneCRDs`/`pruneNamespaces`; exact reverse apply order (T08.5) |
 //! | CRD `Established` wait | bounded poll + `DiscoveryCache::invalidate_and_refresh()` before the CRs, so a CRD + CR pair lands on the **first** sync (T08.3) |
 //! | `createNamespace: true` | `SyncPlan::pre_create_namespace`: the namespace is SSA-applied (unstamped, so never prunable) before the first step |
-//! | Waves/hooks | rejected with an actionable message instead of being mis-ordered (`T10.x`) |
 //! | Rendering | `spec.source.renderer` via the Phase 11 `RenderPipeline` (auto-detected plain/YAML, Kustomize, or Helm; one parse+normalize funnel; tier-sorted; cached per render tuple) |
+//! | Waves | `ferriscd_engine::graph::waves`: the permanent set grouped by `ferriscd.io/sync-wave`, applied one wave per pass, gated on the wave being `Healthy` (`T10.2`) |
+//! | Hooks | `crate::hooks`: created with `Api::create` (so `generateName` works), tracked in `status.operationState.activeHooks`, reaped by their delete policy, never in `status.inventory` (`T10.3`/`T10.4`) |
+//! | Operation state | `ferriscd_engine::sync::SyncMachine`: `PreSync` -> `Sync(wave)` -> `PostSync` -> `Succeeded`, persisted before the requeue, 5 s while waiting, 10 min timeouts (`T10.1`) |
+//! | History & rollback | `ferriscd_engine::sync::history`: bounded `status.history`, and `{"rollback":{"id":N}}` pinned before the diff gate with automation disabled (`T10.5`) |
 //! | Destination clusters | `in-cluster` only; anything else is rejected (`T12.x` credentials) |
 //! | Git credentials | anonymous only (`T12.x`) |
-//! | Health | evaluated from the pass-level live read on **every** pass (including a `Skip`), into `status.health` + `status.resources`, and drives the adaptive requeue (`T09.5`; `T10.x` gates waves/hooks on it) |
+//! | Health | evaluated from the pass-level live read on **every** pass (including a `Skip`), into `status.health` + `status.resources`, and it is what the wave gate waits on (`T09.5`, `T10.2`) |
 //!
 //! Blocking work never runs on a Tokio worker: manifest file I/O and YAML parsing run in
 //! `tokio::task::spawn_blocking` here, and the repo/git layer does the same internally. Every
@@ -53,6 +56,19 @@
 //!   pruned_ok)`, and a mid-sync failure still persists the partial inventory
 //!   ([`ReconcileError::PartialSync`] / [`ReconcileError::SyncConflict`]), so a create that
 //!   already succeeded can never become an untracked orphan (finding C1).
+//! * **A wave is only done when it is `Healthy`** (`T10.2`). A pass applies **one** wave per
+//!   requeue and never sleeps waiting for it: the phase (`Sync(wave -1)`, …) lives in
+//!   `status.operationState`, which is patched *before* the requeue, so a controller restart resumes
+//!   where it stopped. A wave that carries a `CustomResourceDefinition` refreshes discovery before
+//!   the next wave (`WavePlan::contains_crd`), which is the `T08.3` rule lifted to the wave boundary.
+//! * **A hook is never desired state** (`T10.3`). Hooks are partitioned out before anything is
+//!   stamped, planned, diffed or inventoried; they are created with `Api::create` and tracked in
+//!   `status.operationState.activeHooks` by their rendered id, so a requeue observes the `Job` the
+//!   previous pass created instead of running the migration again (finding H2).
+//! * **A rollback is pinned, not compared** (`T10.5`). `{"rollback":{"id":N}}` is parsed before the
+//!   diff gate: the pass renders the *historical* commit, removes `spec.syncPolicy.automated` and
+//!   records a `Warning` condition, because a rollback `selfHeal` immediately reverts is not a
+//!   rollback.
 //! * **`Synced` is never reported as `Healthy`** (`T09.5` trap guard). `status.sync.status` comes
 //!   from the diff, `status.health.status` from the live objects' `status` blocks; a pass that
 //!   applies nothing still assesses health, and a pass that applied everything still reports
@@ -65,11 +81,12 @@ use std::time::Duration;
 
 use ferriscd_crd::application::DEFAULT_DESTINATION_CLUSTER;
 use ferriscd_crd::status::{
-    HealthState, REASON_SYNC_SUCCEEDED, ResourceStatus, SyncState, SyncStatus,
+    ApplicationStatus, HealthState, OperationPhase, OperationState, REASON_SYNC_SUCCEEDED,
+    ResourceStatus, RevisionHistoryEntry, SyncPhase, SyncState, SyncStatus,
 };
-use ferriscd_crd::{Application, annotations};
+use ferriscd_crd::{Application, SyncOptions, annotations};
 use ferriscd_engine::diff::{
-    DiffStatus, DiffSummary, IgnoreRuleSet, ResourceDiff, SyncDecision, should_sync,
+    DiffStatus, DiffSummary, IgnoreRuleSet, ResourceDiff, SyncDecision, SyncTrigger, should_sync,
     source_spec_hash,
 };
 use ferriscd_engine::graph::sort_keys_prune_order;
@@ -82,15 +99,21 @@ use ferriscd_engine::manifest::{
     ResourceKey,
 };
 use ferriscd_engine::repo::{GitSource, RepoCache, RepoCredentials, RepoUrlPolicy};
-use ferriscd_engine::sync::{OrphanCandidate, OrphanOwnership, PlanRequest, SyncPlan};
+use ferriscd_engine::sync::{
+    DEFAULT_REQUEUE_AFTER, OrphanCandidate, OrphanOwnership, PlanRequest, RollbackDecision,
+    RollbackError, StepAction, SyncMachine, SyncPlan, SyncStep, parse_rollback_request,
+    plan_rollback, record_operation_success,
+};
 use futures::future::BoxFuture;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::ResourceExt;
-use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
 use tracing::warn;
 
 use crate::controller::FailureClass;
 use crate::discovery::DiscoveryCache;
 use crate::dry_run::{DryRunApi, DryRunEvaluator};
+use crate::hooks::{self, HookCluster, HookRun};
 use crate::live_state::{
     ClusterStateReader, LiveObjectSource, LiveState, LiveStateMap, TrackingOwner, plan_fetch,
 };
@@ -100,7 +123,10 @@ use crate::reconcile::{
     SyncPipeline, now,
 };
 use crate::scope::{self, InBundleCrd};
-use crate::sync_executor::{ExecutionPolicy, LiveCrdStatusReader, SyncExecutor};
+use crate::sync_executor::{
+    ActionFailure, ExecutionPolicy, ExecutionReport, LiveCrdStatusReader, SyncExecutor,
+};
+use crate::waves::{self, BundleWaves};
 
 /// Requeue delay while any resource is pending on a `CustomResourceDefinition` or namespace.
 ///
@@ -116,6 +142,13 @@ pub const PENDING_REQUEUE: Duration = Duration::from_secs(10);
 /// polls at least this often; the interval is never *longer* than the configured
 /// `spec.requeueAfterSeconds` (so an operator who asked for a 3 s interval keeps it).
 pub const PROGRESSING_REQUEUE: Duration = Duration::from_secs(10);
+
+/// `Ready` reason while a multi-wave/hook operation is between requeues (`T10.2`).
+///
+/// A pass that dispatched one wave is neither `Synced` (later waves have not been applied yet) nor
+/// idle: the operator has to be able to tell "FerrisCD is working through the waves" from "nothing
+/// happened".
+pub const REASON_SYNC_IN_PROGRESS: &str = "SyncInProgress";
 
 /// The only destination cluster this milestone can talk to.
 pub const IN_CLUSTER: &str = DEFAULT_DESTINATION_CLUSTER;
@@ -136,7 +169,7 @@ pub const ALLOW_EMPTY_DESIRED_ENV: &str = "FERRISCD_ALLOW_EMPTY_DESIRED";
 pub const MAX_LOGGED_INVALID_POINTERS: usize = 8;
 
 /// What the `Ready` condition message reports.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct SyncCounts {
     /// Resources in the desired set.
     desired: usize,
@@ -163,6 +196,15 @@ struct SyncCounts {
     /// polled every [`PROGRESSING_REQUEUE`] instead of every `spec.requeueAfterSeconds`. It never
     /// touches `status.sync.status` — synced and healthy are different questions.
     health: HealthStatus,
+    /// Whether this pass completed the sync and may therefore claim `Synced`.
+    ///
+    /// A pass that dispatched one wave of a multi-wave rollout applied everything it was asked to,
+    /// but it is **not** a finished sync: the remaining waves have not been applied yet.
+    settled: bool,
+    /// The step an in-flight operation is waiting on (`Sync(wave 0)`, `PreSync`, …).
+    phase: Option<String>,
+    /// The state machine's requeue hint, which wins over the adaptive interval.
+    requeue: Option<Duration>,
 }
 
 /// One Server-Side Apply call.
@@ -198,6 +240,32 @@ pub enum DeleteOutcome {
     AlreadyGone,
 }
 
+/// One imperative create of a lifecycle hook (`T10.3`).
+#[derive(Debug)]
+pub struct CreateRequest<'a> {
+    /// The hook's rendered object (it is never part of the desired state).
+    pub resource: &'a DesiredResource,
+    /// Discovered resource of the hook's kind.
+    pub api_resource: &'a ApiResource,
+    /// Namespace for a namespaced hook; `None` for a cluster-scoped one.
+    pub namespace: Option<&'a str>,
+}
+
+/// One JSON merge patch on the `Application`'s **own** object (`T10.5`).
+///
+/// A rollback mutates `spec.syncPolicy.automated` and consumes the `ferriscd.io/operation`
+/// annotation, neither of which is part of the `/status` subresource. Both go through this narrow,
+/// typed seam so a test can assert exactly which patch a pass issued without an API server.
+#[derive(Debug)]
+pub struct ApplicationPatch<'a> {
+    /// Namespace of the `Application`.
+    pub namespace: &'a str,
+    /// Name of the `Application`.
+    pub name: &'a str,
+    /// Merge-patch body (never contains a manifest, never a secret).
+    pub patch: serde_json::Value,
+}
+
 /// Cluster mutation seam, so the pipeline is testable without an API server.
 pub trait Applier: Send + Sync + 'static {
     /// Server-Side Applies one desired resource.
@@ -211,6 +279,36 @@ pub trait Applier: Send + Sync + 'static {
         &'a self,
         request: DeleteRequest<'a>,
     ) -> BoxFuture<'a, Result<DeleteOutcome, ReconcileError>>;
+
+    /// Creates one lifecycle hook (`Api::create`, so `metadata.generateName` is honoured).
+    ///
+    /// Default: a terminal error. A hook is never applied as desired state, so a cluster seam that
+    /// only knows how to patch cannot run one, and silently doing nothing would report a
+    /// `PreSync` migration as done.
+    fn create<'a>(
+        &'a self,
+        _request: CreateRequest<'a>,
+    ) -> BoxFuture<'a, Result<DynamicObject, ReconcileError>> {
+        Box::pin(async {
+            Err(ReconcileError::Invalid {
+                message: "this cluster seam cannot create lifecycle hooks (Api::create is \
+                          required for generateName hooks)"
+                    .to_owned(),
+            })
+        })
+    }
+
+    /// Patches the `Application`'s own object (`spec`/`metadata`, never `/status`).
+    fn patch_application<'a>(
+        &'a self,
+        _request: ApplicationPatch<'a>,
+    ) -> BoxFuture<'a, Result<(), ReconcileError>> {
+        Box::pin(async {
+            Err(ReconcileError::Invalid {
+                message: "this cluster seam cannot patch the Application spec/metadata".to_owned(),
+            })
+        })
+    }
 }
 
 /// [`Applier`] backed by dynamic `Api` clients.
@@ -303,6 +401,44 @@ impl Applier for DynamicApiApplier {
             }
         })
     }
+
+    /// Creates a hook with `Api::create`, which is the *only* way `metadata.generateName` works.
+    ///
+    /// A `PreSync` migration must not be Server-Side Applied: SSA needs a name, so a
+    /// `generateName: migrate-` Job would either be rejected or (worse) overwrite the previous
+    /// run of a hook that has the same explicit name (finding H2).
+    fn create<'a>(
+        &'a self,
+        request: CreateRequest<'a>,
+    ) -> BoxFuture<'a, Result<DynamicObject, ReconcileError>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let resource = request.resource.key.canonical();
+            let api: Api<DynamicObject> =
+                dynamic_api(&client, request.api_resource, request.namespace);
+            let body = apply_body(&request.resource.object);
+            api.create(&PostParams::default(), &body)
+                .await
+                .map_err(|source| ReconcileError::Apply { resource, source })
+        })
+    }
+
+    fn patch_application<'a>(
+        &'a self,
+        request: ApplicationPatch<'a>,
+    ) -> BoxFuture<'a, Result<(), ReconcileError>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let api: Api<Application> = Api::namespaced(client, request.namespace);
+            api.patch(
+                request.name,
+                &PatchParams::default(),
+                &Patch::Merge(&request.patch),
+            )
+            .await?;
+            Ok(())
+        })
+    }
 }
 
 /// Builds the dynamic `Api` for `api_resource`, namespaced when `namespace` is set.
@@ -335,6 +471,91 @@ pub fn apply_body(object: &DynamicObject) -> DynamicObject {
     body
 }
 
+/// Everything one pass needs once the diff gate has decided (`T08.2`, `T10.2`).
+struct PassRequest<'a> {
+    app: &'a Application,
+    owner: &'a TrackingOwner,
+    revision: &'a str,
+    bundle: &'a BundleWaves,
+    live: &'a LiveStateMap,
+    statuses: &'a BTreeMap<ResourceKey, DiffStatus>,
+    deferred: &'a BTreeSet<ResourceKey>,
+    orphans: &'a [OrphanCandidate],
+    options: &'a SyncOptions,
+    decision: SyncDecision,
+    prune_enabled: bool,
+    prev_inventory: &'a Inventory,
+    now: &'a Time,
+}
+
+/// What one pass executed, aggregated over the plans it ran (one per wave, plus the prune step).
+#[derive(Debug, Default)]
+struct PassExecution {
+    /// One report per executed plan, in execution order.
+    reports: Vec<ExecutionReport>,
+    /// Orphans deliberately kept (planner `Skip`s and deletes the pruner declined).
+    retained: usize,
+    /// The `status.operationState` to persist (`None` = leave it untouched).
+    operation: Option<OperationState>,
+    /// Whether this pass completed the sync, i.e. may claim `Synced` and advance `lastSynced*`.
+    settled: bool,
+    /// The state machine's requeue hint while an operation is in flight.
+    requeue: Option<Duration>,
+}
+
+impl PassExecution {
+    /// Everything the pass confirmed (applies plus diff-verified live state).
+    fn confirmed(&self) -> Inventory {
+        let mut confirmed = Inventory::new();
+        for report in &self.reports {
+            for (key, entry) in report.confirmed() {
+                confirmed.entry(key).or_insert(entry);
+            }
+        }
+        confirmed
+    }
+
+    /// How many resources this pass actually wrote.
+    fn applied(&self) -> usize {
+        self.reports
+            .iter()
+            .map(|report| report.applied_ok.len())
+            .sum()
+    }
+
+    /// Every confirmed prune.
+    fn pruned_ok(&self) -> Vec<ResourceKey> {
+        self.reports
+            .iter()
+            .flat_map(|report| report.pruned_ok.iter().cloned())
+            .collect()
+    }
+
+    /// Everything still to do (deferred on a CRD/namespace).
+    fn pending(&self) -> BTreeSet<ResourceKey> {
+        let mut pending = BTreeSet::new();
+        for report in &self.reports {
+            pending.extend(report.pending.iter().cloned());
+        }
+        pending
+    }
+
+    /// How many mutating Server-Side Apply calls the pass issued.
+    fn apply_calls(&self) -> usize {
+        self.reports.iter().map(|report| report.apply_calls).sum()
+    }
+
+    /// The first failure, in execution order.
+    fn first_failure(&self) -> Option<&ActionFailure> {
+        self.reports.iter().find_map(ExecutionReport::first_failure)
+    }
+}
+
+/// A rollback this pass must honour (`T10.5`).
+struct RollbackRequested {
+    decision: RollbackDecision,
+}
+
 /// The wired [`SyncPipeline`].
 pub struct InventorySyncPipeline {
     repos: Arc<RepoCache>,
@@ -357,6 +578,8 @@ pub struct InventorySyncPipeline {
     health_config: HealthConfig,
     /// Phase 08 executor pacing (CRD `Established` wait, `Replace` delete wait).
     execution_policy: ExecutionPolicy,
+    /// Phase 10 wave/hook state machine (timeouts, wave gate, requeue hint).
+    machine: SyncMachine,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -401,6 +624,7 @@ impl InventorySyncPipeline {
             health: HealthRegistry::builtin(),
             health_config: HealthConfig::default(),
             execution_policy: ExecutionPolicy::default(),
+            machine: SyncMachine::default(),
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -493,7 +717,31 @@ impl InventorySyncPipeline {
         self.url_policy
     }
 
+    /// Overrides the wave/hook state machine (`T10.1` tunables).
+    ///
+    /// Production uses [`SyncMachine::default`] (5 s requeue, 10 min wave and operation timeouts);
+    /// hermetic tests shorten the timeouts so a stuck wave is provable without sleeping.
+    #[must_use]
+    pub fn with_sync_machine(mut self, machine: SyncMachine) -> Self {
+        self.machine = machine;
+        self
+    }
+
+    /// The wave/hook state machine this pipeline drives.
+    #[must_use]
+    pub fn machine(&self) -> &SyncMachine {
+        &self.machine
+    }
+
     /// Runs one apply pass.
+    ///
+    /// The pass is one of two shapes, and which one is a property of the **commit**, not of a
+    /// configuration flag (see [`BundleWaves::needs_operation`]):
+    ///
+    /// * a single hook-less wave is applied in one pass exactly like Phase 08
+    ///   ([`Self::run_single_pass`]);
+    /// * anything with several waves, a lifecycle hook, or an operation that is already running is
+    ///   driven by [`SyncMachine`] across requeues ([`Self::run_operation`]).
     async fn sync_apply(&self, app: &Application) -> Result<ApplyOutcome, ReconcileError> {
         app.spec.validate().map_err(|err| ReconcileError::Invalid {
             message: err.to_string(),
@@ -515,6 +763,20 @@ impl InventorySyncPipeline {
                 .to_owned(),
         })?;
         let prev_inventory = status_inventory(app)?;
+        let previous_status = app.status.clone().unwrap_or_default();
+        let pass_started = now();
+
+        // --- Phase 10: the rollback request decides *which commit* this pass sees ---------
+        // Parsed before the diff gate and before `spec.source` is resolved: a rollback that first
+        // applied `HEAD` and then "rolled back" would have mutated the cluster towards the wrong
+        // commit (and, with `selfHeal`, fought itself on every requeue).
+        let rollback = self
+            .plan_rollback(app, &previous_status, &pass_started)
+            .await?;
+        let pinned_revision = rollback
+            .as_ref()
+            .map(|rollback| rollback.decision.pinned_revision().to_owned())
+            .or_else(|| pinned_rollback_revision(&previous_status));
 
         if options.server_side_force {
             warn!(
@@ -525,15 +787,25 @@ impl InventorySyncPipeline {
             );
         }
 
-        let (revision, mut resources) = self.fetch_desired(app).await?;
+        let (revision, mut resources) = self.fetch_desired(app, pinned_revision.as_deref()).await?;
         let (in_bundle_crds, in_bundle_namespaces) = self
             .prepare(&mut resources, &app.spec.destination.namespace)
             .await?;
-        // Stamp ownership *after* scope normalization, because the marker is rendered from the
-        // final GKNN key (Phase 05 mirrors the effective namespace onto the key).
-        stamp_ownership(&mut resources, &owner)?;
 
-        let desired_inventory = inventory::inventory_from_desired(&resources);
+        // --- Phase 10: hooks out of the desired state, permanent set into waves ------------
+        // The partition is what keeps a hook out of `status.inventory`, the pruner's universe and
+        // the drift diff (finding H2), so it happens before anything is stamped, planned or read.
+        let mut bundle = BundleWaves::partition(resources).map_err(ReconcileError::Manifest)?;
+        // Stamp ownership *after* scope normalization, because the marker is rendered from the
+        // final GKNN key (Phase 05 mirrors the effective namespace onto the key) — and only onto
+        // the permanent half: a hook is never prunable inventory.
+        stamp_ownership(bundle.hooks.permanent_mut(), &owner)?;
+        // The wave plan owns clones of the permanent resources, so it has to be re-derived from the
+        // stamped half — a plan built before the stamp would apply every wave member without its
+        // `ferriscd.io/tracking-id` and report that annotation as permanent drift.
+        bundle.replan().map_err(ReconcileError::Manifest)?;
+
+        let desired_inventory = bundle.hooks.permanent_inventory();
         // Safety rail: an empty desired set over a non-empty inventory is far more likely to be
         // a wrong `spec.source.git.path` than an intentional "delete everything". Require an
         // explicit opt-in before a pass that would prune the whole inventory.
@@ -566,7 +838,7 @@ impl InventorySyncPipeline {
         // Trap guard: ownership is verified for the whole bundle *before* any mutation — and
         // before the dry-run pass, so an object another `Application` owns never even receives a
         // `dryRun=All` PATCH. The failure is terminal and still reports `OutOfSync`.
-        if let Err(err) = reject_foreign_ownership(&resources, &live) {
+        if let Err(err) = reject_foreign_ownership(bundle.hooks.permanent(), &live) {
             return Err(ReconcileError::OwnershipConflict {
                 message: err.to_string(),
                 inventory: prev_inventory,
@@ -575,19 +847,16 @@ impl InventorySyncPipeline {
         }
 
         // --- Phase 07: diff gate -------------------------------------------------------
-        // The dry-run diff runs over `resources`, which is the *stamped* slice the applier
-        // receives below (see `DryRunEvaluator::evaluate`'s desired-body contract: diffing a
-        // pre-stamp body would look like a request to remove `ferriscd.io/tracking-id`, leaving
-        // every resource `OutOfSync` forever).
+        // The dry-run diff runs over the *permanent* stamped slice the applier receives (see
+        // `DryRunEvaluator::evaluate`'s desired-body contract): diffing a pre-stamp body would look
+        // like a request to remove `ferriscd.io/tracking-id`, leaving every resource `OutOfSync`
+        // forever. A hook is never diffed: it is created imperatively and its lifetime belongs to
+        // its delete policy, not to the cluster-vs-Git comparison.
         let orphan_keys = inventory::orphans(&desired_inventory, &prev_inventory);
         let rules = IgnoreRuleSet::from_ignore_differences(&app.spec.ignore_differences);
-        // Finding H1: a pointer that is not valid RFC 6901 is never applied (a typo must not
-        // fail the reconcile), so it must be *visible* instead of silently dropped: one warning
-        // per pointer here, plus a count in the `Ready` message below (a log line is not
-        // observable on the CR).
         let invalid_ignore_pointers = report_invalid_pointers(&rules, &owner);
         let diffs = self
-            .evaluate_diff(&resources, &orphan_keys, &live, &rules)
+            .evaluate_diff(bundle.hooks.permanent(), &orphan_keys, &live, &rules)
             .await?;
         let summary = DiffSummary::from_diffs(&diffs);
         let spec_hash = source_spec_hash(&app.spec).map_err(|err| ReconcileError::Invalid {
@@ -596,10 +865,6 @@ impl InventorySyncPipeline {
         let decision = should_sync(app, &revision, &spec_hash, &summary, manual_operation(app));
         let statuses = status_by_key(&diffs);
 
-        // --- Phase 08: the explicit sync plan (T08.2) --------------------------------------
-        // Everything that may be mutated is decided here, by pure engine code, before a single
-        // API call: applies/replaces in tier order, ownership-verified prunes in exact reverse,
-        // and a `Skip` (with its reason) for everything the safety rails refuse to touch.
         let orphans: Vec<OrphanCandidate> = orphan_keys
             .iter()
             .map(|key| orphan_candidate(key, &live))
@@ -607,7 +872,9 @@ impl InventorySyncPipeline {
         // A resource the pass-level live read deferred on a *Namespace* cannot be applied yet;
         // one deferred on a *CRD* is planned as an apply, because the executor establishes the
         // CRD and refreshes discovery inside this very pass (T08.3, trap T6).
-        let deferred: BTreeSet<ResourceKey> = resources
+        let deferred: BTreeSet<ResourceKey> = bundle
+            .hooks
+            .permanent()
             .iter()
             .filter(|resource| {
                 matches!(
@@ -618,97 +885,88 @@ impl InventorySyncPipeline {
             .map(|resource| resource.key.clone())
             .collect();
         let prune_enabled = prune_enabled(app);
-        let plan = SyncPlan::build(
-            &PlanRequest::new(
-                decision,
-                &resources,
-                &statuses,
-                &options,
-                &app.spec.destination.namespace,
-            )
-            .with_deferred(&deferred)
-            .with_orphans(&orphans)
-            .with_prune(prune_enabled),
-        );
-        if decision.is_execute() {
-            tracing::debug!(
-                app.namespace = %owner.namespace,
-                app.name = %owner.name,
-                decision = %decision,
-                applies = plan.summary().apply,
-                replaces = plan.summary().replace,
-                prunes = plan.summary().prune,
-                skips = plan.summary().skip,
-                out_of_sync = summary.out_of_sync,
-                missing = summary.missing,
-                synced = summary.synced,
-                "diff gate decided to sync"
-            );
-        } else {
-            tracing::debug!(
-                app.namespace = %owner.namespace,
-                app.name = %owner.name,
-                decision = %decision,
-                out_of_sync = summary.out_of_sync,
-                missing = summary.missing,
-                "diff gate skipped this reconcile"
-            );
-        }
 
-        // --- Phase 08: execute the plan (T08.3/T08.4/T08.5) --------------------------------
-        let policy = ExecutionPolicy {
-            takeover_field_managers: options.takeover_field_managers.clone(),
-            ..self.execution_policy.clone()
+        // --- Phase 08/10: execute -------------------------------------------------------
+        let request = PassRequest {
+            app,
+            owner: &owner,
+            revision: &revision,
+            bundle: &bundle,
+            live: &live,
+            statuses: &statuses,
+            deferred: &deferred,
+            orphans: &orphans,
+            options: &options,
+            decision,
+            prune_enabled,
+            prev_inventory: &prev_inventory,
+            now: &pass_started,
         };
-        let crd_status = LiveCrdStatusReader::new(self.reader.clone());
-        let pruner = OwnershipVerifiedPruner::new(
-            self.applier.as_ref(),
-            &self.reader,
-            &self.discovery,
-            &owner,
-            &options,
-        );
-        let execution = SyncExecutor::new(
-            self.applier.as_ref(),
-            &pruner,
-            &self.reader,
-            &self.discovery,
-            &crd_status,
-            &owner,
-            &policy,
-        )
-        .execute(&plan, &resources, &prev_inventory)
-        .await;
+        let pass = if bundle.needs_operation(BundleWaves::operation_running(app.status.as_ref())) {
+            self.run_operation(&request).await?
+        } else {
+            self.run_single_pass(&request).await
+        };
         // The zero-mutation seam (T07.5): only the SSA applies are counted, never a
         // `dryRun=All` prediction.
         self.mutating_applies
-            .fetch_add(execution.apply_calls, Ordering::SeqCst);
+            .fetch_add(pass.apply_calls(), Ordering::SeqCst);
 
         // Crash-safe inventory: `next_inventory = (prev \ pruned_ok) ∪ (applied_ok ∪ synced)`.
-        let next_inventory = inventory::next_inventory(
-            &prev_inventory,
-            &execution.confirmed(),
-            &execution.pruned_ok,
-        );
+        let next_inventory =
+            inventory::next_inventory(&prev_inventory, &pass.confirmed(), &pass.pruned_ok());
 
-        if let Some(failure) = execution.first_failure() {
+        if let Some(failure) = pass.first_failure() {
             // A policy failure (immutable field without `Replace`, an unlisted field manager, a
-            // foreign owner) can never be fixed by retrying; everything else is a partial sync
-            // the next pass converges from. Both carry the inventory that is already true, so a
-            // create that succeeded never becomes an untracked orphan (finding C1).
+            // foreign owner) can never be fixed by retrying; everything else is a partial sync the
+            // next pass converges from. Both carry the inventory that is already true, so a create
+            // that succeeded never becomes an untracked orphan (finding C1). The retryable case also
+            // carries the `operationState` this pass reached (finding M4): its `activeHooks` records
+            // are the only thing that keeps the next pass from creating a second `generateName` hook
+            // (a second database migration) instead of observing the one that already exists.
             let message = failure.error.to_string();
+            let operation = pass.operation.clone().map(Box::new);
             return Err(match failure.error.failure_class() {
                 FailureClass::Terminal => ReconcileError::SyncConflict {
                     message,
                     inventory: next_inventory,
                     revision: Some(revision),
+                    // Finding H-A: a terminal failure drops nothing either. The state (and with it
+                    // `activeHooks`) has to reach `/status` for both failure classes, or the next
+                    // pass sees a hook that already exists as untracked.
+                    operation,
                 },
                 FailureClass::Retryable => ReconcileError::PartialSync {
                     message,
                     inventory: next_inventory,
                     revision: Some(revision),
+                    operation,
                 },
             });
+        }
+
+        // --- Phase 10: history, and consuming a completed rollback request ---------------
+        let deployment_is_new = previous_status
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.last_synced_revision.as_deref())
+            != Some(revision.as_str());
+        let operation = pass.operation.clone().or_else(|| {
+            // A single-pass sync is an operation too (`T10.5`): recording it is what makes a later
+            // `{"rollback":{"id":N}}` possible for an application that has no waves.
+            pass.settled
+                .then(|| succeeded_operation(&revision, &pass_started, bundle.plan.last_wave()))
+        });
+        let history = match (&operation, pass.settled && deployment_is_new) {
+            (Some(operation), true) => record_history(&previous_status, app, operation),
+            _ => None,
+        };
+        if let Some(rollback) = &rollback
+            && pass.settled
+        {
+            // The request has been honoured: consuming it keeps a stale annotation from pinning the
+            // application forever (the pin now lives in `/status`, next to its warning condition).
+            self.consume_operation(app, rollback).await?;
         }
 
         // --- Phase 09: health --------------------------------------------------------------
@@ -716,19 +974,44 @@ impl InventorySyncPipeline {
         // and sync are orthogonal (T09.5 trap guard). A `Deployment` can be `Synced` and
         // `ImagePullBackOff` at the same time, and it can be `OutOfSync` (an HPA owns
         // `spec.replicas`) while every pod is serving.
-        let assessment = self.assess_health(&resources, &live, &execution.confirmed());
+        let assessment = self.assess_health(
+            bundle.hooks.permanent(),
+            &live,
+            &pass.confirmed(),
+            &waves::scheduled_keys(&bundle.plan, pass.operation.as_ref()),
+        );
         let counts = SyncCounts {
-            desired: resources.len(),
-            applied: execution.applied_ok.len(),
-            pruned: execution.pruned_ok.len(),
+            desired: desired_inventory.len(),
+            applied: pass.applied(),
+            pruned: pass.pruned_ok().len(),
             // A retained orphan is either a `Skip` the plan refused (foreign, unmanaged,
             // rail-protected, pruning disabled) or a prune the pruner declined at delete time.
-            retained_orphans: execution.retained + plan.retained_orphans().len(),
-            pending: execution.pending.len(),
+            retained_orphans: pass.retained,
+            pending: pass.pending().len(),
             invalid_ignore_pointers,
             prune_enabled,
             health: assessment.status,
+            settled: pass.settled,
+            phase: pass.operation.as_ref().map(|state| {
+                waves::step_label(
+                    state.sync_phase.unwrap_or(SyncPhase::Sync),
+                    state.current_wave,
+                )
+            }),
+            requeue: pass.requeue,
         };
+        tracing::debug!(
+            app.namespace = %owner.namespace,
+            app.name = %owner.name,
+            decision = %decision,
+            waves = bundle.plan.wave_count(),
+            hooks = bundle.hooks.hooks().len(),
+            out_of_sync = summary.out_of_sync,
+            missing = summary.missing,
+            synced = summary.synced,
+            health = %health::status_label(assessment.status),
+            "completed a reconcile pass"
+        );
         let outcome = build_outcome(
             app,
             decision,
@@ -744,26 +1027,415 @@ impl InventorySyncPipeline {
                 message: Some(assessment.message.clone()),
             },
             resource_statuses(&assessment, &desired_inventory),
+        )
+        .with_operation_state(operation)
+        .with_history(history);
+        Ok(match rollback {
+            Some(rollback) => outcome.with_warning(rollback.decision.condition),
+            None => outcome,
+        })
+    }
+
+    /// Applies the whole permanent set in one pass (Phase 08 behaviour).
+    ///
+    /// Used for a bundle with exactly one wave and no lifecycle hooks: there is nothing to order
+    /// and nothing to wait for, so the operation state machine would only add a requeue.
+    async fn run_single_pass(&self, request: &PassRequest<'_>) -> PassExecution {
+        let (plan, execution) = self
+            .execute_plan(
+                request.bundle.hooks.permanent(),
+                request.decision,
+                request.statuses,
+                request.deferred,
+                request.orphans,
+                request.options,
+                request.prune_enabled,
+                request.owner,
+                &request.app.spec.destination.namespace,
+                request.prev_inventory,
+            )
+            .await;
+        if request.decision.is_execute() {
+            log_plan(request, &plan);
+        } else {
+            tracing::debug!(
+                app.namespace = %request.owner.namespace,
+                app.name = %request.owner.name,
+                decision = %request.decision,
+                "diff gate skipped this reconcile"
+            );
+        }
+        // Only "executed *and* nothing left pending" is a full sync.
+        let settled = request.decision.is_execute() && execution.pending.is_empty();
+        PassExecution {
+            retained: execution.retained + plan.retained_orphans().len(),
+            reports: vec![execution],
+            operation: None,
+            settled,
+            requeue: None,
+        }
+    }
+
+    /// Drives one step of a multi-wave / hook operation (`T10.1`, `T10.2`, `T10.3`).
+    ///
+    /// One pass does exactly one of the following, and every branch persists the state it reached
+    /// **before** the caller requeues (crash safety):
+    ///
+    /// 1. run the hooks of the persisted step (create what is missing, observe what is tracked);
+    /// 2. step the pure machine with the health that step is judged on;
+    /// 3. execute what the machine asked for — a wave's Server-Side Applies, or nothing at all when
+    ///    it asked to wait — and, once every `Sync` wave has converged, the prunes.
+    async fn run_operation(
+        &self,
+        request: &PassRequest<'_>,
+    ) -> Result<PassExecution, ReconcileError> {
+        let mut pass = PassExecution::default();
+        let schedule = request.bundle.schedule();
+        let persisted = request
+            .app
+            .status
+            .as_ref()
+            .and_then(|status| status.operation_state.clone());
+
+        // 1. Start a new operation, or resume the persisted one.
+        let mut state = match persisted.as_ref() {
+            Some(state) if state.phase == OperationPhase::Running => state.clone(),
+            Some(state) if failed_operation_is_not_retried(request, state) => {
+                // Finding M5: a `Failed` operation is only restarted for a **new revision** or an
+                // explicit manual operation. Restarting it on every requeue would re-run `PreSync`
+                // (and `SyncFail`) hooks against an unchanged commit — for a `generateName` hook a
+                // brand-new `Job`, i.e. a migration that already failed re-run forever.
+                tracing::debug!(
+                    app.namespace = %request.owner.namespace,
+                    app.name = %request.owner.name,
+                    revision = %request.revision,
+                    operation_message = state.message.as_deref().unwrap_or_default(),
+                    "the persisted operation failed; waiting for a new revision or a manual operation"
+                );
+                // Reported as-is: the failure reason lives in `operationState.message`.
+                pass.operation = Some(state.clone());
+                return Ok(pass);
+            }
+            _ if request.decision.is_execute() => {
+                self.machine
+                    .start(Some(request.revision.to_owned()), request.now)
+                    .state
+            }
+            // Nothing to do: no operation is running and the gate said `Skip`.
+            _ => return Ok(pass),
+        };
+
+        // 2. The hooks of the persisted step. Idempotent by construction: a hook that is already
+        //    tracked is observed, never created again (finding H2).
+        let step = self.machine.current_step(&state);
+        let hook_step =
+            hooks::run_step(self, step, &request.bundle.hooks, &state.active_hooks).await;
+        // The records are merged **before** the error is inspected (finding H-NEW): a hook created
+        // before the failure is only protected by its `activeHooks` record, and `apply_once` can
+        // only persist the state the error carries. Merging afterwards would let the retry create a
+        // second `migrate-*` `Job` for a hook that already exists.
+        waves::merge_hook_records(&mut state.active_hooks, &hook_step.run.records);
+        log_hooks(request, step, &hook_step.run);
+        if let Some(error) = hook_step.error {
+            // No wave was applied yet (hooks run before the step executes), so the inventory that
+            // is already true is the one the pass read.
+            return Err(mid_operation_error(
+                request,
+                &error,
+                request.prev_inventory,
+                Some(state),
+            ));
+        }
+        let hook_run = hook_step.run;
+        if let Some(name) = &hook_run.pending_delete {
+            // `BeforeHookCreation` deleted a previous run of a named hook and Kubernetes has not
+            // finished reaping it: re-creating now would answer `409 AlreadyExists` (finding M3), so
+            // this pass only requeues.
+            tracing::debug!(
+                app.namespace = %request.owner.namespace,
+                app.name = %request.owner.name,
+                hook = %name,
+                step = %step,
+                "waiting for a previous hook run to be deleted"
+            );
+            pass.operation = Some(state);
+            pass.requeue = Some(DEFAULT_REQUEUE_AFTER);
+            return Ok(pass);
+        }
+
+        // 3. One pure step: the machine owns the phase graph, the timeouts and the failure path.
+        let health = waves::step_health(
+            step,
+            &request.bundle.plan,
+            request.live,
+            &hook_run.observed,
+            &self.health,
+            &self.health_config,
         );
-        tracing::debug!(
+        let outcome = self.machine.step(
+            &state,
+            &schedule,
+            &health,
+            Some(request.revision),
+            request.now,
+        );
+        pass.operation = Some(outcome.state.clone());
+        pass.requeue = outcome.action.requeue_after();
+
+        // 4. Execute what the machine asked for.
+        let mut targets = Vec::new();
+        if let StepAction::Execute { step: target, .. } = outcome.action {
+            targets.push(target);
+        }
+        for target in targets {
+            if target.phase != SyncPhase::Sync {
+                // A hook phase was already handled in step 2; its verdict is what moved the machine.
+                // (A `Sync` hook of a wave the machine *dispatches* in this pass is created on the
+                // next one: the hooks of the persisted step are the ones this pass may act on, and
+                // the wave's own `Execute` is idempotent, so nothing is skipped — only ordered.)
+                continue;
+            }
+            let Some(wave) = request.bundle.plan.wave(target.wave) else {
+                continue;
+            };
+            let mut wave_options = request.options.clone();
+            // The destination namespace is created once, by the first wave: re-applying it on every
+            // wave would bump its `resourceVersion` (and churn `managedFields`) for nothing.
+            wave_options.create_namespace = request
+                .bundle
+                .plan
+                .wave_numbers()
+                .first()
+                .is_some_and(|first| *first == target.wave)
+                && request.options.create_namespace;
+            let (plan, execution) = self
+                .execute_plan(
+                    &wave.resources,
+                    forced_execute(request.decision),
+                    request.statuses,
+                    request.deferred,
+                    // Pruning never happens between waves: an orphan is reaped once the whole
+                    // rollout has converged (see below).
+                    &[],
+                    &wave_options,
+                    false,
+                    request.owner,
+                    &request.app.spec.destination.namespace,
+                    request.prev_inventory,
+                )
+                .await;
+            log_plan(request, &plan);
+            pass.retained += execution.retained + plan.retained_orphans().len();
+            pass.reports.push(execution);
+            // `T10.2` trap guard: a wave that carries a `CustomResourceDefinition` registers new
+            // kinds only once the API server establishes it, so the next wave must resolve against a
+            // refreshed discovery snapshot (this is `T08.3`'s rule, lifted to the wave boundary).
+            if request.bundle.plan.contains_crd(target.wave) {
+                // A refresh failure stops the pass, but not the state: the wave that was just
+                // applied (and any hook record) must survive the requeue (finding H-NEW).
+                if let Err(error) = self.discovery.invalidate_and_refresh().await {
+                    let inventory =
+                        inventory::next_inventory(request.prev_inventory, &pass.confirmed(), &[]);
+                    return Err(mid_operation_error(
+                        request,
+                        &ReconcileError::from(error),
+                        &inventory,
+                        pass.operation.take(),
+                    ));
+                }
+            }
+        }
+
+        // Pruning runs once every `Sync` wave has converged: on the `PostSync` step, which is always
+        // part of the schedule. A prune in the middle of a rollout could delete a resource that a
+        // later wave depends on, and a hook-only commit (no permanent resources at all) still has to
+        // be able to prune what a previous commit left behind.
+        let prune_due = step.phase == SyncPhase::PostSync
+            || outcome
+                .action
+                .step()
+                .is_some_and(|target| target.phase == SyncPhase::PostSync);
+        if prune_due {
+            let mut prune_options = request.options.clone();
+            prune_options.create_namespace = false;
+            let (plan, execution) = self
+                .execute_plan(
+                    &[],
+                    SyncDecision::Execute(SyncTrigger::PruneRequired),
+                    request.statuses,
+                    request.deferred,
+                    request.orphans,
+                    &prune_options,
+                    request.prune_enabled,
+                    request.owner,
+                    &request.app.spec.destination.namespace,
+                    request.prev_inventory,
+                )
+                .await;
+            pass.retained += execution.retained + plan.retained_orphans().len();
+            pass.reports.push(execution);
+        }
+
+        pass.settled = outcome.state.phase == OperationPhase::Succeeded;
+        Ok(pass)
+    }
+
+    /// Builds and executes the plan for one slice of desired resources.
+    ///
+    /// The single place that turns "these resources, this decision" into cluster calls, so the
+    /// Phase 08 executor (its rails, its `Replace` recovery, its ownership-verified prune, its CRD
+    /// `Established` wait) is shared bit-for-bit by a single pass, each wave, and the prune step.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_plan(
+        &self,
+        desired: &[DesiredResource],
+        decision: SyncDecision,
+        statuses: &BTreeMap<ResourceKey, DiffStatus>,
+        deferred: &BTreeSet<ResourceKey>,
+        orphans: &[OrphanCandidate],
+        options: &SyncOptions,
+        prune_enabled: bool,
+        owner: &TrackingOwner,
+        destination_namespace: &str,
+        prev_inventory: &Inventory,
+    ) -> (SyncPlan, ExecutionReport) {
+        let request = PlanRequest::new(decision, desired, statuses, options, destination_namespace)
+            .with_deferred(deferred)
+            .with_orphans(orphans)
+            .with_prune(prune_enabled);
+        let plan = SyncPlan::build(&request);
+        let policy = ExecutionPolicy {
+            takeover_field_managers: options.takeover_field_managers.clone(),
+            ..self.execution_policy.clone()
+        };
+        let crd_status = LiveCrdStatusReader::new(self.reader.clone());
+        let pruner = OwnershipVerifiedPruner::new(
+            self.applier.as_ref(),
+            &self.reader,
+            &self.discovery,
+            owner,
+            options,
+        );
+        let execution = SyncExecutor::new(
+            self.applier.as_ref(),
+            &pruner,
+            &self.reader,
+            &self.discovery,
+            &crd_status,
+            owner,
+            &policy,
+        )
+        .execute(&plan, desired, prev_inventory)
+        .await;
+        (plan, execution)
+    }
+
+    /// Resolves and applies a `{"rollback":{"id":N}}` request (`T10.5`).
+    ///
+    /// Returns the decision when the annotation really is a rollback request. Pins
+    /// `spec.syncPolicy.automated` to disabled **before** the diff gate runs: with automation left
+    /// on, the very next reconcile compares live state against `HEAD` and self-heals the rollback
+    /// away — the classic GitOps rollback-vs-`selfHeal` fight loop.
+    async fn plan_rollback(
+        &self,
+        app: &Application,
+        status: &ApplicationStatus,
+        now: &Time,
+    ) -> Result<Option<RollbackRequested>, ReconcileError> {
+        let Some(raw) = app.annotations().get(annotations::OPERATION).cloned() else {
+            return Ok(None);
+        };
+        let request = match parse_rollback_request(&raw) {
+            Ok(request) => request,
+            // `{"sync":{...}}` (or any other operation) is a manual sync request, not a rollback.
+            Err(RollbackError::NotARollback) => return Ok(None),
+            Err(err) => {
+                return Err(ReconcileError::Invalid {
+                    message: err.to_string(),
+                });
+            }
+        };
+        let decision =
+            plan_rollback(status, request, now).map_err(|err| ReconcileError::Invalid {
+                message: err.to_string(),
+            })?;
+
+        // Idempotent: a spec that is already manual-only is not patched again.
+        let mut spec = app.spec.clone();
+        if decision.apply_to_spec(&mut spec) {
+            let owner =
+                TrackingOwner::for_application(app).ok_or_else(|| ReconcileError::Invalid {
+                    message: "the Application has no metadata.namespace, so its spec cannot be \
+                          patched"
+                        .to_owned(),
+                })?;
+            self.applier
+                .patch_application(ApplicationPatch {
+                    namespace: &owner.namespace,
+                    name: &owner.name,
+                    patch: serde_json::json!({
+                        "spec": { "syncPolicy": { "automated": serde_json::Value::Null } }
+                    }),
+                })
+                .await?;
+            warn!(
+                app.namespace = %owner.namespace,
+                app.name = %owner.name,
+                history_id = decision.target.history_id,
+                revision = %decision.pinned_revision(),
+                "rollback: spec.syncPolicy.automated was removed so self-heal cannot overwrite the \
+                 pinned revision; revert the commit in Git and re-enable automation"
+            );
+        }
+        Ok(Some(RollbackRequested { decision }))
+    }
+
+    /// Consumes the `ferriscd.io/operation` annotation of a rollback that has been applied.
+    ///
+    /// The pin and its `Warning` condition now live in `/status`, so leaving the annotation behind
+    /// would keep asking for the same rollback on every requeue (and keep forcing a manual sync).
+    async fn consume_operation(
+        &self,
+        app: &Application,
+        rollback: &RollbackRequested,
+    ) -> Result<(), ReconcileError> {
+        let owner = TrackingOwner::for_application(app).ok_or_else(|| ReconcileError::Invalid {
+            message: "the Application has no metadata.namespace, so its annotations cannot be \
+                      patched"
+                .to_owned(),
+        })?;
+        self.applier
+            .patch_application(ApplicationPatch {
+                namespace: &owner.namespace,
+                name: &owner.name,
+                patch: serde_json::json!({
+                    "metadata": { "annotations": { annotations::OPERATION: serde_json::Value::Null } }
+                }),
+            })
+            .await?;
+        tracing::info!(
             app.namespace = %owner.namespace,
             app.name = %owner.name,
-            health = %health::status_label(assessment.status),
-            health_message = %assessment.message,
-            requeue_seconds = outcome.requeue.map(|delay| delay.as_secs()).unwrap_or_default(),
-            "assessed application health"
+            history_id = rollback.decision.target.history_id,
+            revision = %rollback.decision.pinned_revision(),
+            "rollback applied: consumed the ferriscd.io/operation annotation"
         );
-        Ok(outcome)
+        Ok(())
     }
 
     /// Assesses the health of the desired set from this pass's live read (`T09.5`).
+    ///
+    /// `scheduled` is the part of `resources` a *later* wave of the running operation owns
+    /// (finding M3): those resources have deliberately not been created yet, so they are
+    /// `Progressing` (scheduled) instead of `Missing`.
     fn assess_health(
         &self,
         resources: &[DesiredResource],
         live: &LiveStateMap,
         applied: &Inventory,
+        scheduled: &BTreeSet<ResourceKey>,
     ) -> HealthSummary {
-        let inputs = health_inputs(resources, live, applied);
+        let inputs = health_inputs(resources, live, applied, scheduled);
         health::assess(&inputs, &self.health, &self.health_config)
     }
 
@@ -795,13 +1467,19 @@ impl InventorySyncPipeline {
     /// normalize steps a plain-YAML bundle does. The pipeline returns the bundle already tier
     /// sorted, and its result cache is keyed on the full render tuple, so a periodic requeue at an
     /// unchanged commit costs one hash lookup instead of a `kustomize`/`helm` subprocess.
+    ///
+    /// `pinned` overrides `spec.source.git.targetRevision` (`T10.5`): a rollback — or an application
+    /// still holding a rollback warning — must render the commit it was pinned to, never `HEAD`.
     async fn fetch_desired(
         &self,
         app: &Application,
+        pinned: Option<&str>,
     ) -> Result<(String, Vec<DesiredResource>), ReconcileError> {
         let source = GitSource::new(
             app.spec.source.git.repo_url.clone(),
-            app.spec.source.git.target_revision.clone(),
+            pinned
+                .map(str::to_owned)
+                .unwrap_or_else(|| app.spec.source.git.target_revision.clone()),
             app.spec.source.git.path.clone(),
         );
         // Explicit, configurable local-repository policy: `Production` rejects `file://` and
@@ -871,8 +1549,10 @@ impl InventorySyncPipeline {
             &self.discovery,
             &in_bundle_crds,
         )?;
-        // Namespace injection can create GKNN collisions that were absent in the raw set.
-        manifest::check_duplicate_keys(resources.iter())?;
+        // Namespace injection can create GKNN collisions that were absent in the raw set. Hooks are
+        // excluded: a `generateName` hook has no name at all, so two of them legitimately share a
+        // GKNN — they are distinguishable only by their rendered id (`T10.3`, finding H2).
+        manifest::check_duplicate_keys(resources.iter().filter(|resource| !is_hook(resource)))?;
         Ok((in_bundle_crds, in_bundle_namespaces))
     }
 
@@ -945,10 +1625,272 @@ impl SyncPipeline for InventorySyncPipeline {
     }
 }
 
-/// Stamps `ferriscd.io/tracking-id` onto every desired resource.
+/// Implements the [`HookCluster`] seam over the pipeline's own collaborators.
 ///
-/// Hooks are never stamped (and are rejected earlier), so nothing that could be created
-/// imperatively ends up looking prunable.
+/// Hooks are created with `Api::create` (see [`Applier::create`]) and are **not** stamped with a
+/// `ferriscd.io/tracking-id`: their lifetime belongs to their delete policy, not to the pruner. The
+/// health read deliberately goes through [`ClusterStateReader::get_object`] (no ownership
+/// classification), because a hook object is neither `OwnedBySelf` nor foreign — it is simply not
+/// part of Git.
+impl HookCluster for InventorySyncPipeline {
+    fn create_hook<'a>(
+        &'a self,
+        resource: &'a DesiredResource,
+    ) -> BoxFuture<'a, Result<DynamicObject, ReconcileError>> {
+        Box::pin(async move {
+            let gvk = kube::core::GroupVersionKind::gvk(
+                &resource.gvk.group,
+                &resource.gvk.version,
+                &resource.gvk.kind,
+            );
+            let (api_resource, _) = self.discovery.resolve(&gvk).await?;
+            self.applier
+                .create(CreateRequest {
+                    resource,
+                    api_resource: &api_resource,
+                    namespace: resource.key.namespace.as_deref(),
+                })
+                .await
+        })
+    }
+
+    fn delete_hook<'a>(
+        &'a self,
+        key: &'a ResourceKey,
+        version_hint: &'a str,
+    ) -> BoxFuture<'a, Result<DeleteOutcome, ReconcileError>> {
+        Box::pin(async move {
+            let api_resource = self.resolve_hook_resource(key, version_hint).await?;
+            self.applier
+                .delete(DeleteRequest {
+                    key,
+                    api_resource: &api_resource,
+                    namespace: key.namespace.as_deref(),
+                })
+                .await
+        })
+    }
+
+    fn hook_health<'a>(
+        &'a self,
+        key: &'a ResourceKey,
+        version_hint: &'a str,
+    ) -> BoxFuture<'a, Result<Option<HealthStatus>, ReconcileError>> {
+        Box::pin(async move {
+            let api_resource = self.resolve_hook_resource(key, version_hint).await?;
+            let object = self
+                .reader
+                .get_object(&api_resource, key.namespace.as_deref(), &key.name)
+                .await?;
+            let Some(object) = object else {
+                return Ok(None);
+            };
+            let inputs = [HealthInput::live(key, &object)];
+            let summary = health::assess(&inputs, &self.health, &self.health_config);
+            Ok(summary.resources.first().map(|entry| entry.health.status))
+        })
+    }
+}
+
+impl InventorySyncPipeline {
+    /// Resolves the served [`ApiResource`] of a hook object.
+    ///
+    /// Resolved by `(group, kind)` — the same version-agnostic identity a [`ResourceKey`] carries
+    /// (ADR-003), so a hook keeps working across an API version bump and the *served* version always
+    /// comes from discovery rather than from the rendered manifest.
+    async fn resolve_hook_resource(
+        &self,
+        key: &ResourceKey,
+        version_hint: &str,
+    ) -> Result<ApiResource, ReconcileError> {
+        self.discovery
+            .resolve_kind(&key.group, &key.kind)
+            .await?
+            .map(|(api_resource, _)| api_resource)
+            .ok_or_else(|| {
+                ReconcileError::Discovery(crate::discovery::DiscoveryError::NoMatchesForKind {
+                    group: key.group.clone(),
+                    version: version_hint.to_owned(),
+                    kind: key.kind.clone(),
+                })
+            })
+    }
+}
+
+/// The decision a resumed operation plans its waves with.
+///
+/// A running operation keeps applying its waves even when the diff gate would now `Skip` (say
+/// `automated` was disabled mid-rollout, or the resource happens to be `Synced` already). This only
+/// grants *permission*: the plan still refuses to touch a resource the dry-run classified as
+/// `Synced` (`applyOutOfSyncOnly`), so the pass issues no mutating call it does not need.
+fn forced_execute(decision: SyncDecision) -> SyncDecision {
+    if decision.is_execute() {
+        decision
+    } else {
+        SyncDecision::Execute(SyncTrigger::Manual)
+    }
+}
+
+/// Whether this pass must **not** restart a terminally failed operation (finding M5).
+///
+/// `false` means "restart it": that is the case for every phase that is not a terminal failure, and
+/// for a failed operation whose commit changed (a new revision is a new sync) or that the operator
+/// explicitly asked for (`ferriscd.io/operation`). Anything else stays failed until one of those
+/// happens, so a requeue can never re-run the hooks of a commit that already failed.
+fn failed_operation_is_not_retried(request: &PassRequest<'_>, persisted: &OperationState) -> bool {
+    if !matches!(
+        persisted.phase,
+        OperationPhase::Failed | OperationPhase::Error
+    ) {
+        return false;
+    }
+    let new_revision = persisted.revision.as_deref() != Some(request.revision);
+    !(new_revision || manual_operation(request.app))
+}
+
+/// Turns a failure that happened *inside* a running operation into the error that still carries the
+/// state the pass reached (finding H-NEW).
+///
+/// A hook created before the failure is tracked nowhere but in
+/// `status.operationState.activeHooks`, and `apply_once` can only persist the state the error
+/// carries. Returning the bare API error would therefore make the next pass see the created hook as
+/// untracked and create a second `generateName` `Job` — a second database migration.
+///
+/// A terminal failure is not retried, so it is reported as the [`ReconcileError::SyncConflict`] the
+/// rest of the pipeline uses for policy failures (it still carries the inventory that is true). It
+/// carries the operation state too, **marked `Failed`** (finding H-A): dropping it made the next
+/// requeue restart the operation with an empty `activeHooks` list and create a second
+/// `generateName` `Job` — a second migration. Persisting the terminal phase is what makes
+/// `failed_operation_is_not_retried` hold an unchanged commit on the terminal backoff instead; a new
+/// revision or an explicit `ferriscd.io/operation` still restarts it.
+fn mid_operation_error(
+    request: &PassRequest<'_>,
+    error: &ReconcileError,
+    inventory: &Inventory,
+    operation: Option<OperationState>,
+) -> ReconcileError {
+    let message = error.to_string();
+    let revision = Some(request.revision.to_owned());
+    match error.failure_class() {
+        FailureClass::Retryable => ReconcileError::PartialSync {
+            message,
+            inventory: inventory.clone(),
+            revision,
+            operation: operation.map(Box::new),
+        },
+        FailureClass::Terminal => ReconcileError::SyncConflict {
+            message: message.clone(),
+            inventory: inventory.clone(),
+            revision,
+            operation: operation.map(|mut state| {
+                state.phase = OperationPhase::Failed;
+                state.finished_at = Some(request.now.clone());
+                state.message = Some(message);
+                Box::new(state)
+            }),
+        },
+    }
+}
+
+/// The `Succeeded` operation state a **single-pass** sync records (`T10.5`).
+///
+/// A hook-less single-wave commit is applied in one pass and never enters the state machine, but its
+/// deployment still has to be auditable and rollback-able: this synthesizes the terminal state the
+/// machine would have produced, so `status.operationState.revision` is the commit that is live and
+/// `record_operation_success` can append it to `status.history`.
+fn succeeded_operation(revision: &str, now: &Time, last_wave: Option<i32>) -> OperationState {
+    OperationState {
+        phase: OperationPhase::Succeeded,
+        sync_phase: Some(SyncPhase::Succeeded),
+        current_wave: last_wave.unwrap_or(0),
+        phase_started_at: Some(now.clone()),
+        revision: Some(revision.to_owned()),
+        active_hooks: Vec::new(),
+        message: Some("sync completed: every resource is applied".to_owned()),
+        started_at: now.clone(),
+        finished_at: Some(now.clone()),
+    }
+}
+
+/// Appends `operation` to `status.history` (idempotent), returning the new list when it changed.
+///
+/// `record_operation_success` refuses a non-`Succeeded` operation and is idempotent per
+/// `(revision, finishedAt)`, so the caller gates the call on "this is a **new** deployment"
+/// (`lastSyncedRevision != revision`): otherwise every drift-healing pass of the same commit would
+/// append another identical entry and `history` would fill with duplicates of one deployment.
+fn record_history(
+    previous: &ApplicationStatus,
+    app: &Application,
+    operation: &OperationState,
+) -> Option<Vec<RevisionHistoryEntry>> {
+    let mut scratch = previous.clone();
+    record_operation_success(
+        &mut scratch,
+        operation,
+        Some(&app.spec.source),
+        app.spec.revision_history_limit,
+    )
+    .is_first()
+    .then_some(scratch.history)
+}
+
+/// The commit a still-standing rollback is pinned to (`T10.5`).
+///
+/// While the `AutomatedSyncDisabledByRollback` warning is on the application, the revision recorded
+/// by the operation that performed it — not `HEAD` — is what the controller must keep resolving:
+/// that is what makes a rollback **stable** across requeues. Re-enabling
+/// `spec.syncPolicy.automated` clears the warning
+/// ([`ferriscd_engine::sync::clear_rollback_warning_if_automation_reenabled`]), and from then on
+/// `HEAD` wins again.
+pub(crate) fn pinned_rollback_revision(status: &ApplicationStatus) -> Option<String> {
+    let warned = status.conditions.iter().any(|condition| {
+        condition.type_ == ferriscd_engine::sync::CONDITION_WARNING
+            && condition.reason == ferriscd_engine::sync::REASON_AUTOMATED_SYNC_DISABLED_BY_ROLLBACK
+    });
+    if !warned {
+        return None;
+    }
+    status
+        .operation_state
+        .as_ref()
+        .and_then(|state| state.revision.clone())
+}
+
+/// Logs the plan one executed step produced.
+fn log_plan(request: &PassRequest<'_>, plan: &SyncPlan) {
+    let summary = plan.summary();
+    tracing::debug!(
+        app.namespace = %request.owner.namespace,
+        app.name = %request.owner.name,
+        decision = %request.decision,
+        applies = summary.apply,
+        replaces = summary.replace,
+        prunes = summary.prune,
+        skips = summary.skip,
+        "executing a sync plan"
+    );
+}
+
+/// Logs the hook lifecycle of one step.
+fn log_hooks(request: &PassRequest<'_>, step: SyncStep, run: &HookRun) {
+    if run.is_noop() {
+        return;
+    }
+    tracing::debug!(
+        app.namespace = %request.owner.namespace,
+        app.name = %request.owner.name,
+        step = %step,
+        created = run.created,
+        deleted = run.deleted.len(),
+        pending_delete = run.pending_delete.as_deref().unwrap_or_default(),
+        "ran lifecycle hooks"
+    );
+}
+
+/// Stamps `ferriscd.io/tracking-id` onto every **permanent** desired resource.
+///
+/// Called with `HookPartition::permanent_mut()`, so a lifecycle hook is never stamped and nothing
+/// that is created imperatively ends up looking prunable (`T10.3`).
 fn stamp_ownership(
     resources: &mut [DesiredResource],
     owner: &TrackingOwner,
@@ -1131,10 +2073,22 @@ fn build_outcome(
         invalid_ignore_pointers,
         prune_enabled,
         health,
+        settled,
+        phase,
+        requeue: requeue_hint,
     } = counts;
-    let complete = pending == 0;
-    // Only "executed *and* nothing left pending" may claim a full sync.
-    let synced = decision.is_execute() && complete;
+    // Only a pass that finished the whole operation may claim a full sync.
+    //
+    // `settled` is path-specific and already accounts for the gate: a single-pass sync is only
+    // settled when it executed and nothing is pending, while an operation is settled when the state
+    // machine reached `Succeeded`. The second case must **not** be re-gated on
+    // `decision.is_execute()`: the pass that finishes a rollout routinely has nothing left to apply,
+    // so the gate says `Skip` — and re-gating would leave `lastSynced*` unset (making `selfHeal:
+    // false` re-execute forever) and report `SyncSkipped` for a sync that in fact completed.
+    let synced = settled;
+    let trigger = decision
+        .trigger()
+        .map_or("operation", ferriscd_engine::diff::SyncTrigger::as_str);
     let sync = SyncState {
         status: if synced {
             SyncStatus::Synced
@@ -1171,32 +2125,44 @@ fn build_outcome(
     };
     let short = short_sha(&revision);
 
-    let (reason, message) = match decision {
-        SyncDecision::Skip(skip) => (
-            REASON_SYNC_SKIPPED,
-            format!(
-                "no sync performed: {skip}; {desired} resource(s) at revision {short}, \
-                 {} out of sync, {} missing, {} orphan(s){retained}{invalid}",
-                summary.out_of_sync, summary.missing, summary.orphaned
-            ),
-        ),
-        SyncDecision::Execute(trigger) if complete => (
+    let (reason, message) = if synced {
+        (
             REASON_SYNC_SUCCEEDED,
             format!(
                 "applied {applied} of {desired} resource(s) at revision {short}, \
                  pruned {pruned}{retained}{invalid} ({trigger})"
             ),
-        ),
-        SyncDecision::Execute(_) => (
-            REASON_PENDING,
-            format!(
-                "applied {applied} of {desired} resource(s) at revision {short}; {pending} \
-                 resource(s) pending on a CustomResourceDefinition or namespace{retained}{invalid}"
+        )
+    } else {
+        match decision {
+            SyncDecision::Skip(skip) => (
+                REASON_SYNC_SKIPPED,
+                format!(
+                    "no sync performed: {skip}; {desired} resource(s) at revision {short}, \
+                     {} out of sync, {} missing, {} orphan(s){retained}{invalid}",
+                    summary.out_of_sync, summary.missing, summary.orphaned
+                ),
             ),
-        ),
+            SyncDecision::Execute(_) if pending > 0 => (
+                REASON_PENDING,
+                format!(
+                    "applied {applied} of {desired} resource(s) at revision {short}; {pending} \
+                     resource(s) pending on a CustomResourceDefinition or namespace{retained}\
+                     {invalid}"
+                ),
+            ),
+            SyncDecision::Execute(_) => (
+                REASON_SYNC_IN_PROGRESS,
+                format!(
+                    "sync in progress ({}): applied {applied} of {desired} resource(s) at \
+                     revision {short}, waiting for it to become Healthy{retained}{invalid}",
+                    phase.as_deref().unwrap_or("running")
+                ),
+            ),
+        }
     };
 
-    let requeue = plan_requeue(decision.is_execute(), pending, health, app);
+    let requeue = plan_requeue(decision.is_execute(), pending, health, app, requeue_hint);
 
     ApplyOutcome::ready(reason, message)
         .with_inventory(inventory)
@@ -1226,6 +2192,7 @@ fn empty_desired_allowed() -> bool {
 /// |---|---|---|
 /// | `Present` | [`HealthInput::live`] | the object's `status` (the real evaluator) |
 /// | `Missing`, applied this pass | [`HealthInput::applied`] | `Progressing`: the live read predates the write |
+/// | `Missing`, scheduled for a later wave | [`HealthInput::pending`] | `Progressing`: the rollout has not reached it |
 /// | `Missing`, not applied | [`HealthInput::missing`] | `Missing` |
 /// | `DeferredPendingCrd` / `DeferredPendingNamespace` | [`HealthInput::pending`] | `Progressing` |
 /// | `OrphanGvkGone` | skipped | a desired key can never be an orphan |
@@ -1239,10 +2206,16 @@ fn empty_desired_allowed() -> bool {
 /// `status.health` could keep the `Application` `Degraded`/`Missing` forever for an object nobody
 /// declares any more. Health describes what Git asks for — which is also exactly what Phase 10's
 /// waves wait on.
+///
+/// **A scheduled wave is not `Missing` (finding M3).** Mid-rollout, the resources of a wave the
+/// operation has not dispatched yet do not exist *by design*. Reporting them `Missing` makes
+/// `status.health` (and the per-resource list) claim the Application is broken in the middle of a
+/// perfectly healthy rollout; they are `Progressing` until their wave is dispatched.
 fn health_inputs<'a>(
     resources: &'a [DesiredResource],
     live: &'a LiveStateMap,
     applied: &Inventory,
+    scheduled: &BTreeSet<ResourceKey>,
 ) -> Vec<HealthInput<'a>> {
     resources
         .iter()
@@ -1251,6 +2224,10 @@ fn health_inputs<'a>(
             let observation = match live.get(key)? {
                 LiveState::Present(object, _) => HealthInput::live(key, object.as_ref()),
                 LiveState::Missing if applied.contains_key(key) => HealthInput::applied(key),
+                LiveState::Missing if scheduled.contains(key) => HealthInput::pending(
+                    key,
+                    "scheduled: waiting for a later sync wave of the running operation",
+                ),
                 LiveState::Missing => HealthInput::missing(key),
                 LiveState::DeferredPendingCrd => HealthInput::pending(
                     key,
@@ -1308,7 +2285,14 @@ fn plan_requeue(
     pending: usize,
     health: HealthStatus,
     app: &Application,
+    hint: Option<Duration>,
 ) -> Duration {
+    // An in-flight wave/hook operation owns its own pacing (`T10.1`: `Action::requeue(5s)`): it is
+    // waiting for a rollout, not for a timer, and `spec.requeueAfterSeconds` (default 180 s) would
+    // make a three-wave sync take nine minutes for no reason.
+    if let Some(hint) = hint {
+        return hint;
+    }
     let configured = Duration::from_secs(u64::from(app.spec.requeue_after_seconds));
     if execute && pending > 0 {
         return PENDING_REQUEUE;
@@ -1366,30 +2350,33 @@ fn reject_foreign_ownership(
     })
 }
 
-/// Rejects manifests `v0.2` cannot order or track correctly.
-fn reject_unsupported(resource: &DesiredResource) -> Result<(), ReconcileError> {
-    let name = resource.key.canonical();
-    if resource.object.metadata.generate_name.is_some() {
-        return Err(ReconcileError::Invalid {
-            message: format!(
-                "{name}: metadata.generateName is not supported by the v0.2 controller \
-                 (lifecycle hooks arrive in Phase 10)"
-            ),
-        });
-    }
-    let hook = resource
+/// Returns whether `resource` is a lifecycle hook (`ferriscd.io/hook` is present and non-blank).
+///
+/// A blank value is *not* a hook here: `graph::hooks::partition` rejects it as a malformed control
+/// annotation (a typo must never silently mean "no hook"), which is a terminal manifest error.
+fn is_hook(resource: &DesiredResource) -> bool {
+    resource
         .object
         .metadata
         .annotations
         .as_ref()
         .and_then(|map| map.get(annotations::HOOK))
-        .map(|phase| phase.trim().to_owned())
-        .filter(|phase| !phase.is_empty());
-    if let Some(phase) = hook {
+        .is_some_and(|phase| !phase.trim().is_empty())
+}
+
+/// Rejects manifests the controller cannot order or track correctly.
+///
+/// `metadata.generateName` stays unsupported for **permanent** resources: a planned resource is
+/// identified by its GKNN, and a name the API server picks cannot be tracked, diffed or pruned. A
+/// lifecycle hook is the one legitimate user of `generateName` (`T10.3`): it is created with
+/// `Api::create` and tracked in `status.operationState.activeHooks` by its rendered id instead.
+fn reject_unsupported(resource: &DesiredResource) -> Result<(), ReconcileError> {
+    if resource.object.metadata.generate_name.is_some() && !is_hook(resource) {
         return Err(ReconcileError::Invalid {
             message: format!(
-                "{name}: lifecycle hooks are not supported by the v0.2 controller \
-                 (found {} = {phase}; Phase 10)",
+                "{}: metadata.generateName is only supported on lifecycle hooks \
+                 ({}); a permanent resource must be named so it can be tracked and pruned",
+                resource.key.canonical(),
                 annotations::HOOK
             ),
         });
@@ -1421,7 +2408,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::discovery::{DiscoveryFuture, DiscoverySnapshot, DiscoverySource};
+    use crate::discovery::{DiscoveryError, DiscoveryFuture, DiscoverySnapshot, DiscoverySource};
     use crate::dry_run::{DryRunFuture, DryRunOutcome, DryRunTarget};
     use crate::live_state::{FetchTarget, LiveFuture};
     use crate::reconcile::{REASON_OWNERSHIP_CONFLICT, StatusWriter, apply_once};
@@ -1435,11 +2422,23 @@ mod tests {
     struct FakeCluster {
         objects: StdMutex<BTreeMap<String, DynamicObject>>,
         namespaces: StdMutex<Vec<String>>,
+        /// Hook object names `Api::create` produced (a `generateName` hook gets a suffix appended).
+        creates: StdMutex<Vec<String>>,
+        /// Merge patches issued against the `Application` object itself (`T10.5`).
+        app_patches: StdMutex<Vec<serde_json::Value>>,
         applies: StdMutex<Vec<String>>,
         applied_objects: StdMutex<Vec<DynamicObject>>,
         applied_tracking_ids: StdMutex<Vec<String>>,
         deletes: StdMutex<Vec<String>>,
         fail_apply: StdMutex<Vec<String>>,
+        /// GKNNs the API server rejects with a retryable `500` (a `PartialSync`).
+        retryable_apply: StdMutex<Vec<String>>,
+        /// `generateName` prefixes whose *next* create the API server rejects with a retryable `500`
+        /// (each entry is consumed by the failing call, so the retry succeeds).
+        retryable_create: StdMutex<Vec<String>>,
+        /// `generateName` prefixes whose *next* create the API server rejects with a terminal `422`
+        /// (`field is immutable`), so the hook step ends in a `SyncConflict`.
+        terminal_create: StdMutex<Vec<String>>,
         /// GKNNs the API server rejects with `422`/`field is immutable` (a terminal failure).
         immutable_apply: StdMutex<Vec<String>>,
         /// GKNNs whose `tracking-id` is replaced with a foreign one after their first `GET`
@@ -1476,8 +2475,93 @@ mod tests {
             self
         }
 
+        /// Names of the hook objects this fake API server created.
+        fn creates(&self) -> Vec<String> {
+            self.creates.lock().unwrap().clone()
+        }
+
+        /// The merge patches this test issued against the `Application`'s own object.
+        fn app_patches(&self) -> Vec<serde_json::Value> {
+            self.app_patches.lock().unwrap().clone()
+        }
+
+        /// One field of a live object (`/data/version` -> `v1`), for asserting what really landed.
+        fn live_pointer(&self, gknn: &str, pointer: &str) -> Option<String> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(gknn)
+                .and_then(|object| object.data.pointer(pointer))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }
+
+        /// Models a `Deployment` whose rollout converged (`T09.2`'s health contract).
+        fn make_deployment_ready(&self, name: &str, replicas: i32) {
+            self.drift(&format!("apps/Deployment/payments/{name}"), |object| {
+                object.data["status"] = json!({
+                    "observedGeneration": object.metadata.generation,
+                    "replicas": replicas,
+                    "updatedReplicas": replicas,
+                    "availableReplicas": replicas,
+                    "readyReplicas": replicas,
+                    "conditions": [],
+                });
+            });
+        }
+
+        /// Models the API server finishing a hook `Job`: it reports `Complete`.
+        fn complete_job(&self, name: &str) {
+            self.drift(&format!("batch/Job/payments/{name}"), |object| {
+                object.data["status"] = json!({
+                    "conditions": [{ "type": "Complete", "status": "True" }],
+                    "succeeded": 1,
+                });
+            });
+        }
+
+        /// Models a hook `Job` that gave up: the API server reports `Failed=True` (a `Degraded`
+        /// hook, which is what makes the wave machine enter `SyncFail`).
+        fn fail_job(&self, name: &str) {
+            self.drift(&format!("batch/Job/payments/{name}"), |object| {
+                object.data["status"] = json!({
+                    "conditions": [{
+                        "type": "Failed",
+                        "status": "True",
+                        "reason": "BackoffLimitExceeded",
+                    }],
+                    "failed": 1,
+                });
+            });
+        }
+
         fn fail_apply_for(self, key: &str) -> Self {
             self.fail_apply.lock().unwrap().push(key.to_owned());
+            self
+        }
+
+        /// The next apply of `key` is rejected with a *retryable* API error (`500`), so the pass
+        /// ends in [`ReconcileError::PartialSync`] and the next reconcile converges from live state.
+        fn fail_apply_retryably(self, key: &str) -> Self {
+            self.retryable_apply.lock().unwrap().push(key.to_owned());
+            self
+        }
+
+        /// The next `Api::create` of a hook whose `generateName` is `prefix` is rejected with a
+        /// *retryable* API error (`500`), so a hook step fails *after* creating its first hook.
+        fn fail_create_retryably(self, prefix: &str) -> Self {
+            self.retryable_create
+                .lock()
+                .unwrap()
+                .push(prefix.to_owned());
+            self
+        }
+
+        /// The next `Api::create` of a hook whose `generateName` is `prefix` is rejected with the
+        /// API server's terminal `422`, so the hook step fails *after* creating its first hook and
+        /// the reconcile is classified terminal (finding H-A).
+        fn fail_create_terminally(self, prefix: &str) -> Self {
+            self.terminal_create.lock().unwrap().push(prefix.to_owned());
             self
         }
 
@@ -1599,6 +2683,20 @@ mod tests {
         )
     }
 
+    /// The API server's `500` (a transient failure the next reconcile retries).
+    fn backend_error() -> kube::Error {
+        kube::Error::Api(
+            serde_json::from_value::<kube::core::Status>(json!({
+                "status": "Failure",
+                "message": "the server is currently unable to handle the request",
+                "reason": "InternalError",
+                "code": 500,
+            }))
+            .expect("a valid kube Status")
+            .boxed(),
+        )
+    }
+
     impl LiveObjectSource for FakeCluster {
         fn get<'a>(&'a self, target: FetchTarget<'a>) -> LiveFuture<'a, Option<DynamicObject>> {
             let wanted = gknn_of(
@@ -1673,6 +2771,14 @@ mod tests {
                         message: format!("applying {key} failed"),
                     });
                 }
+                if self.cluster.retryable_apply.lock().unwrap().contains(&key) {
+                    // A transient API failure (the API server answered `500`): the pass must end in
+                    // `PartialSync` so the next reconcile converges from live state.
+                    return Err(ReconcileError::Apply {
+                        resource: key,
+                        source: backend_error(),
+                    });
+                }
                 if self.cluster.immutable_apply.lock().unwrap().contains(&key) {
                     // The real API server rejects the SSA patch with `422 Invalid`; the executor's
                     // recovery layer (not this fake) turns it into the terminal, actionable
@@ -1745,6 +2851,68 @@ mod tests {
                 Ok(DeleteOutcome::Deleted)
             })
         }
+
+        /// `Api::create` semantics: a `generateName` hook gets a generated name, a named hook keeps
+        /// the one it rendered, and the created object is then live (a real API server persists it).
+        fn create<'a>(
+            &'a self,
+            request: CreateRequest<'a>,
+        ) -> BoxFuture<'a, Result<DynamicObject, ReconcileError>> {
+            Box::pin(async move {
+                let mut body = apply_body(&request.resource.object);
+                if let Some(prefix) = body.metadata.generate_name.as_deref() {
+                    let mut failing = self.cluster.retryable_create.lock().unwrap();
+                    if let Some(index) = failing.iter().position(|failed| failed == prefix) {
+                        failing.remove(index);
+                        // A transient API failure on the create: the hook step stops here, and the
+                        // hooks it already created must survive the requeue (finding H-NEW).
+                        return Err(ReconcileError::Api(backend_error()));
+                    }
+                    drop(failing);
+                    let mut terminal = self.cluster.terminal_create.lock().unwrap();
+                    if let Some(index) = terminal.iter().position(|failed| failed == prefix) {
+                        terminal.remove(index);
+                        // The API server rejects the create outright (`422`), so retrying the same
+                        // commit cannot help: the pass ends in a terminal `SyncConflict` (H-A).
+                        return Err(ReconcileError::Apply {
+                            resource: request.resource.key.canonical(),
+                            source: immutable_field_error(),
+                        });
+                    }
+                }
+                let name = match body.metadata.generate_name.as_deref() {
+                    Some(prefix) => format!("{prefix}abcde"),
+                    None => body.metadata.name.clone().unwrap_or_default(),
+                };
+                if name.is_empty() {
+                    return Err(ReconcileError::Invalid {
+                        message: "the fake API server rejects an unnamed object".to_owned(),
+                    });
+                }
+                body.metadata.name = Some(name.clone());
+                self.cluster.creates.lock().unwrap().push(name);
+                self.cluster
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .insert(gknn_of_object(&body), body.clone());
+                Ok(body)
+            })
+        }
+
+        fn patch_application<'a>(
+            &'a self,
+            request: ApplicationPatch<'a>,
+        ) -> BoxFuture<'a, Result<(), ReconcileError>> {
+            Box::pin(async move {
+                assert_eq!(
+                    request.namespace, "ferriscd-system",
+                    "an Application patch must target the Application's own namespace"
+                );
+                self.cluster.app_patches.lock().unwrap().push(request.patch);
+                Ok(())
+            })
+        }
     }
 
     /// Scripted discovery source whose snapshot the test can mutate between reconciles.
@@ -1752,6 +2920,14 @@ mod tests {
     struct FakeDiscovery {
         snapshot: StdMutex<DiscoverySnapshot>,
         fetches: AtomicUsize,
+        /// Discovery-outage seam (finding H-A): how many further round trips are still served
+        /// before every refresh fails (`Some(0)` = failing now, `None` = never fails).
+        ///
+        /// A single pass polls discovery several times (render, `prepare`, the executor's post-CRD
+        /// refresh, the wave-boundary refresh of `T10.2`), so "the API server goes down at *this*
+        /// point of the pass" cannot be scripted as a blanket failure — that would land on the
+        /// render refresh and prove nothing about the boundary.
+        fail_refresh_after: StdMutex<Option<usize>>,
     }
 
     impl FakeDiscovery {
@@ -1762,6 +2938,8 @@ mod tests {
                 ("", "Namespace", Scope::Cluster),
                 ("", "Service", Scope::Namespaced),
                 ("apps", "Deployment", Scope::Namespaced),
+                // Lifecycle hooks (T10.3) are `Job`s: scope normalization has to resolve them.
+                ("batch", "Job", Scope::Namespaced),
                 (scope::APIEXTENSIONS_GROUP, scope::CRD_KIND, Scope::Cluster),
             ] {
                 snapshot = with_resource(snapshot, group, kind, scope);
@@ -1769,6 +2947,7 @@ mod tests {
             Self {
                 snapshot: StdMutex::new(snapshot),
                 fetches: AtomicUsize::new(0),
+                fail_refresh_after: StdMutex::new(None),
             }
         }
 
@@ -1776,6 +2955,12 @@ mod tests {
         fn install(&self, group: &str, kind: &str, scope: Scope) {
             let mut snapshot = self.snapshot.lock().unwrap();
             *snapshot = with_resource(snapshot.clone(), group, kind, scope);
+        }
+
+        /// Arms the discovery outage: the next `successes` round trips are served as before, and
+        /// every refresh after them fails (`DiscoveryError::Refresh`).
+        fn fail_refresh_after(&self, successes: usize) {
+            *self.fail_refresh_after.lock().unwrap() = Some(successes);
         }
 
         fn fetches(&self) -> usize {
@@ -1826,6 +3011,24 @@ mod tests {
         fn fetch(&self) -> DiscoveryFuture<'_> {
             Box::pin(async move {
                 self.fetches.fetch_add(1, Ordering::SeqCst);
+                // Discovery outage (finding H-A): serve the scripted number of round trips, then
+                // fail every refresh the way an unavailable API server does.
+                let served = {
+                    let mut remaining = self.fail_refresh_after.lock().unwrap();
+                    match *remaining {
+                        Some(0) => false,
+                        Some(left) => {
+                            *remaining = Some(left - 1);
+                            true
+                        }
+                        None => true,
+                    }
+                };
+                if !served {
+                    return Err(DiscoveryError::Refresh {
+                        message: "apiserver unavailable".to_owned(),
+                    });
+                }
                 Ok(self.snapshot.lock().unwrap().clone())
             })
         }
@@ -1989,6 +3192,13 @@ mod tests {
         _temp: tempfile::TempDir,
     }
 
+    /// A parseable `metav1.Time` fixture.
+    fn at(rfc3339: &str) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Time {
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            rfc3339.parse().expect("valid RFC 3339 timestamp"),
+        )
+    }
+
     fn fixture(cluster: FakeCluster) -> Fixture {
         fixture_with(cluster, FakeDryRun::default())
     }
@@ -2113,6 +3323,11 @@ mod tests {
     }
 
     const CONFIGMAP: &str = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n";
+    /// A `generateName` `PreSync` hook — the one legitimate `generateName` user (`T10.3`).
+    const PRE_SYNC_HOOK: &str = "apiVersion: batch/v1\nkind: Job\nmetadata:\n  generateName: migrate-\n  annotations:\n    ferriscd.io/hook: PreSync\n";
+    /// A second `generateName` `PreSync` hook that runs *before* [`PRE_SYNC_HOOK`] (wave `-1`), so a
+    /// failure on the second create still has a hook object that already exists.
+    const SEED_PRE_SYNC_HOOK: &str = "apiVersion: batch/v1\nkind: Job\nmetadata:\n  generateName: seed-\n  annotations:\n    ferriscd.io/hook: PreSync\n    ferriscd.io/sync-wave: \"-1\"\n";
     /// The same ConfigMap with a `data` field, for the `ignoreDifferences` tests.
     const CONFIGMAP_WITH_DATA: &str =
         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  key: value\n";
@@ -2926,31 +4141,1214 @@ mod tests {
         assert!(fixture.cluster.applies().is_empty());
     }
 
+    /// `T10.3`: a lifecycle hook is created **once** with `Api::create`, tracked in
+    /// `status.operationState.activeHooks` by its generated name, and never becomes prunable
+    /// inventory (finding H2).
     #[tokio::test]
-    async fn lifecycle_hooks_and_generate_name_are_rejected() {
+    async fn a_generate_name_hook_is_created_once_and_never_becomes_inventory() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[
+            (
+                "hook.yaml",
+                "apiVersion: batch/v1\nkind: Job\nmetadata:\n  generateName: migrate-\n  annotations:\n    ferriscd.io/hook: PreSync\n",
+            ),
+            ("configmap.yaml", CONFIGMAP),
+        ]);
+        let app = fixture.app(".");
+
+        // Pass 1: the PreSync hook is created, the wave is not touched yet.
+        let first = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("hooks are supported");
+        assert_eq!(
+            fixture.cluster.creates(),
+            vec!["migrate-abcde".to_owned()],
+            "exactly one hook object, named by the API server"
+        );
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "wave 0 must wait for PreSync (only the hook is created): {:?}",
+            fixture.cluster.applies()
+        );
+        let operation = first
+            .operation_state
+            .clone()
+            .expect("a hook operation persists its state");
+        assert_eq!(operation.sync_phase, Some(SyncPhase::PreSync));
+        assert_eq!(operation.active_hooks.len(), 1);
+        assert_eq!(operation.active_hooks[0].generated_name, "migrate-abcde");
+        assert_eq!(operation.active_hooks[0].phase, SyncPhase::PreSync);
+        assert_eq!(first.reason, REASON_SYNC_IN_PROGRESS);
+        assert_eq!(first.requeue, Some(DEFAULT_REQUEUE_AFTER));
+        let inventory = first.inventory.clone().expect("inventory");
+        assert!(
+            inventory.keys().all(|key| key.kind != "Job"),
+            "a hook must never enter status.inventory: {inventory:?}"
+        );
+
+        // Pass 2: the hook is still running -> observed, never created again.
+        let mut second_app = app.clone();
+        second_app.status = Some(ApplicationStatus {
+            operation_state: Some(operation),
+            ..app.status.clone().unwrap_or_default()
+        });
+        let second = fixture
+            .pipeline
+            .apply(&second_app)
+            .await
+            .expect("the hook is observed, not recreated");
+        assert_eq!(
+            fixture.cluster.creates(),
+            vec!["migrate-abcde".to_owned()],
+            "a requeue must never run the migration twice"
+        );
+        assert_eq!(second.reason, REASON_SYNC_IN_PROGRESS);
+
+        // Pass 3: the Job completed -> PreSync advances to wave 0 and the ConfigMap is applied.
+        fixture.cluster.complete_job("migrate-abcde");
+        let mut third_app = second_app.clone();
+        third_app.status = Some(ApplicationStatus {
+            operation_state: second.operation_state.clone(),
+            ..second_app.status.clone().unwrap_or_default()
+        });
+        let third = fixture.pipeline.apply(&third_app).await.expect("wave 0");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec![CONFIGMAP_KEY.to_owned()],
+            "the wave applies only its own resources"
+        );
+        let operation = third.operation_state.clone().expect("state");
+        assert_eq!(operation.sync_phase, Some(SyncPhase::Sync));
+        assert_eq!(operation.current_wave, 0);
+    }
+
+    /// `metadata.generateName` stays unsupported for a **permanent** resource: its name is its
+    /// identity, and a name the API server picks cannot be tracked, diffed or pruned.
+    #[tokio::test]
+    async fn a_permanent_generate_name_resource_is_still_rejected() {
         let fixture = fixture(FakeCluster::default().with_namespace("payments"));
         fixture.commit(&[(
-            "hook.yaml",
-            "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: migrate\n  annotations:\n    ferriscd.io/hook: PreSync\n",
-        )]);
-        let app = fixture.app(".");
-        let err = fixture
-            .pipeline
-            .apply(&app)
-            .await
-            .expect_err("hooks are unsupported");
-        assert!(err.to_string().contains("lifecycle hooks"), "{err}");
-
-        fixture.commit(&[(
-            "hook.yaml",
+            "job.yaml",
             "apiVersion: batch/v1\nkind: Job\nmetadata:\n  generateName: migrate-\n",
         )]);
+        let app = fixture.app(".");
+
         let err = fixture
             .pipeline
             .apply(&app)
             .await
-            .expect_err("generateName is unsupported");
+            .expect_err("generateName is unsupported for a permanent resource");
         assert!(err.to_string().contains("generateName"), "{err}");
+        assert!(
+            err.to_string().contains("ferriscd.io/hook"),
+            "the error must name the one legitimate use: {err}"
+        );
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert!(fixture.cluster.creates().is_empty());
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    /// `T10.2`: a two-wave bundle is applied one wave at a time, gated on health, and the whole
+    /// rollout is recorded as an operation.
+    #[tokio::test]
+    async fn a_two_wave_bundle_is_applied_wave_by_wave() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let sha = fixture.commit(&[
+            (
+                "migration.yaml",
+                "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: smoke\n  annotations:\n    ferriscd.io/sync-wave: \"-1\"\n",
+            ),
+            ("configmap.yaml", CONFIGMAP),
+            ("deployment.yaml", DEPLOYMENT),
+        ]);
+        let app = fixture.app(".");
+
+        // Pass 1: wave -1 only.
+        let first = fixture.pipeline.apply(&app).await.expect("wave -1");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["batch/Job/payments/smoke".to_owned()],
+            "wave 0 must not be applied before wave -1 is Healthy"
+        );
+        let state = first.operation_state.clone().expect("operation state");
+        assert_eq!(state.sync_phase, Some(SyncPhase::Sync));
+        assert_eq!(state.current_wave, -1);
+        assert_eq!(state.revision.as_deref(), Some(sha.as_str()));
+
+        // Pass 2: wave -1 converged -> wave 0. The fake API server persists the writes, and the
+        // migration Job reports `Complete` (a `Progressing` Job keeps its wave open on purpose).
+        fixture.cluster.seed_applied();
+        fixture.cluster.complete_job("smoke");
+        let mut second_app = app.clone();
+        second_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            ..app.status.clone().unwrap_or_default()
+        });
+        let second = fixture.pipeline.apply(&second_app).await.expect("wave 0");
+        let mut applies = fixture.cluster.applies();
+        applies.drain(0..1);
+        assert_eq!(
+            applies,
+            vec![CONFIGMAP_KEY.to_owned(), DEPLOYMENT_KEY.to_owned()],
+            "wave 0 applies its own resources in tier order"
+        );
+        let state = second.operation_state.clone().expect("state");
+        assert_eq!(state.current_wave, 0);
+        assert!(second.reason == REASON_SYNC_IN_PROGRESS);
+
+        // Pass 3: the rollout converged -> PostSync (one step per pass; the machine never skips a
+        // phase, so `Succeeded` is reached on the following pass).
+        fixture.cluster.seed_applied();
+        fixture.cluster.complete_job("smoke");
+        fixture.cluster.make_deployment_ready("api", 1);
+        let mut third_app = app.clone();
+        third_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            ..app.status.clone().unwrap_or_default()
+        });
+        let third = fixture.pipeline.apply(&third_app).await.expect("post sync");
+        assert_eq!(
+            third.operation_state.as_ref().map(|state| state.sync_phase),
+            Some(Some(SyncPhase::PostSync)),
+            "every wave is Healthy, so the operation moved to its cleanup phase"
+        );
+        assert_eq!(third.reason, REASON_SYNC_IN_PROGRESS);
+        let state = third.operation_state.clone().expect("state");
+
+        // Pass 4: PostSync has nothing to run -> Succeeded, and the deployment is recorded.
+        let mut fourth_app = app.clone();
+        fourth_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            ..app.status.clone().unwrap_or_default()
+        });
+        let fourth = fixture
+            .pipeline
+            .apply(&fourth_app)
+            .await
+            .expect("succeeded");
+        let state = fourth.operation_state.clone().expect("state");
+        assert_eq!(state.phase, OperationPhase::Succeeded);
+        assert_eq!(state.sync_phase, Some(SyncPhase::Succeeded));
+        assert_eq!(
+            fourth.requeue,
+            Some(Duration::from_secs(u64::from(
+                DEFAULT_REQUEUE_AFTER_SECONDS
+            ))),
+            "a finished operation falls back to the drift-detection interval, not the 5 s wave one"
+        );
+        assert_eq!(
+            fourth.reason, REASON_SYNC_SUCCEEDED,
+            "the last wave completes the sync: {}",
+            fourth.message
+        );
+        let history = fourth.history.clone().expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, 1);
+        assert_eq!(history[0].revision, state.revision);
+
+        // Pass 5: the operation is terminal and the cluster converged -> zero mutation.
+        let mut fifth_app = app.clone();
+        fifth_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            history,
+            // The `lastSynced*` markers the succeeded pass wrote: without them the gate would see a
+            // commit it has "never synced" and start a new operation on every pass.
+            sync: fourth.sync.clone(),
+            ..app.status.clone().unwrap_or_default()
+        });
+        let before = fixture.cluster.applies().len();
+        let fifth = fixture.pipeline.apply(&fifth_app).await.expect("settled");
+
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            before,
+            "a settled application issues no mutating apply"
+        );
+        assert!(
+            fifth.history.is_none(),
+            "re-running does not duplicate history"
+        );
+    }
+
+    /// **Finding M3:** mid-rollout, the resources of a wave the operation has not dispatched yet do
+    /// not exist *by design*, so they are reported `Progressing` (scheduled) — never `Missing`,
+    /// which would describe a perfectly healthy rollout as broken between every pair of waves.
+    #[tokio::test]
+    async fn resources_of_a_wave_the_operation_has_not_reached_are_progressing_not_missing() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[
+            (
+                "migration.yaml",
+                "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: smoke\n  annotations:\n    ferriscd.io/sync-wave: \"-1\"\n",
+            ),
+            ("configmap.yaml", CONFIGMAP),
+            ("deployment.yaml", DEPLOYMENT),
+        ]);
+        let app = fixture.app(".");
+
+        // Pass 1 dispatches wave -1 only, so wave 0 has deliberately not been created.
+        let outcome = fixture.pipeline.apply(&app).await.expect("wave -1");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["batch/Job/payments/smoke".to_owned()],
+            "wave 0 must not be applied before wave -1 is Healthy"
+        );
+        assert_eq!(
+            outcome.health.as_ref().map(|health| health.status),
+            Some(HealthStatus::Progressing),
+            "a rollout in flight is Progressing, never Missing: {:?}",
+            outcome
+                .health
+                .as_ref()
+                .and_then(|health| health.message.clone())
+        );
+        let resources = outcome.resources.expect("per-resource health");
+        assert_eq!(resources.len(), 3);
+        for resource in &resources {
+            assert_eq!(
+                resource.health,
+                HealthStatus::Progressing,
+                "{} must be scheduled, not Missing: {}",
+                resource.key,
+                resource.message
+            );
+        }
+        let wave_zero = resources
+            .iter()
+            .find(|resource| resource.key == CONFIGMAP_KEY)
+            .expect("the wave 0 ConfigMap is part of this pass's assessment");
+        assert!(
+            wave_zero.message.contains("scheduled"),
+            "a scheduled resource must say why it is not here yet: {}",
+            wave_zero.message
+        );
+
+        // Once wave 0 has been dispatched, nothing is scheduled any more: a resource that is still
+        // absent then is genuinely `Missing`.
+        fixture.cluster.seed_applied();
+        fixture.cluster.complete_job("smoke");
+        let mut second_app = app.clone();
+        second_app.status = Some(ApplicationStatus {
+            operation_state: outcome.operation_state,
+            ..ApplicationStatus::default()
+        });
+        let second = fixture.pipeline.apply(&second_app).await.expect("wave 0");
+        let second_resources = second.resources.expect("per-resource health");
+        assert!(
+            second_resources
+                .iter()
+                .all(|resource| !resource.message.contains("scheduled")),
+            "no resource of the last dispatched wave is scheduled: {second_resources:?}"
+        );
+    }
+
+    /// **Finding H1:** the persisted operation is on a wave the new commit no longer has. The pass
+    /// must not trip `StepHealth::wave`'s debug assertion; it restarts the operation at `PreSync`
+    /// for the new revision.
+    #[tokio::test]
+    async fn a_commit_that_removes_the_current_wave_restarts_at_pre_sync() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[
+            (
+                "migration.yaml",
+                "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: smoke\n  annotations:\n    ferriscd.io/sync-wave: \"-1\"\n",
+            ),
+            ("configmap.yaml", CONFIGMAP),
+        ]);
+        let app = fixture.app(".");
+        let first = fixture.pipeline.apply(&app).await.expect("wave -1");
+        let state = first.operation_state.clone().expect("operation state");
+        assert_eq!(state.current_wave, -1);
+        assert_eq!(state.sync_phase, Some(SyncPhase::Sync));
+
+        // The next commit deletes wave -1 entirely: `FakeGitClient` commits replace the tree.
+        let new_sha = fixture.commit(&[("configmap.yaml", CONFIGMAP_WITH_DATA)]);
+        let mut second_app = app.clone();
+        second_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            ..ApplicationStatus::default()
+        });
+
+        let second = fixture
+            .pipeline
+            .apply(&second_app)
+            .await
+            .expect("a vanished wave is not an error");
+        let state = second.operation_state.expect("state");
+        assert_eq!(
+            state.sync_phase,
+            Some(SyncPhase::PreSync),
+            "the operation restarts for the new revision instead of judging a wave that is gone"
+        );
+        assert_eq!(state.current_wave, 0);
+        assert_eq!(state.revision.as_deref(), Some(new_sha.as_str()));
+        assert!(
+            state
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("revision changed")),
+            "{:?}",
+            state.message
+        );
+        assert!(
+            fixture.cluster.applies().len() == 1,
+            "the restart pass applies nothing new: {:?}",
+            fixture.cluster.applies()
+        );
+    }
+
+    /// **Finding M4:** a wave pass that fails with a *retryable* API error must persist the hook
+    /// records it created, or the retry creates a second `generateName` `Job` — a second migration.
+    #[tokio::test]
+    async fn a_retryable_wave_failure_persists_the_hook_records_it_created() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .fail_apply_retryably(DEPLOYMENT_KEY),
+        );
+        fixture.commit(&[
+            ("hook.yaml", PRE_SYNC_HOOK),
+            ("configmap.yaml", CONFIGMAP),
+            ("deployment.yaml", DEPLOYMENT),
+        ]);
+        let app = fixture.app(".");
+
+        // Pass 1: the PreSync hook is created and tracked.
+        let first = fixture.pipeline.apply(&app).await.expect("the hook pass");
+        assert_eq!(fixture.cluster.creates(), vec!["migrate-abcde".to_owned()]);
+        let state = first.operation_state.clone().expect("operation state");
+        assert_eq!(state.active_hooks.len(), 1);
+
+        // Pass 2: the hook completed, wave 0 is dispatched, the Deployment fails with a `500`.
+        fixture.cluster.complete_job("migrate-abcde");
+        let mut second_app = app.clone();
+        second_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            ..ApplicationStatus::default()
+        });
+        let err = fixture
+            .pipeline
+            .apply(&second_app)
+            .await
+            .expect_err("the wave apply fails");
+        assert_eq!(
+            err.failure_class(),
+            crate::FailureClass::Retryable,
+            "a 500 is retryable, so the failure must be a PartialSync: {err:?}"
+        );
+        assert!(matches!(err, ReconcileError::PartialSync { .. }), "{err:?}");
+
+        // The failure carries the operation state, hook record included.
+        let operation = err
+            .partial_operation()
+            .expect("a retryable wave failure must carry its operation state")
+            .clone();
+        assert_eq!(operation.sync_phase, Some(SyncPhase::Sync));
+        assert_eq!(operation.current_wave, 0);
+        assert_eq!(operation.active_hooks.len(), 1);
+        assert_eq!(operation.active_hooks[0].generated_name, "migrate-abcde");
+        assert_eq!(
+            operation.active_hooks[0].health,
+            HealthStatus::Healthy,
+            "the record is refreshed to what the pass observed"
+        );
+
+        // Pass 3: the retry resumes from that persisted state and never re-runs the migration.
+        let mut third_app = app.clone();
+        third_app.status = Some(ApplicationStatus {
+            operation_state: Some(operation),
+            ..ApplicationStatus::default()
+        });
+        let _ = fixture.pipeline.apply(&third_app).await;
+        assert_eq!(
+            fixture.cluster.creates(),
+            vec!["migrate-abcde".to_owned()],
+            "a retry must observe the created hook, never create a second Job"
+        );
+    }
+
+    /// **Finding H-NEW:** a hook step that fails on the *second* hook must still hand the hooks it
+    /// already created to `apply_once` (`PartialSync.operation`), or the retry sees them untracked
+    /// and creates a second `generateName` `Job` — a second database migration.
+    #[tokio::test]
+    async fn a_failing_hook_create_persists_the_hooks_created_before_it() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .fail_create_retryably("migrate-"),
+        );
+        fixture.commit(&[
+            ("seed-hook.yaml", SEED_PRE_SYNC_HOOK),
+            ("hook.yaml", PRE_SYNC_HOOK),
+            ("configmap.yaml", CONFIGMAP),
+        ]);
+        let app = fixture.app(".");
+
+        // Pass 1: `seed-` (wave -1) is created, the create of `migrate-` (wave 0) answers `500`.
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("the second hook create fails");
+        assert_eq!(
+            err.failure_class(),
+            crate::FailureClass::Retryable,
+            "a 500 is retryable, so the failure must be a PartialSync: {err:?}"
+        );
+        assert!(matches!(err, ReconcileError::PartialSync { .. }), "{err:?}");
+        assert_eq!(
+            fixture.cluster.creates(),
+            vec!["seed-abcde".to_owned()],
+            "the first hook really was created before the failure"
+        );
+
+        // The failure carries the record of the hook that already exists.
+        let operation = err
+            .partial_operation()
+            .expect("a failing hook step must carry the state it reached")
+            .clone();
+        assert_eq!(operation.sync_phase, Some(SyncPhase::PreSync));
+        assert_eq!(operation.active_hooks.len(), 1);
+        assert_eq!(operation.active_hooks[0].generated_name, "seed-abcde");
+        assert_eq!(
+            operation.active_hooks[0].phase,
+            SyncPhase::PreSync,
+            "the record is what keeps the retry from creating a duplicate"
+        );
+
+        // Pass 2: the retry resumes from that state, observes `seed-abcde` and creates only
+        // `migrate-abcde`, so the operation performs exactly one create per hook.
+        fixture.cluster.complete_job("seed-abcde");
+        let mut retry = app.clone();
+        retry.status = Some(ApplicationStatus {
+            operation_state: Some(operation),
+            ..ApplicationStatus::default()
+        });
+        fixture
+            .pipeline
+            .apply(&retry)
+            .await
+            .expect("the retry resumes the operation and succeeds");
+        assert_eq!(
+            fixture.cluster.creates(),
+            vec!["seed-abcde".to_owned(), "migrate-abcde".to_owned()],
+            "the retry creates the missing hook once, never a second copy of a tracked one"
+        );
+    }
+
+    /// **Finding H-A:** a *terminal* hook-create failure (`422`) is a `SyncConflict`, and it must
+    /// carry the operation state it reached — marked `Failed`. Dropping it made the next requeue
+    /// restart the operation with an empty `activeHooks` list and create a second `seed-*` `Job`
+    /// (a second migration). Persisting the `Failed` phase makes
+    /// `failed_operation_is_not_retried` hold an unchanged revision instead.
+    #[tokio::test]
+    async fn a_terminal_hook_create_failure_persists_a_failed_operation_and_is_not_retried() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .fail_create_terminally("migrate-"),
+        );
+        fixture.commit(&[
+            ("seed-hook.yaml", SEED_PRE_SYNC_HOOK),
+            ("hook.yaml", PRE_SYNC_HOOK),
+            ("configmap.yaml", CONFIGMAP),
+        ]);
+        let mut app = fixture.app(".");
+
+        // Pass 1 (through the real `apply_once`): `seed-` is created, the create of `migrate-`
+        // answers `422`, which is terminal.
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        let err = err.expect("the second hook create fails");
+        assert_eq!(
+            err.failure_class(),
+            crate::FailureClass::Terminal,
+            "a 422 cannot be fixed by retrying: {err:?}"
+        );
+        assert!(
+            matches!(err, ReconcileError::SyncConflict { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            fixture.cluster.creates(),
+            vec!["seed-abcde".to_owned()],
+            "the first hook really was created before the failure"
+        );
+
+        // The failure carries the state, `Failed`, with the record of the hook that exists.
+        let operation = err
+            .partial_operation()
+            .expect("a terminal hook failure must carry the state it reached")
+            .clone();
+        assert_eq!(operation.phase, OperationPhase::Failed);
+        assert_eq!(operation.sync_phase, Some(SyncPhase::PreSync));
+        assert_eq!(operation.active_hooks.len(), 1);
+        assert_eq!(operation.active_hooks[0].generated_name, "seed-abcde");
+        assert!(
+            operation.finished_at.is_some(),
+            "a terminal failure stamps the end of the operation"
+        );
+        assert!(
+            operation
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("immutable")),
+            "the failure reason reaches status.operationState.message: {:?}",
+            operation.message
+        );
+
+        // `apply_once` persisted it, so the next pass sees the terminal operation.
+        let status = status.expect("the failure path must still patch /status");
+        assert!(!status.is_ready());
+        let persisted = status
+            .operation_state
+            .clone()
+            .expect("a terminal wave failure must persist its operation state");
+        assert_eq!(persisted.phase, OperationPhase::Failed);
+        assert_eq!(persisted.active_hooks.len(), 1);
+
+        // Pass 2: the same revision does not restart the failed operation, so nothing is created
+        // again — in particular no second `seed-*` migration `Job`.
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a terminally failed operation is reported, not retried as an error");
+        assert_eq!(
+            fixture.cluster.creates(),
+            vec!["seed-abcde".to_owned()],
+            "a failed operation must never re-run a generateName hook: {:?}",
+            fixture.cluster.creates()
+        );
+        assert_eq!(
+            outcome.operation_state.as_ref().map(|state| state.phase),
+            Some(OperationPhase::Failed),
+            "the operation stays terminally failed"
+        );
+    }
+
+    /// **Finding H-A:** a discovery-refresh failure *after* a CRD wave (`T10.2`'s boundary guard)
+    /// must not drop what the pass reached: the wave that was just applied stays in the carried
+    /// inventory and the hook records stay in the carried operation state.
+    #[tokio::test]
+    async fn a_wave_boundary_discovery_failure_keeps_the_inventory_and_the_hook_records() {
+        // A CRD plus a `PreSync` hook in one commit: the hook has to be created and tracked before
+        // the CRD wave is dispatched.
+        let crd_wave = "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: widgets.example.com\n  annotations:\n    ferriscd.io/sync-wave: \"-1\"\nspec:\n  group: example.com\n  scope: Namespaced\n  names:\n    kind: Widget\n    plural: widgets\n  versions:\n    - name: v1\n      served: true\n      storage: true\n";
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[
+            ("hook.yaml", PRE_SYNC_HOOK),
+            ("crd.yaml", crd_wave),
+            ("configmap.yaml", CONFIGMAP),
+        ]);
+        let app = fixture.app(".");
+
+        // Pass 1: the PreSync hook is created and tracked; no wave is dispatched yet.
+        let first = fixture.pipeline.apply(&app).await.expect("the hook pass");
+        let state = first.operation_state.clone().expect("operation state");
+        assert_eq!(state.active_hooks.len(), 1);
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "a `Progressing` PreSync hook keeps the waves closed: {:?}",
+            fixture.cluster.applies()
+        );
+
+        // Pass 2 dispatches the CRD wave. Discovery is served for the two refreshes of the pass
+        // itself (`prepare`'s and the executor's post-CRD one) and fails at the wave boundary.
+        fixture.discovery.fail_refresh_after(2);
+        fixture.cluster.complete_job("migrate-abcde");
+        let mut second_app = app.clone();
+        second_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            ..ApplicationStatus::default()
+        });
+
+        let err = fixture
+            .pipeline
+            .apply(&second_app)
+            .await
+            .expect_err("the wave-boundary refresh fails");
+        assert_eq!(
+            err.failure_class(),
+            crate::FailureClass::Retryable,
+            "an unavailable API server is retryable, so the pass must be a PartialSync: {err:?}"
+        );
+        assert!(matches!(err, ReconcileError::PartialSync { .. }), "{err:?}");
+
+        // The wave that was applied stays confirmed: a create that succeeded must never become an
+        // untracked orphan (finding C1) just because the refresh after it failed.
+        let (inventory, revision) = err
+            .partial_status()
+            .expect("a partial sync must report the inventory it already owns");
+        assert!(
+            inventory
+                .keys()
+                .any(|key| key.kind == scope::CRD_KIND && key.name == "widgets.example.com"),
+            "the CRD of the wave that was just applied must stay tracked: {:?}",
+            inventory.keys().collect::<Vec<_>>()
+        );
+        assert!(revision.is_some());
+
+        // ...and so does the operation state, hook record included.
+        let operation = err
+            .partial_operation()
+            .expect("a wave-boundary failure must carry the state it reached");
+        assert_eq!(operation.sync_phase, Some(SyncPhase::Sync));
+        assert_eq!(operation.current_wave, -1);
+        assert_eq!(operation.active_hooks.len(), 1);
+        assert_eq!(operation.active_hooks[0].generated_name, "migrate-abcde");
+        assert_eq!(
+            operation.active_hooks[0].health,
+            HealthStatus::Healthy,
+            "the record is refreshed to what the pass observed"
+        );
+    }
+
+    /// **Finding M5:** a `Failed` operation is not restarted by a plain requeue — that would
+    /// re-run `PreSync`/`SyncFail` hooks (and, for a `generateName` hook, start a second migration).
+    /// Only a new revision or an explicit manual operation starts a new operation.
+    #[tokio::test]
+    async fn a_failed_operation_is_not_restarted_without_a_new_revision_or_a_manual_operation() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("hook.yaml", PRE_SYNC_HOOK), ("configmap.yaml", CONFIGMAP)]);
+        let app = fixture.app(".");
+
+        // Pass 1: the PreSync hook is created.
+        let first = fixture.pipeline.apply(&app).await.expect("the hook pass");
+        assert_eq!(fixture.cluster.creates().len(), 1);
+        let mut state = first.operation_state.clone().expect("state");
+
+        // Pass 2: the migration failed -> `SyncFail`.
+        fixture.cluster.fail_job("migrate-abcde");
+        let mut second_app = app.clone();
+        second_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            ..ApplicationStatus::default()
+        });
+        let second = fixture
+            .pipeline
+            .apply(&second_app)
+            .await
+            .expect("sync fail");
+        assert_eq!(
+            second
+                .operation_state
+                .as_ref()
+                .map(|state| state.sync_phase),
+            Some(Some(SyncPhase::SyncFail))
+        );
+        state = second.operation_state.clone().expect("state");
+
+        // Pass 3: a `SyncFail` phase without hooks is over -> terminal `Failed`.
+        let mut third_app = app.clone();
+        third_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            ..ApplicationStatus::default()
+        });
+        let third = fixture.pipeline.apply(&third_app).await.expect("failed");
+        let failed = third.operation_state.clone().expect("state");
+        assert_eq!(failed.phase, OperationPhase::Failed);
+        assert_eq!(
+            fixture.cluster.creates().len(),
+            1,
+            "the failed PreSync hook is never created again by the failure path itself"
+        );
+
+        // Passes 4 and 5: repeated requeues of the same, unchanged commit change nothing.
+        for pass in 0..2 {
+            let mut requeue = app.clone();
+            requeue.status = Some(ApplicationStatus {
+                operation_state: Some(failed.clone()),
+                ..ApplicationStatus::default()
+            });
+            let outcome = fixture
+                .pipeline
+                .apply(&requeue)
+                .await
+                .unwrap_or_else(|err| panic!("pass {pass} must not fail: {err}"));
+            assert_eq!(
+                outcome.operation_state.as_ref().map(|state| state.phase),
+                Some(OperationPhase::Failed),
+                "pass {pass}: the operation stays terminally failed"
+            );
+            assert_eq!(
+                fixture.cluster.creates().len(),
+                1,
+                "pass {pass}: a requeue must not re-run PreSync/SyncFail hooks"
+            );
+        }
+
+        // A new revision is a new sync: it starts a fresh operation at PreSync.
+        fixture.commit(&[
+            ("hook.yaml", PRE_SYNC_HOOK),
+            ("configmap.yaml", CONFIGMAP_WITH_DATA),
+        ]);
+        let mut new_revision = app.clone();
+        new_revision.status = Some(ApplicationStatus {
+            operation_state: Some(failed.clone()),
+            ..ApplicationStatus::default()
+        });
+        let restarted = fixture
+            .pipeline
+            .apply(&new_revision)
+            .await
+            .expect("a new revision restarts the operation");
+        assert_eq!(
+            restarted
+                .operation_state
+                .as_ref()
+                .map(|state| state.sync_phase),
+            Some(Some(SyncPhase::PreSync))
+        );
+        assert_eq!(
+            fixture.cluster.creates().len(),
+            2,
+            "the new commit runs its own PreSync hook"
+        );
+
+        // ...and so is an explicit manual operation on the same commit.
+        let mut manual = app.clone();
+        manual.metadata.annotations = Some(BTreeMap::from([(
+            annotations::OPERATION.to_owned(),
+            r#"{"sync":{}}"#.to_owned(),
+        )]));
+        manual.status = Some(ApplicationStatus {
+            operation_state: Some(failed),
+            ..ApplicationStatus::default()
+        });
+        let manual_outcome = fixture
+            .pipeline
+            .apply(&manual)
+            .await
+            .expect("a manual operation restarts the operation");
+        assert_eq!(
+            manual_outcome
+                .operation_state
+                .as_ref()
+                .map(|state| state.sync_phase),
+            Some(Some(SyncPhase::PreSync)),
+            "an explicit ferriscd.io/operation is the escape hatch from a failed operation"
+        );
+        assert_eq!(fixture.cluster.creates().len(), 3);
+    }
+
+    /// A pass that *finishes* an operation must claim `Synced` even when the diff gate would now
+    /// skip: the rollout has nothing left to apply, so the gate says `Skip`, but the sync is over.
+    /// Re-gating on `decision.is_execute()` would leave `lastSynced*` unset (making `selfHeal:
+    /// false` re-execute forever) and report `SyncSkipped` for a completed sync.
+    #[tokio::test]
+    async fn a_finished_operation_claims_synced_even_when_the_gate_would_skip() {
+        use ferriscd_crd::status::OperationState;
+
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let sha = fixture.commit(&[
+            (
+                "migration.yaml",
+                "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: smoke\n  annotations:\n    ferriscd.io/sync-wave: \"-1\"\n",
+            ),
+            ("configmap.yaml", CONFIGMAP),
+        ]);
+        let mut app = fixture.app(".");
+        // Manual-only: `should_sync` returns `Skip(AutomatedDisabled)` no matter what drifts, which
+        // is exactly the "the gate would skip" case.
+        app.spec.sync_policy = None;
+        // ... and an operation that is one step away from finishing.
+        app.status = Some(ApplicationStatus {
+            operation_state: Some(OperationState {
+                phase: OperationPhase::Running,
+                sync_phase: Some(SyncPhase::PostSync),
+                current_wave: 0,
+                // `now`, not a fixture timestamp: the operation timeout is measured from
+                // `startedAt`, so a hard-coded date would put this operation a day past its
+                // deadline.
+                phase_started_at: Some(now()),
+                revision: Some(sha.clone()),
+                active_hooks: Vec::new(),
+                message: None,
+                started_at: now(),
+                finished_at: None,
+            }),
+            ..ApplicationStatus::default()
+        });
+
+        let outcome = fixture.pipeline.apply(&app).await.expect("the last step");
+        assert_eq!(
+            outcome.operation_state.as_ref().map(|state| state.phase),
+            Some(OperationPhase::Succeeded)
+        );
+        assert_eq!(
+            outcome.reason, REASON_SYNC_SUCCEEDED,
+            "a completed operation is a sync, even on a pass the gate would skip: {}",
+            outcome.message
+        );
+        let sync = outcome.sync.clone().expect("sync state");
+        assert_eq!(sync.status, SyncStatus::Synced);
+        assert_eq!(
+            sync.last_synced_revision.as_deref(),
+            Some(sha.as_str()),
+            "the sync markers prove the commit was deployed"
+        );
+        assert!(sync.last_synced_spec_hash.is_some());
+        assert_eq!(outcome.history.map(|history| history.len()), Some(1));
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "nothing was left to apply"
+        );
+    }
+
+    /// `T10.2` trap guard: a wave that carries a `CustomResourceDefinition` refreshes discovery
+    /// before the next wave, so the custom resource of wave 0 resolves in the same operation.
+    #[tokio::test]
+    async fn a_crd_in_a_wave_refreshes_discovery_before_the_next_wave() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let crd = "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: widgets.example.com\n  annotations:\n    ferriscd.io/sync-wave: \"-1\"\nspec:\n  group: example.com\n  scope: Namespaced\n  names:\n    kind: Widget\n    plural: widgets\n  versions:\n    - name: v1\n      served: true\n      storage: true\n";
+        let widget = "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: one\n";
+        fixture.commit(&[("crd.yaml", crd), ("widget.yaml", widget)]);
+        let app = fixture.app(".");
+
+        let fetches_before = fixture.discovery.fetches();
+        let first = fixture.pipeline.apply(&app).await.expect("the CRD wave");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["apiextensions.k8s.io/CustomResourceDefinition//widgets.example.com".to_owned()]
+        );
+        let fetches_after_first = fixture.discovery.fetches();
+        let state = first.operation_state.clone().expect("state");
+        assert_eq!(state.current_wave, -1);
+        // Four refreshes in the pass that applies the CRD wave, each with a different job:
+        //   1. rendering      — the Phase 11 pipeline needs a fresh `kube_version` before it
+        //                       renders (T11.1/T11.4);
+        //   2. `prepare`      — the bundle declares a CRD, so the snapshot is refreshed up front;
+        //   3. the executor   — a CRD applied *inside* a wave must serve its kind immediately
+        //                       (`T08.3`, trap T6), so the CR of the same wave can be resolved;
+        //   4. the wave runner — the boundary guard (`T10.2`), which is what makes the *next* wave
+        //                       resolvable and is the one this test names.
+        // Removing (4) makes this number 3.
+        assert_eq!(
+            fetches_after_first - fetches_before,
+            4,
+            "the CRD wave must refresh discovery on top of the render, per-pass and executor refreshes"
+        );
+
+        // The fake API server persists an applied CRD *with* its `Established` status, so the wave is
+        // healthy on the next pass without `seed_applied` (which would re-insert the status-less
+        // desired body).
+        let mut second_app = app.clone();
+        second_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            ..app.status.clone().unwrap_or_default()
+        });
+        let _ = fixture
+            .pipeline
+            .apply(&second_app)
+            .await
+            .expect("the CR wave");
+        assert!(
+            fixture
+                .cluster
+                .applies()
+                .contains(&"example.com/Widget/payments/one".to_owned()),
+            "the CR of wave 0 must be applied, got {:?}",
+            fixture.cluster.applies()
+        );
+        assert_eq!(
+            fixture.discovery.fetches() - fetches_after_first,
+            1,
+            "a wave without a CRD needs only the per-pass refresh"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // T10.5 — bounded history and GitOps-safe rollback
+    // ---------------------------------------------------------------------
+
+    /// Runs `count` successful single-pass syncs, each on a fresh commit, and returns
+    /// `(application, sha)` pairs so a test can thread `/status` forward by hand.
+    async fn synced_commits(fixture: &Fixture, contents: &[&str]) -> (Application, Vec<String>) {
+        let mut app = fixture.app(".");
+        let mut shas = Vec::new();
+        for (index, content) in contents.iter().enumerate() {
+            let sha = fixture.commit(&[(format!("configmap-{index}.yaml").as_str(), content)]);
+            let outcome = fixture.pipeline.apply(&app).await.expect("a clean sync");
+            let mut status = app.status.clone().unwrap_or_default();
+            status.operation_state = outcome.operation_state.clone();
+            status.history = outcome.history.clone().unwrap_or(status.history);
+            if let Some(sync) = outcome.sync.clone() {
+                status.sync = Some(sync);
+            }
+            status.inventory = outcome
+                .inventory
+                .clone()
+                .map(|inventory| ferriscd_engine::inventory::to_status_entries(&inventory))
+                .unwrap_or(status.inventory);
+            app.status = Some(status);
+            shas.push(sha);
+        }
+        (app, shas)
+    }
+
+    /// `T10.5`: a rollback re-deploys the historical commit, disables automation, warns the
+    /// operator, consumes the request, and then **stays** on the pinned commit across requeues.
+    #[tokio::test]
+    async fn a_rollback_pins_the_historical_commit_and_disables_automation() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let (mut app, shas) = synced_commits(
+            &fixture,
+            &[
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  version: v1\n",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  version: v2\n",
+            ],
+        )
+        .await;
+        assert_eq!(shas.len(), 2);
+        let history = app.status.as_ref().expect("status").history.clone();
+        assert_eq!(history.len(), 2, "each commit is recorded once");
+        assert_eq!(history[0].revision.as_deref(), Some(shas[1].as_str()));
+        assert_eq!(history[1].id, 1);
+        assert_eq!(history[1].revision.as_deref(), Some(shas[0].as_str()));
+
+        // The operator asks for history id 1 (commit v1).
+        app.annotations_mut().insert(
+            annotations::OPERATION.to_owned(),
+            "{\"rollback\":{\"id\":1}}".to_owned(),
+        );
+        let before = fixture.cluster.applies().len();
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("the rollback pass");
+
+        // 1. The pass rendered the *pinned* commit, not HEAD.
+        let sync = outcome.sync.clone().expect("sync state");
+        assert_eq!(
+            sync.revision.as_deref(),
+            Some(shas[0].as_str()),
+            "a rollback applies history entry 1, never HEAD"
+        );
+        fixture.cluster.seed_applied();
+        assert_eq!(
+            fixture
+                .cluster
+                .live_pointer(CONFIGMAP_KEY, "/data/version")
+                .as_deref(),
+            Some("v1"),
+            "the historical manifest is what reached the cluster: {:?}",
+            fixture.cluster.applies()
+        );
+        assert!(fixture.cluster.applies().len() > before);
+
+        // 2. Automation was disabled through a narrow spec patch, and the request consumed.
+        let patches = fixture.cluster.app_patches();
+        assert_eq!(
+            patches.len(),
+            2,
+            "one spec patch, one consume patch: {patches:?}"
+        );
+        assert_eq!(
+            patches[0],
+            serde_json::json!({"spec": {"syncPolicy": {"automated": null}}}),
+            "only spec.syncPolicy.automated is removed (prune/syncOptions survive)"
+        );
+        assert_eq!(
+            patches[1],
+            serde_json::json!({"metadata": {"annotations": {annotations::OPERATION: null}}}),
+            "the honoured request is consumed so it cannot re-trigger forever"
+        );
+
+        // 3. The operator is told why the app is no longer following Git.
+        assert_eq!(outcome.warnings.len(), 1);
+        let warning = &outcome.warnings[0];
+        assert_eq!(warning.type_, ferriscd_engine::sync::CONDITION_WARNING);
+        assert_eq!(
+            warning.reason,
+            ferriscd_engine::sync::REASON_AUTOMATED_SYNC_DISABLED_BY_ROLLBACK
+        );
+        assert!(warning.message.contains("re-enable"), "{}", warning.message);
+        assert_eq!(warning.status, ferriscd_crd::status::ConditionStatus::True);
+
+        // 4. History records the rollback as a new deployment, idempotently.
+        let history = outcome.history.clone().expect("history");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].id, 3);
+        assert_eq!(history[0].revision.as_deref(), Some(shas[0].as_str()));
+
+        // 5. Stability across requeues: the next passes keep resolving the pinned commit even though
+        //    the annotation is gone and `HEAD` moved on.
+        let mut parked = app.clone();
+        parked.annotations_mut().remove(annotations::OPERATION);
+        // Exactly what the rollback patched: automation is gone, nothing else changed.
+        parked.spec.sync_policy = None;
+        let mut status = parked.status.clone().unwrap_or_default();
+        status.operation_state = outcome.operation_state.clone();
+        status.history = history;
+        status.conditions = outcome.warnings.clone();
+        parked.status = Some(status);
+
+        let applies_before = fixture.cluster.applies().len();
+        for pass in 0..3 {
+            let outcome = fixture
+                .pipeline
+                .apply(&parked)
+                .await
+                .expect("a parked rollback is not an error");
+            assert_eq!(
+                outcome.sync.as_ref().and_then(|sync| sync.revision.clone()),
+                Some(shas[0].to_owned()),
+                "pass {pass}: the pinned revision must not flip back to HEAD"
+            );
+            assert_eq!(
+                outcome.reason, REASON_SYNC_SKIPPED,
+                "pass {pass}: automation is off, so nothing is applied"
+            );
+            assert!(outcome.history.is_none(), "no new deployment to record");
+            // Mirror `apply_outcome_status`: a field the pass did not report is left untouched, so
+            // the terminal operation (and therefore the pinned revision) survives a skipped pass.
+            let previous = parked.status.clone().unwrap_or_default();
+            parked.status = Some(ApplicationStatus {
+                operation_state: outcome
+                    .operation_state
+                    .clone()
+                    .or(previous.operation_state.clone()),
+                sync: outcome.sync.clone().or(previous.sync.clone()),
+                ..previous
+            });
+        }
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            applies_before,
+            "a parked rollback issues no mutating apply"
+        );
+        assert!(
+            fixture.cluster.app_patches().len() == 2,
+            "the spec is not patched again once it is manual-only"
+        );
+    }
+
+    /// Re-enabling automation clears the warning and lets `HEAD` win again (finding M-4).
+    #[tokio::test]
+    async fn re_enabling_automation_clears_the_rollback_warning() {
+        let mut status = ApplicationStatus::default();
+        status.set_condition(ferriscd_crd::status::Condition::new(
+            ferriscd_engine::sync::CONDITION_WARNING,
+            ferriscd_crd::status::ConditionStatus::True,
+            ferriscd_engine::sync::REASON_AUTOMATED_SYNC_DISABLED_BY_ROLLBACK,
+            "rollback disabled automation",
+            at("2026-11-24T12:00:00Z"),
+        ));
+        status.set_condition(ferriscd_crd::status::Condition::ready(
+            ferriscd_crd::status::ConditionStatus::True,
+            ferriscd_crd::status::CONDITION_READY,
+            "ready",
+            at("2026-11-24T12:00:00Z"),
+        ));
+        assert_eq!(status.conditions.len(), 2);
+
+        let mut app = application("https://example.com/repo.git", ".", "payments");
+        // Manual-only, exactly as a rollback leaves it: the warning stands, because the rollback is
+        // still what pins the revision to the historical commit.
+        app.spec.sync_policy = None;
+        assert!(
+            !ferriscd_engine::sync::clear_rollback_warning_if_automation_reenabled(
+                &app.spec,
+                &mut status
+            )
+        );
+        assert_eq!(status.conditions.len(), 2);
+
+        app.spec.sync_policy = Some(self_heal_policy());
+        assert!(
+            ferriscd_engine::sync::clear_rollback_warning_if_automation_reenabled(
+                &app.spec,
+                &mut status
+            )
+        );
+        assert_eq!(status.conditions.len(), 1);
+        assert!(
+            status
+                .condition(ferriscd_engine::sync::CONDITION_WARNING)
+                .is_none(),
+            "the stale warning is gone"
+        );
+        assert!(
+            status
+                .condition(ferriscd_crd::status::CONDITION_READY)
+                .is_some(),
+            "the Ready condition is untouched"
+        );
+
+        // The same clearing happens on a real pass (`apply_once` drives it), so an operator who
+        // re-enables automation never has to delete the warning by hand.
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let app_with_warning = {
+            let mut app = fixture.app(".");
+            app.status = Some(status);
+            app
+        };
+        let writer = RecordingStatus::default();
+        let _ = apply_once(&app_with_warning, &fixture.pipeline, &writer).await;
+        let written = writer.last().expect("the pass writes the status");
+        assert!(
+            written.conditions.iter().all(|condition| condition.reason
+                != ferriscd_engine::sync::REASON_AUTOMATED_SYNC_DISABLED_BY_ROLLBACK),
+            "automation is on, so the rollback warning must not survive the pass: {:?}",
+            written.conditions
+        );
+    }
+
+    /// A rollback to a history id that does not exist is terminal: guessing would redeploy the
+    /// wrong commit, and retrying can never succeed.
+    #[tokio::test]
+    async fn an_unknown_rollback_id_is_terminal_and_mutates_nothing() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+        app.annotations_mut().insert(
+            annotations::OPERATION.to_owned(),
+            "{\"rollback\":{\"id\":7}}".to_owned(),
+        );
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("an unknown history id cannot be rolled back to");
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert!(
+            err.to_string()
+                .contains("no status.history entry with id 7"),
+            "{err}"
+        );
+        assert!(fixture.cluster.applies().is_empty());
+        assert!(fixture.cluster.app_patches().is_empty());
+    }
+
+    /// `{"sync":{...}}` (and any other non-rollback operation) stays a manual sync request.
+    #[tokio::test]
+    async fn a_non_rollback_operation_annotation_is_a_manual_sync() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+        // A manual-only application: without the annotation the gate would skip.
+        app.spec.sync_policy = None;
+        app.annotations_mut().insert(
+            annotations::OPERATION.to_owned(),
+            "{\"sync\":{}}".to_owned(),
+        );
+
+        let outcome = fixture.pipeline.apply(&app).await.expect("a manual sync");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec![CONFIGMAP_KEY.to_owned()],
+            "a manual operation applies the desired set"
+        );
+        assert!(outcome.warnings.is_empty());
+        assert!(
+            fixture.cluster.app_patches().is_empty(),
+            "a manual sync never patches the spec"
+        );
     }
 
     #[tokio::test]
@@ -3866,6 +6264,8 @@ mod tests {
                 pending: 2,
                 invalid_ignore_pointers: 0,
                 prune_enabled: false,
+                settled: false,
+                ..SyncCounts::default()
             },
             "0123456789abcdef0123456789abcdef01234567".to_owned(),
             Inventory::new(),
@@ -3895,6 +6295,8 @@ mod tests {
                 pending: 0,
                 invalid_ignore_pointers: 0,
                 prune_enabled: false,
+                settled: true,
+                ..SyncCounts::default()
             },
             "0123456789abcdef0123456789abcdef01234567".to_owned(),
             Inventory::new(),
@@ -3949,6 +6351,8 @@ mod tests {
                 pending: 0,
                 invalid_ignore_pointers: 0,
                 prune_enabled: false,
+                settled: true,
+                ..SyncCounts::default()
             },
             "0123456789abcdef0123456789abcdef01234567".to_owned(),
             Inventory::new(),
@@ -3986,6 +6390,8 @@ mod tests {
                 pending: 0,
                 invalid_ignore_pointers: 0,
                 prune_enabled: false,
+                settled: false,
+                ..SyncCounts::default()
             },
             "0123456789abcdef0123456789abcdef01234567".to_owned(),
             Inventory::new(),
@@ -4035,6 +6441,8 @@ mod tests {
                 pending: 0,
                 invalid_ignore_pointers: 0,
                 prune_enabled: false,
+                settled: false,
+                ..SyncCounts::default()
             },
             "0123456789abcdef0123456789abcdef01234567".to_owned(),
             Inventory::new(),
@@ -4114,6 +6522,7 @@ mod tests {
             pending: 0,
             invalid_ignore_pointers: 1,
             prune_enabled: false,
+            ..SyncCounts::default()
         };
 
         let skipped = build_outcome(
@@ -4121,7 +6530,7 @@ mod tests {
             SyncDecision::Skip(ferriscd_engine::diff::SkipReason::SelfHealDisabled),
             &orphan_summary,
             HASH,
-            counts,
+            counts.clone(),
             revision.clone(),
             Inventory::new(),
         );
@@ -4457,16 +6866,16 @@ mod tests {
         let mut app = application("https://example.com/repo.git", ".", "payments");
         app.spec.requeue_after_seconds = 180;
         assert_eq!(
-            plan_requeue(true, 2, HealthStatus::Healthy, &app),
+            plan_requeue(true, 2, HealthStatus::Healthy, &app, None),
             PENDING_REQUEUE,
             "a deferred CRD/namespace is retried quickly regardless of health"
         );
         assert_eq!(
-            plan_requeue(true, 0, HealthStatus::Progressing, &app),
+            plan_requeue(true, 0, HealthStatus::Progressing, &app, None),
             PROGRESSING_REQUEUE
         );
         assert_eq!(
-            plan_requeue(false, 0, HealthStatus::Progressing, &app),
+            plan_requeue(false, 0, HealthStatus::Progressing, &app, None),
             PROGRESSING_REQUEUE,
             "a skipped pass still polls fast while a rollout converges"
         );
@@ -4478,7 +6887,7 @@ mod tests {
             HealthStatus::Unknown,
         ] {
             assert_eq!(
-                plan_requeue(true, 0, settled, &app),
+                plan_requeue(true, 0, settled, &app, None),
                 Duration::from_secs(180),
                 "{settled:?} is settled"
             );
@@ -4487,11 +6896,11 @@ mod tests {
         // The progressing interval never *lengthens* an operator's explicit faster interval.
         app.spec.requeue_after_seconds = 3;
         assert_eq!(
-            plan_requeue(true, 0, HealthStatus::Progressing, &app),
+            plan_requeue(true, 0, HealthStatus::Progressing, &app, None),
             Duration::from_secs(3)
         );
         assert_eq!(
-            plan_requeue(true, 1, HealthStatus::Progressing, &app),
+            plan_requeue(true, 1, HealthStatus::Progressing, &app, None),
             PENDING_REQUEUE,
             "a pending dependency outranks the health interval"
         );
@@ -4526,14 +6935,15 @@ mod tests {
         live.insert(missing.clone(), LiveState::Missing);
         live.insert(deferred.clone(), LiveState::DeferredPendingCrd);
 
-        let inputs = health_inputs(&desired, &live, &Inventory::new());
+        let planned: BTreeSet<ResourceKey> = BTreeSet::new();
+        let inputs = health_inputs(&desired, &live, &Inventory::new(), &planned);
         assert_eq!(inputs.len(), 2);
         assert!(matches!(inputs[0].observation, Observation::Missing));
         assert!(matches!(inputs[1].observation, Observation::Pending(_)));
 
         // A resource this pass applied is not `Missing`: the live read simply predates the write.
         let applied = inventory::inventory_from_desired(&desired);
-        let inputs = health_inputs(&desired, &live, &applied);
+        let inputs = health_inputs(&desired, &live, &applied, &planned);
         assert!(
             matches!(
                 inputs[0].observation,
@@ -4542,10 +6952,27 @@ mod tests {
             "an applied resource must not be reported Missing"
         );
 
+        // Finding M3: a resource a *later* wave of the running operation owns has deliberately not
+        // been created yet, so it is scheduled (`Progressing`), never `Missing` — and the explicit
+        // "applied this pass" observation still wins over it.
+        let scheduled: BTreeSet<ResourceKey> = BTreeSet::from([missing.clone()]);
+        let inputs = health_inputs(&desired, &live, &Inventory::new(), &scheduled);
+        assert!(
+            matches!(inputs[0].observation, Observation::Pending(_)),
+            "a scheduled wave must be Progressing, not Missing: {:?}",
+            inputs[0].observation
+        );
+        assert!(matches!(inputs[1].observation, Observation::Pending(_)));
+        let inputs = health_inputs(&desired, &live, &applied, &scheduled);
+        assert!(matches!(
+            inputs[0].observation,
+            Observation::AppliedAwaitingObservation
+        ));
+
         // A kind whose CRD disappeared is not this pass's health business.
         let mut gone: LiveStateMap = BTreeMap::new();
         gone.insert(missing.clone(), LiveState::OrphanGvkGone);
-        assert!(health_inputs(&desired, &gone, &Inventory::new()).is_empty());
+        assert!(health_inputs(&desired, &gone, &Inventory::new(), &scheduled).is_empty());
     }
 
     #[test]

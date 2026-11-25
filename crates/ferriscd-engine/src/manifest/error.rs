@@ -69,6 +69,21 @@ pub enum ManifestError {
     #[error("{file}: {message}")]
     Normalization { file: String, message: String },
 
+    /// A FerrisCD control annotation (`ferriscd.io/sync-wave`, `ferriscd.io/hook`,
+    /// `ferriscd.io/hook-delete-policy`) carried an unparseable value.
+    ///
+    /// Always terminal: the annotation is part of the rendered commit, so re-reading the same
+    /// revision can never produce a different value (and silently defaulting, e.g. treating
+    /// `sync-wave: "-1x"` as wave `0`, would silently reorder a migration Job behind the
+    /// workload it prepares).
+    #[error("{file}: {message}")]
+    InvalidAnnotation {
+        /// Repository-relative source file path.
+        file: String,
+        /// Which annotation of which resource was rejected, and why.
+        message: String,
+    },
+
     /// Two desired resources share the same version-agnostic GKNN key.
     #[error("duplicate resource key '{key}': defined in both '{file_a}' and '{file_b}'")]
     DuplicateResourceKey {
@@ -136,11 +151,12 @@ pub enum ManifestError {
 impl ManifestError {
     /// Returns `true` for transient failures that are safe to retry.
     ///
-    /// Manifest parsing, validation, budget, path-escape, limit, duplicate-key, and every
-    /// renderer failure are deterministic (terminal): the same commit and the same renderer
-    /// configuration can only produce the same result, so a retry loop would never converge.
-    /// Filesystem I/O is retryable **except** [`std::io::ErrorKind::InvalidData`], which a
-    /// non-UTF-8 manifest produces and which can never be fixed by retrying.
+    /// Manifest parsing, validation, budget, path-escape, limit, duplicate-key,
+    /// control-annotation, and every renderer failure are deterministic (terminal): the same
+    /// commit and renderer configuration can only produce the same result, so a retry loop
+    /// would never converge. Filesystem I/O is retryable **except**
+    /// [`std::io::ErrorKind::InvalidData`], which a non-UTF-8 manifest produces and which can
+    /// never be fixed by retrying.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -210,6 +226,13 @@ mod tests {
             (
                 ManifestError::LimitExceeded {
                     reason: "too many files".into(),
+                },
+                false,
+            ),
+            (
+                ManifestError::InvalidAnnotation {
+                    file: "migrations.yaml".into(),
+                    message: "ferriscd.io/sync-wave expects a signed 32-bit integer".into(),
                 },
                 false,
             ),

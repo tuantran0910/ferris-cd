@@ -200,7 +200,9 @@ impl ClusterCleanup {
             "namespace",
             TARGET_NAMESPACE,
             "--ignore-not-found=true",
-            "--wait=false",
+            // Blocking delete: a namespace left `Terminating` by an earlier run races the next
+            // create with `AlreadyExists`/`Forbidden` (finding M2).
+            "--timeout=120s",
         ]);
         Self
     }
@@ -221,7 +223,9 @@ impl Drop for ClusterCleanup {
             "namespace",
             TARGET_NAMESPACE,
             "--ignore-not-found=true",
-            "--wait=false",
+            // Blocking delete: a namespace left `Terminating` by an earlier run races the next
+            // create with `AlreadyExists`/`Forbidden` (finding M2).
+            "--timeout=120s",
         ]);
     }
 }

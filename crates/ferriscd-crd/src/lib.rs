@@ -17,8 +17,9 @@ pub use project::{
     AppProject, AppProjectSpec, AppProjectStatus, GroupKind, PermissivePolicy, ProjectDestination,
 };
 pub use status::{
-    ApplicationStatus, Condition, ConditionStatus, HealthState, HealthStatus, InventoryEntry,
-    OperationPhase, OperationState, ResourceStatus, RevisionHistoryEntry, SyncState, SyncStatus,
+    ActiveHook, ApplicationStatus, Condition, ConditionStatus, HealthState, HealthStatus,
+    InventoryEntry, OperationPhase, OperationState, ResourceStatus, RevisionHistoryEntry,
+    SourceSummary, SyncPhase, SyncState, SyncStatus,
 };
 
 /// Canonical API group of every FerrisCD custom resource.
