@@ -13,9 +13,7 @@ pub use application::{
     RendererSpec, RetryBackoff, RetryPolicy, SourceSpec, SpecValidationError, SyncOptions,
     SyncPolicy,
 };
-pub use project::{
-    AppProject, AppProjectSpec, AppProjectStatus, GroupKind, PermissivePolicy, ProjectDestination,
-};
+pub use project::{AppProject, AppProjectSpec, AppProjectStatus, GroupKind, ProjectDestination};
 pub use status::{
     ActiveHook, ApplicationStatus, Condition, ConditionStatus, HealthState, HealthStatus,
     InventoryEntry, OperationPhase, OperationState, ResourceStatus, RevisionHistoryEntry,

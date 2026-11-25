@@ -137,53 +137,6 @@ pub struct AppProjectStatus {
     pub conditions: Vec<Condition>,
 }
 
-/// Permissive policy stub used from Phase 05 until the real `AppProjectPolicy` lands in Phase 12.
-///
-/// Every check allows everything on purpose: Phases 05–11 build the sync pipeline before
-/// multi-tenancy rules exist. The type is the single swap point —
-/// `AppProjectPolicy` replaces it in `T12.1` without touching call sites — and it is
-/// deliberately infallible so policy checks can never mask a sync error.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PermissivePolicy;
-
-impl PermissivePolicy {
-    /// Allows every source repository.
-    #[must_use]
-    pub fn allows_source_repo(&self, _repo_url: &str) -> bool {
-        true
-    }
-
-    /// Allows every cluster/namespace destination.
-    #[must_use]
-    pub fn allows_destination(&self, _destination: &ProjectDestination) -> bool {
-        true
-    }
-
-    /// Allows every cluster-scoped GroupKind.
-    #[must_use]
-    pub fn allows_cluster_resource(&self, _group_kind: &GroupKind) -> bool {
-        true
-    }
-
-    /// Allows every namespaced GroupKind.
-    #[must_use]
-    pub fn allows_namespace_resource(&self, _group_kind: &GroupKind) -> bool {
-        true
-    }
-
-    /// Allows every ServiceAccount impersonation.
-    #[must_use]
-    pub fn allows_service_account(&self, _namespace: &str, _service_account: &str) -> bool {
-        true
-    }
-
-    /// Allows `Application` objects in every namespace.
-    #[must_use]
-    pub fn allows_source_namespace(&self, _namespace: &str) -> bool {
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -366,22 +319,20 @@ spec: {}
     }
 
     #[test]
-    fn permissive_policy_stub_allows_every_check() {
-        let policy = PermissivePolicy;
-        assert!(policy.allows_source_repo("https://github.com/example/payments.git"));
-        assert!(policy.allows_source_repo("file:///tmp/repo"));
-        assert!(policy.allows_destination(&ProjectDestination {
-            cluster: "prod-west".to_owned(),
-            namespace: "payments".to_owned(),
-        }));
+    fn permissive_stub_is_gone_and_the_default_project_is_the_single_tenant_boundary() {
+        // The `PermissivePolicy` stub was removed when `T12.1` landed: the `default` project's
+        // all-wildcard spec is now the *only* permissive thing, and it is a deliberate, reviewable
+        // manifest rather than a compile-time allow-everything type.
+        let project: AppProject =
+            serde_saphyr::from_str(DEFAULT_PROJECT_MANIFEST).expect("default project must parse");
+        let spec = project.spec;
+        assert_eq!(spec.source_repos, vec![WILDCARD]);
         assert!(
-            policy.allows_cluster_resource(&GroupKind::new(
-                "rbac.authorization.k8s.io",
-                "ClusterRole"
-            ))
+            spec.destinations
+                .iter()
+                .all(|destination| destination.namespace == WILDCARD),
+            "the default project must advertise its permissiveness explicitly"
         );
-        assert!(policy.allows_namespace_resource(&GroupKind::new("", "Secret")));
-        assert!(policy.allows_service_account("payments", "payments-sa"));
-        assert!(policy.allows_source_namespace("any-namespace"));
+        assert_eq!(spec.source_namespaces, vec![CONTROL_PLANE_NAMESPACE]);
     }
 }

@@ -596,9 +596,11 @@ impl fmt::Debug for RedactedUrl<'_> {
 ///   keep).
 ///
 /// Forgetting this is a real leak: repository URLs routinely embed a personal access token, and
-/// both [`RenderContext`] and [`super::cache::RenderCacheKey`] are logged.
+/// [`RenderContext`], [`super::cache::RenderCacheKey`], the `AppProject` policy messages
+/// (`T12.1`), and the sync refusals (`T12.3` finding M4) all quote a repository URL in a log line
+/// or in `Application.status`, which anyone allowed to read the CR can see.
 #[must_use]
-pub(crate) fn redact_repo_url(url: &str) -> String {
+pub fn redact_repo_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         // `git@github.com:org/repo.git` is an scp-style remote, not a URL with userinfo.
         return url.to_owned();

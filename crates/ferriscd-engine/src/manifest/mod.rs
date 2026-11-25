@@ -35,7 +35,8 @@ pub use loader::{ManifestFile, ManifestLoaderConfig, load};
 pub use normalize::{check_duplicate_keys, normalize};
 pub use renderer::{
     ManifestRenderer, PlainYamlOptions, PlainYamlRenderer, RenderContext, RendererBinaries,
-    RendererConfig, RendererKind, detect_renderer, parse_and_normalize, render, render_desired,
+    RendererConfig, RendererKind, detect_renderer, parse_and_normalize, redact_repo_url, render,
+    render_desired,
 };
 pub use types::{DesiredResource, GroupVersionKind, ResourceKey};
 pub use yaml::parse_file;

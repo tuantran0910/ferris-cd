@@ -56,10 +56,13 @@ use crate::sync::DeleteOutcome;
 
 /// The three cluster side effects a hook needs, as a seam.
 ///
-/// Production is the pipeline itself ([`crate::sync::InventorySyncPipeline`], which implements this
-/// for its `Applier`/`ClusterStateReader`/`DiscoveryCache`); tests script every verdict, so the
-/// hook lifecycle — including the async `404` wait — is provable without a cluster.
-pub trait HookCluster: Send + Sync + 'static {
+/// Production is [`crate::sync::PassHooks`]: the sync pipeline wrapped around one pass's
+/// `Applier`/`ClusterStateReader`/`DiscoveryCache`. Tests script every verdict, so the hook
+/// lifecycle — including the async `404` wait — is provable without a cluster.
+///
+/// Deliberately not `'static`: `PassHooks` **borrows** the pass's cluster access, because a hook
+/// must be created and observed as the identity that pass deploys with (`T12.3`).
+pub trait HookCluster: Send + Sync {
     /// Creates the hook object, returning the object the API server persisted.
     ///
     /// Must be `Api::create` (never a Server-Side Apply): only a create honours

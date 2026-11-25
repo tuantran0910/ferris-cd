@@ -9,11 +9,14 @@ use ferriscd_crd::Application;
 use kube::{Api, Client, ResourceExt};
 
 pub mod controller;
+pub mod credentials;
 pub mod discovery;
 pub mod dry_run;
 pub mod hooks;
+pub mod impersonation;
 pub mod live_state;
 pub mod predicate;
+pub mod project;
 pub mod prune;
 pub mod reconcile;
 pub mod scope;
@@ -23,20 +26,40 @@ pub mod sync_recovery;
 pub mod waves;
 
 pub use controller::{
-    BackoffTracker, ConfigError, ControllerConfig, DEFAULT_CONCURRENCY, DEFAULT_DRAIN_TIMEOUT,
-    FailureClass, RETRY_BASE_DELAY, RETRY_MAX_DELAY, TERMINAL_DELAY,
+    APPLICATION_NAMESPACES_ENV, ApplicationControllers, BackoffTracker, ConfigError,
+    ControllerConfig, DEFAULT_CONCURRENCY, DEFAULT_DRAIN_TIMEOUT, FailureClass,
+    NamespacedController, RETRY_BASE_DELAY, RETRY_MAX_DELAY, ReadinessError, TERMINAL_DELAY,
+    build_controllers,
+};
+pub use credentials::{
+    CredentialError, CredentialSource, CredentialTemplate, KEY_KNOWN_HOSTS, KEY_PASSWORD,
+    KEY_SSH_PRIVATE_KEY, KEY_TOKEN, KEY_URL, KEY_USERNAME, SECRET_TYPE_LABEL,
+    SECRET_TYPE_REPOSITORY, SecretCredentialStore, match_credentials, normalize_repo_url,
+    templates_from_secrets,
 };
 pub use discovery::{CachedDiscovery, DiscoveryCache, DiscoveryError, ScopeLookup};
 pub use dry_run::{
     DRY_RUN_CONCURRENCY, DryRunApi, DryRunError, DryRunEvaluator, DryRunFuture, DryRunOutcome,
     DryRunTarget, DynamicDryRunApi, MAX_FIELD_CONFLICTS, parse_conflict_status,
 };
+pub use ferriscd_engine::policy::{
+    ALL_NAMESPACES, AppProjectPolicy, ApplicationNamespaces, ApplicationScope,
+    ApplicationScopeError, PolicyError,
+};
 pub use hooks::{HookCluster, HookRun, hooks_for_step, run_step};
+pub use impersonation::{
+    ClusterAccess, ClusterIdentity, FORBIDDEN_GROUP, GROUP_AUTHENTICATED, GROUP_SERVICE_ACCOUNTS,
+    IMPERSONATE_EXTRA_PREFIX, IMPERSONATE_GROUP_HEADER, IMPERSONATE_UID_HEADER,
+    IMPERSONATE_USER_HEADER, ImpersonatingAccess, Impersonation, ImpersonationError,
+    ImpersonationLayer, ImpersonationPool, ImpersonationService, ImpersonationSource,
+    MAX_CACHED_IDENTITIES,
+};
 pub use live_state::{
     ClusterStateReader, DynamicApiSource, FetchRequest, LiveObjectSource, LiveState,
     LiveStateError, TrackingOwner,
 };
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
+pub use project::{ApiProjectSource, ProjectSource};
 pub use prune::{
     OwnershipVerifiedPruner, PruneResult, ResourcePruner, RetainReason, prune_opted_out, prune_rail,
 };
@@ -80,6 +103,13 @@ pub struct RunOptions {
     /// `None` falls back to `FERRISCD_NAMESPACE`, then `ferriscd-system`.
     pub namespace: Option<String>,
 
+    /// Namespaces allowed to host `Application` objects (`T12.2`).
+    ///
+    /// `None` falls back to `FERRISCD_APPLICATION_NAMESPACES`, then to the control-plane
+    /// namespace only (the safe default). Accepts a comma-separated list or `*` for every
+    /// namespace; the control-plane namespace is always watched.
+    pub application_namespaces: Option<String>,
+
     /// Accept `file://` URLs and local filesystem paths as Git sources.
     ///
     /// Off by default: production only allows `https://`/`ssh://`/SCP-style remotes, so an
@@ -113,6 +143,11 @@ pub async fn run() -> anyhow::Result<()> {
 pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
+    // `T12.3` prerequisite: two `rustls` providers are linked into this binary (`ring` via `kube`,
+    // `aws-lc-rs` via `gix`'s `reqwest`), and `rustls` refuses to pick one. Pin it before the first
+    // HTTPS client — the controller's own included — is built.
+    impersonation::ensure_crypto_provider();
+
     let log_format = init_logging()?;
     tracing::info!(
         controller = controller_name(),
@@ -126,16 +161,47 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
         Some(namespace) => Some(namespace.to_owned()),
         None => std::env::var(controller::NAMESPACE_ENV).ok(),
     };
+    // `T12.2`: the flag wins, then `FERRISCD_APPLICATION_NAMESPACES`, then the safe default
+    // (`--namespace` only).
+    let application_namespaces = match options.application_namespaces.as_deref() {
+        Some(value) => ApplicationNamespaces::parse(Some(value))?,
+        None => ControllerConfig::application_namespaces_from_env()?,
+    };
     let config = ControllerConfig {
         namespace: controller::namespace_from_env_value(namespace_value.as_deref())?,
+        application_namespaces,
         ..ControllerConfig::default()
     };
-    let client = Client::try_default()
-        .await
+    // The `Config` is inferred once and shared: the controller's own client and the `T12.3`
+    // impersonation pool are both built from it, so a tenant request authenticates with the same
+    // credential material as the controller's.
+    let kube_config = kube::Config::infer().await.context(
+        "failed to infer the Kubernetes configuration from kubeconfig/in-cluster config",
+    )?;
+    let client = Client::try_from(kube_config.clone())
         .context("failed to initialize the Kubernetes client from kubeconfig/in-cluster config")?;
 
+    if config
+        .application_scope()
+        .watches_more_than_the_control_plane()
+    {
+        tracing::warn!(
+            control_plane_namespace = %config.namespace,
+            application_namespaces = %config.application_scope().describe(),
+            "Apps-in-any-namespace is enabled: an Application outside the control-plane namespace \
+             is refused unless it sets spec.serviceAccountName (it is deployed as that \
+             ServiceAccount, never as the controller's) and its AppProject lists its namespace, \
+             destination, Kubernetes kinds, and that ServiceAccount (spec.sourceNamespaces, \
+             spec.destinations, *ResourceWhitelist, spec.allowedServiceAccounts). The project \
+             allow-lists stay the boundary: impersonation narrows what a tenant can do, it does \
+             not authorize an Application the project does not permit."
+        );
+    }
+
     let apps_api = Api::<Application>::namespaced(client.clone(), &config.namespace);
-    let status = Arc::new(ApiStatusWriter::new(apps_api.clone()));
+    // Status patches and finalizer writes follow the object's own namespace, so a tenant
+    // `Application` is patched where it lives (`T12.2`).
+    let status = Arc::new(ApiStatusWriter::new(apps_api.clone()).with_client(client.clone()));
 
     // Git: one scratch root backs both the gix worktrees and the repo cache, so publishing a
     // checkout is a same-filesystem atomic rename.
@@ -163,6 +229,32 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
         ferriscd_engine::repo::RepoCacheConfig::new(&work_root),
     ));
 
+    // `T12.3`: ONE shared HTTP/TLS connector for every impersonated identity, built once from the
+    // controller's own `kube::Config` (see `impersonation::ImpersonationPool`). It is created
+    // eagerly — not lazily on the first tenant `Application` — so a broken TLS configuration is a
+    // startup failure instead of a reconcile that fails forever.
+    let pool_config = kube_config.clone();
+    let pool =
+        tokio::task::spawn_blocking(move || impersonation::ImpersonationPool::new(&pool_config))
+            .await
+            .context("the impersonation connector task panicked")?
+            .context(
+                "failed to build the ServiceAccount impersonation connector; tenant Applications \
+             need it, and deploying them with the controller's own identity is never an option",
+            )?;
+    tracing::info!(
+        connectors = pool.connectors(),
+        "ServiceAccount impersonation pool ready (one shared HTTP/TLS connector)"
+    );
+    tracing::info!(
+        namespace = %config.namespace,
+        label = %credentials::SecretCredentialStore::label_selector(),
+        "repository credentials: reading labeled Secrets from the control-plane namespace only \
+         (namespaced list, never cluster-wide; no match clones anonymously)"
+    );
+    let impersonation_source: Arc<dyn impersonation::ImpersonationSource> =
+        Arc::new(impersonation::ImpersonatingAccess::new(Arc::new(pool)));
+
     let pipeline = Arc::new(
         sync::InventorySyncPipeline::new(
             repos,
@@ -172,9 +264,30 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
             // The dry-run half of drift detection (T07.1): `dryRun=All` PATCHes per resource.
             Arc::new(DynamicDryRunApi::new(client.clone())),
         )
-        .with_url_policy(url_policy),
+        .with_url_policy(url_policy)
+        // `T12.1`: every `Application` is validated against its `AppProject`, which is read from
+        // the control-plane namespace (never from the `Application`'s own namespace).
+        .with_project_source(Arc::new(ApiProjectSource::new(
+            client.clone(),
+            &config.namespace,
+        )))
+        // `T12.2`: the same scope the watcher uses, so a tenant `Application` is refused here even
+        // if it somehow reaches a reconcile.
+        .with_application_scope(config.application_scope())
+        // `T12.3`: one pooled connector for every impersonated ServiceAccount. Building it reads
+        // the CA bundle, so it is moved off the async workers; it happens exactly once.
+        .with_impersonation_source(impersonation_source)
+        // `T12.4`: Git credentials come from `ferriscd.io/secret-type=repository` Secrets in the
+        // control-plane namespace only. The store holds a *namespaced* `Api<Secret>`, so no code
+        // path can ask for a cluster-wide `Secret` read (trap guard for `T12.4`); no match means
+        // anonymous, which keeps public repositories working unchanged.
+        .with_credential_source(Arc::new(credentials::SecretCredentialStore::new(
+            client.clone(),
+            &config.namespace,
+        ))),
     );
-    let ctx = Arc::new(ReconcileContext::new(apps_api, pipeline, status));
+    let ctx =
+        Arc::new(ReconcileContext::new(apps_api, pipeline, status).with_client(client.clone()));
 
     controller::run(client, config, ctx).await?;
     Ok(())
