@@ -21,6 +21,8 @@ enum Commands {
     Crd(commands::crd::CrdArgs),
     /// Run the Kubernetes controller (watch `Application` CRs and sync them).
     Controller(commands::controller::ControllerArgs),
+    /// Run the controller **and** the in-process REST API/webhook server in one process.
+    Server(commands::server::ServerArgs),
 }
 
 #[tokio::main]
@@ -39,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::ApplyFile(args) => commands::apply_file::run(args).await,
         Commands::Crd(args) => commands::crd::run(args).await,
         Commands::Controller(args) => commands::controller::run(args).await,
+        Commands::Server(args) => commands::server::run(args).await,
     }
 }
 

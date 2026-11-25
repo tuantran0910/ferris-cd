@@ -1,0 +1,1816 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "FerrisCD Control Plane API",
+    "description": "In-process REST API of the FerrisCD GitOps control plane (ADR-002). `GET .../diff` and `GET .../resources` are computed live from the same `RepoCache`, renderer cache, `ClusterManager` and SSA dry-run diff the controller reconciles with, so an API answer can never disagree with the next reconcile. All diff payloads are `Secret`-redacted before they leave the engine.",
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/applications": {
+      "get": {
+        "tags": [
+          "applications"
+        ],
+        "summary": "Lists every `Application` this control plane watches.",
+        "description": "Every `Application` this control plane watches, with its sync/health verdict.",
+        "operationId": "list_applications",
+        "responses": {
+          "200": {
+            "description": "Every watched Application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationListView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The cluster could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/applications/{namespace}/{name}": {
+      "get": {
+        "tags": [
+          "applications"
+        ],
+        "summary": "Reads one `Application`.",
+        "description": "One `Application`, with its conditions, deployment history, and running operation.",
+        "operationId": "get_application",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The Application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationDetailView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such Application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The cluster could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/applications/{namespace}/{name}/diff": {
+      "get": {
+        "tags": [
+          "applications"
+        ],
+        "summary": "Computes the live, Secret-redacted diff of an `Application` (`T14.1`).",
+        "description": "The live, `Secret`-redacted Server-Side-Apply dry-run diff. Computed by the controller's own pipeline in-process, and read-only: nothing is applied, pruned, or patched.",
+        "operationId": "get_diff",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The redacted live diff",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiffView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such Application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The diff could not be computed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/applications/{namespace}/{name}/resources": {
+      "get": {
+        "tags": [
+          "applications"
+        ],
+        "summary": "Reads the live resource graph of an `Application` (`T14.1`).",
+        "description": "The live resource graph: `status.inventory` read on demand from the destination cluster, plus `Deployment -> ReplicaSet -> Pod` children discovered through `metadata.ownerReferences` (no informers). One listing per (cluster, namespace, kind) per request, bounded by `MAX_GRAPH_NODES` and `MAX_GRAPH_LIST_REQUESTS`.",
+        "operationId": "get_resources",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The live resource graph",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceGraphView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such Application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The destination cluster could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/applications/{namespace}/{name}/rollback": {
+      "post": {
+        "tags": [
+          "applications"
+        ],
+        "summary": "Requests a rollback to a history entry (`T14.1`).",
+        "description": "Requests a rollback by patching `ferriscd.io/operation` to `{\"rollback\":{\"id\":N}}`. The id must exist in `status.history`. A rollback supersedes a pending manual sync or an earlier rollback (one annotation slot) and is consumed by the controller once applied.",
+        "operationId": "rollback_application",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RollbackRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The rollback request was recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not the expected JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such Application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The Application changed while the request was recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload too large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No history entry with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/applications/{namespace}/{name}/sync": {
+      "post": {
+        "tags": [
+          "applications"
+        ],
+        "summary": "Requests a manual sync (`T14.1`).",
+        "description": "Requests a reconcile by patching `ferriscd.io/operation` to `{\"sync\":{}}`. The controller does the work; this endpoint never syncs anything itself, and the controller consumes the annotation once a pass has settled. A pending manual sync answers 202 (idempotent); only a pending rollback is a conflict.",
+        "operationId": "sync_application",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "`POST .../sync` request body.",
+                "properties": {
+                  "dryRun": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ],
+                    "description": "Compute the sync without applying it. **Not supported in `v1.0`**: that is `GET .../diff`."
+                  },
+                  "prune": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ],
+                    "description": "Prune orphans after the sync. **Not supported in `v1.0`**: pruning is a spec field\n(`syncPolicy.automated.prune`)."
+                  },
+                  "revision": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "Pin the sync to a specific revision. **Not supported in `v1.0`** (see [`sync_application`])."
+                  }
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The sync request was recorded (or is already pending)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such Application",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A rollback is pending, or the Application changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload too large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The request cannot be honoured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/clusters": {
+      "get": {
+        "tags": [
+          "platform"
+        ],
+        "summary": "Lists every addressable cluster: `in-cluster` plus every registered registration (`T13.1`).",
+        "description": "The cluster registry: `in-cluster` first, then every registered cluster name.",
+        "operationId": "list_clusters",
+        "responses": {
+          "200": {
+            "description": "The cluster registry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterListView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "platform"
+        ],
+        "summary": "Serves the OpenAPI 3.1 document (`T14.1`).",
+        "description": "This OpenAPI 3.1 document. The same bytes are committed to `docs/api/openapi.json` and used to generate the TypeScript client.",
+        "operationId": "openapi_document",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.1 document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The document could not be serialized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects": {
+      "get": {
+        "tags": [
+          "platform"
+        ],
+        "summary": "Lists every `AppProject` of the control-plane namespace.",
+        "description": "Every `AppProject` of the control-plane namespace, with its repository, namespace, destination, and ServiceAccount allow-lists.",
+        "operationId": "list_projects",
+        "responses": {
+          "200": {
+            "description": "Every AppProject",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectListView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The cluster could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/webhooks/github": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "`POST /api/v1/webhooks/github`.",
+        "description": "GitHub push webhook. Authenticated by `X-Hub-Signature-256` (HMAC-SHA256 over the raw body, constant-time) and replay-protected by `X-GitHub-Delivery`. Responds 202 with how many Applications matched; nothing is applied here.",
+        "operationId": "github",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The push was accepted and a refresh scheduled, or a replayed delivery / non-push event was ignored (`status` says which)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed delivery id or payload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The signature is missing or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload too large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "GitHub webhooks are not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/webhooks/gitlab": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "`POST /api/v1/webhooks/gitlab`.",
+        "description": "GitLab push webhook. Authenticated by the `X-Gitlab-Token` shared secret (constant-time); GitLab signs nothing, so the token is the whole authentication. Responds 202 with how many Applications matched; nothing is applied here.",
+        "operationId": "gitlab",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The push was accepted and a refresh scheduled, or a non-push event was ignored (`status` says which)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed payload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The token is missing or wrong",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload too large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "GitLab webhooks are not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Liveness probe: the process is running and the router answers.",
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "The API server is alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Readiness probe: `503` until the readiness seam says the control plane can serve traffic.",
+        "description": "**Limitation, tracked as `TODO(T15.x)`:** readiness is the API server's own verdict (the router\nanswers, and the seam wired today is [`crate::state::ServingReadiness`]). It does **not** yet\nreflect controller watch readiness — whether the `Application`/`AppProject` watches (and, with\n`T13.1`, the cluster-registry `Secret` watch) have completed their initial list. So a pod can\nreport `ready` while its controller is still listing: a client may observe an empty\n`/api/v1/applications` for a few seconds after a restart. `T15.x` (health/metrics) is where the\nwatch state becomes part of this answer; until then the false-`ready` window is bounded by the\ninitial list and nothing is served from a cache.",
+        "operationId": "readyz",
+        "responses": {
+          "200": {
+            "description": "Ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Not ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiErrorBody": {
+        "type": "object",
+        "description": "The body of a failed request.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ApiErrorDetail",
+            "description": "The failure."
+          }
+        }
+      },
+      "ApiErrorDetail": {
+        "type": "object",
+        "description": "One failure, in the shape the OpenAPI document declares.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable code (`NotFound`, `BadRequest`, `Conflict`, `Unprocessable`, `Unauthorized`,\n`Forbidden`, `BackendUnavailable`, `PayloadTooLarge`)."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable explanation, secret-free."
+          }
+        }
+      },
+      "ApplicationDetailView": {
+        "type": "object",
+        "description": "`GET /api/v1/applications/{namespace}/{name}` body.",
+        "required": [
+          "application"
+        ],
+        "properties": {
+          "application": {
+            "$ref": "#/components/schemas/ApplicationSummary",
+            "description": "The application itself."
+          },
+          "history": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HistoryView"
+            },
+            "description": "Last `status.history` entries, oldest first."
+          },
+          "operation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OperationView",
+                "description": "The running operation, when one is recorded."
+              }
+            ]
+          }
+        }
+      },
+      "ApplicationListView": {
+        "type": "object",
+        "description": "`GET /api/v1/applications` body.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApplicationSummary"
+            },
+            "description": "Every watched `Application`."
+          }
+        }
+      },
+      "ApplicationSummary": {
+        "type": "object",
+        "description": "One `Application`, reduced to what a UI/CLI lists.",
+        "required": [
+          "namespace",
+          "name",
+          "project",
+          "source",
+          "destination",
+          "resourceCount"
+        ],
+        "properties": {
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConditionView"
+            },
+            "description": "`status.conditions`, newest last, exactly as the controller wrote them."
+          },
+          "destination": {
+            "$ref": "#/components/schemas/DestinationView",
+            "description": "`spec.destination`."
+          },
+          "health": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HealthView",
+                "description": "`status.health`."
+              }
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "`metadata.name`."
+          },
+          "namespace": {
+            "type": "string",
+            "description": "`metadata.namespace`."
+          },
+          "observedGeneration": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`status.observedGeneration`."
+          },
+          "project": {
+            "type": "string",
+            "description": "`spec.project`."
+          },
+          "resourceCount": {
+            "type": "integer",
+            "description": "How many resources `status.inventory` tracks.",
+            "minimum": 0
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourceView",
+            "description": "`spec.source` summary (the repository URL is redacted)."
+          },
+          "sync": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SyncView",
+                "description": "`status.sync` (absent before the first reconcile)."
+              }
+            ]
+          }
+        }
+      },
+      "ClusterListView": {
+        "type": "object",
+        "description": "`GET /api/v1/clusters` body.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClusterView"
+            },
+            "description": "`in-cluster` first, then every registered cluster name."
+          }
+        }
+      },
+      "ClusterView": {
+        "type": "object",
+        "description": "One addressable cluster.",
+        "required": [
+          "name",
+          "inCluster"
+        ],
+        "properties": {
+          "inCluster": {
+            "type": "boolean",
+            "description": "Whether this is the cluster the control plane runs in."
+          },
+          "name": {
+            "type": "string",
+            "description": "`spec.destination.cluster` name."
+          }
+        }
+      },
+      "ConditionView": {
+        "type": "object",
+        "description": "One `status.conditions` entry.",
+        "required": [
+          "type",
+          "status",
+          "reason",
+          "message",
+          "lastTransitionTime"
+        ],
+        "properties": {
+          "lastTransitionTime": {
+            "type": "string",
+            "description": "When the status last changed (RFC 3339)."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable message."
+          },
+          "observedGeneration": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`metadata.generation` observed when the condition was computed."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Machine-readable reason."
+          },
+          "status": {
+            "type": "string",
+            "description": "`True`, `False`, or `Unknown`."
+          },
+          "type": {
+            "type": "string",
+            "description": "Condition type (`Ready`)."
+          }
+        }
+      },
+      "DestinationView": {
+        "type": "object",
+        "description": "`spec.destination`.",
+        "required": [
+          "cluster",
+          "namespace"
+        ],
+        "properties": {
+          "cluster": {
+            "type": "string",
+            "description": "`spec.destination.cluster`."
+          },
+          "namespace": {
+            "type": "string",
+            "description": "`spec.destination.namespace`."
+          }
+        }
+      },
+      "DiffChangeView": {
+        "type": "object",
+        "description": "One field-level change of a diffed resource.",
+        "required": [
+          "path",
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`added`, `removed`, or `modified`."
+          },
+          "live": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Live value at `path`, already redacted."
+          },
+          "path": {
+            "type": "string",
+            "description": "RFC 6901 JSON Pointer into the redacted object."
+          },
+          "predicted": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Predicted value at `path`, already redacted."
+          }
+        }
+      },
+      "DiffConflictView": {
+        "type": "object",
+        "description": "One Server-Side Apply field-ownership conflict.",
+        "properties": {
+          "field": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The disputed field, as reported by the API server."
+          },
+          "manager": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The manager that owns the field."
+          }
+        }
+      },
+      "DiffResourceView": {
+        "type": "object",
+        "description": "One diffed resource.",
+        "required": [
+          "key",
+          "status",
+          "truncated"
+        ],
+        "properties": {
+          "changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiffChangeView"
+            },
+            "description": "The field changes, already `Secret`-redacted and `ignoreDifferences`-filtered."
+          },
+          "conflicts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiffConflictView"
+            },
+            "description": "Field-ownership conflicts."
+          },
+          "key": {
+            "type": "string",
+            "description": "Version-agnostic GKNN key."
+          },
+          "owner": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The foreign owner, when `status` is `OwnershipConflict`."
+          },
+          "status": {
+            "type": "string",
+            "description": "`Synced`, `OutOfSync`, `Missing`, `Orphaned`, or `OwnershipConflict`."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether the change list was cut by the engine's bound."
+          }
+        }
+      },
+      "DiffSummaryView": {
+        "type": "object",
+        "description": "Aggregate counts of a diff.",
+        "required": [
+          "total",
+          "synced",
+          "outOfSync",
+          "missing",
+          "orphaned",
+          "ownershipConflicts",
+          "fieldConflicts"
+        ],
+        "properties": {
+          "fieldConflicts": {
+            "type": "integer",
+            "description": "Field-ownership conflicts.",
+            "minimum": 0
+          },
+          "missing": {
+            "type": "integer",
+            "description": "Resources that do not exist yet.",
+            "minimum": 0
+          },
+          "orphaned": {
+            "type": "integer",
+            "description": "Tracked resources no longer in Git.",
+            "minimum": 0
+          },
+          "outOfSync": {
+            "type": "integer",
+            "description": "Resources that differ.",
+            "minimum": 0
+          },
+          "ownershipConflicts": {
+            "type": "integer",
+            "description": "Resources owned by another `Application`.",
+            "minimum": 0
+          },
+          "synced": {
+            "type": "integer",
+            "description": "Resources whose live state matches the prediction.",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "description": "Resources classified.",
+            "minimum": 0
+          }
+        }
+      },
+      "DiffView": {
+        "type": "object",
+        "description": "`GET /api/v1/applications/{namespace}/{name}/diff` body.",
+        "required": [
+          "revision",
+          "desired",
+          "wouldSync",
+          "summary"
+        ],
+        "properties": {
+          "desired": {
+            "type": "integer",
+            "description": "How many resources the rendered bundle contains.",
+            "minimum": 0
+          },
+          "resources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiffResourceView"
+            },
+            "description": "One entry per resource in `desired ∪ status.inventory`."
+          },
+          "revision": {
+            "type": "string",
+            "description": "Commit the desired state was rendered from."
+          },
+          "summary": {
+            "$ref": "#/components/schemas/DiffSummaryView",
+            "description": "Counts over [`Self::resources`]."
+          },
+          "wouldSync": {
+            "type": "boolean",
+            "description": "Whether the sync decision gate would apply this set right now."
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "description": "Liveness answer.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "Always `ok` while the process answers."
+          }
+        }
+      },
+      "HealthView": {
+        "type": "object",
+        "description": "`status.health`.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bounded human-readable message."
+          },
+          "status": {
+            "type": "string",
+            "description": "`Healthy`, `Progressing`, `Degraded`, `Suspended`, `Missing`, or `Unknown`."
+          }
+        }
+      },
+      "HistoryView": {
+        "type": "object",
+        "description": "One `status.history` entry.",
+        "required": [
+          "id",
+          "deployedAt"
+        ],
+        "properties": {
+          "deployedAt": {
+            "type": "string",
+            "description": "When it was deployed (RFC 3339)."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Deployment id (the `{\"rollback\":{\"id\":N}}` handle)."
+          },
+          "revision": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit that was deployed."
+          }
+        }
+      },
+      "OperationResponse": {
+        "type": "object",
+        "description": "What a `sync`/`rollback` request did.",
+        "required": [
+          "status",
+          "operation",
+          "namespace",
+          "name",
+          "request"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Name of the `Application`."
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Namespace of the `Application`."
+          },
+          "operation": {
+            "type": "string",
+            "description": "`sync` or `rollback`."
+          },
+          "request": {
+            "type": "string",
+            "description": "The exact `ferriscd.io/operation` value that was patched."
+          },
+          "resourceVersion": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The resource version the patch was conditioned on, when it was read."
+          },
+          "status": {
+            "type": "string",
+            "description": "Always `accepted` (the controller performs the work)."
+          }
+        }
+      },
+      "OperationView": {
+        "type": "object",
+        "description": "`status.operationState`.",
+        "required": [
+          "phase",
+          "currentWave",
+          "startedAt"
+        ],
+        "properties": {
+          "currentWave": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Sync wave currently being applied."
+          },
+          "finishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it finished (RFC 3339), absent while running."
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bounded progress/error message."
+          },
+          "phase": {
+            "type": "string",
+            "description": "`Running`, `Succeeded`, `Failed`, or `Error`."
+          },
+          "revision": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Revision the operation is working on."
+          },
+          "startedAt": {
+            "type": "string",
+            "description": "When it started (RFC 3339)."
+          }
+        }
+      },
+      "ProjectListView": {
+        "type": "object",
+        "description": "`GET /api/v1/projects` body.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProjectView"
+            },
+            "description": "Every `AppProject` of the control-plane namespace."
+          }
+        }
+      },
+      "ProjectView": {
+        "type": "object",
+        "description": "One `AppProject`, reduced to its boundary facts.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "allowedServiceAccounts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`spec.allowedServiceAccounts`."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`spec.description`."
+          },
+          "destinations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`spec.destinations`, rendered as `cluster/namespace`."
+          },
+          "name": {
+            "type": "string",
+            "description": "`metadata.name`."
+          },
+          "sourceNamespaces": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`spec.sourceNamespaces`."
+          },
+          "sourceRepos": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`spec.sourceRepos`."
+          }
+        }
+      },
+      "ReadyResponse": {
+        "type": "object",
+        "description": "Readiness answer.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it is not ready."
+          },
+          "status": {
+            "type": "string",
+            "description": "`ready` or `not ready`."
+          }
+        }
+      },
+      "ResourceGraphView": {
+        "type": "object",
+        "description": "`GET /api/v1/applications/{namespace}/{name}/resources` body.",
+        "required": [
+          "namespace",
+          "cluster",
+          "syncStatus",
+          "healthStatus",
+          "nodes",
+          "truncated"
+        ],
+        "properties": {
+          "cluster": {
+            "type": "string",
+            "description": "Cluster the graph was read from (`spec.destination.cluster`)."
+          },
+          "healthStatus": {
+            "type": "string",
+            "description": "`Application.status.health.status`."
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Namespace the graph was read from (`spec.destination.namespace`)."
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResourceNodeView"
+            },
+            "description": "Inventory nodes plus discovered `Deployment -> ReplicaSet -> Pod` children."
+          },
+          "syncStatus": {
+            "type": "string",
+            "description": "`Application.status.sync.status` — the per-application sync verdict."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether the response was cut at [`MAX_GRAPH_NODES`]."
+          }
+        }
+      },
+      "ResourceNodeView": {
+        "type": "object",
+        "description": "One node of the resource graph.",
+        "required": [
+          "key",
+          "group",
+          "kind",
+          "name",
+          "present"
+        ],
+        "properties": {
+          "group": {
+            "type": "string",
+            "description": "API group (empty for the core group)."
+          },
+          "health": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Per-resource health from the last reconcile (`status.resourceStatuses`)."
+          },
+          "healthMessage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The health message of the last reconcile."
+          },
+          "key": {
+            "type": "string",
+            "description": "Version-agnostic GKNN key (`group/kind/namespace/name`)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Resource kind."
+          },
+          "name": {
+            "type": "string",
+            "description": "Object name."
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Namespace, absent for cluster-scoped resources."
+          },
+          "ownership": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Ownership verdict for a present object."
+          },
+          "parent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "GKNN of the owning node (`Deployment -> ReplicaSet -> Pod`), absent for roots."
+          },
+          "present": {
+            "type": "boolean",
+            "description": "Whether the object exists in the destination cluster right now."
+          }
+        }
+      },
+      "RollbackRequestBody": {
+        "type": "object",
+        "description": "`POST .../rollback` request body.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`status.history[].id` to redeploy."
+          }
+        }
+      },
+      "SourceView": {
+        "type": "object",
+        "description": "`spec.source` summary.",
+        "required": [
+          "repoUrl",
+          "path",
+          "targetRevision",
+          "renderer"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path inside the repository."
+          },
+          "renderer": {
+            "type": "string",
+            "description": "Selected renderer (`auto`, `plainYaml`, `kustomize`, `helm`)."
+          },
+          "repoUrl": {
+            "type": "string",
+            "description": "Repository URL, redacted (a remote URL may carry a token)."
+          },
+          "targetRevision": {
+            "type": "string",
+            "description": "Requested revision (branch, tag, or `HEAD`)."
+          }
+        }
+      },
+      "SyncRequestBody": {
+        "type": "object",
+        "description": "`POST .../sync` request body.",
+        "properties": {
+          "dryRun": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Compute the sync without applying it. **Not supported in `v1.0`**: that is `GET .../diff`."
+          },
+          "prune": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Prune orphans after the sync. **Not supported in `v1.0`**: pruning is a spec field\n(`syncPolicy.automated.prune`)."
+          },
+          "revision": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pin the sync to a specific revision. **Not supported in `v1.0`** (see [`sync_application`])."
+          }
+        }
+      },
+      "SyncView": {
+        "type": "object",
+        "description": "`status.sync`.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "lastSyncedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When that settled sync happened (RFC 3339)."
+          },
+          "lastSyncedRevision": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Revision of the last **settled** sync."
+          },
+          "revision": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Revision the last pass rendered."
+          },
+          "status": {
+            "type": "string",
+            "description": "`Synced` or `OutOfSync`."
+          }
+        }
+      },
+      "WebhookResponse": {
+        "type": "object",
+        "description": "The `ferriscd.io/refresh` request a webhook reports back.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "matched": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "How many `Application`s matched.",
+            "minimum": 0
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why nothing was done (`ignored`), or which delivery id was a replay."
+          },
+          "reference": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pushed ref (`refs/heads/main`)."
+          },
+          "repository": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pushed repository, redacted (a remote URL may carry a token)."
+          },
+          "status": {
+            "type": "string",
+            "description": "`accepted`, `duplicate`, or `ignored`."
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer_auth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "health",
+      "description": "Liveness and readiness probes"
+    },
+    {
+      "name": "applications",
+      "description": "Applications, live resources, diffs, and manual operations"
+    },
+    {
+      "name": "platform",
+      "description": "Projects, clusters, and the OpenAPI contract"
+    },
+    {
+      "name": "webhooks",
+      "description": "GitHub/GitLab push webhooks (secret-authenticated)"
+    }
+  ]
+}

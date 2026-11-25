@@ -10,8 +10,19 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+# `T14.1`: the in-process REST API of the modular monolith (ADR-002). No new transitive dependency
+# is introduced that the lock file did not already carry (`axum` sits on `hyper`/`tower`/`http`,
+# which `kube-client` already pulls in).
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+] }
 base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
+# `env` lets the webhook secrets come from `FERRISCD_*_WEBHOOK_*` instead of argv (a flag is
+# visible in `ps`); no new crate, clap already ships the feature.
+clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 futures = "0.3"
 # `http`/`hyper-util`/`hyper-timeout`/`tower` back the `T12.3` impersonation tower layer over the
@@ -24,7 +35,13 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 # workspace (`ring` via `kube`, `aws-lc-rs` via `gix`'s `reqwest`), and `rustls` refuses to guess
 # between them — see `ferriscd_controller::impersonation::ensure_crypto_provider`.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Constant-time comparison for the `T14.2` webhook signature/token checks. Already in the lock file
+# (`rustls` and `ring` depend on it): comparing a MAC with `==` leaks how much of it matched.
+subtle = "2"
 tower = { version = "0.5", features = ["retry", "util"] }
+# `utoipa` generates the OpenAPI 3.1 contract `GET /api/v1/openapi.json` serves and
+# `docs/api/openapi.json` freezes (`T14.1`); the TypeScript web UI is typed from it (`T16.1`).
+utoipa = "5"
 gix = { version = "0.90", default-features = false, features = [
     "sha1",
     "max-performance",
@@ -53,6 +70,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 ferriscd-crd = { path = "crates/ferriscd-crd" }
 ferriscd-engine = { path = "crates/ferriscd-engine" }
 ferriscd-controller = { path = "crates/ferriscd-controller" }
+ferriscd-server = { path = "crates/ferriscd-server" }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

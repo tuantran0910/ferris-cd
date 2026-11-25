@@ -168,7 +168,7 @@ pub async fn run(args: ControllerArgs) -> Result<()> {
 ///
 /// Split out of [`run`] so the flag → controller mapping is testable without a cluster — including
 /// the `T13.3` decision never to forward the single-leader `Lease` name to a sharded replica.
-fn run_options(args: ControllerArgs) -> ferriscd_controller::RunOptions {
+pub(crate) fn run_options(args: ControllerArgs) -> ferriscd_controller::RunOptions {
     let leader_election =
         args.leader_election
             .then(|| ferriscd_controller::LeaderElectionOptions {

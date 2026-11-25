@@ -1,26 +1,31 @@
-//! Dependency-free SHA-256 (FIPS 180-4), used for diff fingerprints only.
+//! Dependency-free SHA-256 (FIPS 180-4), used for diff fingerprints and webhook HMACs.
 //!
 //! # Why hand-rolled
 //!
 //! No SHA-256 implementation exists in `Cargo.lock` (`sha2` is absent) and Phase 07 does not add
 //! crates — unlike `jsonptr`, which was already in the lock as a `json-patch` dependency and so
 //! cost nothing to use directly. Hand-rolling a hash is normally the wrong call, and it is
-//! acceptable here only because every use is a **non-authenticated fingerprint**:
+//! acceptable here because every use is either a **non-authenticated fingerprint** or a MAC whose
+//! secrecy comes from the key rather than from the hash:
 //!
 //! * Secret value redaction (`redact`), so a diff can prove *whether* a value changed
-//!   without exposing it, and
+//!   without exposing it,
 //! * `source_spec_hash` (`decision`), so an `Application.spec` edit that produces no new
-//!   commit still triggers a sync (finding H7).
+//!   commit still triggers a sync (finding H7), and
+//! * the `T14.2` GitHub `X-Hub-Signature-256` HMAC, which [`digest`] backs
+//!   ([`crate::diff::sha256`] is the *only* SHA-256 in the workspace, so `ferriscd-server` builds
+//!   its HMAC on top of it instead of adding a second hash implementation).
 //!
 //! The digests only ever answer "changed or not" for a value the caller already holds; the one
 //! place a digest touches secret material is the redaction fingerprint, which is a truncated
 //! (32-bit) prefix published precisely so drift stays visible — see the limitation noted in
 //! `redact`.
 //!
-//! **Never use this for authentication, signatures, MACs, password storage, certificate or
-//! token validation, or any comparison that must be constant-time.** Reach for a vetted
-//! implementation (`sha2`, `ring`, `aws-lc`) the moment a real cryptographic requirement shows
-//! up; that is a deliberate dependency decision, not a drop-in replacement here.
+//! **Do not use this for password storage, signature *generation* with long-lived keys, or any
+//! comparison that must be constant-time** — comparing two digests byte-by-byte leaks their
+//! prefix, so HMAC verification must use a constant-time comparison (`subtle`, `ring`, or
+//! `aws-lc`). A vetted implementation (`sha2`, `ring`, `aws-lc`) should replace this module the
+//! moment it becomes a direct dependency.
 //!
 //! It is pinned to the published FIPS 180-4 known-answer vectors by the tests below.
 
@@ -109,7 +114,12 @@ const H0: [u32; 8] = [
 const HEX: [u8; 16] = *b"0123456789abcdef";
 
 /// Computes the SHA-256 digest of `message`.
-pub(crate) fn digest(message: &[u8]) -> [u8; 32] {
+///
+/// Public because it is the workspace's only SHA-256: `ferriscd-server` builds its `T14.2`
+/// `X-Hub-Signature-256` HMAC on top of it rather than linking a second hash implementation.
+/// Treat it as a primitive, not as an authentication API — see the module docs.
+#[must_use]
+pub fn digest(message: &[u8]) -> [u8; 32] {
     let bit_len = (message.len() as u64).wrapping_mul(8);
     // Pad to a multiple of 64 bytes: `0x80`, zero fill, then the 64-bit big-endian length.
     // A copied buffer keeps the function pure (`message` is never mutated) and keeps the

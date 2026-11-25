@@ -133,3 +133,74 @@ Scoped to the multi-cluster registry (`cluster_manager.rs`), the native `Lease` 
 - **Milestone `v0.5`:** code-complete for `T13.1`/`T13.2`; the `#[ignore]`d live `kind` suite (`tests/integration/v0_5_ha.rs`, two clusters) is still **pending** and its output is not recorded.
 - **Phase 13 (`T13.3`–`T13.4`) completed:** opt-in deterministic sharding (signed index validation, per-shard `ferriscd-leader-shard-<id>` leases, SHA-256 over `(namespace, name)`, stream-level filter, 1,000-app disjoint/complete proof at N=1/3/5) and the `v0.5` enterprise/HA live suite + lesson 13. Migration between sharded and unsharded fleets is **stop-then-start** (the leases do not exclude each other); documented in the README, CLI help and lesson.
 - **Follow-ups (non-blocking):** the `#[ignore]`d live `v0.5`/`v0.5_ha`/`v0.5_enterprise` suites are still **pending** (two `kind` clusters needed); cluster-registration `Secret` events are applied one at a time on the watch task; the HTTPS Git-server credential fixture remains unimplemented; duplicate `--shard-id` across replicas is lease-serialised but not logged.
+
+---
+
+## Phase 14 implementation review, part 1 (`T14.1`–`T14.2`)
+
+Scoped to `crates/ferriscd-server/` (router, handlers, auth seam, OpenAPI, production wiring), the
+`ferriscd server` command, and the `ferriscd.io/operation` annotation contract in
+`ferriscd-controller/src/sync.rs`. Finding IDs are namespaced `P14-*` so they never collide with the
+plan-level trap matrix (C1/C2, H1…M6) or the `P07-*`/`P13-*` rounds above.
+
+- **`P14-C1` / the manual-sync annotation is consumed:** `POST .../sync` writes
+  `ferriscd.io/operation: {"sync":{}}`, and the controller used to consume only rollback requests — so
+  the annotation stayed forever, `manual_operation()` kept bypassing `automated: None`, and the API
+  answered `409` to every later sync/rollback. A settled pass now consumes whichever request it
+  honoured (`consume_operation` takes the annotation value; rollback semantics unchanged), and the
+  API treats the single slot explicitly: a pending manual sync is an idempotent `202`, a rollback
+  supersedes it, and only an **unconsumed rollback** followed by a sync is a `409` (transient, because
+  the controller consumes rollbacks). Proven by `a_settled_manual_sync_consumes_its_annotation_and_the_next_pass_skips`
+  (the next pass reports `Skip(AutomatedDisabled)` and writes no patch), `an_unsettled_manual_sync_keeps_its_annotation`
+  (a failed pass must not consume it), and the HTTP tests `a_pending_manual_sync_is_an_idempotent_202`
+  / `a_pending_manual_sync_is_superseded_by_a_rollback` / `a_pending_rollback_blocks_only_a_sync_until_it_is_consumed`.
+- **`P14-H1` / the API is no longer "always open by construction":** `--auth-policy {pass-through|deny-all}`
+  (`FERRISCD_AUTH_POLICY`) is wired through `AppState::with_auth`, the default bind moved to
+  `127.0.0.1:8080`, and `auth::exposes_unauthenticated_api` is asserted by both the binary (startup
+  `warn!`, from the parsed address and again from the bound listener) and the tests. The flip to
+  default-deny is `T14.3`'s.
+- **`P14-H2` / bounded graph reads:** `/resources` no longer lists the namespace once per workload. One
+  `GraphTraversal` per request caches each `(cluster, namespace, kind)` listing, owner references are
+  matched in memory, every listing uses `ListParams::limit(GRAPH_LIST_LIMIT)`, and the request may
+  issue at most `MAX_GRAPH_LIST_REQUESTS` listings (beyond that the answer is `truncated: true`).
+  `several_deployments_cost_one_list_per_kind_and_namespace` asserts the exact listing sequence
+  (3 Deployments → 1 `ReplicaSet` list, 2 ReplicaSets → 1 `Pod` list, a second namespace → 1 more, a
+  `ConfigMap` → 0); `the_traversal_stops_at_the_listing_budget` is the trap guard.
+- **`P14-M1` / one error shape:** the operation handlers take `Bytes` + parse helpers instead of `Json`,
+  so `BytesRejection` maps to the documented `413` (`PayloadTooLarge`) and a malformed body to `400`,
+  both in `{"error":{code,message}}`; nothing echoes the payload, only a line/column. `413` is now
+  declared on `/sync` and `/rollback` in the OpenAPI document.
+- **`P14-M2` / `ServerArgs` has a hand-written `Debug`:** the plaintext webhook secret and GitLab token
+  are rendered as `<redacted>`, asserted by `the_parsed_arguments_never_print_a_webhook_secret`.
+- **`P14-M3` / `openapi::document_value()` returns `Result`:** the handler maps a serialization failure
+  to a `502` instead of answering `200 null`, and the served document is now asserted equal to the
+  generated one.
+- **`P14-M4` / dead `OpenApiBuilder` scaffolding removed**, and the stray `use std::future::Future;`
+  moved to the module's import block.
+- **`P14-M5` / `/resources` documents its exact per-request cost** (`I` inventory reads, at most
+  `min(N, MAX_GRAPH_LIST_REQUESTS)` listings, one per distinct `(cluster, namespace, kind)`, zero
+  writes), and `/readyz` carries a `TODO(T15.x)` noting it does not yet reflect controller watch
+  readiness.
+- **`P14-H3` / the live `T14.2` test exists, and its verifiability limits are stated in it:**
+  `tests/integration/v0_9_api_webhooks.rs` (shim: `crates/ferriscd-server/tests/v0_9_api_webhooks.rs`,
+  `#[ignore]` + `kind-` context guard) runs the real control plane and the real listener, posts an
+  `X-Hub-Signature-256`-signed push carrying `X-GitHub-Delivery`, and requires `accepted/matched:1`,
+  the `ferriscd.io/refresh` annotation, and `status.sync.lastSyncedRevision` to move to the pushed
+  commit with `spec.requeueAfterSeconds: 600` (so a periodic requeue cannot be mistaken for the push).
+  Two parts are **not** asserted, for stated reasons: (1) *who* signs the delivery — the test signs
+  with the same shared secret via the same `hmac_sha256`, because whether GitHub computes that header
+  cannot be observed locally without a public endpoint; (2) the roadmap's "`< 2 s`" — that is the
+  webhook budget (the 2 s debounce FerrisCD controls), while the observable end-to-end time also
+  contains a `git` fetch, a render, an SSA apply and a `/status` patch, so the test bounds the
+  annotation at 30 s and the sync at 180 s and prints the measured latency instead of a hard-coded
+  two seconds. Like every other live suite here, its `kind` run is **pending** and no output is
+  recorded.
+- **Trap guards asserted hermetically:** no auth policy reads or logs a token, the probes and
+  webhooks stay outside the protected group under both policies, the body cap is installed before any
+  parsing, the replay cache stays bounded, `Secret` values and webhook secrets never reach a
+  `Debug`/error/log surface, the served OpenAPI document equals the committed one, and the graph
+  traversal is per request (a later request never reuses an earlier listing cache).
+- **Follow-ups (non-blocking):** `T14.3`–`T14.6` (TokenReview AuthN, RBAC, metrics/`/readyz` watch
+  readiness, web UI); a manual sync on an application whose multi-wave operation keeps failing is
+  still retried on every requeue (pre-existing: `failed_operation_is_not_retried` treats the
+  annotation as the escape hatch, and a failing operation never settles, so it is never consumed).

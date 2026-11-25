@@ -25,6 +25,7 @@ use ferriscd_crd::status::{
     OperationState, REASON_SYNC_ERROR, ResourceStatus, RevisionHistoryEntry, SyncState, SyncStatus,
 };
 use ferriscd_crd::{Application, annotations};
+use ferriscd_engine::diff::{DiffSummary, ResourceDiff};
 use ferriscd_engine::inventory::Inventory;
 use ferriscd_engine::manifest::ManifestError;
 use ferriscd_engine::repo::RepoError;
@@ -558,6 +559,29 @@ fn is_absent(err: &kube::Error) -> bool {
     matches!(err, kube::Error::Api(status) if status.code == 404 || status.code == 410)
 }
 
+/// A read-only diff preview for the control-plane API (`T14.1`).
+///
+/// Produced from the **same** in-process engine a reconcile uses — the shared `RepoCache`,
+/// renderer, `ClusterManager` and SSA `dryRun=All` diff — so `GET .../diff` can never disagree
+/// with what the next reconcile would do (finding C9). Nothing here is persisted: a preview is
+/// computed on demand from `desired ∪ status.inventory`, exactly like drift detection.
+///
+/// Every [`ResourceDiff`] is built by the engine's only redacting constructor, so no `Secret`
+/// value can reach the API payload, a log line, or an error.
+#[derive(Debug, Clone)]
+pub struct DiffPreview {
+    /// The commit the desired state was rendered from (a rollback pin is honoured).
+    pub revision: String,
+    /// One entry per resource in `desired ∪ status.inventory`, with field-level changes.
+    pub diffs: Vec<ResourceDiff>,
+    /// Counts derived from [`Self::diffs`] (the same summary a reconcile reports to `/status`).
+    pub summary: DiffSummary,
+    /// How many resources the rendered bundle contains (drift-independent).
+    pub desired: usize,
+    /// Whether the sync decision gate would apply this set right now.
+    pub would_sync: bool,
+}
+
 /// The diff/sync pipeline seam implemented in Phases 07–08.
 ///
 /// Both methods are idempotent and must tolerate being cancelled: they are wrapped in the
@@ -575,6 +599,27 @@ pub trait SyncPipeline: Send + Sync + 'static {
         app: &'a Application,
         mode: CleanupMode,
     ) -> BoxFuture<'a, Result<CleanupOutcome, ReconcileError>>;
+
+    /// Computes a **read-only** diff preview (`T14.1`).
+    ///
+    /// The contract is "no writes at all": no apply, no prune, no `/status` patch, no
+    /// `Application` patch. It is the read-only prefix of a reconcile, so the same policy checks,
+    /// the same render and the same `dryRun=All` diff run — a preview can therefore be refused
+    /// (`PolicyViolation`, an unreachable cluster, a bad revision) exactly like a sync would be.
+    ///
+    /// The default **refuses**: a pipeline that cannot preview must not fabricate a diff, because
+    /// an invented "everything is synced" is indistinguishable from the real thing.
+    fn diff<'a>(
+        &'a self,
+        app: &'a Application,
+    ) -> BoxFuture<'a, Result<DiffPreview, ReconcileError>> {
+        let _ = app;
+        Box::pin(async {
+            Err(ReconcileError::Invalid {
+                message: "this sync pipeline cannot compute a live diff preview".to_owned(),
+            })
+        })
+    }
 }
 
 /// `/status` patching seam so the always-update-status contract is testable.

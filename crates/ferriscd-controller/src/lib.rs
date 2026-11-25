@@ -81,7 +81,8 @@ pub use prune::{
 };
 pub use reconcile::{
     ApiStatusWriter, ApplyOutcome, CleanupDisposition, CleanupMode, CleanupOutcome,
-    ControllerError, FINALIZER, ReconcileContext, ReconcileError, StatusWriter, SyncPipeline,
+    ControllerError, DiffPreview, FINALIZER, ReconcileContext, ReconcileError, StatusWriter,
+    SyncPipeline,
 };
 pub use scope::{ClusterNamespacePolicy, InBundleCrd, ScopeError, normalize_scopes};
 pub use sharding::{
@@ -324,6 +325,154 @@ pub async fn run() -> anyhow::Result<()> {
 /// Fails when the log format is invalid, the namespace configuration is invalid, the
 /// Kubernetes client cannot be configured, or in-flight reconciles outlive the drain timeout.
 pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
+    prepare(options).await?.run().await
+}
+
+/// Everything one `ferriscd` process builds **once**, shared by the controller loop and the
+/// in-process API server (`T14.1`, ADR-002).
+///
+/// This is the answer to finding C9: `GET .../diff` renders, diffs and reads live state through
+/// the *same* [`InventorySyncPipeline`](crate::sync::InventorySyncPipeline) — and therefore the
+/// same `RepoCache`, renderer cache, `ClusterManager`, `DiscoveryCache` and `DryRunEvaluator` — that
+/// the next reconcile will use. Nothing is duplicated and nothing is persisted: a preview is
+/// computed on demand and thrown away, which is why `Application.status` never has to hold rendered
+/// YAML or a diff (ADR-001).
+///
+/// Building is deliberately separate from running: `ferriscd server` needs the collaborators, while
+/// `ferriscd controller` only needs [`ControlPlane::run`]. Both share the one cluster registry watch
+/// this value owns.
+pub struct ControlPlane {
+    client: Client,
+    config: ControllerConfig,
+    ctx: Arc<ReconcileContext>,
+    pipeline: Arc<dyn SyncPipeline>,
+    clusters: Arc<ClusterManager>,
+    leader_election: Option<LeaderElectionConfig>,
+    cluster_stop: tokio_util::sync::CancellationToken,
+    cluster_watch: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for ControlPlane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlane")
+            .field("namespace", &self.config.namespace)
+            .field(
+                "application_scope",
+                &self.config.application_scope().describe(),
+            )
+            .field("clusters", &self.clusters.names())
+            .field("leader_election", &self.leader_election.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlane {
+    /// The control plane's own `kube::Client` (the API server reads `Application`s with it).
+    #[must_use]
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// The controller configuration (namespace, application scope, shard, concurrency).
+    #[must_use]
+    pub fn config(&self) -> &ControllerConfig {
+        &self.config
+    }
+
+    /// The control-plane namespace (`--namespace`, `ferriscd-system` by default).
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.config.namespace
+    }
+
+    /// Which namespaces may host `Application` objects (`T12.2`).
+    #[must_use]
+    pub fn application_scope(&self) -> ferriscd_engine::policy::ApplicationScope {
+        self.config.application_scope()
+    }
+
+    /// The diff/sync pipeline: the controller's, not a copy of it (`T14.1`).
+    #[must_use]
+    pub fn sync_pipeline(&self) -> Arc<dyn SyncPipeline> {
+        self.pipeline.clone()
+    }
+
+    /// The cluster registry (`T13.1`), including the control plane's own `in-cluster` handle.
+    #[must_use]
+    pub fn clusters(&self) -> Arc<ClusterManager> {
+        self.clusters.clone()
+    }
+
+    /// Runs the controller loop until `SIGINT`/`SIGTERM`, then stops the cluster registry watch.
+    ///
+    /// # Errors
+    ///
+    /// See [`run_with`].
+    pub async fn run(self) -> anyhow::Result<()> {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let listener = stop.clone();
+        // The listener only cancels the token: everything that reacts to a stop (lease release,
+        // drain) is `run_until`'s job, so `SIGTERM` and an external stop are the same code path.
+        let signal = tokio::spawn(async move {
+            let reason = shutdown_signal().await;
+            tracing::info!(
+                signal = reason.as_str(),
+                "graceful shutdown requested; draining in-flight reconciles"
+            );
+            listener.cancel();
+        });
+        let result = self.run_until(stop).await;
+        signal.abort();
+        result
+    }
+
+    /// Runs the controller loop until `stop` is cancelled (`T14.1`).
+    ///
+    /// This is what makes `ferriscd server` a **single** process with **one** shutdown: the CLI owns
+    /// one signal listener, cancels this token, and both the reconcile loops and the API server drain
+    /// from that one decision. A lost leader lease ends the term through the same token, exactly as
+    /// before.
+    ///
+    /// # Errors
+    ///
+    /// See [`run_with`].
+    pub async fn run_until(self, stop: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
+        let result: anyhow::Result<()> = match self.leader_election.clone() {
+            // The non-leader path reuses the public per-term driver: it treats the token as its only
+            // shutdown input, which is precisely the contract this method promises.
+            None => controller::run_as_leader(
+                self.client.clone(),
+                self.config.clone(),
+                self.ctx.clone(),
+                stop.clone(),
+            )
+            .await
+            .map_err(anyhow::Error::from),
+            Some(leader) => {
+                run_as_leader(
+                    self.client.clone(),
+                    self.config.clone(),
+                    self.ctx.clone(),
+                    leader,
+                    self.cluster_stop.clone(),
+                    stop,
+                )
+                .await
+            }
+        };
+        // The registry is a background watcher: stopping it is enough, nothing is buffered.
+        self.cluster_stop.cancel();
+        drop(self.cluster_watch);
+        result
+    }
+}
+
+/// Builds the [`ControlPlane`] a controller loop *or* an API server runs on.
+///
+/// # Errors
+///
+/// See [`run_with`].
+pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     use anyhow::Context as _;
 
     // `T12.3` prerequisite: two `rustls` providers are linked into this binary (`ring` via `kube`,
@@ -515,7 +664,9 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
     let impersonation_source: Arc<dyn impersonation::ImpersonationSource> =
         Arc::new(impersonation::ImpersonatingAccess::new(pool.clone()));
 
-    let pipeline = Arc::new(
+    // `T14.1`: the pipeline is held as `Arc<dyn SyncPipeline>` so the API server can compute a live
+    // diff through the *same* object the controller reconciles with (`SyncPipeline::diff`).
+    let pipeline: Arc<dyn SyncPipeline> = Arc::new(
         sync::InventorySyncPipeline::new(
             repos,
             DiscoveryCache::new(client.clone()),
@@ -549,19 +700,20 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
         // non-`in-cluster` destination is a terminal error, which is the pre-Phase-13 behaviour.
         .with_cluster_source(clusters.clone()),
     );
-    let ctx =
-        Arc::new(ReconcileContext::new(apps_api, pipeline, status).with_client(client.clone()));
+    let ctx = Arc::new(
+        ReconcileContext::new(apps_api, pipeline.clone(), status).with_client(client.clone()),
+    );
 
-    let result: anyhow::Result<()> = match leader_election {
-        None => controller::run(client, config, ctx)
-            .await
-            .map_err(anyhow::Error::from),
-        Some(leader) => run_as_leader(client, config, ctx, leader, cluster_stop.clone()).await,
-    };
-    // The registry is a background watcher: stopping it is enough, nothing is buffered.
-    cluster_stop.cancel();
-    drop(cluster_watch);
-    result
+    Ok(ControlPlane {
+        client,
+        config,
+        ctx,
+        pipeline,
+        clusters,
+        leader_election,
+        cluster_stop,
+        cluster_watch,
+    })
 }
 
 /// Seeds the cluster registry from one label-filtered list of the control-plane namespace.
@@ -648,22 +800,14 @@ async fn run_as_leader(
     ctx: Arc<ReconcileContext>,
     leader: LeaderElectionConfig,
     cluster_stop: tokio_util::sync::CancellationToken,
+    stop: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     let election = LeaderElection::from_client(client.clone(), leader)?;
-    // The signal listener only cancels the token: releasing the lease (and cancelling the leader
-    // token) is `Leadership::hold`'s job, so the release happens in one place.
-    let stop = tokio_util::sync::CancellationToken::new();
-    let signal = stop.clone();
-    tokio::spawn(async move {
-        let reason = shutdown_signal().await;
-        tracing::info!(
-            signal = reason.as_str(),
-            "graceful shutdown requested; releasing the leader lease before draining"
-        );
-        signal.cancel();
-    });
+    // `stop` is owned by the caller (`ControlPlane::run` wires it to `SIGINT`/`SIGTERM`): releasing
+    // the lease (and cancelling the leader token) is `Leadership::hold`'s job, so the release happens
+    // in one place, and a CLI that stops the API server stops the lease too.
     tracing::info!(
         lease = %election.elector().config().lease_name(),
         namespace = %election.elector().config().namespace(),
