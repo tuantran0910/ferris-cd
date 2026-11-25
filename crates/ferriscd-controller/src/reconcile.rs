@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferriscd_crd::status::{
-    ApplicationStatus, Condition, ConditionStatus, MAX_STATUS_MESSAGE_CHARS, REASON_SYNC_ERROR,
-    SyncState, SyncStatus,
+    ApplicationStatus, Condition, ConditionStatus, HealthState, MAX_STATUS_MESSAGE_CHARS,
+    REASON_SYNC_ERROR, ResourceStatus, SyncState, SyncStatus,
 };
 use ferriscd_crd::{Application, annotations};
 use ferriscd_engine::inventory::Inventory;
@@ -97,9 +97,9 @@ pub enum CleanupMode {
 /// Outcome of a successful apply (diff + sync) pass.
 ///
 /// Beyond the condition text it carries everything the pipeline learned that must be persisted
-/// on `/status`: the crash-safe inventory and the sync state. Both stay `None` for a pipeline
-/// that has nothing to report (e.g. [`UnwiredSyncPipeline`]), in which case `apply_once` leaves
-/// the corresponding status fields untouched instead of clearing them.
+/// on `/status`: the crash-safe inventory, the sync state, and the health assessment. All of them
+/// stay `None` for a pipeline that has nothing to report (e.g. [`UnwiredSyncPipeline`]), in which
+/// case `apply_once` leaves the corresponding status fields untouched instead of clearing them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
     /// `Ready=True` reason (e.g. `SyncSucceeded`).
@@ -112,6 +112,13 @@ pub struct ApplyOutcome {
     pub inventory: Option<Inventory>,
     /// Sync observability to persist in `status.sync` (`None` = leave untouched).
     pub sync: Option<SyncState>,
+    /// Aggregated health to persist in `status.health` (`None` = leave untouched).
+    pub health: Option<HealthState>,
+    /// Per-resource health summaries for `status.resources` (`None` = leave untouched).
+    ///
+    /// When present the list is authoritative: `status.resources` is replaced, so a resource that
+    /// no longer exists cannot linger in the status forever.
+    pub resources: Option<Vec<ResourceStatus>>,
 }
 
 impl ApplyOutcome {
@@ -124,6 +131,8 @@ impl ApplyOutcome {
             requeue: None,
             inventory: None,
             sync: None,
+            health: None,
+            resources: None,
         }
     }
 
@@ -145,6 +154,14 @@ impl ApplyOutcome {
     #[must_use]
     pub fn with_sync(mut self, sync: SyncState) -> Self {
         self.sync = Some(sync);
+        self
+    }
+
+    /// Attaches the aggregated health and the per-resource summaries to persist.
+    #[must_use]
+    pub fn with_health(mut self, health: HealthState, resources: Vec<ResourceStatus>) -> Self {
+        self.health = Some(health);
+        self.resources = Some(resources);
         self
     }
 }
@@ -446,15 +463,58 @@ impl StatusWriter for ApiStatusWriter {
                 .ok_or_else(|| ReconcileError::Invalid {
                     message: "application has no metadata.name".to_owned(),
                 })?;
+            let body = status_patch_body(&status)?;
             // Merge patch on the `/status` subresource: only the fields we send are
             // updated, so Phase 06+ fields written by another pass are preserved.
-            let body = serde_json::json!({ "status": status });
             self.api
                 .patch_status(&name, &self.params, &Patch::Merge(&body))
                 .await?;
             Ok(())
         })
     }
+}
+
+/// Builds the JSON merge-patch body of one `/status` write.
+///
+/// A merge patch treats an **absent** field as "unchanged", and [`ApplicationStatus`] skips empty
+/// and zero fields on serialization. That is right for everything Phase 06–08 writes (`inventory`,
+/// `sync`, `health`, `operationState`, `history` are only omitted when the pass had nothing to say),
+/// but it would make the two Phase 09 fields go stale, because the per-resource list is
+/// *replaced* on every pass rather than merged:
+///
+/// * `resources` — a pass that assesses zero resources must clear the previous summaries, so the
+///   array is always sent (even when empty);
+/// * `resourcesOmitted` — the overflow counter is reset together with the list, so a `0` has to
+///   reach the API server instead of being omitted and leaving the previous count behind.
+///
+/// # Errors
+///
+/// Returns [`ReconcileError::Invalid`] when the status cannot be serialized (it is a plain data
+/// structure, so this is unreachable in practice — but `patch` must not guess).
+fn status_patch_body(status: &ApplicationStatus) -> Result<serde_json::Value, ReconcileError> {
+    let serialization_error = |err: serde_json::Error| ReconcileError::Invalid {
+        message: format!("cannot serialize the application status: {err}"),
+    };
+
+    let serde_json::Value::Object(mut fields) =
+        serde_json::to_value(status).map_err(serialization_error)?
+    else {
+        return Err(ReconcileError::Invalid {
+            message: "the application status did not serialize to a JSON object".to_owned(),
+        });
+    };
+    fields.insert(
+        "resources".to_owned(),
+        serde_json::to_value(&status.resources).map_err(serialization_error)?,
+    );
+    fields.insert(
+        "resourcesOmitted".to_owned(),
+        serde_json::Value::from(status.resources_omitted),
+    );
+
+    let mut body = serde_json::Map::new();
+    body.insert("status".to_owned(), serde_json::Value::Object(fields));
+    Ok(serde_json::Value::Object(body))
 }
 
 /// Shared controller state handed to every reconcile.
@@ -748,17 +808,32 @@ pub async fn apply_once(
     }
 }
 
-/// Persists the pipeline-reported inventory and sync state on `status`.
+/// Persists the pipeline-reported inventory, sync state and health on `status`.
 ///
 /// Only fields the pipeline actually reported are written: an outcome without them (for
 /// example [`UnwiredSyncPipeline`]) must never clear state owned by another pass, and
 /// `lastSynced*` markers are preserved by [`merge_sync_state`].
+///
+/// The per-resource list is **replaced**, not merged: it is this pass's assessment of exactly the
+/// desired set, so a resource that was removed from Git (or from the cluster) must not keep a stale
+/// summary in `status.resources` forever. The list is bounded by
+/// [`ApplicationStatus::record_resource_status`], which also counts the overflow.
 pub fn apply_outcome_status(status: &mut ApplicationStatus, outcome: &ApplyOutcome) {
     if let Some(inventory) = &outcome.inventory {
         status.set_inventory(ferriscd_engine::inventory::to_status_entries(inventory));
     }
     if let Some(sync) = &outcome.sync {
         merge_sync_state(status, sync.clone());
+    }
+    if let Some(health) = &outcome.health {
+        status.health = Some(health.clone());
+    }
+    if let Some(resources) = &outcome.resources {
+        status.resources.clear();
+        status.resources_omitted = 0;
+        for resource in resources {
+            status.record_resource_status(resource.clone());
+        }
     }
 }
 
@@ -969,7 +1044,8 @@ mod tests {
         DEFAULT_REQUEUE_AFTER_SECONDS, DEFAULT_REVISION_HISTORY_LIMIT,
     };
     use ferriscd_crd::status::{
-        CONDITION_READY, HealthState, HealthStatus, RevisionHistoryEntry, SyncState, SyncStatus,
+        CONDITION_READY, HealthState, HealthStatus, ResourceStatus, RevisionHistoryEntry,
+        SyncState, SyncStatus,
     };
     use ferriscd_crd::{
         ApplicationSpec, DEFAULT_PROJECT_NAME, DestinationSpec, GitSourceSpec, RendererSpec,
@@ -1609,6 +1685,116 @@ mod tests {
         );
         assert_eq!(status.history.len(), 1);
         assert!(status.is_ready());
+    }
+
+    /// `T09.5`: health reaches `status.health` and the per-resource list is replaced, not merged.
+    /// A merge patch must be able to *clear* the per-resource list and reset its counter.
+    #[test]
+    fn the_status_patch_body_always_sends_the_per_resource_fields() {
+        // An empty list: both fields would otherwise be skipped by `skip_serializing_if`, and the
+        // API server would keep the previous summaries forever.
+        let empty = ApplicationStatus::default();
+        let body = status_patch_body(&empty).expect("status must serialize");
+        assert_eq!(
+            body,
+            serde_json::json!({ "status": { "resources": [], "resourcesOmitted": 0 } }),
+            "an empty assessment must clear the previous per-resource statuses"
+        );
+
+        let mut filled = ApplicationStatus {
+            resources_omitted: 0,
+            ..ApplicationStatus::default()
+        };
+        filled.record_resource_status(ResourceStatus::new(
+            "apps/Deployment/payments/api",
+            "v1",
+            HealthStatus::Progressing,
+            "Waiting for controller to observe generation",
+        ));
+        let body = status_patch_body(&filled).expect("status must serialize");
+        assert_eq!(
+            body["status"]["resources"][0]["key"],
+            serde_json::json!("apps/Deployment/payments/api")
+        );
+        assert_eq!(
+            body["status"]["resources"][0]["health"],
+            serde_json::json!("Progressing")
+        );
+        assert_eq!(body["status"]["resourcesOmitted"], serde_json::json!(0));
+        // Fields the pass did not report stay absent, so a merge patch leaves them untouched.
+        assert!(body["status"].get("inventory").is_none());
+        assert!(body["status"].get("health").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_successful_outcome_persists_health_and_replaces_the_resource_summaries() {
+        let mut app = application(&[]);
+        let mut seeded = inventory_status();
+        seeded.resources = vec![ResourceStatus::new(
+            "apps/Deployment/payments/gone",
+            "v1",
+            HealthStatus::Healthy,
+            "a resource that no longer exists",
+        )];
+        seeded.resources_omitted = 4;
+        app.status = Some(seeded);
+
+        let outcome = ApplyOutcome::ready("SyncSucceeded", "applied 1 resource").with_health(
+            HealthState {
+                status: HealthStatus::Progressing,
+                message: Some("1 of 1 resource(s) are not Healthy".to_owned()),
+            },
+            vec![
+                ResourceStatus::new(
+                    "apps/Deployment/payments/api",
+                    "v1",
+                    HealthStatus::Progressing,
+                    "Waiting for controller to observe generation",
+                ),
+                ResourceStatus::new(
+                    "/ConfigMap/payments/settings",
+                    "v1",
+                    HealthStatus::Healthy,
+                    "ConfigMap exists",
+                ),
+            ],
+        );
+        let pipeline = FakePipeline {
+            apply: Box::new(move || Ok(outcome.clone())),
+            ..FakePipeline::ready()
+        };
+        let writer = RecordingStatusWriter::default();
+
+        apply_once(&app, &pipeline, &writer)
+            .await
+            .expect("apply must succeed");
+
+        let status = &writer.patches()[0];
+        assert_eq!(
+            status.health.as_ref().map(|health| health.status),
+            Some(HealthStatus::Progressing),
+            "health must be persisted independently of the sync status"
+        );
+        assert_eq!(
+            status
+                .resources
+                .iter()
+                .map(|resource| resource.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "apps/Deployment/payments/api",
+                "/ConfigMap/payments/settings"
+            ],
+            "the per-resource list is this pass's assessment, so stale entries must be dropped"
+        );
+        assert_eq!(
+            status.resources_omitted, 0,
+            "the overflow counter belongs to the list that was just replaced"
+        );
+        assert!(
+            status.is_ready(),
+            "the Ready condition is untouched by health"
+        );
     }
 
     #[tokio::test]

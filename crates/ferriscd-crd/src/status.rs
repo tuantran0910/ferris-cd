@@ -140,8 +140,8 @@ pub enum SyncStatus {
 
 /// Health status values.
 ///
-/// The aggregation precedence (`Degraded > Missing > Progressing > Suspended > Healthy >
-/// Unknown`) is implemented by the health evaluator in Phase 09; this type only fixes the
+/// The aggregation precedence (`Degraded > Missing > Progressing > Suspended > Unknown >
+/// Healthy`) is implemented by the health evaluator in Phase 09; this type only fixes the
 /// wire values so `Application.status.health` stays stable across phases.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema, Default)]
 pub enum HealthStatus {

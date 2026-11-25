@@ -3,6 +3,7 @@
 
 pub mod diff;
 pub mod graph;
+pub mod health;
 pub mod inventory;
 pub mod manifest;
 pub mod repo;

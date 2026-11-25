@@ -43,7 +43,7 @@ FerrisCD delivers **two equal outcomes**:
 | FR-05 | SSA Dry-Run Diff & Drift | `Patch::Apply` with `dryRun=All`, `managedFields`-aware conflict reporting, `ignoreDifferences` (JSON Pointer), Secret redaction, brownfield adoption guidance |
 | FR-06 | Ordered Sync & Orchestration | Deterministic kind priority ordering, CRD-before-CR with mid-sync `Discovery` refresh, crash-safe re-entrant sync waves (`OperationState`), lifecycle hooks (`generateName` supported), immutable-field `Replace` opt-in |
 | FR-07 | Safe Pruning & Self-Healing | Version-agnostic GKNN inventory + `ferriscd.io/tracking-id` ownership verification; never auto-prune CRDs/Namespaces by default; distinct `automated` vs `selfHeal` semantics |
-| FR-08 | Health Assessment | Independent health lattice (`Degraded > Missing > Progressing > Suspended > Healthy > Unknown`) covering core workloads, edge cases (`paused`, `replicas: 0`, `OnDelete` STS), and generic CRD conditions |
+| FR-08 | Health Assessment | Independent health lattice (`Degraded > Missing > Progressing > Suspended > Unknown > Healthy`) covering core workloads, edge cases (`paused`, `replicas: 0`, `OnDelete` STS), and generic CRD conditions |
 | FR-09 | History & Rollback | Bounded metadata-only `status.history` (hard cap 20) and safe Git-revision rollback that avoids immediate `HEAD` re-overwrite |
 | FR-10 | Security & Multi-Tenancy | `AppProject` allow-lists (checked on every rendered resource's actual namespace), `ServiceAccount` impersonation (with `Impersonate-Group` headers & pooled connectors), worktree symlink/SSRF defense |
 | FR-11 | Multi-Cluster & HA | Secret-registered remote clusters with TLS validation, Lease-based active/standby leader election, opt-in deterministic sharding |

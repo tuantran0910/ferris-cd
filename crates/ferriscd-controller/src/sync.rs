@@ -19,6 +19,7 @@
 //! | Waves/hooks | rejected with an actionable message instead of being mis-ordered | `T10.x` |
 //! | Destination clusters | `in-cluster` only; anything else is rejected | `T12.x` credentials |
 //! | Git credentials | anonymous only | `T12.x` |
+//! | Health | evaluated from the pass-level live read on **every** pass (including a `Skip`), into `status.health` + `status.resources`, and drives the adaptive requeue | `T10.x` gates waves/hooks on it |
 //!
 //! Blocking work never runs on a Tokio worker: manifest file I/O and YAML parsing run in
 //! `tokio::task::spawn_blocking` here, and the repo/git layer does the same internally. Every
@@ -47,6 +48,10 @@
 //!   pruned_ok)`, and a mid-sync failure still persists the partial inventory
 //!   ([`ReconcileError::PartialSync`]), so a create that already succeeded can never become an
 //!   untracked orphan (finding C1).
+//! * **`Synced` is never reported as `Healthy`** (`T09.5` trap guard). `status.sync.status` comes
+//!   from the diff, `status.health.status` from the live objects' `status` blocks; a pass that
+//!   applies nothing still assesses health, and a pass that applied everything still reports
+//!   `Progressing` for the objects it just created (the live read predates the write).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -54,13 +59,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferriscd_crd::application::DEFAULT_DESTINATION_CLUSTER;
-use ferriscd_crd::status::{REASON_SYNC_SUCCEEDED, SyncState, SyncStatus};
+use ferriscd_crd::status::{
+    HealthState, REASON_SYNC_SUCCEEDED, ResourceStatus, SyncState, SyncStatus,
+};
 use ferriscd_crd::{Application, SyncOptions, annotations};
 use ferriscd_engine::diff::{
     DiffStatus, DiffSummary, IgnoreRuleSet, ResourceDiff, SyncDecision, should_sync,
     source_spec_hash,
 };
 use ferriscd_engine::graph::sort_by_tier;
+use ferriscd_engine::health::{
+    self, HealthConfig, HealthInput, HealthRegistry, HealthStatus, HealthSummary,
+};
 use ferriscd_engine::inventory::{self, Inventory, InventoryEntry, Ownership};
 use ferriscd_engine::manifest::{self, DesiredResource, ManifestLoaderConfig, ResourceKey};
 use ferriscd_engine::repo::{GitSource, RepoCache, RepoCheckout, RepoCredentials, RepoUrlPolicy};
@@ -87,6 +97,15 @@ use crate::scope::{self, InBundleCrd};
 /// A pending resource is not an error (it is the documented `DeferredPending*` behaviour), so
 /// the controller retries quickly instead of waiting for the full `spec.requeueAfterSeconds`.
 pub const PENDING_REQUEUE: Duration = Duration::from_secs(10);
+
+/// Upper bound on the requeue delay while an `Application` is `Progressing` (`T09.5`).
+///
+/// A rollout is expected to converge in seconds, so a settled interval of three minutes means the
+/// operator (and the sync wave that waits for it, in Phase 10) waits three minutes for a `Healthy`
+/// verdict that was available after ten seconds. While anything is still converging the controller
+/// polls at least this often; the interval is never *longer* than the configured
+/// `spec.requeueAfterSeconds` (so an operator who asked for a 3 s interval keeps it).
+pub const PROGRESSING_REQUEUE: Duration = Duration::from_secs(10);
 
 /// The only destination cluster this milestone can talk to.
 pub const IN_CLUSTER: &str = DEFAULT_DESTINATION_CLUSTER;
@@ -128,6 +147,12 @@ struct SyncCounts {
     /// "a prune is due" (`OutOfSync`), with pruning disabled it can never be deleted, so it must
     /// not pin the status (finding H2).
     prune_enabled: bool,
+    /// The aggregated health verdict of this pass (`T09.5`).
+    ///
+    /// It only selects the requeue interval ([`plan_requeue`]): a `Progressing` `Application` is
+    /// polled every [`PROGRESSING_REQUEUE`] instead of every `spec.requeueAfterSeconds`. It never
+    /// touches `status.sync.status` — synced and healthy are different questions.
+    health: HealthStatus,
 }
 
 /// What one prune pass did.
@@ -323,6 +348,11 @@ pub struct InventorySyncPipeline {
     dry_run: Arc<dyn DryRunApi>,
     loader: ManifestLoaderConfig,
     url_policy: RepoUrlPolicy,
+    /// Phase 09 health registry: `(group, kind)` -> evaluator, unknown kinds falling back to the
+    /// generic `status.conditions` heuristic.
+    health: HealthRegistry,
+    /// Phase 09 health tunables (`LoadBalancer` on a local cluster, spec-only CRs).
+    health_config: HealthConfig,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -332,6 +362,8 @@ impl std::fmt::Debug for InventorySyncPipeline {
             .field("discovery", &self.discovery)
             .field("loader", &self.loader)
             .field("url_policy", &self.url_policy)
+            .field("health", &self.health)
+            .field("health_config", &self.health_config)
             .finish_non_exhaustive()
     }
 }
@@ -358,6 +390,8 @@ impl InventorySyncPipeline {
             dry_run,
             loader: ManifestLoaderConfig::default(),
             url_policy: RepoUrlPolicy::Production,
+            health: HealthRegistry::builtin(),
+            health_config: HealthConfig::default(),
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -389,6 +423,32 @@ impl InventorySyncPipeline {
     pub fn with_loader_config(mut self, loader: ManifestLoaderConfig) -> Self {
         self.loader = loader;
         self
+    }
+
+    /// Overrides the health tunables (`T09.5`).
+    ///
+    /// A local cluster needs `health_config.load_balancer = LoadBalancerPolicy::Ignore`, otherwise
+    /// every `Service: LoadBalancer` stays `Progressing` forever (there is no cloud provider to
+    /// publish an address). The per-object annotation
+    /// [`ferriscd_engine::health::LOAD_BALANCER_HEALTH_ANNOTATION`] remains the narrower lever.
+    #[must_use]
+    pub fn with_health_config(mut self, config: HealthConfig) -> Self {
+        self.health_config = config;
+        self
+    }
+
+    /// Replaces the health registry (a test/metric seam; production uses
+    /// [`HealthRegistry::builtin`]).
+    #[must_use]
+    pub fn with_health_registry(mut self, registry: HealthRegistry) -> Self {
+        self.health = registry;
+        self
+    }
+
+    /// The health tunables this pipeline evaluates with.
+    #[must_use]
+    pub fn health_config(&self) -> &HealthConfig {
+        &self.health_config
     }
 
     /// The configured repository URL policy (production rejects local paths).
@@ -634,23 +694,58 @@ impl InventorySyncPipeline {
 
         let confirmed = inventory::next_inventory(&applied_ok, &synced_ok, &[]);
         let next_inventory = inventory::next_inventory(&prev_inventory, &confirmed, &prune.pruned);
-        Ok(build_outcome(
+        // --- Phase 09: health --------------------------------------------------------------
+        // Assessed from the pass-level live read on **every** pass, including a `Skip` one: health
+        // and sync are orthogonal (T09.5 trap guard). A `Deployment` can be `Synced` and
+        // `ImagePullBackOff` at the same time, and it can be `OutOfSync` (an HPA owns
+        // `spec.replicas`) while every pod is serving.
+        let assessment = self.assess_health(&resources, &live, &applied_ok);
+        let counts = SyncCounts {
+            desired: resources.len(),
+            applied: applied_ok.len(),
+            pruned: prune.pruned.len(),
+            retained_orphans,
+            pending: pending.len(),
+            invalid_ignore_pointers,
+            prune_enabled,
+            health: assessment.status,
+        };
+        let outcome = build_outcome(
             app,
             decision,
             &summary,
             &spec_hash,
-            SyncCounts {
-                desired: resources.len(),
-                applied: applied_ok.len(),
-                pruned: prune.pruned.len(),
-                retained_orphans,
-                pending: pending.len(),
-                invalid_ignore_pointers,
-                prune_enabled,
-            },
+            counts,
             revision,
             next_inventory,
-        ))
+        )
+        .with_health(
+            HealthState {
+                status: assessment.status,
+                message: Some(assessment.message.clone()),
+            },
+            resource_statuses(&assessment, &desired_inventory),
+        );
+        tracing::debug!(
+            app.namespace = %owner.namespace,
+            app.name = %owner.name,
+            health = %health::status_label(assessment.status),
+            health_message = %assessment.message,
+            requeue_seconds = outcome.requeue.map(|delay| delay.as_secs()).unwrap_or_default(),
+            "assessed application health"
+        );
+        Ok(outcome)
+    }
+
+    /// Assesses the health of the desired set from this pass's live read (`T09.5`).
+    fn assess_health(
+        &self,
+        resources: &[DesiredResource],
+        live: &LiveStateMap,
+        applied: &Inventory,
+    ) -> HealthSummary {
+        let inputs = health_inputs(resources, live, applied);
+        health::assess(&inputs, &self.health, &self.health_config)
     }
 
     /// Classifies the stamped desired set with the SSA `dryRun=All` evaluator (T07.1–T07.3).
@@ -1202,6 +1297,7 @@ fn build_outcome(
         pending,
         invalid_ignore_pointers,
         prune_enabled,
+        health,
     } = counts;
     let complete = pending == 0;
     // Only "executed *and* nothing left pending" may claim a full sync.
@@ -1267,12 +1363,7 @@ fn build_outcome(
         ),
     };
 
-    let requeue = if decision.is_execute() && !complete {
-        // A deferred resource is retried quickly; the full interval is for settled passes.
-        PENDING_REQUEUE
-    } else {
-        Duration::from_secs(u64::from(app.spec.requeue_after_seconds))
-    };
+    let requeue = plan_requeue(decision.is_execute(), pending, health, app);
 
     ApplyOutcome::ready(reason, message)
         .with_inventory(inventory)
@@ -1291,6 +1382,108 @@ fn empty_desired_allowed() -> bool {
             && !value.eq_ignore_ascii_case("0")
             && !value.eq_ignore_ascii_case("false")
     })
+}
+
+/// Builds the [`HealthInput`] list for a pass (`T09.5`).
+///
+/// Health is assessed **per desired resource**, fed by the live state the pass already fetched
+/// (one scoped read, model 1 drift detection — no extra API calls, no cluster-wide informers):
+///
+/// | `LiveState` | Observation | Verdict source |
+/// |---|---|---|
+/// | `Present` | [`HealthInput::live`] | the object's `status` (the real evaluator) |
+/// | `Missing`, applied this pass | [`HealthInput::applied`] | `Progressing`: the live read predates the write |
+/// | `Missing`, not applied | [`HealthInput::missing`] | `Missing` |
+/// | `DeferredPendingCrd` / `DeferredPendingNamespace` | [`HealthInput::pending`] | `Progressing` |
+/// | `OrphanGvkGone` | skipped | a desired key can never be an orphan |
+///
+/// A `Present` object is used even when this pass re-applied it: its `status` is at worst one
+/// reconcile stale, and the next pass corrects it, whereas reporting `Missing` for an object that
+/// demonstrably exists would be a lie.
+///
+/// **Orphans are not assessed.** A resource that is tracked in `status.inventory` but no longer in
+/// Git is on its way out (`prune`) or deliberately retained (`prune: false`); letting it pin
+/// `status.health` could keep the `Application` `Degraded`/`Missing` forever for an object nobody
+/// declares any more. Health describes what Git asks for — which is also exactly what Phase 10's
+/// waves wait on.
+fn health_inputs<'a>(
+    resources: &'a [DesiredResource],
+    live: &'a LiveStateMap,
+    applied: &Inventory,
+) -> Vec<HealthInput<'a>> {
+    resources
+        .iter()
+        .filter_map(|resource| {
+            let key = &resource.key;
+            let observation = match live.get(key)? {
+                LiveState::Present(object, _) => HealthInput::live(key, object.as_ref()),
+                LiveState::Missing if applied.contains_key(key) => HealthInput::applied(key),
+                LiveState::Missing => HealthInput::missing(key),
+                LiveState::DeferredPendingCrd => HealthInput::pending(
+                    key,
+                    "waiting for the CustomResourceDefinition to be served",
+                ),
+                LiveState::DeferredPendingNamespace => {
+                    HealthInput::pending(key, "waiting for the Namespace to exist")
+                }
+                // A desired key is never fetched as an orphan; if one shows up, its health is not
+                // this pass's business (the prune path owns it).
+                LiveState::OrphanGvkGone => return None,
+            };
+            Some(observation)
+        })
+        .collect()
+}
+
+/// Renders the per-resource `status.resources` summaries.
+///
+/// The version hint comes from `status.inventory`'s desired half (never from the key), so the
+/// operator sees the same GKNN identity in `status.resources[].key` and `status.inventory[].key`
+/// (ADR-003: identity is version-agnostic).
+fn resource_statuses(health: &HealthSummary, desired: &Inventory) -> Vec<ResourceStatus> {
+    health
+        .resources
+        .iter()
+        .map(|assessment| {
+            ResourceStatus::new(
+                assessment.key.canonical(),
+                desired
+                    .get(&assessment.key)
+                    .map(|entry| entry.version.clone())
+                    .unwrap_or_default(),
+                assessment.health.status,
+                assessment.health.message.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Decides how long to wait before the next reconcile (`T09.5` adaptive requeue).
+///
+/// * a resource pending on a CRD/namespace → [`PENDING_REQUEUE`] (it is not an error, and the
+///   deployment that follows it is blocked on it);
+/// * `Progressing` → [`PROGRESSING_REQUEUE`], capped by `spec.requeueAfterSeconds` so an operator
+///   who asked for a *faster* interval still gets it;
+/// * settled (`Healthy`/`Degraded`/`Suspended`/`Missing`/`Unknown`) → the configured interval.
+///
+/// Only `Progressing` shortens the interval on purpose: `Degraded` and `Missing` are terminal-ish
+/// observations that a faster poll cannot change, and hammering the API server while a workload is
+/// broken helps nobody.
+#[must_use]
+fn plan_requeue(
+    execute: bool,
+    pending: usize,
+    health: HealthStatus,
+    app: &Application,
+) -> Duration {
+    let configured = Duration::from_secs(u64::from(app.spec.requeue_after_seconds));
+    if execute && pending > 0 {
+        return PENDING_REQUEUE;
+    }
+    if health == HealthStatus::Progressing {
+        return PROGRESSING_REQUEUE.min(configured);
+    }
+    configured
 }
 
 /// First 7 characters of a commit SHA (the full SHA lives in `status.sync.revision`).
@@ -1487,6 +1680,7 @@ mod tests {
         SourceSpec, SyncPolicy,
     };
     use ferriscd_engine::diff::{SkipReason, SyncTrigger};
+    use ferriscd_engine::health::Observation;
     use ferriscd_engine::manifest::GroupVersionKind;
     use ferriscd_engine::repo::{FakeGitClient, FakeGitClientConfig, RepoCacheConfig};
     use kube::discovery::ApiCapabilities;
@@ -2045,12 +2239,15 @@ mod tests {
             "finding H7: a successful sync persists the spec hash alongside the revision"
         );
         assert_eq!(outcome.reason, REASON_SYNC_SUCCEEDED);
+        // T09.5: the pass applied both resources, so the live read that predates the write saw
+        // nothing: the `Application` is `Synced` (Git matches) but not yet `Healthy` (the API
+        // server has not reported the new objects), and the controller polls fast until it is.
         assert_eq!(
-            outcome.requeue,
-            Some(Duration::from_secs(u64::from(
-                DEFAULT_REQUEUE_AFTER_SECONDS
-            )))
+            outcome.health.as_ref().map(|health| health.status),
+            Some(HealthStatus::Progressing),
+            "a just-applied resource has not been observed yet"
         );
+        assert_eq!(outcome.requeue, Some(PROGRESSING_REQUEUE));
     }
 
     #[tokio::test]
@@ -3556,6 +3753,7 @@ mod tests {
             &summary,
             HASH,
             SyncCounts {
+                health: HealthStatus::Healthy,
                 desired: 3,
                 applied: 1,
                 pruned: 0,
@@ -3584,6 +3782,7 @@ mod tests {
             &summary,
             HASH,
             SyncCounts {
+                health: HealthStatus::Healthy,
                 desired: 3,
                 applied: 3,
                 pruned: 1,
@@ -3637,6 +3836,7 @@ mod tests {
             &summary,
             HASH,
             SyncCounts {
+                health: HealthStatus::Healthy,
                 desired: 1,
                 applied: 1,
                 pruned: 0,
@@ -3673,6 +3873,7 @@ mod tests {
             &drifting,
             HASH,
             SyncCounts {
+                health: HealthStatus::Healthy,
                 desired: 2,
                 applied: 0,
                 pruned: 0,
@@ -3721,6 +3922,7 @@ mod tests {
             },
             HASH,
             SyncCounts {
+                health: HealthStatus::Healthy,
                 desired: 2,
                 applied: 0,
                 pruned: 0,
@@ -3799,6 +4001,7 @@ mod tests {
             ..DiffSummary::default()
         };
         let counts = SyncCounts {
+            health: HealthStatus::Healthy,
             desired: 0,
             applied: 0,
             pruned: 0,
@@ -3957,6 +4160,321 @@ mod tests {
             .get_or_insert_with(BTreeMap::new)
             .insert(annotations::PRUNE.to_owned(), "FALSE".to_owned());
         assert!(!prune_allowed(&configmap, &opted_in, &opted_out));
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 09: health assessment (T09.5)
+    // ---------------------------------------------------------------------
+
+    /// A live `Deployment` that diffs `Synced` against `DEPLOYMENT` and carries a chosen status.
+    fn deployment_live(generation: i64, status: serde_json::Value) -> DynamicObject {
+        let mut annotation_map = serde_json::Map::new();
+        annotation_map.insert(
+            annotations::TRACKING_ID.to_owned(),
+            json!("ferriscd-system/payments:apps/Deployment:payments/api"),
+        );
+        serde_json::from_value(json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "api",
+                "namespace": "payments",
+                "generation": generation,
+                "annotations": annotation_map,
+            },
+            "spec": { "replicas": 1 },
+            "status": status,
+        }))
+        .unwrap()
+    }
+
+    /// A `status.sync` that claims the revision in `sha` is already deployed.
+    fn synced_status(sha: &str, spec_hash: &str) -> ApplicationStatus {
+        ApplicationStatus {
+            inventory: vec![ferriscd_crd::InventoryEntry::new(DEPLOYMENT_KEY, "v1")],
+            sync: Some(SyncState {
+                status: SyncStatus::Synced,
+                revision: Some(sha.to_owned()),
+                last_synced_revision: Some(sha.to_owned()),
+                last_synced_spec_hash: Some(spec_hash.to_owned()),
+                last_synced_at: Some(now()),
+            }),
+            ..ApplicationStatus::default()
+        }
+    }
+
+    /// `T09.5` trap guard: `Synced` and `Healthy` are different questions.
+    ///
+    /// The Deployment's `spec` is exactly what Git says (`Synced`, the gate skips, zero applies)
+    /// while the rollout it describes is still in flight (`Progressing`).
+    #[tokio::test]
+    async fn a_skipped_pass_still_reports_health_and_never_claims_healthy() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                // The previous rollout's counters: `observedGeneration` 1 vs `generation` 2.
+                .with_object(deployment_live(
+                    2,
+                    json!({
+                        "observedGeneration": 1,
+                        "replicas": 1,
+                        "updatedReplicas": 1,
+                        "availableReplicas": 1,
+                        "readyReplicas": 1,
+                    }),
+                )),
+        );
+        let sha = fixture.commit(&[("deployment.yaml", DEPLOYMENT)]);
+        let mut app = fixture.app(".");
+        let spec_hash = source_spec_hash(&app.spec).expect("spec hash");
+        app.status = Some(synced_status(&sha, &spec_hash));
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("apply must succeed");
+
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "nothing drifted, so the gate must issue zero applies: {:?}",
+            fixture.cluster.applies()
+        );
+        assert_eq!(
+            outcome.sync.as_ref().map(|sync| sync.status),
+            Some(SyncStatus::Synced),
+            "the spec matches Git, so the sync status is Synced"
+        );
+        assert_eq!(outcome.reason, REASON_SYNC_SKIPPED);
+
+        let health = outcome.health.as_ref().expect("health must be reported");
+        assert_eq!(
+            health.status,
+            HealthStatus::Progressing,
+            "a stale observedGeneration is not healthy: {:?}",
+            health.message
+        );
+        assert!(
+            health
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("Deployment")),
+            "the message must name the resource: {:?}",
+            health.message
+        );
+
+        let resources = outcome.resources.as_ref().expect("per-resource health");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].key, DEPLOYMENT_KEY);
+        assert_eq!(
+            resources[0].version, "v1",
+            "the version hint comes from the inventory"
+        );
+        assert_eq!(resources[0].health, HealthStatus::Progressing);
+        assert!(
+            resources[0].message.contains("observe generation"),
+            "{}",
+            resources[0].message
+        );
+
+        // A converging Application is polled fast so the next verdict is seconds old, not minutes.
+        assert_eq!(outcome.requeue, Some(PROGRESSING_REQUEUE));
+    }
+
+    /// The bad-image case, hermetically: `Synced`, `Degraded`, and a *settled* requeue interval.
+    #[tokio::test]
+    async fn a_synced_but_degraded_workload_is_degraded_and_requeues_at_the_configured_interval() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(deployment_live(
+                    2,
+                    json!({
+                        "observedGeneration": 2,
+                        "replicas": 1,
+                        "updatedReplicas": 1,
+                        "availableReplicas": 0,
+                        "readyReplicas": 0,
+                        "conditions": [{
+                            "type": "Progressing",
+                            "status": "False",
+                            "reason": "ProgressDeadlineExceeded",
+                            "message": "ReplicaSet \"api-6f9\" has timed out progressing.",
+                        }],
+                    }),
+                )),
+        );
+        fixture.commit(&[("deployment.yaml", DEPLOYMENT)]);
+        let app = fixture.app(".");
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("apply must succeed");
+
+        assert_eq!(
+            outcome.sync.as_ref().map(|sync| sync.status),
+            Some(SyncStatus::Synced)
+        );
+        let health = outcome.health.as_ref().expect("health must be reported");
+        assert_eq!(health.status, HealthStatus::Degraded);
+        assert!(
+            health
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("progress deadline")),
+            "{:?}",
+            health.message
+        );
+        // Degraded is settled: a faster poll cannot change it, so the full interval is used.
+        assert_eq!(
+            outcome.requeue,
+            Some(Duration::from_secs(u64::from(
+                DEFAULT_REQUEUE_AFTER_SECONDS
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_healthy_application_reports_healthy_and_requeues_slowly() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(deployment_live(
+                    2,
+                    json!({
+                        "observedGeneration": 2,
+                        "replicas": 1,
+                        "updatedReplicas": 1,
+                        "availableReplicas": 1,
+                        "readyReplicas": 1,
+                    }),
+                )),
+        );
+        fixture.commit(&[("deployment.yaml", DEPLOYMENT)]);
+        let mut app = fixture.app(".");
+        app.spec.requeue_after_seconds = 300;
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("apply must succeed");
+
+        assert_eq!(
+            outcome.health.as_ref().map(|health| health.status),
+            Some(HealthStatus::Healthy)
+        );
+        assert_eq!(
+            outcome
+                .health
+                .as_ref()
+                .and_then(|health| health.message.clone()),
+            Some("all 1 resource(s) are healthy".to_owned())
+        );
+        assert_eq!(
+            outcome.requeue,
+            Some(Duration::from_secs(300)),
+            "a settled Application uses spec.requeueAfterSeconds"
+        );
+    }
+
+    /// The adaptive requeue table (`T09.5`).
+    #[test]
+    fn plan_requeue_polls_fast_only_while_converging() {
+        let mut app = application("https://example.com/repo.git", ".", "payments");
+        app.spec.requeue_after_seconds = 180;
+        assert_eq!(
+            plan_requeue(true, 2, HealthStatus::Healthy, &app),
+            PENDING_REQUEUE,
+            "a deferred CRD/namespace is retried quickly regardless of health"
+        );
+        assert_eq!(
+            plan_requeue(true, 0, HealthStatus::Progressing, &app),
+            PROGRESSING_REQUEUE
+        );
+        assert_eq!(
+            plan_requeue(false, 0, HealthStatus::Progressing, &app),
+            PROGRESSING_REQUEUE,
+            "a skipped pass still polls fast while a rollout converges"
+        );
+        for settled in [
+            HealthStatus::Healthy,
+            HealthStatus::Degraded,
+            HealthStatus::Suspended,
+            HealthStatus::Missing,
+            HealthStatus::Unknown,
+        ] {
+            assert_eq!(
+                plan_requeue(true, 0, settled, &app),
+                Duration::from_secs(180),
+                "{settled:?} is settled"
+            );
+        }
+
+        // The progressing interval never *lengthens* an operator's explicit faster interval.
+        app.spec.requeue_after_seconds = 3;
+        assert_eq!(
+            plan_requeue(true, 0, HealthStatus::Progressing, &app),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            plan_requeue(true, 1, HealthStatus::Progressing, &app),
+            PENDING_REQUEUE,
+            "a pending dependency outranks the health interval"
+        );
+    }
+
+    #[test]
+    fn health_inputs_cover_every_live_state() {
+        let missing = ResourceKey::new(
+            "".to_owned(),
+            "ConfigMap".to_owned(),
+            Some("payments".to_owned()),
+            "settings".to_owned(),
+        );
+        let deferred = ResourceKey::new(
+            "example.com".to_owned(),
+            "Widget".to_owned(),
+            Some("payments".to_owned()),
+            "one".to_owned(),
+        );
+        let desired: Vec<DesiredResource> = [&missing, &deferred]
+            .iter()
+            .map(|key| DesiredResource {
+                key: (*key).clone(),
+                gvk: ferriscd_engine::manifest::GroupVersionKind::parse("v1", &key.kind)
+                    .expect("gvk"),
+                object: config_map(&key.name, None),
+                source_file: "fixture.yaml".to_owned(),
+            })
+            .collect();
+
+        let mut live: LiveStateMap = BTreeMap::new();
+        live.insert(missing.clone(), LiveState::Missing);
+        live.insert(deferred.clone(), LiveState::DeferredPendingCrd);
+
+        let inputs = health_inputs(&desired, &live, &Inventory::new());
+        assert_eq!(inputs.len(), 2);
+        assert!(matches!(inputs[0].observation, Observation::Missing));
+        assert!(matches!(inputs[1].observation, Observation::Pending(_)));
+
+        // A resource this pass applied is not `Missing`: the live read simply predates the write.
+        let applied = inventory::inventory_from_desired(&desired);
+        let inputs = health_inputs(&desired, &live, &applied);
+        assert!(
+            matches!(
+                inputs[0].observation,
+                Observation::AppliedAwaitingObservation
+            ),
+            "an applied resource must not be reported Missing"
+        );
+
+        // A kind whose CRD disappeared is not this pass's health business.
+        let mut gone: LiveStateMap = BTreeMap::new();
+        gone.insert(missing.clone(), LiveState::OrphanGvkGone);
+        assert!(health_inputs(&desired, &gone, &Inventory::new()).is_empty());
     }
 
     #[test]
