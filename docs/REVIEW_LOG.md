@@ -200,7 +200,5 @@ plan-level trap matrix (C1/C2, H1…M6) or the `P07-*`/`P13-*` rounds above.
   parsing, the replay cache stays bounded, `Secret` values and webhook secrets never reach a
   `Debug`/error/log surface, the served OpenAPI document equals the committed one, and the graph
   traversal is per request (a later request never reuses an earlier listing cache).
-- **Follow-ups (non-blocking):** `T14.3`–`T14.6` (TokenReview AuthN, RBAC, metrics/`/readyz` watch
-  readiness, web UI); a manual sync on an application whose multi-wave operation keeps failing is
-  still retried on every requeue (pre-existing: `failed_operation_is_not_retried` treats the
-  annotation as the escape hatch, and a failing operation never settles, so it is never consumed).
+- **Phase 14 part 2 (`T14.3`–`T14.6`):** TokenReview AuthN with a positive-only 30 s cache, default-`token-review` policy (`deny-all` lockdown, explicit `pass-through` dev escape), RBAC from `ferriscd-rbac-cm` (default-deny, 404-if-unseen/403-if-visible, list filtering), the full `ferriscd` CLI (login/app/project/cluster, table/json/yaml, exit code 2 for drift, 0600 credential file), and lesson 14. The auth proof covers every protected route (GET and POST) and every protected handler extracts the authenticated identity, so a lost auth layer fails closed. RBAC is a startup snapshot.
+- **Follow-ups (non-blocking):** live `v1_0_control_plane_auth` / `v0_9_api_webhooks` suites are **pending** on `kind`; RBAC policy parsing should move to the engine's guarded YAML parser (duplicate-key/alias budgets); CLI config read is still a small synchronous file read; `GET /clusters` is authN-only (not project-scoped); the e2e leaves two `AppProject`s behind; metrics/`/readyz` watch readiness is Phase 15.

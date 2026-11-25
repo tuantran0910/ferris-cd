@@ -23,6 +23,9 @@ k8s-openapi.workspace = true
 kube.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The `T14.4` RBAC policy is a YAML document inside the `ferriscd-rbac-cm` ConfigMap; parsing it
+# with the workspace's `serde-saphyr` keeps one YAML implementation for CRDs, manifests and policy.
+serde-saphyr.workspace = true
 # Constant-time HMAC/token comparison (`T14.2`); already in the lock file.
 subtle.workspace = true
 thiserror.workspace = true

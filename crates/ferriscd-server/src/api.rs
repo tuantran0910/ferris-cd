@@ -38,7 +38,7 @@ use std::collections::BTreeMap;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::{get, post};
@@ -55,9 +55,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth;
+use crate::auth::{self, AuthenticatedIdentity};
 use crate::error::{ApiError, ApiErrorBody};
 use crate::openapi;
+use crate::rbac::{Action, Actor};
 use crate::state::{
     AppState, ClusterEntry, GraphRequest, GraphTraversal, MAX_GRAPH_LIST_REQUESTS, OperationRequest,
 };
@@ -85,14 +86,14 @@ const SECOND_LEVEL_KINDS: [&str; 1] = ["ReplicaSet"];
 // ---------------------------------------------------------------------------
 
 /// Liveness answer.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthResponse {
     /// Always `ok` while the process answers.
     pub status: String,
 }
 
 /// Readiness answer.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadyResponse {
     /// `ready` or `not ready`.
     pub status: String,
@@ -102,14 +103,14 @@ pub struct ReadyResponse {
 }
 
 /// `GET /api/v1/applications` body.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApplicationListView {
     /// Every watched `Application`.
     pub items: Vec<ApplicationSummary>,
 }
 
 /// One `Application`, reduced to what a UI/CLI lists.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplicationSummary {
     /// `metadata.namespace`.
@@ -139,7 +140,7 @@ pub struct ApplicationSummary {
 }
 
 /// `spec.source` summary.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceView {
     /// Repository URL, redacted (a remote URL may carry a token).
@@ -153,7 +154,7 @@ pub struct SourceView {
 }
 
 /// `spec.destination`.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DestinationView {
     /// `spec.destination.cluster`.
@@ -163,7 +164,7 @@ pub struct DestinationView {
 }
 
 /// `status.sync`.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncView {
     /// `Synced` or `OutOfSync`.
@@ -180,7 +181,7 @@ pub struct SyncView {
 }
 
 /// `status.health`.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthView {
     /// `Healthy`, `Progressing`, `Degraded`, `Suspended`, `Missing`, or `Unknown`.
@@ -191,7 +192,7 @@ pub struct HealthView {
 }
 
 /// One `status.conditions` entry.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConditionView {
     /// Condition type (`Ready`).
@@ -211,7 +212,7 @@ pub struct ConditionView {
 }
 
 /// One `status.history` entry.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryView {
     /// Deployment id (the `{"rollback":{"id":N}}` handle).
@@ -224,7 +225,7 @@ pub struct HistoryView {
 }
 
 /// `status.operationState`.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationView {
     /// `Running`, `Succeeded`, `Failed`, or `Error`.
@@ -245,7 +246,7 @@ pub struct OperationView {
 }
 
 /// `GET /api/v1/applications/{namespace}/{name}` body.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApplicationDetailView {
     /// The application itself.
     pub application: ApplicationSummary,
@@ -258,7 +259,7 @@ pub struct ApplicationDetailView {
 }
 
 /// One node of the resource graph.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceNodeView {
     /// Version-agnostic GKNN key (`group/kind/namespace/name`).
@@ -289,7 +290,7 @@ pub struct ResourceNodeView {
 }
 
 /// `GET /api/v1/applications/{namespace}/{name}/resources` body.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceGraphView {
     /// Namespace the graph was read from (`spec.destination.namespace`).
@@ -307,7 +308,7 @@ pub struct ResourceGraphView {
 }
 
 /// One field-level change of a diffed resource.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffChangeView {
     /// RFC 6901 JSON Pointer into the redacted object.
@@ -323,7 +324,7 @@ pub struct DiffChangeView {
 }
 
 /// One Server-Side Apply field-ownership conflict.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffConflictView {
     /// The disputed field, as reported by the API server.
@@ -335,7 +336,7 @@ pub struct DiffConflictView {
 }
 
 /// One diffed resource.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffResourceView {
     /// Version-agnostic GKNN key.
@@ -356,7 +357,7 @@ pub struct DiffResourceView {
 }
 
 /// Aggregate counts of a diff.
-#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffSummaryView {
     /// Resources classified.
@@ -376,7 +377,7 @@ pub struct DiffSummaryView {
 }
 
 /// `GET /api/v1/applications/{namespace}/{name}/diff` body.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffView {
     /// Commit the desired state was rendered from.
@@ -416,7 +417,7 @@ pub struct RollbackRequestBody {
 }
 
 /// What a `sync`/`rollback` request did.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationResponse {
     /// Always `accepted` (the controller performs the work).
@@ -435,14 +436,14 @@ pub struct OperationResponse {
 }
 
 /// `GET /api/v1/projects` body.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProjectListView {
     /// Every `AppProject` of the control-plane namespace.
     pub items: Vec<ProjectView>,
 }
 
 /// One `AppProject`, reduced to its boundary facts.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectView {
     /// `metadata.name`.
@@ -465,14 +466,14 @@ pub struct ProjectView {
 }
 
 /// `GET /api/v1/clusters` body.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClusterListView {
     /// `in-cluster` first, then every registered cluster name.
     pub items: Vec<ClusterView>,
 }
 
 /// One addressable cluster.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterView {
     /// `spec.destination.cluster` name.
@@ -516,8 +517,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/projects", get(list_projects))
         .route("/api/v1/clusters", get(list_clusters))
         .route("/api/v1/openapi.json", get(openapi_document))
-        // The `T14.3` seam: one layer, installed on the group, before the groups are merged, so a
-        // route added here later cannot escape authentication.
+        // The `T14.3` seam: one layer installed on the group before it is merged. `axum`'s
+        // `route_layer` covers only the routes registered **above** it — add new protected routes
+        // before this call, never after. Handlers also extract `Extension<AuthenticatedIdentity>`,
+        // so a route that somehow lost the layer fails closed (500) rather than answering.
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
@@ -599,7 +602,12 @@ pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<ReadyRes
 // Handlers: applications
 // ---------------------------------------------------------------------------
 
-/// Lists every `Application` this control plane watches.
+/// Lists every `Application` this control plane watches, filtered to the caller's projects.
+///
+/// **The filter is the authorization** (`T14.4` trap guard): an application in a project the caller
+/// has no grant on is simply absent — the same answer a control plane that does not manage it would
+/// give — so a tenant cannot learn about another tenant's applications by listing them, and the
+/// response never reports how many were filtered out.
 ///
 /// # Errors
 ///
@@ -607,10 +615,10 @@ pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<ReadyRes
 #[utoipa::path(
     get,
     path = "/api/v1/applications",
-    description = "Every `Application` this control plane watches, with its sync/health verdict.",
+    description = "Every `Application` this control plane watches, with its sync/health verdict. Filtered to the projects the caller is authorized for: anything outside them is absent, exactly as if it did not exist.",
     tag = "applications",
     responses(
-        (status = 200, description = "Every watched Application", body = ApplicationListView),
+        (status = 200, description = "Every watched Application the caller may see", body = ApplicationListView),
         (status = 401, description = "Authentication required", body = ApiErrorBody),
         (status = 502, description = "The cluster could not be read", body = ApiErrorBody),
     ),
@@ -618,10 +626,16 @@ pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<ReadyRes
 )]
 pub async fn list_applications(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
 ) -> Result<Json<ApplicationListView>, ApiError> {
+    let actor = Actor::new(&state.rbac, &identity);
     let applications = state.applications.list().await?;
     Ok(Json(ApplicationListView {
-        items: applications.iter().map(application_summary).collect(),
+        items: applications
+            .iter()
+            .filter(|app| actor.can_see(&app.spec.project))
+            .map(application_summary)
+            .collect(),
     }))
 }
 
@@ -629,11 +643,14 @@ pub async fn list_applications(
 ///
 /// # Errors
 ///
-/// [`ApiError::NotFound`] when it does not exist (or lives outside the watched namespaces).
+/// [`ApiError::NotFound`] when it does not exist (or lives outside the watched namespaces) **and**
+/// when the caller has no grant on its project: the two answers are byte-identical, so a `404` can
+/// never be used to discover that an application exists (trap guard).
+/// [`ApiError::Forbidden`] only when the caller can already see the application but lacks `get`.
 #[utoipa::path(
     get,
     path = "/api/v1/applications/{namespace}/{name}",
-    description = "One `Application`, with its conditions, deployment history, and running operation.",
+    description = "One `Application`, with its conditions, deployment history, and running operation. An application in a project the caller may not see answers exactly the 404 a nonexistent one answers.",
     tag = "applications",
     params(
         ("namespace" = String, Path, description = "Namespace of the Application"),
@@ -642,16 +659,20 @@ pub async fn list_applications(
     responses(
         (status = 200, description = "The Application", body = ApplicationDetailView),
         (status = 401, description = "Authentication required", body = ApiErrorBody),
-        (status = 404, description = "No such Application", body = ApiErrorBody),
+        (status = 403, description = "The caller may see this Application but not read it", body = ApiErrorBody),
+        (status = 404, description = "No such Application, or none visible to the caller", body = ApiErrorBody),
         (status = 502, description = "The cluster could not be read", body = ApiErrorBody),
     ),
     security(("bearer_auth" = [])),
 )]
 pub async fn get_application(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<ApplicationDetailView>, ApiError> {
+    let actor = Actor::new(&state.rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
+    authorize(&actor, &app, &namespace, &name, Action::Get, "read")?;
     Ok(Json(application_detail(&app)))
 }
 
@@ -684,8 +705,9 @@ pub async fn get_application(
 ///
 /// # Errors
 ///
-/// [`ApiError::NotFound`] for an unknown `Application`, [`ApiError::Backend`] when the destination
-/// cluster cannot be read.
+/// [`ApiError::NotFound`] for an unknown (or invisible) `Application`, [`ApiError::Forbidden`] when
+/// the caller may see it but not read it, [`ApiError::Backend`] when the destination cluster cannot
+/// be read.
 #[utoipa::path(
     get,
     path = "/api/v1/applications/{namespace}/{name}/resources",
@@ -698,16 +720,20 @@ pub async fn get_application(
     responses(
         (status = 200, description = "The live resource graph", body = ResourceGraphView),
         (status = 401, description = "Authentication required", body = ApiErrorBody),
-        (status = 404, description = "No such Application", body = ApiErrorBody),
+        (status = 403, description = "The caller may see this Application but not read it", body = ApiErrorBody),
+        (status = 404, description = "No such Application, or none visible to the caller", body = ApiErrorBody),
         (status = 502, description = "The destination cluster could not be read", body = ApiErrorBody),
     ),
     security(("bearer_auth" = [])),
 )]
 pub async fn get_resources(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<ResourceGraphView>, ApiError> {
+    let actor = Actor::new(&state.rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
+    authorize(&actor, &app, &namespace, &name, Action::Get, "read")?;
     let live = state.inventory.read(&app).await?;
     let status = app.status.clone().unwrap_or_default();
     let per_resource = resource_health(&status);
@@ -823,9 +849,10 @@ pub async fn get_resources(
 ///
 /// # Errors
 ///
-/// [`ApiError::NotFound`] for an unknown `Application`, and [`ApiError::Backend`] with the same
-/// refusal a sync would report (a denied `AppProject`, an unusable revision, an unreachable
-/// destination cluster, a render failure).
+/// [`ApiError::NotFound`] for an unknown (or invisible) `Application`, [`ApiError::Forbidden`] when
+/// the caller may see it but lacks `diff`, and [`ApiError::Backend`] with the same refusal a sync
+/// would report (a denied `AppProject`, an unusable revision, an unreachable destination cluster, a
+/// render failure).
 #[utoipa::path(
     get,
     path = "/api/v1/applications/{namespace}/{name}/diff",
@@ -838,16 +865,20 @@ pub async fn get_resources(
     responses(
         (status = 200, description = "The redacted live diff", body = DiffView),
         (status = 401, description = "Authentication required", body = ApiErrorBody),
-        (status = 404, description = "No such Application", body = ApiErrorBody),
+        (status = 403, description = "The caller may see this Application but not diff it", body = ApiErrorBody),
+        (status = 404, description = "No such Application, or none visible to the caller", body = ApiErrorBody),
         (status = 502, description = "The diff could not be computed", body = ApiErrorBody),
     ),
     security(("bearer_auth" = [])),
 )]
 pub async fn get_diff(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<DiffView>, ApiError> {
+    let actor = Actor::new(&state.rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
+    authorize(&actor, &app, &namespace, &name, Action::Diff, "diff")?;
     let preview = state.diffs.diff(&app).await?;
     Ok(Json(DiffView {
         revision: preview.revision,
@@ -894,6 +925,8 @@ pub async fn get_diff(
 /// * `413` for a body over the router's limit, `400` for a body that is not JSON.
 /// * `422` for a body asking for something `v1.0` cannot honour (`revision`, `prune`, `dryRun`):
 ///   silently ignoring it would report a sync that did not happen the way it was requested.
+/// * `404` when the `Application` does not exist **or** the caller has no grant on its project
+///   (identical answers), `403` when it is visible but `sync` is not granted (`T14.4`).
 #[utoipa::path(
     post,
     path = "/api/v1/applications/{namespace}/{name}/sync",
@@ -908,7 +941,8 @@ pub async fn get_diff(
         (status = 202, description = "The sync request was recorded (or is already pending)", body = OperationResponse),
         (status = 400, description = "The body is not JSON", body = ApiErrorBody),
         (status = 401, description = "Authentication required", body = ApiErrorBody),
-        (status = 404, description = "No such Application", body = ApiErrorBody),
+        (status = 403, description = "The caller may see this Application but not sync it", body = ApiErrorBody),
+        (status = 404, description = "No such Application, or none visible to the caller", body = ApiErrorBody),
         (status = 409, description = "A rollback is pending, or the Application changed", body = ApiErrorBody),
         (status = 413, description = "Payload too large", body = ApiErrorBody),
         (status = 422, description = "The request cannot be honoured", body = ApiErrorBody),
@@ -917,6 +951,7 @@ pub async fn get_diff(
 )]
 pub async fn sync_application(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
     Path((namespace, name)): Path<(String, String)>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<OperationResponse>), ApiError> {
@@ -941,7 +976,9 @@ pub async fn sync_application(
             )));
         }
     }
+    let actor = Actor::new(&state.rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
+    authorize(&actor, &app, &namespace, &name, Action::Sync, "sync")?;
     let operation = OperationRequest::Sync;
     request_operation(&state, &app, operation).await
 }
@@ -963,6 +1000,8 @@ pub async fn sync_application(
 /// * `409` when the object changed under the request (the compare-and-swap precondition failed).
 /// * `413` for a body over the router's limit, `400` for a body that is not the expected JSON.
 /// * `422` when `status.history` has no entry with that id.
+/// * `404` when the `Application` does not exist **or** the caller has no grant on its project
+///   (identical answers), `403` when it is visible but `rollback` is not granted (`T14.4`).
 #[utoipa::path(
     post,
     path = "/api/v1/applications/{namespace}/{name}/rollback",
@@ -977,7 +1016,8 @@ pub async fn sync_application(
         (status = 202, description = "The rollback request was recorded", body = OperationResponse),
         (status = 400, description = "The body is not the expected JSON", body = ApiErrorBody),
         (status = 401, description = "Authentication required", body = ApiErrorBody),
-        (status = 404, description = "No such Application", body = ApiErrorBody),
+        (status = 403, description = "The caller may see this Application but not roll it back", body = ApiErrorBody),
+        (status = 404, description = "No such Application, or none visible to the caller", body = ApiErrorBody),
         (status = 409, description = "The Application changed while the request was recorded", body = ApiErrorBody),
         (status = 413, description = "Payload too large", body = ApiErrorBody),
         (status = 422, description = "No history entry with that id", body = ApiErrorBody),
@@ -986,12 +1026,22 @@ pub async fn sync_application(
 )]
 pub async fn rollback_application(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
     Path((namespace, name)): Path<(String, String)>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<OperationResponse>), ApiError> {
     let body = require_body(state.webhooks.max_body_bytes(), body)?;
     let request: RollbackRequestBody = parse_body(&body)?;
+    let actor = Actor::new(&state.rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
+    authorize(
+        &actor,
+        &app,
+        &namespace,
+        &name,
+        Action::Rollback,
+        "roll back",
+    )?;
     let history: &[RevisionHistoryEntry] = app
         .status
         .as_ref()
@@ -1179,7 +1229,10 @@ fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
     })
 }
 
-/// Lists every `AppProject` of the control-plane namespace.
+/// Lists every `AppProject` of the control-plane namespace the caller may see.
+///
+/// Filtered like the application list (`T14.4`): a project the caller holds no grant on is absent,
+/// so the project catalogue is not a directory of other tenants either.
 ///
 /// # Errors
 ///
@@ -1198,10 +1251,16 @@ fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
 )]
 pub async fn list_projects(
     State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
 ) -> Result<Json<ProjectListView>, ApiError> {
+    let actor = Actor::new(&state.rbac, &identity);
     let projects = state.projects.list().await?;
     Ok(Json(ProjectListView {
-        items: projects.iter().map(project_view).collect(),
+        items: projects
+            .iter()
+            .filter(|project| actor.can_see(&project.name_any()))
+            .map(project_view)
+            .collect(),
     }))
 }
 
@@ -1217,7 +1276,10 @@ pub async fn list_projects(
     ),
     security(("bearer_auth" = [])),
 )]
-pub async fn list_clusters(State(state): State<AppState>) -> Json<ClusterListView> {
+pub async fn list_clusters(
+    State(state): State<AppState>,
+    _identity: Extension<AuthenticatedIdentity>,
+) -> Json<ClusterListView> {
     Json(ClusterListView {
         items: state
             .clusters
@@ -1250,7 +1312,9 @@ pub async fn list_clusters(State(state): State<AppState>) -> Json<ClusterListVie
     ),
     security(("bearer_auth" = [])),
 )]
-pub async fn openapi_document() -> Result<Json<serde_json::Value>, ApiError> {
+pub async fn openapi_document(
+    _identity: Extension<AuthenticatedIdentity>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     openapi::document_value()
         .map(Json)
         .map_err(|err| ApiError::backend(&err))
@@ -1271,6 +1335,44 @@ async fn require_application(
         .get(namespace, name)
         .await?
         .ok_or_else(|| ApiError::not_found("Application", namespace, name))
+}
+
+/// The `T14.4` gate for one `Application`, applied **before** any work is done for it.
+///
+/// One rule, in one place, so every handler answers consistently:
+///
+/// * **no grant at all** on the application's project → the *identical* `404` body a nonexistent
+///   application gets. A caller who cannot see an application must not be able to tell it apart from
+///   one that does not exist, whichever endpoint they probe (trap guard).
+/// * **a grant, but not this action** → `403`. This is not an existence leak: the caller can already
+///   read the application (or the list that contains it), so they already know it exists.
+/// * otherwise → proceed.
+///
+/// `namespace`/`name` are the ones from the request path, not from the object, so the hidden `404` is
+/// byte-identical to [`ApiError::not_found`]'s answer for a missing object.
+fn authorize(
+    actor: &Actor<'_>,
+    app: &Application,
+    namespace: &str,
+    name: &str,
+    action: Action,
+    verb: &'static str,
+) -> Result<(), ApiError> {
+    let grant = actor.grant(&app.spec.project);
+    if !grant.is_visible() {
+        return Err(ApiError::not_found("Application", namespace, name));
+    }
+    if grant.allows(action) {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden {
+        message: format!(
+            "not permitted to {verb} Application {namespace}/{name}: this identity has no `{}` \
+             grant on AppProject {project}",
+            action.as_str(),
+            project = app.spec.project,
+        ),
+    })
 }
 
 /// Maps an `Application` to its list representation.

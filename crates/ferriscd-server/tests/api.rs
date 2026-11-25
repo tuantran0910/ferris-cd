@@ -312,6 +312,10 @@ fn state_with(
         Arc::new(Ready(true)),
     )
     .with_refresh_sink(sink)
+    // These tests exercise the handlers, not authentication: `pass-through` is the documented
+    // development escape (`--auth-policy pass-through`), and `T14.3`/`T14.4` have their own suite
+    // (`tests/auth_rbac.rs`).
+    .with_auth(AuthPolicy::PassThrough)
 }
 
 fn state(apps: Vec<Application>) -> AppState {
@@ -544,7 +548,9 @@ async fn the_resource_graph_stitches_deployment_replicaset_and_pod() {
         Arc::new(Diffs::default()),
         Arc::new(Ready(true)),
     );
-    state = state.with_refresh_sink(Arc::new(Sink::default()));
+    state = state
+        .with_refresh_sink(Arc::new(Sink::default()))
+        .with_auth(AuthPolicy::PassThrough);
 
     let (status, body) = get(
         state.clone(),
@@ -648,7 +654,8 @@ async fn the_resource_graph_is_capped() {
         Arc::new(Diffs::default()),
         Arc::new(Ready(true)),
     )
-    .with_refresh_sink(Arc::new(Sink::default()));
+    .with_refresh_sink(Arc::new(Sink::default()))
+    .with_auth(AuthPolicy::PassThrough);
 
     let (status, body) = get(
         state,
@@ -906,6 +913,7 @@ fn operations_state(app: Application, operations: Arc<Operations>) -> AppState {
         Arc::new(Ready(true)),
     )
     .with_refresh_sink(Arc::new(Sink::default()))
+    .with_auth(AuthPolicy::PassThrough)
 }
 
 #[tokio::test]
@@ -1195,7 +1203,8 @@ async fn projects_and_clusters_are_listed() {
         Arc::new(Diffs::default()),
         Arc::new(Ready(true)),
     )
-    .with_refresh_sink(Arc::new(Sink::default()));
+    .with_refresh_sink(Arc::new(Sink::default()))
+    .with_auth(AuthPolicy::PassThrough);
 
     let (status, body) = get(state.clone(), "/api/v1/projects").await;
     assert_eq!(status, StatusCode::OK);

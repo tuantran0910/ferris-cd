@@ -1,8 +1,18 @@
 //! `ferriscd` CLI binary entrypoint.
 
+mod client;
 mod commands;
+mod output;
 
 use clap::{Parser, Subcommand};
+use std::process::ExitCode;
+
+/// Exit code for success.
+pub const EXIT_OK: u8 = 0;
+/// Exit code for any error.
+pub const EXIT_ERROR: u8 = 1;
+/// Exit code for "the application is out of sync" (`ferriscd app diff`), so CI can gate on it.
+pub const EXIT_OUT_OF_SYNC: u8 = 2;
 
 #[derive(Debug, Parser)]
 #[command(name = "ferriscd", version, about = "FerrisCD GitOps CLI")]
@@ -23,10 +33,18 @@ enum Commands {
     Controller(commands::controller::ControllerArgs),
     /// Run the controller **and** the in-process REST API/webhook server in one process.
     Server(commands::server::ServerArgs),
+    /// Store the API server URL and a Kubernetes bearer token (`~/.config/ferriscd/config.json`).
+    Login(commands::login::LoginArgs),
+    /// Inspect and operate `Application`s through `ferriscd-server` (list/get/diff/sync/rollback).
+    App(commands::app::AppArgs),
+    /// Inspect `AppProject`s through `ferriscd-server`.
+    Project(commands::platform::ProjectArgs),
+    /// Inspect the cluster registry through `ferriscd-server`.
+    Cluster(commands::platform::ClusterArgs),
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     tracing::debug!(
@@ -36,12 +54,38 @@ async fn main() -> anyhow::Result<()> {
         "executing ferriscd cli"
     );
 
+    match run(cli).await {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            report(&error);
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
+/// Runs one command and returns its documented exit code.
+async fn run(cli: Cli) -> anyhow::Result<u8> {
     match cli.command {
-        Commands::Apply(args) => commands::apply::run(args).await,
-        Commands::ApplyFile(args) => commands::apply_file::run(args).await,
-        Commands::Crd(args) => commands::crd::run(args).await,
-        Commands::Controller(args) => commands::controller::run(args).await,
-        Commands::Server(args) => commands::server::run(args).await,
+        Commands::Apply(args) => commands::apply::run(args).await.map(|()| EXIT_OK),
+        Commands::ApplyFile(args) => commands::apply_file::run(args).await.map(|()| EXIT_OK),
+        Commands::Crd(args) => commands::crd::run(args).await.map(|()| EXIT_OK),
+        Commands::Controller(args) => commands::controller::run(args).await.map(|()| EXIT_OK),
+        Commands::Server(args) => commands::server::run(args).await.map(|()| EXIT_OK),
+        Commands::Login(args) => commands::login::run(args).await.map(|()| EXIT_OK),
+        Commands::App(args) => commands::app::run(args).await,
+        Commands::Project(args) => commands::platform::run_project(args).await,
+        Commands::Cluster(args) => commands::platform::run_cluster(args).await,
+    }
+}
+
+/// Renders an error to stderr: the cause chain, one line each, and no panic.
+///
+/// `main` cannot return `anyhow::Result` any more (it owns the exit code), so the `anyhow` reporting
+/// has to be explicit. Only the messages are printed — never a request header, and never a token.
+fn report(error: &anyhow::Error) {
+    eprintln!("Error: {error}");
+    for cause in error.chain().skip(1) {
+        eprintln!("  caused by: {cause}");
     }
 }
 

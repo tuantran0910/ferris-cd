@@ -13,7 +13,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// Longest error message the API will render.
@@ -187,14 +187,17 @@ impl ApiError {
 }
 
 /// The body of a failed request.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+///
+/// `Deserialize` as well as `Serialize` because it is the contract in **both** directions: the
+/// `ferriscd` CLI (`T14.5`) maps a refused request back onto this shape instead of re-inventing one.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiErrorBody {
     /// The failure.
     pub error: ApiErrorDetail,
 }
 
 /// One failure, in the shape the OpenAPI document declares.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiErrorDetail {
     /// Stable code (`NotFound`, `BadRequest`, `Conflict`, `Unprocessable`, `Unauthorized`,
     /// `Forbidden`, `BackendUnavailable`, `PayloadTooLarge`).

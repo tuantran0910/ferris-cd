@@ -19,11 +19,16 @@ use ferriscd_crd::{AppProject, Application};
 use ferriscd_engine::inventory::{self, Inventory};
 use ferriscd_engine::manifest::ResourceKey;
 use k8s_openapi::api::apps::v1::ReplicaSet;
-use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, ListParams, Patch, PatchParams};
+use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod};
+use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
 use kube::{Client, ResourceExt};
 
+use crate::auth::{
+    AuthPolicy, AuthenticatedIdentity, IdentityCache, MAX_BEARER_TOKEN_CHARS, TokenAuthenticator,
+};
 use crate::error::ApiError;
+use crate::rbac::{RBAC_CONFIGMAP_KEY, RBAC_CONFIGMAP_NAME, RbacPolicy, RbacPolicyError};
 use crate::state::{
     AppState, ApplicationSource, ChildNode, ClusterCatalog, ClusterEntry, DiffSource,
     GRAPH_LIST_LIMIT, GraphRequest, GraphTraversal, InventoryReader, ListKey, ListedNode,
@@ -55,6 +60,14 @@ pub fn app_state(plane: &ControlPlane, webhooks: WebhookConfig) -> AppState {
         Arc::new(ServingReadiness),
     )
     .with_refresh_sink(refreshes)
+    // `T14.3`: the production bearer-token validator. `AppState` defaults to a validator that
+    // refuses everything, so forgetting this line fails closed rather than open.
+    .with_token_authenticator(Arc::new(KubeTokenAuthenticator::new(
+        plane.client().clone(),
+    )))
+    .with_identity_cache(Arc::new(IdentityCache::default()))
+    // `T14.4`: deny everything until the binary loads `ferriscd-rbac-cm` (`load_rbac_policy`).
+    .with_rbac(Arc::new(RbacPolicy::empty()))
     .with_webhooks(webhooks)
 }
 
@@ -618,6 +631,263 @@ impl RefreshSink for ApiRefreshSink {
                 .map_err(|err| ApiError::backend(&err))
         })
     }
+}
+
+/// The production [`TokenAuthenticator`]: one `authentication.k8s.io/v1` `TokenReview` per token.
+///
+/// # Why a `TokenReview` and not a JWT check
+///
+/// FerrisCD never issues or introspects credentials itself: Kubernetes is the identity provider for
+/// every workload in the cluster, and a `TokenReview` is the only way to ask *it* whether a token is
+/// currently valid — including audience binding, expiry and a `ServiceAccount` that has been
+/// deleted. Verifying a JWT locally would require the cluster's signing key and would keep accepting
+/// a revoked identity until the token expired.
+///
+/// # Cost
+///
+/// A `TokenReview` is a create against the API server (an etcd write). This type is therefore always
+/// behind [`IdentityCache`](crate::auth::IdentityCache), which turns a polling dashboard's requests
+/// into one review per identity per 30 s.
+///
+/// # RBAC
+///
+/// The control plane's `ServiceAccount` needs `create` on
+/// `tokenreviews.authentication.k8s.io`; without it every review fails and every protected request
+/// answers `401` (fail closed). The lesson documents the `ClusterRole`.
+pub struct KubeTokenAuthenticator {
+    client: Client,
+}
+
+impl std::fmt::Debug for KubeTokenAuthenticator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KubeTokenAuthenticator")
+            .finish_non_exhaustive()
+    }
+}
+
+impl KubeTokenAuthenticator {
+    /// Builds the validator over the controller's own client (no second connector pool).
+    #[must_use]
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+impl TokenAuthenticator for KubeTokenAuthenticator {
+    fn authenticate<'a>(&'a self, token: &'a str) -> SeamFuture<'a, Option<AuthenticatedIdentity>> {
+        Box::pin(async move {
+            // Defence in depth: the middleware already refused an over-long credential, and this
+            // guard keeps the request body bounded even if a future caller forgets.
+            if token.is_empty() || token.chars().count() > MAX_BEARER_TOKEN_CHARS {
+                return Ok(None);
+            }
+            let review = TokenReview {
+                spec: TokenReviewSpec {
+                    token: Some(token.to_owned()),
+                    audiences: None,
+                },
+                ..TokenReview::default()
+            };
+            // `TokenReview` is cluster-scoped: `Api::all`, never a namespace.
+            let api: Api<TokenReview> = Api::all(self.client.clone());
+            let reviewed = api
+                .create(&PostParams::default(), &review)
+                .await
+                .map_err(|err| ApiError::backend(&err))?;
+            let status = reviewed.status.unwrap_or_default();
+            if status.authenticated != Some(true) {
+                return Ok(None);
+            }
+            let Some(user) = status.user else {
+                // `authenticated: true` without a user is not an identity anybody can be authorized
+                // against, so it is refused rather than half-trusted.
+                return Ok(None);
+            };
+            let Some(username) = user.username else {
+                // `authenticated: true` with no user name is not an identity that can be authorized.
+                return Ok(None);
+            };
+            if username.trim().is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(AuthenticatedIdentity::new(
+                username,
+                user.groups.unwrap_or_default(),
+            )))
+        })
+    }
+}
+
+/// Why the RBAC `ConfigMap` could not be turned into a policy.
+///
+/// Every variant means **deny everything** (`T14.4`: the policy fails closed). None of them quotes
+/// a value from the document: the loader's job is to log *which* ConfigMap is broken, not to
+/// publish the group names inside it.
+#[derive(Debug, thiserror::Error)]
+pub enum RbacLoadError {
+    /// There is no `ferriscd-rbac-cm` in the control-plane namespace.
+    #[error(
+        "the RBAC ConfigMap {namespace}/{name} does not exist, so no authenticated caller is \
+         authorized for anything"
+    )]
+    Missing {
+        /// Namespace that was searched.
+        namespace: String,
+        /// ConfigMap name that is required.
+        name: String,
+    },
+
+    /// The `ConfigMap` exists but has no `policy.yaml` entry.
+    #[error(
+        "the RBAC ConfigMap {namespace}/{name} has no `{key}` entry, so no authenticated caller is \
+         authorized for anything"
+    )]
+    MissingKey {
+        /// Namespace the ConfigMap lives in.
+        namespace: String,
+        /// ConfigMap name.
+        name: String,
+        /// The key that was expected.
+        key: String,
+    },
+
+    /// The `ConfigMap` could not be read from the cluster.
+    #[error("the RBAC ConfigMap {namespace}/{name} could not be read: {source}")]
+    Read {
+        /// Namespace the ConfigMap lives in.
+        namespace: String,
+        /// ConfigMap name.
+        name: String,
+        /// The API failure.
+        #[source]
+        source: kube::Error,
+    },
+
+    /// The document is not a valid policy.
+    #[error("the RBAC ConfigMap {namespace}/{name} is not a usable policy: {source}")]
+    Invalid {
+        /// Namespace the ConfigMap lives in.
+        namespace: String,
+        /// ConfigMap name.
+        name: String,
+        /// Why the document was rejected.
+        #[source]
+        source: RbacPolicyError,
+    },
+}
+
+/// Reads [`RBAC_CONFIGMAP_NAME`] from the control-plane namespace and turns it into a policy.
+///
+/// Deliberately **not** a per-request load: an `Application` list or a diff already costs cluster
+/// reads, and an authorization decision that costs an etcd read per request would be a fine denial
+/// of service against the API server. The policy is a startup snapshot (`T14.4`); changing it means
+/// restarting the API server, which is documented as a limitation rather than hidden.
+#[derive(Debug, Clone)]
+pub struct KubeRbacLoader {
+    api: Api<ConfigMap>,
+    namespace: String,
+}
+
+impl KubeRbacLoader {
+    /// Builds a loader reading `namespace` (the control-plane namespace).
+    #[must_use]
+    pub fn new(client: Client, namespace: impl Into<String>) -> Self {
+        let namespace = namespace.into();
+        Self {
+            api: Api::namespaced(client, &namespace),
+            namespace,
+        }
+    }
+
+    /// The namespace the policy is read from.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Reads and parses the policy.
+    ///
+    /// # Errors
+    ///
+    /// [`RbacLoadError`] when the ConfigMap is missing, unreadable, missing its `policy.yaml` entry,
+    /// or not a valid policy document.
+    pub async fn load(&self) -> Result<RbacPolicy, RbacLoadError> {
+        let config_map =
+            self.api
+                .get_opt(RBAC_CONFIGMAP_NAME)
+                .await
+                .map_err(|err| RbacLoadError::Read {
+                    namespace: self.namespace.clone(),
+                    name: RBAC_CONFIGMAP_NAME.to_owned(),
+                    source: err,
+                })?;
+        let Some(config_map) = config_map else {
+            return Err(RbacLoadError::Missing {
+                namespace: self.namespace.clone(),
+                name: RBAC_CONFIGMAP_NAME.to_owned(),
+            });
+        };
+        let document = config_map
+            .data
+            .as_ref()
+            .and_then(|data| data.get(RBAC_CONFIGMAP_KEY))
+            .ok_or_else(|| RbacLoadError::MissingKey {
+                namespace: self.namespace.clone(),
+                name: RBAC_CONFIGMAP_NAME.to_owned(),
+                key: RBAC_CONFIGMAP_KEY.to_owned(),
+            })?;
+        RbacPolicy::parse(document).map_err(|source| RbacLoadError::Invalid {
+            namespace: self.namespace.clone(),
+            name: RBAC_CONFIGMAP_NAME.to_owned(),
+            source,
+        })
+    }
+}
+
+/// Loads the RBAC policy for the binary, falling back to deny-all with a loud log.
+///
+/// The fallback is the whole point (`T14.4` trap guard): a missing, unreadable or malformed policy
+/// must make the API authorize **nobody**, never everybody. The server keeps serving (probes and
+/// webhooks are unaffected, and an operator can fix the ConfigMap and restart) instead of crashing
+/// into a crash loop that hides the actual problem.
+pub async fn load_rbac_policy(plane: &ControlPlane) -> RbacPolicy {
+    let loader = KubeRbacLoader::new(plane.client().clone(), plane.namespace());
+    let result = loader.load().await;
+    if result.is_ok() {
+        tracing::info!(
+            configmap = %format!("{}/{}", loader.namespace(), RBAC_CONFIGMAP_NAME),
+            rules = result.as_ref().map_or(0, RbacPolicy::rule_count),
+            "loaded the project-scoped RBAC policy"
+        );
+    }
+    fallback_to_deny_all(result)
+}
+
+/// The binary's fail-closed fallback: a load error becomes an **empty** policy.
+///
+/// Split out from [`load_rbac_policy`] so the decision — the one thing that must never regress to
+/// "allow everybody" — is a pure function a test can drive without a cluster.
+#[must_use]
+pub fn fallback_to_deny_all(result: Result<RbacPolicy, RbacLoadError>) -> RbacPolicy {
+    match result {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "the RBAC policy could not be loaded; every authenticated request will be refused \
+                 (fail closed). Fix the `{}` ConfigMap (key `{}`) and restart the server",
+                RBAC_CONFIGMAP_NAME,
+                RBAC_CONFIGMAP_KEY,
+            );
+            RbacPolicy::empty()
+        }
+    }
+}
+
+/// Whether `state` would refuse every authenticated caller (used by the startup warnings).
+#[must_use]
+pub fn denies_every_authenticated_caller(state: &AppState) -> bool {
+    state.auth == AuthPolicy::TokenReview && state.rbac.is_empty()
 }
 
 #[cfg(test)]

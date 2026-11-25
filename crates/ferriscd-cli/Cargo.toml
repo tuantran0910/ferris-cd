@@ -23,7 +23,15 @@ ferriscd-server.workspace = true
 tokio-util.workspace = true
 k8s-openapi = { workspace = true, features = ["v1_35"] }
 kube.workspace = true
+# `T14.5`: the API client. The CLI is a binary crate, so the `k8s-openapi` version feature above is
+# allowed here (ADR-002 §3) — `ferriscd-server` stays version-agnostic.
+reqwest.workspace = true
+# The CLI's `--output json|yaml` and its typed reads of `ferriscd_server::api` DTOs.
+serde.workspace = true
+serde_json.workspace = true
 serde-saphyr.workspace = true
+# Typed client errors (`ClientError`): the same derive the controller and the server use.
+thiserror.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -31,3 +39,9 @@ tracing.workspace = true
 [dev-dependencies]
 # Asserts the exported OpenAPI document is the JSON the server serves.
 serde_json.workspace = true
+# The CLI tests drive the real client against a local `axum` server on `127.0.0.1:0` (no cluster, no
+# external network, no sleeps), so the HTTP paths, status mapping and exit codes are exercised end to
+# end. `axum` is already a workspace dependency (`ferriscd-server` serves with it).
+axum.workspace = true
+# Unix permission assertions on the stored token file (`0600`).
+tempfile.workspace = true
