@@ -428,6 +428,7 @@ impl LiveStateError {
 }
 
 /// Union live-state fetcher (`desired ∪ prev_inventory`).
+#[derive(Clone)]
 pub struct ClusterStateReader {
     source: Arc<dyn LiveObjectSource>,
 }
@@ -494,6 +495,51 @@ impl ClusterStateReader {
         let mut fetched = fetched;
         fetched.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(fetched.into_iter().collect())
+    }
+
+    /// Returns whether `namespace` exists in the cluster.
+    ///
+    /// Used by `syncOptions.createNamespace` (T08.3) to decide whether the destination namespace
+    /// still has to be created: re-applying it every pass would be idempotent but would still
+    /// bump its `metadata.resourceVersion` (and therefore churn `managedFields`) on every
+    /// reconcile of an otherwise settled `Application`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the source's transport/authorization failures; an absent namespace is
+    /// `Ok(false)`, never an error.
+    pub async fn namespace_exists(&self, namespace: &str) -> Result<bool, LiveStateError> {
+        self.source.namespace_exists(namespace).await
+    }
+
+    /// Reads one object verbatim, with no ownership classification.
+    ///
+    /// Used by the `Established` wait (T08.3): a `CustomResourceDefinition` is read for its
+    /// `status.conditions` only, and classifying its `tracking-id` would be noise. `404`/`410`
+    /// (whether surfaced as `Ok(None)` or as an error) is `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every other transport/authorization failure: a pass that cannot read the CRD
+    /// must retry instead of assuming it is not established.
+    pub async fn get_object(
+        &self,
+        api_resource: &ApiResource,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<DynamicObject>, LiveStateError> {
+        let target = FetchTarget {
+            api_resource,
+            namespace,
+            name,
+        };
+        match self.source.get(target).await {
+            Ok(object) => Ok(object),
+            Err(LiveStateError::Api {
+                code: 404 | 410, ..
+            }) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     /// Re-reads and re-classifies **one** key, without any per-pass memoization.
@@ -652,8 +698,8 @@ impl NamespaceVerdicts {
 /// Returns whether this sync is responsible for creating `namespace`.
 ///
 /// Only a `Namespace` manifest in the desired set counts (`in_bundle_namespaces`).
-/// `syncOptions.createNamespace` is rejected by the pipeline (see `sync.rs`), so this can
-/// never widen to "the destination namespace is ours to create".
+/// `syncOptions.createNamespace` is satisfied by `SyncPlan::pre_create_namespace` /
+/// `SyncExecutor::ensure_namespace`, so this set stays narrow to namespaces declared in Git.
 fn namespace_is_ours(namespace: &str, in_bundle_namespaces: &[String]) -> bool {
     in_bundle_namespaces
         .iter()

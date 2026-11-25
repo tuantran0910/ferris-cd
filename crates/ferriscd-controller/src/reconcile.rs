@@ -279,6 +279,33 @@ pub enum ReconcileError {
         revision: Option<String>,
     },
 
+    /// A planned action could not be executed and retrying cannot help (terminal).
+    ///
+    /// Raised by the sync executor for the cases that are *policy* failures, not API failures: an
+    /// immutable field without `ferriscd.io/sync-options: Replace=true`, or a `409 Conflict` whose
+    /// conflicting field manager is not listed in `syncOptions.takeoverFieldManagers` (T08.4).
+    /// Carries the confirmed inventory so `/status` still records what did apply (finding C1).
+    #[error("{message}")]
+    SyncConflict {
+        /// Actionable, secret-free description naming the resource and the opt-in.
+        message: String,
+        /// Crash-safe inventory confirming everything the pass confirmed before the failure.
+        inventory: Inventory,
+        /// The revision that could not be fully synced.
+        revision: Option<String>,
+    },
+
+    /// A recovery step could not confirm completion inside its bounded window (retryable).
+    ///
+    /// The delete of a `Replace` succeeded but the object was still present when the wait
+    /// expired (a finalizer, most likely). Re-applying now would answer `409 AlreadyExists`, so
+    /// the pass stops and the next reconcile re-reads live state and continues (finding M3).
+    #[error("{message}")]
+    SyncRetry {
+        /// Actionable, secret-free description.
+        message: String,
+    },
+
     /// The desired state is invalid and retrying cannot help (terminal).
     #[error("{message}")]
     Invalid {
@@ -302,6 +329,8 @@ impl ReconcileError {
             Self::Scope(_)
             | Self::Invalid { .. }
             | Self::PartialSync { .. }
+            | Self::SyncConflict { .. }
+            | Self::SyncRetry { .. }
             | Self::OwnershipConflict { .. } => false,
             // A kind nobody serves means nothing is left to clean up.
             Self::Live(err) => matches!(err, LiveStateError::UnknownKind { .. }),
@@ -323,9 +352,12 @@ impl ReconcileError {
             Self::Discovery(DiscoveryError::Refresh { .. }) => FailureClass::Retryable,
             // An ownership conflict cannot be fixed by retrying: another `Application` owns the
             // object, so the terminal backoff is what stops a self-heal loop (trap T10).
-            Self::Scope(_) | Self::Invalid { .. } | Self::OwnershipConflict { .. } => {
-                FailureClass::Terminal
-            }
+            Self::Scope(_)
+            | Self::Invalid { .. }
+            | Self::SyncConflict { .. }
+            | Self::OwnershipConflict { .. } => FailureClass::Terminal,
+            // The next pass picks the replacement up where this one stopped.
+            Self::SyncRetry { .. } => FailureClass::Retryable,
             Self::Diff(err) => classify_engine_error(err.is_retryable()),
             Self::Live(err) => {
                 if err.is_retryable() {
@@ -357,6 +389,11 @@ impl ReconcileError {
             // Nothing was applied, so the inventory is the one that was already true; the
             // conflict still has to surface as `OutOfSync` (T07.4 semantics).
             Self::OwnershipConflict {
+                inventory,
+                revision,
+                ..
+            }
+            | Self::SyncConflict {
                 inventory,
                 revision,
                 ..
@@ -680,15 +717,70 @@ pub fn now() -> Time {
     Time(k8s_openapi::jiff::Timestamp::now())
 }
 
+/// Shortest opaque run that is treated as possible secret material in a status message.
+///
+/// A base64 payload quoted back by a `422` is a long, unbroken run of `[A-Za-z0-9+/=]`; ordinary
+/// prose and resource names are not. The alphabet deliberately excludes `-`/`_`/`.` so that
+/// hyphenated advice (`kubectl-client-side-apply`, `ferriscd.io/sync-options`) and qualified
+/// names survive intact.
+///
+/// The trade-off is **best effort, not a guarantee**, in two directions:
+///
+/// * **Missed payloads.** A run shorter than [`MIN_OPAQUE_RUN`] is left alone (a short base64
+///   value, e.g. a 20-character secret, is not redacted), and the alphabet stops at `-`/`_`, so a
+///   `base64url` value only redacts the pieces that happen to be long enough on their own — a
+///   43-character base64url string split by a `-` in the middle stays visible.
+/// * **Over-redaction.** The check is structural, not semantic: a long, equally opaque *non*
+///   secret run (a long resource name, a bare hex digest) is redacted too. That is the deliberate
+///   direction to err in — a redacted directive is noise, a leaked `Secret` value is a breach.
+const MIN_OPAQUE_RUN: usize = 40;
+
+/// Replaces base64-looking runs with a length marker.
+///
+/// This is the last line of defense for trap T4: the API server can quote the value it rejected,
+/// so an `Apply`/`Live` error message may contain a `Secret` `.data` value, and `/status` is
+/// readable by anyone allowed to `get` the `Application`. Only runs of payload characters are
+/// touched, so actionable prose (which names managers, annotations, and reasons) survives intact.
+fn redact_payloads(message: &str) -> String {
+    fn is_payload_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')
+    }
+
+    fn flush(run: &mut String, out: &mut String) {
+        if run.chars().count() >= MIN_OPAQUE_RUN {
+            out.push_str(&format!("<redacted {} char(s)>", run.chars().count()));
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    }
+
+    let mut redacted = String::with_capacity(message.len());
+    let mut run = String::new();
+    for c in message.chars() {
+        if is_payload_char(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut redacted);
+            redacted.push(c);
+        }
+    }
+    flush(&mut run, &mut redacted);
+    redacted
+}
+
 /// Truncates `message` to [`MAX_STATUS_MESSAGE_CHARS`] on a UTF-8 boundary.
 ///
 /// `/status` is capped by `etcd`'s 1.5 MiB object limit, so an unbounded error message
-/// (a stack-trace-shaped string) can never be allowed to grow the status.
-fn bounded(message: &str) -> String {
-    if message.chars().count() <= MAX_STATUS_MESSAGE_CHARS {
-        return message.to_owned();
+/// (a stack-trace-shaped string) can never be allowed to grow the status. Payload-looking runs
+/// are redacted first ([`redact_payloads`]), so a `Secret` value quoted by the API server never
+/// reaches `/status`.
+pub(crate) fn bounded(message: &str) -> String {
+    let redacted = redact_payloads(message);
+    if redacted.chars().count() <= MAX_STATUS_MESSAGE_CHARS {
+        return redacted;
     }
-    let mut truncated: String = message.chars().take(MAX_STATUS_MESSAGE_CHARS).collect();
+    let mut truncated: String = redacted.chars().take(MAX_STATUS_MESSAGE_CHARS).collect();
     truncated.push('…');
     truncated
 }
@@ -1195,6 +1287,42 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// **Secret safety (trap T4):** a value the API server quoted back is never written to
+    /// `/status` verbatim, and actionable prose survives the redaction.
+    #[test]
+    fn status_messages_redact_payload_looking_runs_and_stay_bounded() {
+        let quoted = "Secret \"db\" is invalid: data[password]: Invalid value: \
+                      \"c3VwZXItc2VjcmV0LXZhbHVlLXdpdGgtbG90cy1vZi1ieXRlcw==\": field is immutable";
+        let rendered = bounded(quoted);
+        assert!(
+            !rendered.contains("c3VwZXItc2VjcmV0LXZhbHVlLXdpdGgtbG90cy1vZi1ieXRlcw=="),
+            "the payload leaked: {rendered}"
+        );
+        assert!(rendered.contains("redacted"), "{rendered}");
+        assert!(
+            rendered.contains("field is immutable"),
+            "prose must survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("ferriscd") || rendered.contains("Secret"),
+            "{rendered}"
+        );
+
+        // A hyphenated annotation name and a manager name are not payloads.
+        let prose = "add ferriscd.io/sync-options: Replace=true, or list \
+                     kubectl-client-side-apply in syncOptions.takeoverFieldManagers";
+        assert_eq!(bounded(prose), prose);
+
+        // The bound still applies (prose, so nothing is redacted first).
+        let long = "apply failed ".repeat(MAX_STATUS_MESSAGE_CHARS);
+        assert_eq!(bounded(&long).chars().count(), MAX_STATUS_MESSAGE_CHARS + 1);
+        assert!(bounded(&long).ends_with('…'));
+
+        // An unbroken opaque run is redacted *and* the result stays small.
+        let opaque = "A".repeat(400);
+        assert_eq!(bounded(&opaque), "<redacted 400 char(s)>");
     }
 
     #[test]

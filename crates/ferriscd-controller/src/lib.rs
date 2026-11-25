@@ -13,9 +13,12 @@ pub mod discovery;
 pub mod dry_run;
 pub mod live_state;
 pub mod predicate;
+pub mod prune;
 pub mod reconcile;
 pub mod scope;
 pub mod sync;
+pub mod sync_executor;
+pub mod sync_recovery;
 
 pub use controller::{
     BackoffTracker, ConfigError, ControllerConfig, DEFAULT_CONCURRENCY, DEFAULT_DRAIN_TIMEOUT,
@@ -31,6 +34,9 @@ pub use live_state::{
     LiveStateError, TrackingOwner,
 };
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
+pub use prune::{
+    OwnershipVerifiedPruner, PruneResult, ResourcePruner, RetainReason, prune_opted_out, prune_rail,
+};
 pub use reconcile::{
     ApiStatusWriter, ApplyOutcome, CleanupDisposition, CleanupMode, CleanupOutcome,
     ControllerError, FINALIZER, ReconcileContext, ReconcileError, StatusWriter, SyncPipeline,
@@ -39,6 +45,17 @@ pub use scope::{ClusterNamespacePolicy, InBundleCrd, ScopeError, normalize_scope
 pub use sync::{
     Applier, ApplyRequest, DeleteOutcome, DeleteRequest, DynamicApiApplier, InventorySyncPipeline,
     PENDING_REQUEUE, PROGRESSING_REQUEUE,
+};
+pub use sync_executor::{
+    ActionFailure, CrdReadiness, CrdStatusReader, DEFAULT_CRD_ESTABLISH_TIMEOUT,
+    DEFAULT_CRD_POLL_INTERVAL, ESTABLISHED_CONDITION, ExecutionPolicy, ExecutionReport,
+    LiveCrdStatusReader, NAMES_ACCEPTED_CONDITION, SyncExecutor, crd_readiness, is_established,
+    namespace_resource, resolve_desired_target, resolve_key_target,
+};
+pub use sync_recovery::{
+    DEFAULT_REPLACE_INTERVAL, DEFAULT_REPLACE_TIMEOUT, IMMUTABLE_MESSAGE_MARKERS,
+    REPLACE_ANNOTATION, REPLACE_HINT, Recovery, ReplacePolicy, ReplaceRecovery, TAKEOVER_FIELD,
+    classify_apply_failure, conflicting_managers, is_immutable_field_error, log_takeover,
 };
 
 /// Environment variable selecting the log format (`json` or `pretty`).

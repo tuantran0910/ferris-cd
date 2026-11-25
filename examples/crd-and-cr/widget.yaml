@@ -1,0 +1,13 @@
+# A custom resource of the kind `crd.yaml` defines in the *same* commit.
+#
+# It only exists once the API server serves `example.com/v1 Widget`, which is exactly what the
+# CRD `Established` wait + discovery refresh in `T08.3` guarantees before this object is applied.
+apiVersion: example.com/v1
+kind: Widget
+metadata:
+  name: one
+  labels:
+    app.kubernetes.io/part-of: ferriscd-crd-and-cr-example
+spec:
+  size: 3
+  color: green

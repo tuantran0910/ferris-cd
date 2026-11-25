@@ -1,25 +1,27 @@
 //! The wired sync pipeline: `Application` -> Git -> manifests -> scope -> live state ->
-//! SSA `dryRun=All` diff -> sync decision -> ordered SSA apply -> crash-safe inventory ->
-//! `/status`.
+//! SSA `dryRun=All` diff -> sync decision -> [`SyncPlan`] -> [`SyncExecutor`] -> crash-safe
+//! inventory -> `/status`.
 //!
-//! This is the first *real* [`SyncPipeline`]. Phase 07 replaced the `v0.2` "apply everything on
-//! every pass" loop with a diff-gated one: the pipeline classifies the whole bundle with a
-//! Server-Side Apply dry-run (T07.1–T07.3), asks
-//! [`ferriscd_engine::diff::should_sync`] whether this reconcile may apply anything (T07.4), and
-//! then applies **only** what the diff says needs it (`applyOutOfSyncOnly`).
+//! Phase 07 replaced the `v0.2` "apply everything on every pass" loop with a diff-gated one: the
+//! pipeline classifies the whole bundle with a Server-Side Apply dry-run (T07.1–T07.3) and asks
+//! [`ferriscd_engine::diff::should_sync`] whether this reconcile may apply anything (T07.4).
+//! Phase 08 turns that verdict into an explicit [`SyncPlan`] (T08.2) and executes it with
+//! [`SyncExecutor`] (T08.3–T08.5) instead of looping over the desired set here.
 //!
-//! | Concern | Here | Later phase |
-//! |---|---|---|
-//! | Drift detection | SSA `dryRun=All` diff of the stamped desired set, `ignoreDifferences` honoured | — |
-//! | Sync decision gate | `automated: None` / `selfHeal` / source change (`revision` + `lastSyncedSpecHash`) / manual operation | `T10.x` consumes `ferriscd.io/operation` |
-//! | Force | `false` for both the dry-run and the apply (trap T5); `serverSideForce` is logged and ignored | `T08.4` (`takeoverFieldManagers`) |
-//! | Prune | minimal: only with `automated.prune` and only when the gate executes; only `OwnedBySelf`, never `CRD`/`Namespace` unless opted in, reverse key order (not reverse wave order) | `T08.1` reverse prune order, `T08.2` `SyncPlan`, `T08.5` ownership-verified pruner |
-//! | CRD `Established` wait | a CRD + CR bundle simply requeues (`DeferredPendingCrd`) until discovery serves the kind | `T08.3` |
-//! | `createNamespace: true` | **rejected** with an actionable message; namespace creation is not wired | `T08.2`/`T08.3` (`pre_create_namespace`) |
-//! | Waves/hooks | rejected with an actionable message instead of being mis-ordered | `T10.x` |
-//! | Destination clusters | `in-cluster` only; anything else is rejected | `T12.x` credentials |
-//! | Git credentials | anonymous only | `T12.x` |
-//! | Health | evaluated from the pass-level live read on **every** pass (including a `Skip`), into `status.health` + `status.resources`, and drives the adaptive requeue | `T10.x` gates waves/hooks on it |
+//! | Concern | Here |
+//! |---|---|
+//! | Drift detection | `crate::dry_run` (SSA `dryRun=All`, `ignoreDifferences` honoured) |
+//! | Sync decision gate | `ferriscd_engine::diff::should_sync` (`automated`, `selfHeal`, source change, manual operation) |
+//! | What may be mutated | `ferriscd_engine::sync::SyncPlan` (pure: order, rails, skip reasons) |
+//! | How it is mutated | [`SyncExecutor`]: SSA apply, `Replace` (delete → `404` → apply), ownership-verified prune, CRD `Established` wait + discovery refresh |
+//! | Force / takeover | `force: false` on every first attempt (trap T5); one forced retry only for managers listed in `syncOptions.takeoverFieldManagers` (T08.4) |
+//! | Prune | `automated.prune` + the gate; `OwnedBySelf` only, re-verified immediately before `Delete`; `CRD`/`Namespace` need `pruneCRDs`/`pruneNamespaces`; exact reverse apply order (T08.5) |
+//! | CRD `Established` wait | bounded poll + `DiscoveryCache::invalidate_and_refresh()` before the CRs, so a CRD + CR pair lands on the **first** sync (T08.3) |
+//! | `createNamespace: true` | `SyncPlan::pre_create_namespace`: the namespace is SSA-applied (unstamped, so never prunable) before the first step |
+//! | Waves/hooks | rejected with an actionable message instead of being mis-ordered (`T10.x`) |
+//! | Destination clusters | `in-cluster` only; anything else is rejected (`T12.x` credentials) |
+//! | Git credentials | anonymous only (`T12.x`) |
+//! | Health | evaluated from the pass-level live read on **every** pass (including a `Skip`), into `status.health` + `status.resources`, and drives the adaptive requeue (`T09.5`; `T10.x` gates waves/hooks on it) |
 //!
 //! Blocking work never runs on a Tokio worker: manifest file I/O and YAML parsing run in
 //! `tokio::task::spawn_blocking` here, and the repo/git layer does the same internally. Every
@@ -27,10 +29,11 @@
 //! async `kube` request. The diff *comparison* itself is CPU-only engine code over the payloads
 //! the API server returned, so it never blocks a worker on a syscall either.
 //!
-//! `syncOptions.createNamespace` is rejected instead of silently livelocking: there is no
-//! namespace creator, so a `404` in a namespace nobody declares would classify as
-//! `DeferredPendingNamespace` and requeue forever. Declaring the `Namespace` in Git (or
-//! creating it by hand) is the supported path until `T08.3` adds on-demand creation.
+//! A resource whose namespace is created *by this bundle's* `Namespace` manifest is deferred to
+//! the next pass (`DeferredPendingNamespace`): the namespace has to exist before anything can be
+//! applied into it, and the requeue is the documented "not an error" path
+//! ([`PENDING_REQUEUE`]). `syncOptions.createNamespace` removes that wait by creating the
+//! namespace up front.
 //!
 //! Three safety properties are non-negotiable and implemented here:
 //!
@@ -39,15 +42,16 @@
 //!   reconcile **before** a single `Patch` is issued — before the dry-run pass too — so two
 //!   `Application`s pointing at the same manifest can never fight over (or prune) each other's
 //!   workloads. The failure is terminal (retrying cannot help) and still reports
-//!   `status.sync.status = OutOfSync`.
+//!   `status.sync.status = OutOfSync`. Prunes and `Replace`s re-verify the same marker
+//!   immediately before their `Delete`.
 //! * **Nothing is applied without proof it is needed.** The dry-run diff decides; a `Skip` from
 //!   [`should_sync`] issues **zero** mutating `Patch` calls, and a second reconcile of an
 //!   already-synced `Application` converges to exactly that (the assertion the T07.5 live test
 //!   makes against a real API server).
 //! * **The inventory is crash-safe.** It is only ever `next_inventory(prev, confirmed,
 //!   pruned_ok)`, and a mid-sync failure still persists the partial inventory
-//!   ([`ReconcileError::PartialSync`]), so a create that already succeeded can never become an
-//!   untracked orphan (finding C1).
+//!   ([`ReconcileError::PartialSync`] / [`ReconcileError::SyncConflict`]), so a create that
+//!   already succeeded can never become an untracked orphan (finding C1).
 //! * **`Synced` is never reported as `Healthy`** (`T09.5` trap guard). `status.sync.status` comes
 //!   from the diff, `status.health.status` from the live objects' `status` blocks; a pass that
 //!   applies nothing still assesses health, and a pass that applied everything still reports
@@ -62,35 +66,37 @@ use ferriscd_crd::application::DEFAULT_DESTINATION_CLUSTER;
 use ferriscd_crd::status::{
     HealthState, REASON_SYNC_SUCCEEDED, ResourceStatus, SyncState, SyncStatus,
 };
-use ferriscd_crd::{Application, SyncOptions, annotations};
+use ferriscd_crd::{Application, annotations};
 use ferriscd_engine::diff::{
     DiffStatus, DiffSummary, IgnoreRuleSet, ResourceDiff, SyncDecision, should_sync,
     source_spec_hash,
 };
-use ferriscd_engine::graph::sort_by_tier;
+use ferriscd_engine::graph::{sort_by_tier, sort_keys_prune_order};
 use ferriscd_engine::health::{
     self, HealthConfig, HealthInput, HealthRegistry, HealthStatus, HealthSummary,
 };
-use ferriscd_engine::inventory::{self, Inventory, InventoryEntry, Ownership};
+use ferriscd_engine::inventory::{self, Inventory, Ownership};
 use ferriscd_engine::manifest::{self, DesiredResource, ManifestLoaderConfig, ResourceKey};
 use ferriscd_engine::repo::{GitSource, RepoCache, RepoCheckout, RepoCredentials, RepoUrlPolicy};
+use ferriscd_engine::sync::{OrphanCandidate, OrphanOwnership, PlanRequest, SyncPlan};
 use futures::future::BoxFuture;
 use kube::ResourceExt;
-use kube::api::{self, Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
-use kube::discovery::Scope;
+use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
 use tracing::warn;
 
+use crate::controller::FailureClass;
 use crate::discovery::DiscoveryCache;
 use crate::dry_run::{DryRunApi, DryRunEvaluator};
 use crate::live_state::{
-    ClusterStateReader, FetchRequest, LiveObjectSource, LiveState, LiveStateMap, TrackingOwner,
-    plan_fetch,
+    ClusterStateReader, LiveObjectSource, LiveState, LiveStateMap, TrackingOwner, plan_fetch,
 };
+use crate::prune::{OwnershipVerifiedPruner, PruneResult};
 use crate::reconcile::{
     ApplyOutcome, CleanupMode, CleanupOutcome, REASON_PENDING, REASON_SYNC_SKIPPED, ReconcileError,
     SyncPipeline, now,
 };
 use crate::scope::{self, InBundleCrd};
+use crate::sync_executor::{ExecutionPolicy, LiveCrdStatusReader, SyncExecutor};
 
 /// Requeue delay while any resource is pending on a `CustomResourceDefinition` or namespace.
 ///
@@ -153,22 +159,6 @@ struct SyncCounts {
     /// polled every [`PROGRESSING_REQUEUE`] instead of every `spec.requeueAfterSeconds`. It never
     /// touches `status.sync.status` — synced and healthy are different questions.
     health: HealthStatus,
-}
-
-/// What one prune pass did.
-#[derive(Debug, Default)]
-struct PruneReport {
-    /// Keys that were confirmed gone (`Delete` accepted, `404`, `410`).
-    pruned: Vec<ResourceKey>,
-    /// Orphans deliberately left alone, so a stuck orphan is visible in `/status`.
-    retained: usize,
-}
-
-/// A resolved apply/delete target.
-#[derive(Clone, Debug)]
-struct Target {
-    api_resource: ApiResource,
-    scope: Scope,
 }
 
 /// One Server-Side Apply call.
@@ -297,8 +287,10 @@ impl Applier for DynamicApiApplier {
             let resource = request.key.canonical();
             let api: Api<DynamicObject> =
                 dynamic_api(&client, request.api_resource, request.namespace);
+            // `background()` (finding H1): the API server owns garbage collection, so a
+            // finalizer can never block this worker while the object drains.
             match api
-                .delete(&request.key.name, &DeleteParams::default())
+                .delete(&request.key.name, &DeleteParams::background())
                 .await
             {
                 Ok(_) => Ok(DeleteOutcome::Deleted),
@@ -353,6 +345,8 @@ pub struct InventorySyncPipeline {
     health: HealthRegistry,
     /// Phase 09 health tunables (`LoadBalancer` on a local cluster, spec-only CRs).
     health_config: HealthConfig,
+    /// Phase 08 executor pacing (CRD `Established` wait, `Replace` delete wait).
+    execution_policy: ExecutionPolicy,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -392,6 +386,7 @@ impl InventorySyncPipeline {
             url_policy: RepoUrlPolicy::Production,
             health: HealthRegistry::builtin(),
             health_config: HealthConfig::default(),
+            execution_policy: ExecutionPolicy::default(),
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -451,6 +446,16 @@ impl InventorySyncPipeline {
         &self.health_config
     }
 
+    /// Overrides the executor's pacing (CRD `Established` wait, `Replace` delete wait).
+    ///
+    /// Production uses [`ExecutionPolicy::default`]; hermetic tests use
+    /// [`ExecutionPolicy::without_waits`] so a scripted cluster never sleeps.
+    #[must_use]
+    pub fn with_execution_policy(mut self, policy: ExecutionPolicy) -> Self {
+        self.execution_policy = policy;
+        self
+    }
+
     /// The configured repository URL policy (production rejects local paths).
     #[must_use]
     pub fn url_policy(&self) -> RepoUrlPolicy {
@@ -473,16 +478,6 @@ impl InventorySyncPipeline {
             });
         }
         let options = app.spec.sync_options();
-        // Rejected before *anything* else happens: `v0.2` never creates a namespace, so honoring
-        // the flag would classify every key in the missing namespace as
-        // `DeferredPendingNamespace` and requeue forever without ever making progress.
-        if options.create_namespace {
-            return Err(ReconcileError::Invalid {
-                message: "syncOptions.createNamespace is not supported in v0.2; declare the \
-                          Namespace in Git or create it manually"
-                    .to_owned(),
-            });
-        }
         let owner = TrackingOwner::for_application(app).ok_or_else(|| ReconcileError::Invalid {
             message: "the Application has no metadata.namespace, so no ferriscd.io/tracking-id \
                       can be verified"
@@ -553,7 +548,7 @@ impl InventorySyncPipeline {
         // receives below (see `DryRunEvaluator::evaluate`'s desired-body contract: diffing a
         // pre-stamp body would look like a request to remove `ferriscd.io/tracking-id`, leaving
         // every resource `OutOfSync` forever).
-        let orphans = inventory::orphans(&desired_inventory, &prev_inventory);
+        let orphan_keys = inventory::orphans(&desired_inventory, &prev_inventory);
         let rules = IgnoreRuleSet::from_ignore_differences(&app.spec.ignore_differences);
         // Finding H1: a pointer that is not valid RFC 6901 is never applied (a typo must not
         // fail the reconcile), so it must be *visible* instead of silently dropped: one warning
@@ -561,7 +556,7 @@ impl InventorySyncPipeline {
         // observable on the CR).
         let invalid_ignore_pointers = report_invalid_pointers(&rules, &owner);
         let diffs = self
-            .evaluate_diff(&resources, &orphans, &live, &rules)
+            .evaluate_diff(&resources, &orphan_keys, &live, &rules)
             .await?;
         let summary = DiffSummary::from_diffs(&diffs);
         let spec_hash = source_spec_hash(&app.spec).map_err(|err| ReconcileError::Invalid {
@@ -569,19 +564,50 @@ impl InventorySyncPipeline {
         })?;
         let decision = should_sync(app, &revision, &spec_hash, &summary, manual_operation(app));
         let statuses = status_by_key(&diffs);
-        let apply_keys = apply_selection(
-            decision,
-            &statuses,
-            &resources,
-            options.apply_out_of_sync_only,
+
+        // --- Phase 08: the explicit sync plan (T08.2) --------------------------------------
+        // Everything that may be mutated is decided here, by pure engine code, before a single
+        // API call: applies/replaces in tier order, ownership-verified prunes in exact reverse,
+        // and a `Skip` (with its reason) for everything the safety rails refuse to touch.
+        let orphans: Vec<OrphanCandidate> = orphan_keys
+            .iter()
+            .map(|key| orphan_candidate(key, &live))
+            .collect();
+        // A resource the pass-level live read deferred on a *Namespace* cannot be applied yet;
+        // one deferred on a *CRD* is planned as an apply, because the executor establishes the
+        // CRD and refreshes discovery inside this very pass (T08.3, trap T6).
+        let deferred: BTreeSet<ResourceKey> = resources
+            .iter()
+            .filter(|resource| {
+                matches!(
+                    live.get(&resource.key),
+                    Some(LiveState::DeferredPendingNamespace)
+                )
+            })
+            .map(|resource| resource.key.clone())
+            .collect();
+        let prune_enabled = prune_enabled(app);
+        let plan = SyncPlan::build(
+            &PlanRequest::new(
+                decision,
+                &resources,
+                &statuses,
+                &options,
+                &app.spec.destination.namespace,
+            )
+            .with_deferred(&deferred)
+            .with_orphans(&orphans)
+            .with_prune(prune_enabled),
         );
-        let execute = decision.is_execute();
-        if execute {
+        if decision.is_execute() {
             tracing::debug!(
                 app.namespace = %owner.namespace,
                 app.name = %owner.name,
                 decision = %decision,
-                to_apply = apply_keys.len(),
+                applies = plan.summary().apply,
+                replaces = plan.summary().replace,
+                prunes = plan.summary().prune,
+                skips = plan.summary().skip,
                 out_of_sync = summary.out_of_sync,
                 missing = summary.missing,
                 synced = summary.synced,
@@ -598,114 +624,76 @@ impl InventorySyncPipeline {
             );
         }
 
-        // --- apply -------------------------------------------------------------------------
-        // `applied_ok`: applies this pass confirmed (the crash-safe inventory input).
-        // `synced_ok`: resources the diff verified are already in place *and* carry our
-        // `tracking-id`, so they are recorded without a mutating call.
-        let mut applied_ok = Inventory::new();
-        let mut synced_ok = Inventory::new();
-        let mut pending: Vec<ResourceKey> = Vec::new();
+        // --- Phase 08: execute the plan (T08.3/T08.4/T08.5) --------------------------------
+        let policy = ExecutionPolicy {
+            takeover_field_managers: options.takeover_field_managers.clone(),
+            ..self.execution_policy.clone()
+        };
+        let crd_status = LiveCrdStatusReader::new(self.reader.clone());
+        let pruner = OwnershipVerifiedPruner::new(
+            self.applier.as_ref(),
+            &self.reader,
+            &self.discovery,
+            &owner,
+            &options,
+        );
+        let execution = SyncExecutor::new(
+            self.applier.as_ref(),
+            &pruner,
+            &self.reader,
+            &self.discovery,
+            &crd_status,
+            &owner,
+            &policy,
+        )
+        .execute(&plan, &resources, &prev_inventory)
+        .await;
+        // The zero-mutation seam (T07.5): only the SSA applies are counted, never a
+        // `dryRun=All` prediction.
+        self.mutating_applies
+            .fetch_add(execution.apply_calls, Ordering::SeqCst);
 
-        for resource in &resources {
-            if live.get(&resource.key).is_some_and(LiveState::is_deferred) {
-                // `DeferredPendingCrd` / `DeferredPendingNamespace`: requeue, never fail — but
-                // only a pass that actually tried to apply has something to wait for.
-                if execute {
-                    pending.push(resource.key.clone());
-                }
-                continue;
-            }
+        // Crash-safe inventory: `next_inventory = (prev \ pruned_ok) ∪ (applied_ok ∪ synced)`.
+        let next_inventory = inventory::next_inventory(
+            &prev_inventory,
+            &execution.confirmed(),
+            &execution.pruned_ok,
+        );
 
-            // Finding C1: a `Synced` resource exists and is ours, so it belongs in the
-            // inventory even on a skipped pass — otherwise a wiped `status.inventory` would leak
-            // it as an untracked orphan (the `v0.2` loop re-applied everything and self-healed).
-            if statuses
-                .get(&resource.key)
-                .is_some_and(DiffStatus::is_synced)
-            {
-                synced_ok.insert(
-                    resource.key.clone(),
-                    InventoryEntry::new(resource.gvk.version.clone()),
-                );
-            }
-
-            if !apply_keys.contains(&resource.key) {
-                // `applyOutOfSyncOnly` (the default): the diff says this one already matches,
-                // so it must not be patched again.
-                continue;
-            }
-
-            let target = self.resolve_desired_target(resource).await?;
-            let namespace = desired_namespace(resource, target.scope)?;
-            let request = ApplyRequest {
-                resource,
-                api_resource: &target.api_resource,
-                namespace: namespace.as_deref(),
-                // `serverSideForce` stays ignored: the dry-run and the apply must agree, and a
-                // forced apply silently steals fields another manager owns (trap T5).
-                force: false,
-            };
-
-            self.mutating_applies.fetch_add(1, Ordering::SeqCst);
-            match self.applier.apply(request).await {
-                Ok(_) => {
-                    applied_ok.insert(
-                        resource.key.clone(),
-                        InventoryEntry::new(resource.gvk.version.clone()),
-                    );
-                }
-                Err(err) => {
-                    // Crash-safe: persist what already applied instead of losing it (C1).
-                    return Err(ReconcileError::PartialSync {
-                        message: err.to_string(),
-                        inventory: inventory::next_inventory(&prev_inventory, &applied_ok, &[]),
-                        revision: Some(revision),
-                    });
-                }
-            }
+        if let Some(failure) = execution.first_failure() {
+            // A policy failure (immutable field without `Replace`, an unlisted field manager, a
+            // foreign owner) can never be fixed by retrying; everything else is a partial sync
+            // the next pass converges from. Both carry the inventory that is already true, so a
+            // create that succeeded never becomes an untracked orphan (finding C1).
+            let message = failure.error.to_string();
+            return Err(match failure.error.failure_class() {
+                FailureClass::Terminal => ReconcileError::SyncConflict {
+                    message,
+                    inventory: next_inventory,
+                    revision: Some(revision),
+                },
+                FailureClass::Retryable => ReconcileError::PartialSync {
+                    message,
+                    inventory: next_inventory,
+                    revision: Some(revision),
+                },
+            });
         }
 
-        // Prune is part of "execute": a gate that decided to skip issues no deletes either.
-        let prune_enabled = prune_enabled(app);
-        let prune = if execute {
-            self.prune(
-                app,
-                &options,
-                &desired_inventory,
-                &prev_inventory,
-                &live,
-                &applied_ok,
-                &revision,
-                &owner,
-            )
-            .await?
-        } else {
-            PruneReport::default()
-        };
-
-        // Finding H2: with pruning disabled `prune()` is a pure no-op and reports zero, while the
-        // diff still classified the tracked-but-undesired keys as orphans. They *are* retained
-        // (FerrisCD will never delete them), so the count comes from the summary there.
-        let retained_orphans = if prune_enabled {
-            prune.retained
-        } else {
-            summary.orphaned
-        };
-
-        let confirmed = inventory::next_inventory(&applied_ok, &synced_ok, &[]);
-        let next_inventory = inventory::next_inventory(&prev_inventory, &confirmed, &prune.pruned);
         // --- Phase 09: health --------------------------------------------------------------
         // Assessed from the pass-level live read on **every** pass, including a `Skip` one: health
         // and sync are orthogonal (T09.5 trap guard). A `Deployment` can be `Synced` and
         // `ImagePullBackOff` at the same time, and it can be `OutOfSync` (an HPA owns
         // `spec.replicas`) while every pod is serving.
-        let assessment = self.assess_health(&resources, &live, &applied_ok);
+        let assessment = self.assess_health(&resources, &live, &execution.confirmed());
         let counts = SyncCounts {
             desired: resources.len(),
-            applied: applied_ok.len(),
-            pruned: prune.pruned.len(),
-            retained_orphans,
-            pending: pending.len(),
+            applied: execution.applied_ok.len(),
+            pruned: execution.pruned_ok.len(),
+            // A retained orphan is either a `Skip` the plan refused (foreign, unmanaged,
+            // rail-protected, pruning disabled) or a prune the pruner declined at delete time.
+            retained_orphans: execution.retained + plan.retained_orphans().len(),
+            pending: execution.pending.len(),
             invalid_ignore_pointers,
             prune_enabled,
             health: assessment.status,
@@ -842,201 +830,14 @@ impl InventorySyncPipeline {
         Ok((in_bundle_crds, in_bundle_namespaces))
     }
 
-    /// Resolves the exact GVK the manifest asks for.
-    ///
-    /// No version fallback here: a manifest that pins an unserved `apiVersion` is a spec bug
-    /// and must fail terminally instead of being silently applied through another version.
-    async fn resolve_desired_target(
-        &self,
-        resource: &DesiredResource,
-    ) -> Result<Target, ReconcileError> {
-        let gvk = api::GroupVersionKind::gvk(
-            &resource.gvk.group,
-            &resource.gvk.version,
-            &resource.gvk.kind,
-        );
-        let (api_resource, capabilities) = self.discovery.resolve(&gvk).await?;
-        Ok(Target {
-            api_resource,
-            scope: capabilities.scope,
-        })
-    }
-
-    /// Resolves a version-agnostic key: version hint first, then any served version.
-    ///
-    /// Used for deletes, where only the `status.inventory` hint is available and identity must
-    /// survive an API upgrade (finding C2).
-    async fn resolve_key(
-        &self,
-        key: &ResourceKey,
-        version_hint: Option<&str>,
-    ) -> Result<Option<Target>, ReconcileError> {
-        if let Some(version) = version_hint.map(str::trim).filter(|hint| !hint.is_empty()) {
-            let gvk = api::GroupVersionKind::gvk(&key.group, version, &key.kind);
-            match self.discovery.resolve(&gvk).await {
-                Ok((api_resource, capabilities)) => {
-                    return Ok(Some(Target {
-                        api_resource,
-                        scope: capabilities.scope,
-                    }));
-                }
-                Err(err) if err.is_no_matches_for_kind() => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-        Ok(self
-            .discovery
-            .resolve_kind(&key.group, &key.kind)
-            .await?
-            .map(|(api_resource, capabilities)| Target {
-                api_resource,
-                scope: capabilities.scope,
-            }))
-    }
-
-    /// Minimal `v0.2` prune.
-    ///
-    /// Only runs with `spec.syncPolicy.automated.prune`, only deletes objects that are
-    /// verifiably `OwnedBySelf` — **twice**: once from the pass-level live read and once more
-    /// immediately before `Delete`, because a live object can be taken over or deleted between
-    /// the two (TOCTOU) — and never deletes `CRD`/`Namespace` unless explicitly opted in.
-    /// Deliberately *not* the full planner: deletion order is reverse key order rather than
-    /// reverse sync-wave order (`T08.1`/`T08.2`), and `ferriscd.io/prune: "false"` is the only
-    /// per-resource opt-out. The dedicated ownership-verified pruner is `T08.5`.
-    #[allow(clippy::too_many_arguments)]
-    async fn prune(
-        &self,
-        app: &Application,
-        options: &SyncOptions,
-        desired: &Inventory,
-        prev_inventory: &Inventory,
-        live: &BTreeMap<ResourceKey, LiveState>,
-        applied_ok: &Inventory,
-        revision: &str,
-        owner: &TrackingOwner,
-    ) -> Result<PruneReport, ReconcileError> {
-        let mut report = PruneReport::default();
-        if !prune_enabled(app) {
-            return Ok(report);
-        }
-
-        let mut orphans = inventory::orphans(desired, prev_inventory);
-        if desired.is_empty() && !orphans.is_empty() {
-            // Reachable only with `FERRISCD_ALLOW_EMPTY_DESIRED` set: a repository (or
-            // `spec.source.git.path`) that renders nothing prunes the whole inventory. That is
-            // literal GitOps behaviour, but it must never happen silently.
-            warn!(
-                destination.namespace = %app.spec.destination.namespace,
-                orphans = orphans.len(),
-                "the desired set is empty and pruning is enabled: every tracked resource will be \
-                 pruned"
-            );
-        }
-        // Reverse key order: reverse-wave ordering arrives with the sync planner (`T08.1`).
-        orphans.reverse();
-
-        for key in orphans {
-            let Some(state) = live.get(&key) else {
-                // Not fetched at all: never delete something this pass did not classify.
-                report.retained += 1;
-                continue;
-            };
-            match state {
-                // A confirmed absence counts as a confirmed prune (MASTER_PLAN §4.3).
-                LiveState::Missing | LiveState::OrphanGvkGone => report.pruned.push(key),
-                LiveState::Present(object, Ownership::OwnedBySelf) => {
-                    if !prune_allowed(&key, options, object) {
-                        report.retained += 1;
-                        continue;
-                    }
-                    let hint = prev_inventory.get(&key).map(|entry| entry.version.as_str());
-                    let Some(target) = self.resolve_key(&key, hint).await? else {
-                        // The kind disappeared between the fetch and the delete: it is gone.
-                        report.pruned.push(key);
-                        continue;
-                    };
-                    let namespace = match target.scope {
-                        Scope::Namespaced => key.namespace.clone(),
-                        Scope::Cluster => None,
-                    };
-                    // TOCTOU: re-read and re-classify right before the delete. Pruning is the
-                    // highest-blast-radius operation, so a stale verdict from the pass-level
-                    // fetch is not good enough.
-                    let rechecked = self
-                        .reader
-                        .recheck(
-                            &key,
-                            Some(target.api_resource.version.as_str()),
-                            &self.discovery,
-                            &[],
-                            &[],
-                            owner,
-                        )
-                        .await?;
-                    match &rechecked {
-                        LiveState::Present(fresh, Ownership::OwnedBySelf) => {
-                            // The opt-out annotation may have changed in the same window.
-                            if !prune_allowed(&key, options, fresh) {
-                                report.retained += 1;
-                                continue;
-                            }
-                        }
-                        // Gone in the meantime: a confirmed absence is a confirmed prune.
-                        LiveState::Missing | LiveState::OrphanGvkGone => {
-                            report.pruned.push(key);
-                            continue;
-                        }
-                        other => {
-                            warn!(
-                                resource = %key.canonical(),
-                                state = %describe_state(other),
-                                "refusing to prune: the object changed between the live read and \
-                                 the delete"
-                            );
-                            report.retained += 1;
-                            continue;
-                        }
-                    }
-                    let request = DeleteRequest {
-                        key: &key,
-                        api_resource: &target.api_resource,
-                        namespace: namespace.as_deref(),
-                    };
-                    match self.applier.delete(request).await {
-                        Ok(DeleteOutcome::Deleted | DeleteOutcome::AlreadyGone) => {
-                            report.pruned.push(key);
-                        }
-                        Err(err) => {
-                            return Err(ReconcileError::PartialSync {
-                                message: err.to_string(),
-                                inventory: inventory::next_inventory(
-                                    prev_inventory,
-                                    applied_ok,
-                                    &report.pruned,
-                                ),
-                                revision: Some(revision.to_owned()),
-                            });
-                        }
-                    }
-                }
-                // Never delete something we cannot prove we own, or something still pending.
-                LiveState::Present(_, ownership) => {
-                    warn!(
-                        resource = %key.canonical(),
-                        ownership = %describe_ownership(ownership),
-                        "refusing to prune a resource this Application does not own"
-                    );
-                    report.retained += 1;
-                }
-                LiveState::DeferredPendingCrd | LiveState::DeferredPendingNamespace => {
-                    report.retained += 1;
-                }
-            }
-        }
-        Ok(report)
-    }
-
     /// Cleans up managed resources when the `Application` is being deleted.
+    ///
+    /// The cascade uses exactly the same [`OwnershipVerifiedPruner`] as a normal prune (T08.5),
+    /// in **reverse apply order** (`sort_keys_prune_order`): a `Namespace` is deleted after the
+    /// workloads inside it, and a `CustomResourceDefinition` after its custom resources. Deleting
+    /// an `Application` can therefore never delete more than a prune would — every delete is
+    /// re-verified against `ferriscd.io/tracking-id` on a freshly read object, and the
+    /// `pruneCRDs`/`pruneNamespaces`/`ferriscd.io/prune=false` rails apply unchanged.
     async fn cleanup_inner(
         &self,
         app: &Application,
@@ -1055,44 +856,27 @@ impl InventorySyncPipeline {
             return Ok(CleanupOutcome::Completed);
         }
 
-        let requests: Vec<FetchRequest> = inventory
-            .iter()
-            .map(|(key, entry)| {
-                FetchRequest::new(key.clone(), vec![entry.version.clone()]).as_orphan()
-            })
-            .collect();
-        let live = self
-            .reader
-            .fetch_live(&requests, &self.discovery, &[], &[], &owner)
-            .await?;
-
         let options = app.spec.sync_options();
-        let mut keys: Vec<&ResourceKey> = live.keys().collect();
-        keys.reverse();
-
+        let pruner = OwnershipVerifiedPruner::new(
+            self.applier.as_ref(),
+            &self.reader,
+            &self.discovery,
+            &owner,
+            &options,
+        );
+        let keys = sort_keys_prune_order(inventory.keys().cloned().collect());
         for key in keys {
-            let Some(LiveState::Present(object, Ownership::OwnedBySelf)) = live.get(key) else {
-                // Gone, foreign or unmanaged: never delete on cascade either.
-                continue;
-            };
-            if !prune_allowed(key, &options, object) {
-                continue;
+            let hint = inventory.get(&key).map(|entry| entry.version.as_str());
+            match pruner.prune(&key, hint).await? {
+                PruneResult::Pruned => {}
+                PruneResult::Retained(reason) => {
+                    warn!(
+                        resource = %key.canonical(),
+                        reason = reason.as_str(),
+                        "cascade cleanup kept a resource it may not delete"
+                    );
+                }
             }
-            let hint = inventory.get(key).map(|entry| entry.version.as_str());
-            let Some(target) = self.resolve_key(key, hint).await? else {
-                continue;
-            };
-            let namespace = match target.scope {
-                Scope::Namespaced => key.namespace.clone(),
-                Scope::Cluster => None,
-            };
-            self.applier
-                .delete(DeleteRequest {
-                    key,
-                    api_resource: &target.api_resource,
-                    namespace: namespace.as_deref(),
-                })
-                .await?;
         }
         Ok(CleanupOutcome::Completed)
     }
@@ -1240,34 +1024,37 @@ fn sync_status_without_orphans(summary: &DiffSummary) -> SyncStatus {
     .sync_status()
 }
 
-/// Selects the desired keys this pass must apply.
+/// Classifies one orphan for the planner from the pass-level live read.
 ///
-/// The trap guard for `syncOptions.applyOutOfSyncOnly` (default `true`) lives here, as one pure
-/// function, so the "synced resources are skipped cleanly" property is provable without a
-/// cluster: a `Skip` decision (or a resource the diff classified `Synced`) can never end up in
-/// the returned set. A resource with no diff entry at all is *not* applied — every desired key is
-/// classified by [`DryRunEvaluator::evaluate`], so a missing entry means the pass never looked at
-/// it, and patching something that was never compared would defeat the gate.
-#[must_use]
-fn apply_selection(
-    decision: SyncDecision,
-    statuses: &BTreeMap<ResourceKey, DiffStatus>,
-    resources: &[DesiredResource],
-    apply_out_of_sync_only: bool,
-) -> BTreeSet<ResourceKey> {
-    if decision.is_skip() {
-        return BTreeSet::new();
+/// The planner is pure, so the ownership *verdict* is what it gets — never a live object (no
+/// `Secret` document can reach it). A key the pass never classified, or one still deferred on a
+/// CRD/namespace, is [`OrphanOwnership::NotFetched`]: FerrisCD never deletes what it did not look
+/// at.
+fn orphan_candidate(key: &ResourceKey, live: &BTreeMap<ResourceKey, LiveState>) -> OrphanCandidate {
+    // The per-resource opt-out is the one rail the *planner* cannot infer from the key alone, so
+    // it travels with the candidate; the CRD/namespace rails are key-derived and checked there.
+    let opted_out = match live.get(key) {
+        Some(LiveState::Present(object, _)) => crate::prune::prune_opted_out(object),
+        _ => false,
+    };
+    OrphanCandidate::new(key.clone(), orphan_ownership(live, key), opted_out)
+}
+
+/// Maps a live-state verdict onto the planner's ownership enum.
+fn orphan_ownership(live: &BTreeMap<ResourceKey, LiveState>, key: &ResourceKey) -> OrphanOwnership {
+    match live.get(key) {
+        Some(LiveState::Present(_, Ownership::OwnedBySelf)) => OrphanOwnership::SelfOwned,
+        Some(LiveState::Present(_, Ownership::OwnedByForeign(owner))) => {
+            OrphanOwnership::Foreign(owner.clone())
+        }
+        Some(LiveState::Present(_, Ownership::Unmanaged)) => OrphanOwnership::Unmanaged,
+        // A confirmed absence is a confirmed prune (MASTER_PLAN §4.3).
+        Some(LiveState::Missing | LiveState::OrphanGvkGone) => OrphanOwnership::Gone,
+        // Deferred on a CRD/namespace this bundle creates, or never fetched at all: wait.
+        Some(LiveState::DeferredPendingCrd | LiveState::DeferredPendingNamespace) | None => {
+            OrphanOwnership::NotFetched
+        }
     }
-    resources
-        .iter()
-        .filter(|resource| {
-            !apply_out_of_sync_only
-                || statuses
-                    .get(&resource.key)
-                    .is_some_and(DiffStatus::needs_apply)
-        })
-        .map(|resource| resource.key.clone())
-        .collect()
 }
 
 /// Builds the successful [`ApplyOutcome`], including the crash-safe inventory and sync state.
@@ -1533,61 +1320,6 @@ fn reject_foreign_ownership(
     })
 }
 
-/// Returns whether a live object may be deleted.
-///
-/// Safety rails: `CustomResourceDefinition` and `Namespace` need an explicit opt-in, and
-/// `ferriscd.io/prune: "false"` opts out a single resource.
-fn prune_allowed(key: &ResourceKey, options: &SyncOptions, object: &DynamicObject) -> bool {
-    let opted_out = object
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|map| map.get(annotations::PRUNE))
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("false"));
-    if opted_out {
-        return false;
-    }
-
-    if key.group == scope::APIEXTENSIONS_GROUP && key.kind == scope::CRD_KIND {
-        if !options.prune_crds {
-            warn!(
-                resource = %key.canonical(),
-                "not pruning a CustomResourceDefinition: set syncOptions.pruneCRDs to opt in"
-            );
-            return false;
-        }
-        return true;
-    }
-    if key.group.is_empty() && key.kind == "Namespace" && !options.prune_namespaces {
-        warn!(
-            resource = %key.canonical(),
-            "not pruning a Namespace: set syncOptions.pruneNamespaces to opt in"
-        );
-        return false;
-    }
-    true
-}
-
-/// Human-readable ownership, used only in warnings.
-fn describe_ownership(ownership: &Ownership) -> &'static str {
-    match ownership {
-        Ownership::OwnedBySelf => "OwnedBySelf",
-        Ownership::Unmanaged => "Unmanaged",
-        Ownership::OwnedByForeign(_) => "OwnedByForeign",
-    }
-}
-
-/// Human-readable live state, used only in warnings.
-fn describe_state(state: &LiveState) -> &'static str {
-    match state {
-        LiveState::Present(_, ownership) => describe_ownership(ownership),
-        LiveState::Missing => "Missing",
-        LiveState::DeferredPendingCrd => "DeferredPendingCrd",
-        LiveState::DeferredPendingNamespace => "DeferredPendingNamespace",
-        LiveState::OrphanGvkGone => "OrphanGvkGone",
-    }
-}
-
 /// Rejects manifests `v0.2` cannot order or track correctly.
 fn reject_unsupported(resource: &DesiredResource) -> Result<(), ReconcileError> {
     let name = resource.key.canonical();
@@ -1619,30 +1351,6 @@ fn reject_unsupported(resource: &DesiredResource) -> Result<(), ReconcileError> 
     Ok(())
 }
 
-/// Returns the namespace a namespaced target must be applied in.
-fn desired_namespace(
-    resource: &DesiredResource,
-    target_scope: Scope,
-) -> Result<Option<String>, ReconcileError> {
-    match target_scope {
-        Scope::Cluster => Ok(None),
-        Scope::Namespaced => resource
-            .object
-            .metadata
-            .namespace
-            .clone()
-            .filter(|namespace| !namespace.trim().is_empty())
-            .map(Some)
-            .ok_or_else(|| ReconcileError::Invalid {
-                message: format!(
-                    "{}: namespaced kind {} has no metadata.namespace after scope normalization",
-                    resource.key.canonical(),
-                    resource.gvk.kind
-                ),
-            }),
-    }
-}
-
 /// Loads, parses, normalizes and tier-sorts the desired manifest set (blocking).
 ///
 /// A free function so it can run inside `tokio::task::spawn_blocking` holding no `&self`.
@@ -1665,7 +1373,7 @@ fn load_desired_resources(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1677,13 +1385,13 @@ mod tests {
     };
     use ferriscd_crd::{
         ApplicationSpec, AutomatedSyncPolicy, DestinationSpec, GitSourceSpec, RendererSpec,
-        SourceSpec, SyncPolicy,
+        SourceSpec, SyncOptions, SyncPolicy,
     };
-    use ferriscd_engine::diff::{SkipReason, SyncTrigger};
     use ferriscd_engine::health::Observation;
     use ferriscd_engine::manifest::GroupVersionKind;
     use ferriscd_engine::repo::{FakeGitClient, FakeGitClientConfig, RepoCacheConfig};
-    use kube::discovery::ApiCapabilities;
+    use kube::api::GroupVersionKind as KubeGvk;
+    use kube::discovery::{ApiCapabilities, Scope};
     use serde_json::json;
 
     use super::*;
@@ -1706,10 +1414,26 @@ mod tests {
         applied_tracking_ids: StdMutex<Vec<String>>,
         deletes: StdMutex<Vec<String>>,
         fail_apply: StdMutex<Vec<String>>,
+        /// GKNNs the API server rejects with `422`/`field is immutable` (a terminal failure).
+        immutable_apply: StdMutex<Vec<String>>,
         /// GKNNs whose `tracking-id` is replaced with a foreign one after their first `GET`
         /// (simulates a takeover between the pass-level fetch and the prune re-check).
         ownership_flip_after_get: StdMutex<Vec<String>>,
         deletes_confirmed: AtomicUsize,
+        /// How the fake API server treats a `CustomResourceDefinition` it is handed.
+        crd_mode: CrdMode,
+    }
+
+    /// What the fake API server does with an applied `CustomResourceDefinition`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    enum CrdMode {
+        /// Accepted, established, and its kind immediately served (a real cluster).
+        #[default]
+        Establish,
+        /// Accepted but not established (yet): `Established=False`.
+        Pending,
+        /// Accepted, then rejected: `NamesAccepted=False` (never establishes, finding H5).
+        Rejected,
     }
 
     impl FakeCluster {
@@ -1731,6 +1455,24 @@ mod tests {
             self
         }
 
+        /// The next apply of `key` is rejected with the API server's immutable-field `422`.
+        fn fail_apply_as_immutable(self, key: &str) -> Self {
+            self.immutable_apply.lock().unwrap().push(key.to_owned());
+            self
+        }
+
+        /// The next applied CRD stays `Established=False` (and its kind is never served).
+        fn with_unestablished_crds(mut self) -> Self {
+            self.crd_mode = CrdMode::Pending;
+            self
+        }
+
+        /// The next applied CRD is rejected by the API server (`NamesAccepted=False`).
+        fn with_rejected_crds(mut self) -> Self {
+            self.crd_mode = CrdMode::Rejected;
+            self
+        }
+
         fn with_ownership_flip_after_get(self, gknn: &str) -> Self {
             self.ownership_flip_after_get
                 .lock()
@@ -1741,6 +1483,15 @@ mod tests {
 
         fn applies(&self) -> Vec<String> {
             self.applies.lock().unwrap().clone()
+        }
+
+        /// Models a `Namespace` the API server has accepted: the *next* pass sees it as existing.
+        ///
+        /// [`Self::seed_applied`] records the applied object itself; this records the namespace
+        /// *existence* verdict the live read probes for, which is what ends a
+        /// `DeferredPendingNamespace` wait.
+        fn seed_namespace(&self, namespace: &str) {
+            self.namespaces.lock().unwrap().push(namespace.to_owned());
         }
 
         /// Makes every object the applier has written live, modelling the API server write.
@@ -1804,6 +1555,24 @@ mod tests {
         format!("{group}/{kind}/{}/{}", namespace.unwrap_or_default(), name)
     }
 
+    /// The API server's `422 Invalid` rejection of an in-place update of an immutable field.
+    ///
+    /// The message mirrors what Kubernetes actually returns for an `immutable: true`
+    /// `ConfigMap`, which is what the executor's recovery layer classifies as terminal.
+    fn immutable_field_error() -> kube::Error {
+        kube::Error::Api(
+            serde_json::from_value::<kube::core::Status>(json!({
+                "status": "Failure",
+                "message": "ConfigMap \"api\" is invalid: data: Invalid value: field is immutable \
+                            when `immutable` is set",
+                "reason": "Invalid",
+                "code": 422,
+            }))
+            .expect("a valid kube Status")
+            .boxed(),
+        )
+    }
+
     impl LiveObjectSource for FakeCluster {
         fn get<'a>(&'a self, target: FetchTarget<'a>) -> LiveFuture<'a, Option<DynamicObject>> {
             let wanted = gknn_of(
@@ -1852,6 +1621,10 @@ mod tests {
     /// Applier that records the calls and never touches a cluster.
     struct FakeApplier {
         cluster: Arc<FakeCluster>,
+        /// Snapshot the fake API server publishes a newly applied CRD's kind into.
+        discovery: Arc<FakeDiscovery>,
+        /// How the fake API server treats an applied CRD (see [`CrdMode`]).
+        crd_mode: CrdMode,
     }
 
     impl Applier for FakeApplier {
@@ -1874,7 +1647,51 @@ mod tests {
                         message: format!("applying {key} failed"),
                     });
                 }
-                self.cluster.applies.lock().unwrap().push(key);
+                if self.cluster.immutable_apply.lock().unwrap().contains(&key) {
+                    // The real API server rejects the SSA patch with `422 Invalid`; the executor's
+                    // recovery layer (not this fake) turns it into the terminal, actionable
+                    // message, which is exactly the path a terminal failure has to survive.
+                    return Err(ReconcileError::Apply {
+                        resource: key,
+                        source: immutable_field_error(),
+                    });
+                }
+                self.cluster.applies.lock().unwrap().push(key.clone());
+                // A `CustomResourceDefinition` is established by the API server as soon as it is
+                // accepted, and the aggregated discovery document then serves its kind. Modelling
+                // both here is what lets the CRD+CR tests converge like a real cluster (T08.3).
+                let is_crd = body.types.as_ref().is_some_and(|types| {
+                    types.kind == scope::CRD_KIND
+                        && types.api_version.starts_with(scope::APIEXTENSIONS_GROUP)
+                });
+                if is_crd {
+                    let mut served = body.clone();
+                    served.data["status"] = match self.crd_mode {
+                        CrdMode::Establish => json!({
+                            "conditions": [{ "type": "Established", "status": "True" }],
+                        }),
+                        CrdMode::Pending => json!({
+                            "conditions": [
+                                { "type": "NamesAccepted", "status": "True" },
+                                { "type": "Established", "status": "False" },
+                            ],
+                        }),
+                        CrdMode::Rejected => json!({
+                            "conditions": [
+                                { "type": "NamesAccepted", "status": "False" },
+                                { "type": "Established", "status": "False" },
+                            ],
+                        }),
+                    };
+                    self.cluster
+                        .objects
+                        .lock()
+                        .unwrap()
+                        .insert(gknn_of_object(&served), served);
+                    if self.crd_mode == CrdMode::Establish {
+                        install_crd_kind(&self.discovery, &body);
+                    }
+                }
                 self.cluster
                     .applied_objects
                     .lock()
@@ -1940,13 +1757,41 @@ mod tests {
         }
     }
 
+    /// Publishes the kind a just-applied `CustomResourceDefinition` defines.
+    ///
+    /// Reads the same fields the API server does (`spec.group`, `spec.names.kind`,
+    /// `spec.scope`), so the fixture cannot drift from the manifest under test.
+    fn install_crd_kind(discovery: &FakeDiscovery, crd: &DynamicObject) {
+        let group = crd
+            .data
+            .pointer("/spec/group")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let kind = crd
+            .data
+            .pointer("/spec/names/kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let scope = match crd
+            .data
+            .pointer("/spec/scope")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("Cluster") => Scope::Cluster,
+            _ => Scope::Namespaced,
+        };
+        if !group.is_empty() && !kind.is_empty() {
+            discovery.install(group, kind, scope);
+        }
+    }
+
     fn with_resource(
         snapshot: DiscoverySnapshot,
         group: &str,
         kind: &str,
         scope: Scope,
     ) -> DiscoverySnapshot {
-        let mut resource = ApiResource::from_gvk(&api::GroupVersionKind::gvk(group, "v1", kind));
+        let mut resource = ApiResource::from_gvk(&KubeGvk::gvk(group, "v1", kind));
         resource.plural = format!("{}s", kind.to_ascii_lowercase());
         snapshot.with_resource(resource, capabilities(scope))
     }
@@ -2141,10 +1986,15 @@ mod tests {
             cluster.clone(),
             Arc::new(FakeApplier {
                 cluster: cluster.clone(),
+                discovery: discovery.clone(),
+                crd_mode: cluster.crd_mode,
             }),
             dry_run.clone(),
         )
-        .with_url_policy(RepoUrlPolicy::AllowLocal);
+        .with_url_policy(RepoUrlPolicy::AllowLocal)
+        // Hermetic: a scripted cluster never needs a bounded wait, and `without_waits` keeps the
+        // suite free of timing sleeps.
+        .with_execution_policy(ExecutionPolicy::without_waits());
         let repo_url = temp.path().join("repo.git").display().to_string();
         Fixture {
             git,
@@ -2386,23 +2236,105 @@ mod tests {
         );
     }
 
+    /// **Finding M2:** a *terminal* apply failure — the API server's `422` for an immutable field
+    /// without `ferriscd.io/sync-options: Replace=true` — must surface as
+    /// [`ReconcileError::SyncConflict`], never [`ReconcileError::PartialSync`]. The two carry a
+    /// different [`crate::FailureClass`] downstream (terminal backoff vs retry), so a silent
+    /// downgrade would turn a permanent policy failure into a livelock, and the inventory that is
+    /// already true must still travel with it (finding C1).
+    #[tokio::test]
+    async fn an_immutable_field_failure_is_a_sync_conflict_not_a_partial_sync() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .fail_apply_as_immutable("apps/Deployment/payments/api"),
+        );
+        fixture.commit(&[
+            ("configmap.yaml", CONFIGMAP),
+            ("deployment.yaml", DEPLOYMENT),
+        ]);
+        let app = fixture.app(".");
+
+        let err = fixture.pipeline.apply(&app).await.expect_err("apply fails");
+
+        assert!(
+            matches!(err, ReconcileError::SyncConflict { .. }),
+            "an immutable field without Replace=true is terminal, so it must be a \
+             SyncConflict and not a PartialSync: {err:?}"
+        );
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        let message = err.to_string();
+        assert!(message.contains("immutable"), "{message}");
+        assert!(
+            message.contains("Replace=true"),
+            "the failure must name the opt-in: {message}"
+        );
+        let (inventory, revision) = err
+            .partial_status()
+            .expect("a SyncConflict still reports the inventory it already owns");
+        assert_eq!(
+            inventory.len(),
+            1,
+            "the ConfigMap applied before the failure must stay tracked (C1)"
+        );
+        assert_eq!(inventory.keys().next().unwrap().kind, "ConfigMap");
+        assert!(revision.is_some());
+    }
+
     // ---------------------------------------------------------------------
     // Deferred states
     // ---------------------------------------------------------------------
 
+    const CRD_MANIFEST: &str = "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n  versions:\n    - name: v1\n      served: true\n      storage: true\n      schema:\n        openAPIV3Schema:\n          type: object\n";
+    const WIDGET_MANIFEST: &str =
+        "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: one\n";
+
+    /// **Verification (T08.3, trap T6):** a brand-new CRD and its CR in one commit land on the
+    /// **first** sync: the CRD is applied, polled for `Established`, discovery is refreshed, and
+    /// only then is the custom resource resolved and applied.
     #[tokio::test]
-    async fn a_pending_crd_defers_the_custom_resource_and_requeues() {
+    async fn a_crd_and_its_custom_resource_are_applied_in_one_pass() {
         let fixture = fixture(FakeCluster::default().with_namespace("payments"));
-        fixture.commit(&[
-            (
-                "crd.yaml",
-                "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n  versions:\n    - name: v1\n      served: true\n      storage: true\n      schema:\n        openAPIV3Schema:\n          type: object\n",
-            ),
-            (
-                "widget.yaml",
-                "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: one\n",
-            ),
-        ]);
+        fixture.commit(&[("crd.yaml", CRD_MANIFEST), ("widget.yaml", WIDGET_MANIFEST)]);
+        let app = fixture.app(".");
+        let fetches_before = fixture.discovery.fetches();
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a brand-new CRD plus its CR must sync on the first pass");
+
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec![
+                "apiextensions.k8s.io/CustomResourceDefinition//widgets.example.com".to_owned(),
+                "example.com/Widget/payments/one".to_owned(),
+            ],
+            "the CRD must be applied before its custom resource (trap T6)"
+        );
+        assert!(
+            fixture.discovery.fetches() > fetches_before,
+            "the executor must refresh discovery after the CRD is established"
+        );
+        assert_eq!(outcome.reason, REASON_SYNC_SUCCEEDED, "{}", outcome.message);
+        let inventory = outcome.inventory.expect("inventory is always reported");
+        assert!(
+            inventory.keys().any(|key| key.kind == "Widget"),
+            "the custom resource that applied must be tracked"
+        );
+    }
+
+    /// **Trap guard (T08.3):** when the CRD never establishes, the pass requeues and the custom
+    /// resource is never applied against a kind the API server does not serve.
+    #[tokio::test]
+    async fn an_unestablished_crd_defers_the_custom_resource_and_requeues() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_unestablished_crds(),
+        );
+        fixture.commit(&[("crd.yaml", CRD_MANIFEST), ("widget.yaml", WIDGET_MANIFEST)]);
         let app = fixture.app(".");
 
         let outcome = fixture
@@ -2430,50 +2362,73 @@ mod tests {
         );
     }
 
+    /// **Trap guard (H5):** a CRD the API server rejects (`NamesAccepted=False`) fails with an
+    /// actionable message instead of requeueing forever.
     #[tokio::test]
-    async fn a_bundle_with_a_crd_forces_a_discovery_refresh_so_the_deferred_cr_lands() {
-        // Pass 1: the CRD applies, the CR is deferred on a kind the cluster does not serve yet.
-        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
-        fixture.commit(&[
-            (
-                "crd.yaml",
-                "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n  versions:\n    - name: v1\n      served: true\n      storage: true\n      schema:\n        openAPIV3Schema:\n          type: object\n",
-            ),
-            (
-                "widget.yaml",
-                "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: one\n",
-            ),
-        ]);
+    async fn a_rejected_crd_fails_instead_of_requeueing() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_rejected_crds(),
+        );
+        fixture.commit(&[("crd.yaml", CRD_MANIFEST), ("widget.yaml", WIDGET_MANIFEST)]);
         let app = fixture.app(".");
-        let first = fixture.pipeline.apply(&app).await.expect("first pass");
-        assert_eq!(first.reason, REASON_PENDING);
-        let fetches_after_first = fixture.discovery.fetches();
 
-        // The API server now serves the new kind (the CRD got established).
-        fixture
-            .discovery
-            .install("example.com", "Widget", Scope::Namespaced);
-
-        // A fresh 1h snapshot would hide the new kind for minutes; the bundle contains a CRD, so
-        // the pass must force a refresh instead of trusting the TTL (trap T6).
-        let second = fixture.pipeline.apply(&app).await.expect("second pass");
-        assert!(
-            fixture.discovery.fetches() > fetches_after_first,
-            "a bundle that defines CRDs must force a discovery refresh"
-        );
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("a rejected CRD must not be reported as pending");
         assert_eq!(
-            second.reason, REASON_SYNC_SUCCEEDED,
-            "the deferred custom resource must land on the follow-up pass: {}",
-            second.message
+            err.failure_class(),
+            crate::FailureClass::Terminal,
+            "a rejected definition can never be fixed by retrying: {err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("NamesAccepted"), "{message}");
+        assert!(
+            message.contains("widgets.example.com"),
+            "the message must name the CRD: {message}"
         );
         assert!(
-            fixture
+            !fixture
                 .cluster
                 .applies()
                 .iter()
-                .any(|applied| applied == "example.com/Widget/payments/one"),
-            "the custom resource must be applied: {:?}",
+                .any(|applied| applied.contains("Widget")),
+            "the custom resource must never be applied"
+        );
+    }
+
+    /// A bundle that defines CRDs forces a discovery refresh instead of trusting the TTL, and the
+    /// second pass is a no-op (nothing is re-applied).
+    #[tokio::test]
+    async fn a_crd_bundle_forces_a_discovery_refresh_and_settles() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("crd.yaml", CRD_MANIFEST), ("widget.yaml", WIDGET_MANIFEST)]);
+        let app = fixture.app(".");
+        let fetches_before = fixture.discovery.fetches();
+        fixture.pipeline.apply(&app).await.expect("first pass");
+        assert!(
+            fixture.discovery.fetches() > fetches_before,
+            "a bundle that defines CRDs must force a discovery refresh"
+        );
+
+        // The second pass sees both objects live and synced: zero mutating applies.
+        fixture.cluster.seed_applied();
+        let applies_before = fixture.cluster.applies().len();
+        let second = fixture.pipeline.apply(&app).await.expect("second pass");
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            applies_before,
+            "an already-synced CRD + CR must not be re-applied: {:?}",
             fixture.cluster.applies()
+        );
+        assert_eq!(second.reason, REASON_SYNC_SUCCEEDED, "{}", second.message);
+        assert!(
+            second.message.contains("applied 0 of 2"),
+            "both the CRD and its CR are already synced: {}",
+            second.message
         );
     }
 
@@ -2506,43 +2461,103 @@ mod tests {
         );
     }
 
+    /// The `DeferredPendingNamespace` wait costs exactly **one** extra pass, unconditionally.
+    ///
+    /// The executor never resolves a `Skip(Deferred)` step in-pass, whatever else the pass did: a
+    /// deferred key is always reported pending and left for the next reconcile. Only a
+    /// `Namespace` this bundle declares can defer a key (the plan is handed exactly the
+    /// `DeferredPendingNamespace` keys), and that namespace exists only after the pass that
+    /// applies it, so pass 1 applies the `Namespace`, the requeue brings the `ConfigMap`, and
+    /// nothing is ever applied into a namespace that does not exist yet.
     #[tokio::test]
-    async fn create_namespace_is_rejected_instead_of_livelocking() {
-        // H1: v0.2 never creates a namespace, so honoring the flag would defer every key
-        // forever. It must fail terminally on the *first* pass instead.
+    async fn a_namespace_deferral_costs_exactly_one_extra_pass() {
+        let fixture = fixture(FakeCluster::default());
+        fixture.commit(&[
+            (
+                "namespace.yaml",
+                "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: payments\n",
+            ),
+            ("configmap.yaml", CONFIGMAP),
+        ]);
+        let mut app = fixture.app(".");
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(
+            err.is_none(),
+            "a pending namespace is not an error: {err:?}"
+        );
+        assert_eq!(ready(&status).reason, REASON_PENDING);
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/Namespace//payments".to_owned()],
+            "nothing may be applied into a namespace that does not exist yet"
+        );
+
+        // The namespace the first pass applied exists now: the requeued pass completes the sync.
+        fixture.cluster.seed_namespace("payments");
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/Namespace//payments".to_owned(), CONFIGMAP_KEY.to_owned()],
+            "the extra pass applies the deferred ConfigMap and nothing else"
+        );
+        assert_eq!(ready(&status).reason, REASON_SYNC_SUCCEEDED);
+    }
+
+    /// **Verification (T08.3):** `createNamespace: true` creates the destination namespace in the
+    /// same pass and then applies into it — no livelock, and the namespace is never stamped with a
+    /// `tracking-id` (so it is never prunable).
+    #[tokio::test]
+    async fn create_namespace_creates_the_namespace_then_syncs_into_it() {
         let fixture = fixture(FakeCluster::default());
         fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
         let mut app = fixture.app(".");
         app.spec.sync_policy = Some(SyncPolicy {
-            automated: None,
-            sync_options: Some(ferriscd_crd::SyncOptions {
+            automated: Some(AutomatedSyncPolicy {
+                prune: true,
+                self_heal: true,
+            }),
+            sync_options: Some(SyncOptions {
                 create_namespace: true,
-                ..ferriscd_crd::SyncOptions::default()
+                ..SyncOptions::default()
             }),
             retry: None,
         });
 
-        let err = fixture
+        let outcome = fixture
             .pipeline
             .apply(&app)
             .await
-            .expect_err("createNamespace must be rejected, not deferred");
+            .expect("createNamespace must be honoured, not rejected");
 
-        assert!(
-            matches!(err, ReconcileError::Invalid { .. }),
-            "the rejection must be terminal: {err}"
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/Namespace//payments".to_owned(), CONFIGMAP_KEY.to_owned()],
+            "the Namespace is applied first, then the ConfigMap in the same pass"
         );
-        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
-        let message = err.to_string();
-        assert!(message.contains("createNamespace"), "{message}");
-        assert!(
-            message.contains("declare the Namespace in Git"),
-            "the message must be actionable: {message}"
+        assert_eq!(
+            fixture.cluster.applied_tracking_ids(),
+            vec![
+                String::new(),
+                "ferriscd-system/payments:/ConfigMap:payments/settings".to_owned()
+            ],
+            "a namespace FerrisCD only created must never look owned (and so is never prunable)"
         );
+        assert_eq!(outcome.reason, REASON_SYNC_SUCCEEDED);
+        let inventory = outcome.inventory.expect("inventory is always reported");
         assert!(
-            fixture.cluster.applies().is_empty() && fixture.cluster.deletes().is_empty(),
-            "nothing may be applied or deleted when the option is rejected"
+            !inventory
+                .keys()
+                .any(|key| key.kind == "Namespace" && key.name == "payments"),
+            "the pre-created namespace must never be tracked in status.inventory"
         );
+        assert!(inventory.contains_key(&ResourceKey::new(
+            "",
+            "ConfigMap",
+            Some("payments".to_owned()),
+            "settings"
+        )));
     }
 
     #[tokio::test]
@@ -2780,6 +2795,8 @@ mod tests {
             cluster.clone(),
             Arc::new(FakeApplier {
                 cluster: cluster.clone(),
+                discovery: Arc::new(FakeDiscovery::with_cluster_kinds()),
+                crd_mode: CrdMode::Establish,
             }),
             Arc::new(FakeDryRun::default()),
         );
@@ -2983,73 +3000,11 @@ mod tests {
             .expect("the pass must persist status.sync")
     }
 
-    /// A desired `ConfigMap` for the pure selection tests.
-    fn desired_configmap(name: &str) -> DesiredResource {
-        DesiredResource {
-            key: ResourceKey::new("", "ConfigMap", Some("payments".to_owned()), name),
-            gvk: GroupVersionKind::parse("v1", "ConfigMap").unwrap(),
-            object: config_map(name, None),
-            source_file: "configmap.yaml".to_owned(),
-        }
-    }
-
     fn operation_annotation() -> BTreeMap<String, String> {
         BTreeMap::from([(
             annotations::OPERATION.to_owned(),
             r#"{"sync":{"revision":"main"}}"#.to_owned(),
         )])
-    }
-
-    /// **Trap guard** (`applyOutOfSyncOnly`): a resource the diff classified `Synced` is never
-    /// selected for an apply, and a skipped pass selects nothing at all.
-    #[test]
-    fn apply_out_of_sync_only_skips_synced_resources() {
-        let settings = desired_configmap("settings");
-        let extra = desired_configmap("extra");
-        let resources = vec![settings.clone(), extra.clone()];
-
-        let statuses = BTreeMap::from([
-            (settings.key.clone(), DiffStatus::Synced),
-            (extra.key.clone(), DiffStatus::OutOfSync),
-        ]);
-        let execute = SyncDecision::Execute(SyncTrigger::DriftDetected);
-
-        assert_eq!(
-            apply_selection(execute, &statuses, &resources, true),
-            BTreeSet::from([extra.key.clone()]),
-            "only the out-of-sync resource may be patched"
-        );
-        assert_eq!(
-            apply_selection(execute, &statuses, &resources, false),
-            BTreeSet::from([settings.key.clone(), extra.key.clone()]),
-            "applyOutOfSyncOnly: false applies the whole desired set"
-        );
-        for skip in [
-            SkipReason::AutomatedDisabled,
-            SkipReason::SelfHealDisabled,
-            SkipReason::AlreadySynced,
-        ] {
-            assert!(
-                apply_selection(SyncDecision::Skip(skip), &statuses, &resources, false).is_empty(),
-                "a skip decision must never select an apply ({skip})"
-            );
-        }
-
-        // A `Missing` resource needs a create, an orphan needs nothing.
-        let mixed = BTreeMap::from([
-            (settings.key.clone(), DiffStatus::Missing),
-            (extra.key.clone(), DiffStatus::Orphaned),
-        ]);
-        assert_eq!(
-            apply_selection(execute, &mixed, &resources, true),
-            BTreeSet::from([settings.key.clone()])
-        );
-
-        // A resource the diff never classified must not be patched blind.
-        assert!(
-            apply_selection(execute, &BTreeMap::new(), &resources, true).is_empty(),
-            "an unclassified resource must never be applied"
-        );
     }
 
     /// Manual-operation detection is one pure helper (T07.4's `manual_op` input).
@@ -3498,6 +3453,61 @@ mod tests {
             ready(&status).message
         );
         assert!(fixture.cluster.deletes().is_empty());
+    }
+
+    /// A pass the gate **skipped** still reports the orphans it may never delete: a foreign or
+    /// unmanaged orphan used to count as zero on a skipped pass, which made a permanent conflict
+    /// look like "nothing to retain".
+    #[tokio::test]
+    async fn a_skipped_pass_still_reports_foreign_and_unmanaged_orphans() {
+        let foreign = config_map(
+            "foreign",
+            Some("ferriscd-system/other:/ConfigMap:payments/foreign"),
+        );
+        let unmanaged = config_map("unmanaged", None);
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(foreign)
+                .with_object(unmanaged),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+        // `automated: None`: the gate never executes, so nothing is applied and nothing is pruned.
+        // The two orphans are still *retained*, and that must be visible in `/status`.
+        app.spec.sync_policy = None;
+        app.status = Some(ApplicationStatus {
+            inventory: vec![
+                ferriscd_crd::InventoryEntry::new("/ConfigMap/payments/foreign", "v1"),
+                ferriscd_crd::InventoryEntry::new("/ConfigMap/payments/unmanaged", "v1"),
+            ],
+            ..ApplicationStatus::default()
+        });
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a skipped pass is not an error");
+
+        assert_eq!(outcome.reason, REASON_SYNC_SKIPPED, "{}", outcome.message);
+        assert!(
+            outcome.message.contains("2 orphan(s) retained"),
+            "both orphans must be reported on a skipped pass: {}",
+            outcome.message
+        );
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "a skipped pass deletes nothing"
+        );
+        assert!(
+            outcome
+                .inventory
+                .expect("inventory is always reported")
+                .len()
+                == 2,
+            "the retained orphans stay tracked"
+        );
     }
 
     /// Finding H7: a `spec.source.git.path` edit produces no new commit, so `selfHeal: false`
@@ -4126,40 +4136,6 @@ mod tests {
         let err = reject_foreign_ownership(&resources, &BTreeMap::new())
             .expect_err("applying without a live read must be refused");
         assert!(err.to_string().contains("ownership check"), "{err}");
-    }
-
-    #[test]
-    fn prune_safety_rails_protect_opted_out_resources_crds_and_namespaces() {
-        let options = SyncOptions::default();
-        let crd = ResourceKey::new(
-            scope::APIEXTENSIONS_GROUP,
-            scope::CRD_KIND,
-            None,
-            "widgets.example.com",
-        );
-        let namespace = ResourceKey::new("", "Namespace", None, "team-a");
-        let configmap = ResourceKey::new("", "ConfigMap", Some("payments".to_owned()), "settings");
-        let object = config_map("settings", None);
-
-        assert!(!prune_allowed(&crd, &options, &object));
-        assert!(!prune_allowed(&namespace, &options, &object));
-        assert!(prune_allowed(&configmap, &options, &object));
-
-        let opted_in = SyncOptions {
-            prune_crds: true,
-            prune_namespaces: true,
-            ..SyncOptions::default()
-        };
-        assert!(prune_allowed(&crd, &opted_in, &object));
-        assert!(prune_allowed(&namespace, &opted_in, &object));
-
-        let mut opted_out = object.clone();
-        opted_out
-            .metadata
-            .annotations
-            .get_or_insert_with(BTreeMap::new)
-            .insert(annotations::PRUNE.to_owned(), "FALSE".to_owned());
-        assert!(!prune_allowed(&configmap, &opted_in, &opted_out));
     }
 
     // ---------------------------------------------------------------------

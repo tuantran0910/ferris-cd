@@ -7,6 +7,7 @@ pub mod health;
 pub mod inventory;
 pub mod manifest;
 pub mod repo;
+pub mod sync;
 
 /// Returns the default Server-Side Apply field manager identity for FerrisCD.
 #[must_use]
