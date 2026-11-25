@@ -2910,6 +2910,44 @@ mod tests {
         }
     }
 
+    /// **`T12.4` security boundary:** a plaintext `http://` remote can never carry `Secret`-backed
+    /// credentials, because the URL policy refuses it under **both** policies — before a transport
+    /// exists — and `gix` itself refuses to put credentials on the wire in clear text. Without this
+    /// the whole credential path would have a silent plaintext downgrade.
+    #[tokio::test]
+    async fn a_plaintext_http_remote_never_reaches_a_transport() {
+        let creds = RepoCredentials::HttpBasic {
+            username: "ferris-cd".to_owned(),
+            password: "ghp_super_secret_token_987654".to_owned(),
+        };
+        let src = GitSource::new("http://127.0.0.1:8080/org/repo.git", "main", "");
+
+        for policy in [RepoUrlPolicy::Production, RepoUrlPolicy::AllowLocal] {
+            // No work root: the URL is refused before any directory is created.
+            let client = GixGitClient::new(GixGitClientConfig::new().with_url_policy(policy));
+            for err in [
+                client
+                    .resolve_revision(&src, &creds)
+                    .await
+                    .expect_err("plaintext http must never be cloned"),
+                client
+                    .checkout(&src, "0123456789abcdef0123456789abcdef01234567", &creds)
+                    .await
+                    .expect_err("plaintext http must never be cloned"),
+            ] {
+                assert!(
+                    matches!(err, RepoError::InvalidUrl { .. }),
+                    "the URL policy must refuse it: {err:?}"
+                );
+                assert!(!err.is_retryable(), "no reconcile can un-refuse a scheme");
+                assert!(
+                    !err.to_string().contains("ghp_super_secret_token_987654"),
+                    "{err}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn parse_gix_url_rejects_remote_file_hosts_and_normalizes_localhost() {
         let local_policy = RepoUrlPolicy::AllowLocal;

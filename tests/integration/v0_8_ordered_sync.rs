@@ -57,6 +57,7 @@ fn a_crd_and_its_custom_resource_sync_on_the_first_pass() {
     );
     install_crds();
     ensure_namespace(CONTROL_NAMESPACE);
+    ensure_default_project();
 
     let _cluster_cleanup = ClusterCleanup::new();
     let _controller_cleanup = ControllerProcess::start();
@@ -110,6 +111,7 @@ fn an_immutable_configmap_fails_safely_and_recreates_with_replace() {
     );
     install_crds();
     ensure_namespace(CONTROL_NAMESPACE);
+    ensure_default_project();
 
     let fixture = tempfile::tempdir().expect("create git fixture directory");
     let repo = fixture.path();
@@ -166,6 +168,7 @@ fn a_kubectl_applied_configmap_is_adopted_only_when_the_manager_is_listed() {
     );
     install_crds();
     ensure_namespace(CONTROL_NAMESPACE);
+    ensure_default_project();
 
     let fixture = tempfile::tempdir().expect("create git fixture directory");
     let repo = fixture.path();
@@ -230,6 +233,7 @@ fn pruning_is_ownership_verified_and_protects_crd_orphans() {
     );
     install_crds();
     ensure_namespace(CONTROL_NAMESPACE);
+    ensure_default_project();
 
     let fixture = tempfile::tempdir().expect("create git fixture directory");
     let repo = fixture.path();
@@ -614,6 +618,22 @@ fn install_crds() {
     assert!(
         output.status.success(),
         "kubectl apply -f deploy/crds failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Applies the shipped `default` `AppProject` (`T12.1`).
+///
+/// Every `Application` is validated against the project it references and a missing project is a
+/// terminal denial, so the live suite has to install the same manifest an operator applies.
+/// Idempotent, and it must run *after* the control-plane namespace exists.
+fn ensure_default_project() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/manifests/default-project.yaml");
+    let output = kubectl(&["apply", "-f", &manifest.display().to_string()]);
+    assert!(
+        output.status.success(),
+        "kubectl apply -f deploy/manifests/default-project.yaml failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

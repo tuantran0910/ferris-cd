@@ -31,6 +31,7 @@ use ferriscd_engine::repo::RepoError;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use kube::Client;
 use kube::ResourceExt;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
@@ -80,6 +81,13 @@ pub const REASON_SYNC_SKIPPED: &str = "SyncSkipped";
 /// Terminal (trap T10): no apply FerrisCD could issue would resolve the conflict, so the
 /// reconcile fails once and is retried on the terminal backoff instead of self-healing forever.
 pub const REASON_OWNERSHIP_CONFLICT: &str = "OwnershipConflict";
+
+/// Condition reason recorded when the referenced `AppProject` denies the `Application`.
+///
+/// Terminal (`T12.1`): the project — or the `Application`'s namespace, repository, destination,
+/// ServiceAccount, or a rendered resource — must change. `kubectl describe app` shows which one,
+/// because the condition message names the offending field and key.
+pub const REASON_POLICY_VIOLATION: &str = "PolicyViolation";
 
 /// Whether a deletion cascades through `status.inventory`.
 ///
@@ -274,6 +282,33 @@ pub enum ReconcileError {
         revision: Option<String>,
     },
 
+    /// The referenced `AppProject` does not permit this `Application` (`T12.1`, `T12.2`).
+    ///
+    /// Terminal and raised **before any mutation** — before the repository is cloned, before the
+    /// `dryRun=All` diff, before an apply or a prune — so a denial costs the cluster nothing. Every
+    /// variant names the offending field, key, or resource.
+    #[error(transparent)]
+    Policy(#[from] ferriscd_engine::policy::PolicyError),
+
+    /// The `Application`'s `ServiceAccount` cannot be impersonated (`T12.3`).
+    ///
+    /// Terminal: an invalid ServiceAccount or namespace name, a forbidden group, or no
+    /// impersonation pool wired into the pipeline can never be fixed by retrying — and refusing
+    /// is the only safe answer, because the alternative is deploying a tenant `Application` with
+    /// the controller's own privileged identity (trap T12).
+    #[error(transparent)]
+    Impersonation(#[from] crate::impersonation::ImpersonationError),
+
+    /// A `ferriscd.io/secret-type=repository` `Secret` cannot be used (`T12.4`).
+    ///
+    /// Terminal: the credential lives in a `Secret` the controller does not write, and the
+    /// alternative to refusing — picking a different `Secret`, or cloning anonymously when a
+    /// credential was configured — would hide a misconfiguration and could leak a repository to
+    /// the wrong identity. Every variant names the `Secret`, its namespace, and the offending
+    /// keys; none carries a secret value.
+    #[error(transparent)]
+    Credentials(#[from] crate::credentials::CredentialError),
+
     /// A Server-Side Apply call failed for a specific resource.
     #[error("server-side apply failed for {resource}: {source}")]
     Apply {
@@ -380,7 +415,10 @@ impl ReconcileError {
             | Self::PartialSync { .. }
             | Self::SyncConflict { .. }
             | Self::SyncRetry { .. }
-            | Self::OwnershipConflict { .. } => false,
+            | Self::OwnershipConflict { .. }
+            | Self::Policy(_)
+            | Self::Impersonation(_)
+            | Self::Credentials(_) => false,
             // A kind nobody serves means nothing is left to clean up.
             Self::Live(err) => matches!(err, LiveStateError::UnknownKind { .. }),
             Self::Repo(_) | Self::Manifest(_) | Self::Diff(_) => false,
@@ -401,10 +439,20 @@ impl ReconcileError {
             Self::Discovery(DiscoveryError::Refresh { .. }) => FailureClass::Retryable,
             // An ownership conflict cannot be fixed by retrying: another `Application` owns the
             // object, so the terminal backoff is what stops a self-heal loop (trap T10).
+            // A policy violation is deterministic too (`T12.1`): the `AppProject` or the
+            // `Application` must change, and retrying only churns the work queue.
             Self::Scope(_)
             | Self::Invalid { .. }
             | Self::SyncConflict { .. }
-            | Self::OwnershipConflict { .. } => FailureClass::Terminal,
+            | Self::OwnershipConflict { .. }
+            | Self::Policy(_)
+            // An unusable ServiceAccount identity is deterministic too: the spec (or the
+            // controller's wiring) must change.
+            | Self::Impersonation(_)
+            // A malformed or ambiguous repository credential `Secret` is a configuration error
+            // only the operator can fix (`T12.4`); retrying would churn the queue while every
+            // clone failed the same way.
+            | Self::Credentials(_) => FailureClass::Terminal,
             // The next pass picks the replacement up where this one stopped.
             Self::SyncRetry { .. } => FailureClass::Retryable,
             Self::Diff(err) => classify_engine_error(err.is_retryable()),
@@ -529,6 +577,9 @@ pub trait StatusWriter: Send + Sync + 'static {
 /// [`StatusWriter`] backed by `Api::patch_status`.
 pub struct ApiStatusWriter {
     api: Api<Application>,
+    /// Client used to patch an `Application` in its **own** namespace (`T12.2`); `None` keeps the
+    /// fixed `api` (hermetic tests and the single-namespace default are unaffected).
+    client: Option<Client>,
     params: PatchParams,
 }
 
@@ -538,7 +589,23 @@ impl ApiStatusWriter {
     pub fn new(api: Api<Application>) -> Self {
         Self {
             api,
+            client: None,
             params: PatchParams::default(),
+        }
+    }
+
+    /// Patches `/status` in each `Application`'s own namespace (`T12.2`).
+    #[must_use]
+    pub fn with_client(mut self, client: Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// The `Application` API for `app`'s own namespace.
+    fn api_for(&self, app: &Application) -> Api<Application> {
+        match (self.client.as_ref(), app.namespace()) {
+            (Some(client), Some(namespace)) => Api::namespaced(client.clone(), &namespace),
+            _ => self.api.clone(),
         }
     }
 }
@@ -568,7 +635,7 @@ impl StatusWriter for ApiStatusWriter {
             let body = status_patch_body(&status)?;
             // Merge patch on the `/status` subresource: only the fields we send are
             // updated, so Phase 06+ fields written by another pass are preserved.
-            self.api
+            self.api_for(app)
                 .patch_status(&name, &self.params, &Patch::Merge(&body))
                 .await?;
             Ok(())
@@ -622,6 +689,13 @@ fn status_patch_body(status: &ApplicationStatus) -> Result<serde_json::Value, Re
 /// Shared controller state handed to every reconcile.
 pub struct ReconcileContext {
     apps_api: Api<Application>,
+    /// Client used to target an `Application`'s **own** namespace (`T12.2`).
+    ///
+    /// With `--application-namespaces` the controller may reconcile `Application` objects outside
+    /// the control-plane namespace, and the finalizer helper has to patch the object it was called
+    /// with — in that object's namespace. `None` (the hermetic tests) keeps the single fixed
+    /// `apps_api`.
+    client: Option<Client>,
     pipeline: Arc<dyn SyncPipeline>,
     status: Arc<dyn StatusWriter>,
     backoff: BackoffTracker,
@@ -637,16 +711,33 @@ impl ReconcileContext {
     ) -> Self {
         Self {
             apps_api,
+            client: None,
             pipeline,
             status,
             backoff: BackoffTracker::new(),
         }
     }
 
-    /// The namespaced `Application` API used by the finalizer helper.
+    /// Resolves the `Application` API per object namespace instead of a fixed one (`T12.2`).
     #[must_use]
-    pub fn apps_api(&self) -> &Api<Application> {
-        &self.apps_api
+    pub fn with_client(mut self, client: Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// The `Application` API for `app`'s own namespace.
+    ///
+    /// This is the **only** way to reach the object: the finalizer helper and the `/status` writer
+    /// patch the object they were handed, so with `--application-namespaces` (`T12.2`) that object
+    /// may live outside the control-plane namespace. It falls back to the configured
+    /// `apps_api` only when no client is wired (hermetic tests) or when the object carries no
+    /// namespace (which the API server never returns for a namespaced kind).
+    #[must_use]
+    pub fn apps_api_for(&self, app: &Application) -> Api<Application> {
+        match (self.client.as_ref(), app.namespace()) {
+            (Some(client), Some(namespace)) => Api::namespaced(client.clone(), &namespace),
+            _ => self.apps_api.clone(),
+        }
     }
 
     /// The diff/sync pipeline.
@@ -772,6 +863,14 @@ pub fn failure_reason(err: &ReconcileError) -> &'static str {
         | ReconcileError::Live(LiveStateError::ScopeMismatch { .. }) => REASON_INVALID_SPEC,
         // A foreign owner is not a spec bug: `kubectl describe` must name the conflict.
         ReconcileError::OwnershipConflict { .. } => REASON_OWNERSHIP_CONFLICT,
+        // Nor is a project denial: it is a tenancy decision, and the message names the field.
+        ReconcileError::Policy(_) => REASON_POLICY_VIOLATION,
+        // An unusable ServiceAccount identity is a spec problem (`T12.3`): the operator has to fix
+        // `spec.serviceAccountName`, `spec.destination.namespace`, or the controller's RBAC.
+        ReconcileError::Impersonation(_) => REASON_INVALID_SPEC,
+        // An unusable repository credential `Secret` is a spec/configuration problem too (`T12.4`):
+        // the operator has to fix the `Secret` named in the message, and no retry can do that.
+        ReconcileError::Credentials(_) => REASON_INVALID_SPEC,
         _ => REASON_SYNC_ERROR,
     }
 }
@@ -1146,7 +1245,9 @@ async fn reconcile_inner(
     ctx: Arc<ReconcileContext>,
 ) -> Result<Action, ControllerError> {
     let key = object_key(&app);
-    let api = ctx.apps_api.clone();
+    // The finalizer helper patches the object it was handed, so it must use that object's own
+    // namespace: a tenant `Application` (`T12.2`) does not live in the control-plane namespace.
+    let api = ctx.apps_api_for(&app);
     let inner_ctx = ctx.clone();
 
     let result = finalizer::finalizer(&api, FINALIZER, app.clone(), move |event| {
@@ -1646,6 +1747,175 @@ mod tests {
                 gvk: "example.com/v1/Widget".to_owned(),
             })),
             REASON_INVALID_SPEC
+        );
+        // A project denial is its own condition reason: it is a tenancy decision, not a spec typo.
+        let policy =
+            ReconcileError::Policy(ferriscd_engine::policy::PolicyError::ProjectNotFound {
+                project: "payments".to_owned(),
+                namespace: "ferriscd-system".to_owned(),
+                application: "ferriscd-system/demo".to_owned(),
+            });
+        assert_eq!(failure_reason(&policy), REASON_POLICY_VIOLATION);
+        assert_eq!(policy.failure_class(), FailureClass::Terminal);
+        assert!(!policy.is_already_deleted());
+        assert!(
+            policy.partial_status().is_none(),
+            "a policy denial happens before any mutation, so there is no inventory to persist"
+        );
+
+        // `T12.3`: an unusable ServiceAccount identity is a spec problem, and it is just as
+        // terminal — the alternative (deploying as the controller) is a privilege escalation.
+        let impersonation = ReconcileError::Impersonation(
+            crate::impersonation::ImpersonationError::InvalidServiceAccountName {
+                service_account: "Deployer".to_owned(),
+            },
+        );
+        assert_eq!(failure_reason(&impersonation), REASON_INVALID_SPEC);
+        assert_eq!(impersonation.failure_class(), FailureClass::Terminal);
+        assert!(!impersonation.is_already_deleted());
+        assert!(
+            impersonation.partial_status().is_none(),
+            "an impersonation refusal happens before any mutation"
+        );
+        assert!(
+            impersonation.to_string().contains("Deployer"),
+            "the message must name the rejected name: {impersonation}"
+        );
+
+        // `T12.4`: an unusable repository credential `Secret` is the operator's configuration to
+        // fix, so it gets the spec reason instead of the generic `SyncError` (finding M-5).
+        let credentials =
+            ReconcileError::Credentials(crate::credentials::CredentialError::Malformed {
+                secret: "repo-creds".to_owned(),
+                namespace: "ferriscd-system".to_owned(),
+                reason: "both password and token are set".to_owned(),
+            });
+        assert_eq!(failure_reason(&credentials), REASON_INVALID_SPEC);
+        assert_eq!(credentials.failure_class(), FailureClass::Terminal);
+        assert!(!credentials.is_already_deleted());
+        assert!(
+            credentials.partial_status().is_none(),
+            "a credential error happens before the clone, so there is no inventory to persist"
+        );
+        // The offending `Secret` is named; no credential value is (there is none in the error).
+        assert!(
+            credentials.to_string().contains("repo-creds"),
+            "{credentials}"
+        );
+    }
+
+    /// **`T12.3` trap guard:** refusing an `Application` because its `ServiceAccount` cannot be
+    /// impersonated must behave exactly like a policy denial: `Ready=False` with an actionable
+    /// reason, and the previous good inventory untouched.
+    #[tokio::test]
+    async fn an_impersonation_refusal_fails_the_reconcile_without_touching_the_inventory() {
+        let mut app = application(&[]);
+        let mut status = ApplicationStatus {
+            inventory: vec![ferriscd_crd::InventoryEntry::new(
+                "/ConfigMap/payments/kept",
+                "v1",
+            )],
+            ..ApplicationStatus::default()
+        };
+        status.observed_generation = Some(1);
+        app.status = Some(status);
+        app.metadata.generation = Some(2);
+        let pipeline = FakePipeline::failing(|| {
+            ReconcileError::Impersonation(crate::impersonation::ImpersonationError::NotWired {
+                service_account: "system:serviceaccount:payments:deployer".to_owned(),
+            })
+        });
+        let writer = RecordingStatusWriter::default();
+
+        let err = apply_once(&app, &pipeline, &writer)
+            .await
+            .expect_err("a refusal must fail the reconcile");
+        assert!(matches!(err, ReconcileError::Impersonation(_)), "{err:?}");
+
+        let patched = writer.patches();
+        assert_eq!(
+            patched.len(),
+            1,
+            "the always-update-status contract holds for this failure class too"
+        );
+        let status = &patched[0];
+        assert_eq!(status.observed_generation, Some(2));
+        let ready = status
+            .condition(CONDITION_READY)
+            .expect("a Ready condition must be written");
+        assert_eq!(ready.status, ConditionStatus::False);
+        assert_eq!(ready.reason, REASON_INVALID_SPEC);
+        assert!(
+            ready
+                .message
+                .contains("system:serviceaccount:payments:deployer"),
+            "the operator must see which identity was refused: {}",
+            ready.message
+        );
+        assert_eq!(
+            status.inventory,
+            vec![ferriscd_crd::InventoryEntry::new(
+                "/ConfigMap/payments/kept",
+                "v1"
+            )],
+            "a refusal must never corrupt the inventory of the last good pass"
+        );
+        assert!(
+            status.sync.is_none(),
+            "a refusal must not claim a sync state it never reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_denial_fails_the_reconcile_without_touching_the_inventory() {
+        // `T12.1`: a denial must never look like a successful sync, and it must not corrupt the
+        // crash-safe inventory of a previous good pass.
+        let mut app = application(&[]);
+        let mut status = ApplicationStatus {
+            inventory: vec![ferriscd_crd::InventoryEntry::new(
+                "/ConfigMap/payments/kept",
+                "v1",
+            )],
+            ..ApplicationStatus::default()
+        };
+        status.observed_generation = Some(1);
+        app.status = Some(status);
+        app.metadata.generation = Some(2);
+        let pipeline = FakePipeline::failing(|| {
+            ReconcileError::Policy(ferriscd_engine::policy::PolicyError::SourceRepoNotAllowed {
+                application: "ferriscd-system/demo".to_owned(),
+                project: "payments".to_owned(),
+                repo_url: "https://github.com/evil/demo.git".to_owned(),
+            })
+        });
+        let writer = RecordingStatusWriter::default();
+
+        let err = apply_once(&app, &pipeline, &writer)
+            .await
+            .expect_err("a policy denial must fail the reconcile");
+        assert!(matches!(err, ReconcileError::Policy(_)), "{err:?}");
+
+        let patched = writer.patches();
+        assert_eq!(patched.len(), 1, "the always-update-status contract holds");
+        let status = &patched[0];
+        assert_eq!(status.observed_generation, Some(2));
+        let ready = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .expect("a Ready condition must be written");
+        assert_eq!(ready.reason, REASON_POLICY_VIOLATION);
+        assert_eq!(
+            status.inventory,
+            vec![ferriscd_crd::InventoryEntry::new(
+                "/ConfigMap/payments/kept",
+                "v1"
+            )],
+            "the inventory of the last good pass must survive a denial"
+        );
+        assert!(
+            status.sync.is_none(),
+            "a denial must not claim a sync state it never reached"
         );
     }
 

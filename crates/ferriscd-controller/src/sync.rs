@@ -23,8 +23,11 @@
 //! | Hooks | `crate::hooks`: created with `Api::create` (so `generateName` works), tracked in `status.operationState.activeHooks`, reaped by their delete policy, never in `status.inventory` (`T10.3`/`T10.4`) |
 //! | Operation state | `ferriscd_engine::sync::SyncMachine`: `PreSync` -> `Sync(wave)` -> `PostSync` -> `Succeeded`, persisted before the requeue, 5 s while waiting, 10 min timeouts (`T10.1`) |
 //! | History & rollback | `ferriscd_engine::sync::history`: bounded `status.history`, and `{"rollback":{"id":N}}` pinned before the diff gate with automation disabled (`T10.5`) |
-//! | Destination clusters | `in-cluster` only; anything else is rejected (`T12.x` credentials) |
-//! | Git credentials | anonymous only (`T12.x`) |
+//! | Tenancy policy | `ferriscd_engine::policy::AppProjectPolicy`: the referenced `AppProject` is read from the control-plane namespace and enforced **before** the repository is resolved, then re-checked on **every** rendered resource after scope normalization (`T12.1`) |
+//! | Application namespaces | `--application-namespaces` widens the watch (`T12.2`), and a tenant `Application` is refused unless its project lists its namespace and it names its own authorized `serviceAccountName` |
+//! | Impersonation | `crate::impersonation` (`T12.3`): an `Application` with `spec.serviceAccountName` deploys as that ServiceAccount in `spec.destination.namespace` — live reads, `dryRun=All` diffs, applies, deletes/hooks and the cascade cleanup all run as it — while the `Application`'s own `/status` and finalizer stay with the controller |
+//! | Destination clusters | `in-cluster` only; anything else is rejected (remote clusters and their per-cluster credentials are `T13.1`/`T12.4`) |
+//! | Git credentials | `ferriscd.io/secret-type=repository` Secrets in the control-plane namespace (`T12.4`): exact URL or longest-prefix match, one scoped label-filtered list per resolve, no match is anonymous |
 //! | Health | evaluated from the pass-level live read on **every** pass (including a `Skip`), into `status.health` + `status.resources`, and it is what the wave gate waits on (`T09.5`, `T10.2`) |
 //!
 //! Blocking work never runs on a Tokio worker: manifest file I/O and YAML parsing run in
@@ -98,6 +101,7 @@ use ferriscd_engine::manifest::{
     self, DesiredResource, ManifestLoaderConfig, RenderContext, RenderPipeline, RendererBinaries,
     ResourceKey,
 };
+use ferriscd_engine::policy::{AppProjectPolicy, ApplicationScope, PolicyError};
 use ferriscd_engine::repo::{GitSource, RepoCache, RepoCredentials, RepoUrlPolicy};
 use ferriscd_engine::sync::{
     DEFAULT_REQUEUE_AFTER, OrphanCandidate, OrphanOwnership, PlanRequest, RollbackDecision,
@@ -111,12 +115,17 @@ use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParam
 use tracing::warn;
 
 use crate::controller::FailureClass;
+use crate::credentials::CredentialSource;
 use crate::discovery::DiscoveryCache;
 use crate::dry_run::{DryRunApi, DryRunEvaluator};
 use crate::hooks::{self, HookCluster, HookRun};
+use crate::impersonation::{
+    ClusterAccess, ClusterIdentity, Impersonation, ImpersonationError, ImpersonationSource,
+};
 use crate::live_state::{
     ClusterStateReader, LiveObjectSource, LiveState, LiveStateMap, TrackingOwner, plan_fetch,
 };
+use crate::project::ProjectSource;
 use crate::prune::{OwnershipVerifiedPruner, PruneResult};
 use crate::reconcile::{
     ApplyOutcome, CleanupMode, CleanupOutcome, REASON_PENDING, REASON_SYNC_SKIPPED, ReconcileError,
@@ -299,6 +308,10 @@ pub trait Applier: Send + Sync + 'static {
     }
 
     /// Patches the `Application`'s own object (`spec`/`metadata`, never `/status`).
+    ///
+    /// Deliberately **not** impersonated (`T12.3`): the object is the tenant's `Application` CR,
+    /// which the tenant's ServiceAccount typically cannot write, and the controller must always be
+    /// able to record a rollback (`T10.5`) even when the destination is unavailable.
     fn patch_application<'a>(
         &'a self,
         _request: ApplicationPatch<'a>,
@@ -474,6 +487,9 @@ pub fn apply_body(object: &DynamicObject) -> DynamicObject {
 /// Everything one pass needs once the diff gate has decided (`T08.2`, `T10.2`).
 struct PassRequest<'a> {
     app: &'a Application,
+    /// The cluster access this pass acts through (`T12.3`): the pipeline's own seams for a
+    /// controller-identity `Application`, the pooled impersonated client for a tenant one.
+    access: ClusterAccess,
     owner: &'a TrackingOwner,
     revision: &'a str,
     bundle: &'a BundleWaves,
@@ -580,6 +596,21 @@ pub struct InventorySyncPipeline {
     execution_policy: ExecutionPolicy,
     /// Phase 10 wave/hook state machine (timeouts, wave gate, requeue hint).
     machine: SyncMachine,
+    /// `T12.1`: reads the `AppProject` an `Application` references. `None` is a wiring bug and
+    /// refuses every sync (fail closed) — policy is never silently skipped.
+    project_source: Option<Arc<dyn ProjectSource>>,
+    /// `T12.2`: which namespaces may host `Application` objects; the safe default is the
+    /// control-plane namespace only.
+    application_scope: ApplicationScope,
+    /// `T12.3`: how an `Application`'s `serviceAccountName` is turned into cluster access. `None`
+    /// means impersonation is not wired, and an `Application` that asks for it is refused rather
+    /// than silently deployed with the controller's own identity.
+    impersonation: Option<Arc<dyn ImpersonationSource>>,
+    /// `T12.4`: how a repository URL is turned into `RepoCredentials`. `None` — the default —
+    /// clones every repository anonymously, exactly as before `T12.4`; that stays correct for
+    /// public repositories, which is why a missing source is not an error (unlike a missing
+    /// [`ProjectSource`], which would disable multi-tenancy).
+    credentials: Option<Arc<dyn CredentialSource>>,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -593,6 +624,9 @@ impl std::fmt::Debug for InventorySyncPipeline {
             .field("url_policy", &self.url_policy)
             .field("health", &self.health)
             .field("health_config", &self.health_config)
+            .field("application_scope", &self.application_scope)
+            .field("impersonation", &self.impersonation.is_some())
+            .field("credentials", &self.credentials.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -625,6 +659,10 @@ impl InventorySyncPipeline {
             health_config: HealthConfig::default(),
             execution_policy: ExecutionPolicy::default(),
             machine: SyncMachine::default(),
+            project_source: None,
+            application_scope: ApplicationScope::default(),
+            impersonation: None,
+            credentials: None,
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -649,6 +687,124 @@ impl InventorySyncPipeline {
     pub fn with_url_policy(mut self, policy: RepoUrlPolicy) -> Self {
         self.url_policy = policy;
         self
+    }
+
+    /// Wires the `AppProject` reader the policy enforcer uses (`T12.1`).
+    ///
+    /// Without one the pipeline refuses every sync (`Ready=False`): a missing project source is a
+    /// wiring bug, and treating it as "permissive" would silently disable multi-tenancy.
+    #[must_use]
+    pub fn with_project_source(mut self, source: Arc<dyn ProjectSource>) -> Self {
+        self.project_source = Some(source);
+        self
+    }
+
+    /// Sets the namespaces that may host `Application` objects (`T12.2`).
+    ///
+    /// The safe default is [`ApplicationScope::default`] (`ferriscd-system` only); the controller
+    /// passes the same scope it watches, so the guard and the watch never disagree.
+    #[must_use]
+    pub fn with_application_scope(mut self, scope: ApplicationScope) -> Self {
+        self.application_scope = scope;
+        self
+    }
+
+    /// The namespace scope this pipeline enforces.
+    #[must_use]
+    pub fn application_scope(&self) -> &ApplicationScope {
+        &self.application_scope
+    }
+
+    /// Wires the pooled `ServiceAccount` impersonation seam (`T12.3`).
+    ///
+    /// Without it an `Application` that sets `spec.serviceAccountName` is **refused**
+    /// ([`ReconcileError::Impersonation`] via [`ImpersonationError::NotWired`]): deploying it with
+    /// the controller's own identity instead would hand a tenant the controller's privileges
+    /// (trap T12). `Application`s that name no `serviceAccountName` are unaffected.
+    #[must_use]
+    pub fn with_impersonation_source(mut self, source: Arc<dyn ImpersonationSource>) -> Self {
+        self.impersonation = Some(source);
+        self
+    }
+
+    /// Wires the Secret-backed repository credential store (`T12.4`).
+    ///
+    /// Without one every clone is anonymous — the pre-`T12.4` behaviour, which is still the right
+    /// answer for public repositories and therefore not an error. With one, an `Application`'s
+    /// `spec.source.git.repoUrl` is matched against the labeled
+    /// [`SecretCredentialStore`](crate::credentials::SecretCredentialStore) templates and the
+    /// result is handed to the Git client; a URL that matches nothing is `Anonymous`, and a
+    /// `Secret` that cannot be used is a **terminal** [`ReconcileError::Credentials`] (never a
+    /// silent fallback to anonymity).
+    #[must_use]
+    pub fn with_credential_source(mut self, source: Arc<dyn CredentialSource>) -> Self {
+        self.credentials = Some(source);
+        self
+    }
+
+    /// Resolves the credentials one repository is cloned with (`T12.4`).
+    ///
+    /// The lookup happens **after** the `AppProject` policy has authorized the repository URL
+    /// (`T12.1`), so a credential is never resolved for an `Application` the project does not
+    /// permit, and **before** the URL is fetched, so the clone never starts anonymously.
+    ///
+    /// # Errors
+    ///
+    /// [`ReconcileError::Credentials`] for an unusable `Secret` (terminal), and any API failure of
+    /// the namespaced read itself.
+    async fn credentials_for(&self, repo_url: &str) -> Result<RepoCredentials, ReconcileError> {
+        let Some(source) = self.credentials.as_deref() else {
+            return Ok(RepoCredentials::Anonymous);
+        };
+        let credentials = source.credentials_for(repo_url).await?;
+        tracing::debug!(
+            // Finding M4: this line and the `/status` message that may quote it go through the
+            // shared redaction helper — a Git remote routinely embeds a personal access token.
+            repo = %manifest::redact_repo_url(repo_url),
+            credentials = %credentials,
+            "resolved repository credentials"
+        );
+        Ok(credentials)
+    }
+
+    /// Resolves the cluster access one `Application` deploys through (`T12.3`).
+    ///
+    /// The `ServiceAccount` is resolved in `spec.destination.namespace` — never in the
+    /// `Application`'s own namespace (ADR-007) — and only after the caller has run
+    /// [`AppProjectPolicy::check_application`], i.e. after the project has authorized the
+    /// destination *and* the `ServiceAccount` name.
+    ///
+    /// # Errors
+    ///
+    /// [`ReconcileError::Impersonation`] for an invalid name, a forbidden group, or an
+    /// `Application` that asks for impersonation when none is wired. Every variant is terminal:
+    /// the alternative (falling back to the controller's identity) is a privilege escalation.
+    fn access_for(&self, app: &Application) -> Result<ClusterAccess, ReconcileError> {
+        let Some(impersonation) = Impersonation::for_application(app)? else {
+            // No `serviceAccountName`: the controller's own identity. `ClusterAccess::new` is two
+            // `Arc` clones, so the non-impersonated path is exactly what it was before `T12.3`.
+            return Ok(ClusterAccess::new(
+                ClusterIdentity::Controller,
+                self.applier.clone(),
+                self.reader.source().clone(),
+                self.dry_run.clone(),
+            ));
+        };
+        let Some(source) = self.impersonation.as_deref() else {
+            return Err(ReconcileError::Impersonation(
+                ImpersonationError::NotWired {
+                    service_account: impersonation.user().to_owned(),
+                },
+            ));
+        };
+        let access = source.access_for(&impersonation)?;
+        tracing::debug!(
+            app.namespace = %app.namespace().unwrap_or_default(),
+            app.name = %app.name_any(),
+            identity = %access.identity(),
+            "reconciling as an impersonated ServiceAccount"
+        );
+        Ok(access)
     }
 
     /// Overrides the manifest loader budgets.
@@ -750,8 +906,8 @@ impl InventorySyncPipeline {
             return Err(ReconcileError::Invalid {
                 message: format!(
                     "spec.destination.cluster '{}' is not supported yet: only '{IN_CLUSTER}' can \
-                     be synced (remote destination clusters arrive with cluster credentials, \
-                     Phase 12)",
+                     be synced (remote destination clusters arrive with the cluster registry and \
+                     per-cluster credentials in T13.1)",
                     app.spec.destination.cluster
                 ),
             });
@@ -762,6 +918,20 @@ impl InventorySyncPipeline {
                       can be verified"
                 .to_owned(),
         })?;
+
+        // --- Phase 12 (`T12.1`/`T12.2`): tenancy policy, *before* anything is cloned ------
+        // The project is read from the control-plane namespace and enforced here, before the
+        // repository is resolved: an `Application` the project does not permit must never cause a
+        // fetch, a render, a `dryRun=All` PATCH, an apply, or a prune. A missing project is a
+        // terminal denial, never an implicit "allow".
+        let policy = self.load_project_policy(app).await?;
+        policy.check_application(app, &self.application_scope)?;
+        // `T12.3`: the project has now authorized `(destination.cluster,
+        // destination.namespace)` *and* the `serviceAccountName`, so this is the first point at
+        // which the ServiceAccount may be resolved — in the destination namespace, never in the
+        // `Application`'s own namespace.
+        let access = self.access_for(app)?;
+
         let prev_inventory = status_inventory(app)?;
         let previous_status = app.status.clone().unwrap_or_default();
         let pass_started = now();
@@ -792,6 +962,14 @@ impl InventorySyncPipeline {
             .prepare(&mut resources, &app.spec.destination.namespace)
             .await?;
 
+        // `T12.1`: re-check **every** rendered resource on its *actual* scope. Scope normalization
+        // is what makes "namespaced vs cluster-scoped" and the effective namespace facts, so a
+        // manifest that hardcodes `metadata.namespace: kube-system` (preserved by Stage 2) or ships
+        // a `ClusterRoleBinding` is caught here — before the partition, the ownership stamp, the
+        // dry-run diff, the apply, and the prune. Hooks are covered too: they are created
+        // imperatively but they are still rendered resources.
+        policy.check_resources(&app.spec.destination.cluster, &resources)?;
+
         // --- Phase 10: hooks out of the desired state, permanent set into waves ------------
         // The partition is what keeps a hook out of `status.inventory`, the pruner's universe and
         // the drift diff (finding H2), so it happens before anything is stamped, planned or read.
@@ -816,7 +994,10 @@ impl InventorySyncPipeline {
                      tracked in status.inventory; refusing to sync (check spec.source.git.path \
                      and the repository contents). Set {ALLOW_EMPTY_DESIRED_ENV}=1 to allow \
                      pruning the entire inventory",
-                    app.spec.source.git.repo_url,
+                    // Finding M4: this message reaches `Application.status`, so the repository URL
+                    // is quoted through the shared redaction helper — a Git remote routinely
+                    // carries a personal access token.
+                    manifest::redact_repo_url(&app.spec.source.git.repo_url),
                     app.spec.source.git.path,
                     prev_inventory.len()
                 ),
@@ -824,8 +1005,8 @@ impl InventorySyncPipeline {
         }
 
         let requests = plan_fetch(&desired_inventory, &prev_inventory);
-        let live = self
-            .reader
+        let live = access
+            .reader()
             .fetch_live(
                 &requests,
                 &self.discovery,
@@ -856,7 +1037,13 @@ impl InventorySyncPipeline {
         let rules = IgnoreRuleSet::from_ignore_differences(&app.spec.ignore_differences);
         let invalid_ignore_pointers = report_invalid_pointers(&rules, &owner);
         let diffs = self
-            .evaluate_diff(bundle.hooks.permanent(), &orphan_keys, &live, &rules)
+            .evaluate_diff(
+                &access,
+                bundle.hooks.permanent(),
+                &orphan_keys,
+                &live,
+                &rules,
+            )
             .await?;
         let summary = DiffSummary::from_diffs(&diffs);
         let spec_hash = source_spec_hash(&app.spec).map_err(|err| ReconcileError::Invalid {
@@ -889,6 +1076,7 @@ impl InventorySyncPipeline {
         // --- Phase 08/10: execute -------------------------------------------------------
         let request = PassRequest {
             app,
+            access,
             owner: &owner,
             revision: &revision,
             bundle: &bundle,
@@ -1043,6 +1231,7 @@ impl InventorySyncPipeline {
     async fn run_single_pass(&self, request: &PassRequest<'_>) -> PassExecution {
         let (plan, execution) = self
             .execute_plan(
+                &request.access,
                 request.bundle.hooks.permanent(),
                 request.decision,
                 request.statuses,
@@ -1128,8 +1317,18 @@ impl InventorySyncPipeline {
         // 2. The hooks of the persisted step. Idempotent by construction: a hook that is already
         //    tracked is observed, never created again (finding H2).
         let step = self.machine.current_step(&state);
-        let hook_step =
-            hooks::run_step(self, step, &request.bundle.hooks, &state.active_hooks).await;
+        // Hooks are created and observed as the pass's identity, like every other workload call.
+        let hook_cluster = PassHooks {
+            pipeline: self,
+            access: &request.access,
+        };
+        let hook_step = hooks::run_step(
+            &hook_cluster,
+            step,
+            &request.bundle.hooks,
+            &state.active_hooks,
+        )
+        .await;
         // The records are merged **before** the error is inspected (finding H-NEW): a hook created
         // before the failure is only protected by its `activeHooks` record, and `apply_once` can
         // only persist the state the error carries. Merging afterwards would let the retry create a
@@ -1210,6 +1409,7 @@ impl InventorySyncPipeline {
                 && request.options.create_namespace;
             let (plan, execution) = self
                 .execute_plan(
+                    &request.access,
                     &wave.resources,
                     forced_execute(request.decision),
                     request.statuses,
@@ -1260,6 +1460,7 @@ impl InventorySyncPipeline {
             prune_options.create_namespace = false;
             let (plan, execution) = self
                 .execute_plan(
+                    &request.access,
                     &[],
                     SyncDecision::Execute(SyncTrigger::PruneRequired),
                     request.statuses,
@@ -1288,6 +1489,7 @@ impl InventorySyncPipeline {
     #[allow(clippy::too_many_arguments)]
     async fn execute_plan(
         &self,
+        access: &ClusterAccess,
         desired: &[DesiredResource],
         decision: SyncDecision,
         statuses: &BTreeMap<ResourceKey, DiffStatus>,
@@ -1308,18 +1510,18 @@ impl InventorySyncPipeline {
             takeover_field_managers: options.takeover_field_managers.clone(),
             ..self.execution_policy.clone()
         };
-        let crd_status = LiveCrdStatusReader::new(self.reader.clone());
+        let crd_status = LiveCrdStatusReader::new(access.reader().clone());
         let pruner = OwnershipVerifiedPruner::new(
-            self.applier.as_ref(),
-            &self.reader,
+            access.applier(),
+            access.reader(),
             &self.discovery,
             owner,
             options,
         );
         let execution = SyncExecutor::new(
-            self.applier.as_ref(),
+            access.applier(),
             &pruner,
-            &self.reader,
+            access.reader(),
             &self.discovery,
             &crd_status,
             owner,
@@ -1448,15 +1650,55 @@ impl InventorySyncPipeline {
     /// server is an error, never a guessed "synced": guessing would silently skip a needed apply.
     async fn evaluate_diff(
         &self,
+        access: &ClusterAccess,
         resources: &[DesiredResource],
         orphans: &[ResourceKey],
         live: &LiveStateMap,
         rules: &IgnoreRuleSet,
     ) -> Result<Vec<ResourceDiff>, ReconcileError> {
-        DryRunEvaluator::with_api(self.dry_run.clone(), self.discovery.clone())
+        // The `dryRun=All` predictions run as the pass's identity (`T12.3`): a tenant's diff must
+        // be rejected by the API server exactly like its applies would be, or the controller would
+        // report `Synced` for a resource it cannot actually write.
+        DryRunEvaluator::with_api(access.dry_run_arc(), self.discovery.clone())
             .evaluate(resources, orphans, live, rules)
             .await
             .map_err(ReconcileError::Diff)
+    }
+
+    /// Resolves the `AppProject` an `Application` references and builds its policy (`T12.1`).
+    ///
+    /// The project is fetched once per reconcile from the control-plane namespace (a scoped read,
+    /// never a cluster-wide informer) and reduced to a pure [`AppProjectPolicy`] the engine can
+    /// enforce offline.
+    ///
+    /// # Errors
+    ///
+    /// * [`PolicyError::ProjectNotFound`] when the referenced project does not exist — terminal, so
+    ///   an operator sees "create the AppProject" instead of an unexplained refusal.
+    /// * [`ReconcileError::Invalid`] when no project source is wired at all: a pipeline that cannot
+    ///   enforce policy must not sync, and must not pretend the project is permissive.
+    /// * Any API failure of the fetch itself (retryable by classification).
+    async fn load_project_policy(
+        &self,
+        app: &Application,
+    ) -> Result<AppProjectPolicy, ReconcileError> {
+        let Some(source) = self.project_source.as_deref() else {
+            return Err(ReconcileError::Invalid {
+                message: "no AppProject source is wired into the sync pipeline, so AppProject \
+                          policy cannot be enforced; refusing to sync (wire `ApiProjectSource` \
+                          when building the pipeline)"
+                    .to_owned(),
+            });
+        };
+        let project = source.get(&app.spec.project).await?;
+        let Some(project) = project else {
+            return Err(ReconcileError::Policy(PolicyError::ProjectNotFound {
+                project: app.spec.project.clone(),
+                namespace: self.application_scope.control_plane().to_owned(),
+                application: format!("{}/{}", app.namespace().unwrap_or_default(), app.name_any()),
+            }));
+        };
+        Ok(AppProjectPolicy::from_project(&project))
     }
 
     /// Resolves the revision and renders the desired manifest set.
@@ -1486,8 +1728,10 @@ impl InventorySyncPipeline {
         // bare local paths, so a misconfigured `Application` cannot read the pod's filesystem.
         source.validate(self.url_policy)?;
 
-        // Phase 12 reads credentials from a `RepoCredentials` Secret; v0.2 is anonymous only.
-        let credentials = RepoCredentials::Anonymous;
+        // `T12.4`: the credentials come from a `ferriscd.io/secret-type=repository` Secret in the
+        // control-plane namespace. No match is `Anonymous` (public repositories keep working);
+        // an unusable Secret is a terminal error instead of a silent anonymous clone.
+        let credentials = self.credentials_for(&source.repo_url).await?;
         let resolved = self.repos.resolve_revision(&source, &credentials).await?;
         let checkout = self
             .repos
@@ -1564,6 +1808,34 @@ impl InventorySyncPipeline {
     /// an `Application` can therefore never delete more than a prune would — every delete is
     /// re-verified against `ferriscd.io/tracking-id` on a freshly read object, and the
     /// `pruneCRDs`/`pruneNamespaces`/`ferriscd.io/prune=false` rails apply unchanged.
+    ///
+    /// # Intentional policy bypass (finding N2)
+    ///
+    /// Unlike [`Self::sync_apply`], this path does **not** evaluate the whole
+    /// [`AppProjectPolicy`](ferriscd_engine::policy::AppProjectPolicy): it runs while the
+    /// `Application` is being deleted, and refusing here would wedge the object in
+    /// `Terminating` (finding C5) for a project that — say — dropped the `sourceNamespaces` entry
+    /// the `Application` still lives in. The bypass is safe because cleanup is strictly narrower
+    /// than a sync in every other respect:
+    ///
+    /// * it only ever deletes keys that are in **this** `Application`'s `status.inventory`, i.e.
+    ///   objects FerrisCD itself applied and stamped;
+    /// * every delete re-reads the live object and re-verifies `ferriscd.io/tracking-id` before
+    ///   issuing it (`OwnershipVerifiedPruner`), so a foreign object is retained, never deleted;
+    /// * the `pruneCRDs`/`pruneNamespaces`/`ferriscd.io/prune=false` rails still apply;
+    /// * it runs with the `Application`'s own identity (`T12.3`), so the API server's RBAC still
+    ///   bounds what a tenant can cascade.
+    ///
+    /// A denied project therefore cannot be used to delete anything a permitted one could not.
+    ///
+    /// **One exception: the ServiceAccount allow-list (finding H1).** `spec.allowedServiceAccounts`
+    /// is not a "may this `Application` deploy?" question — it decides *as whom* the deletes are
+    /// issued. A tenant could otherwise leave an unauthorized `spec.serviceAccountName` on the
+    /// object, delete the `Application`, and cascade with an identity no project ever authorized
+    /// (or with an identity it retargeted a moment earlier). The check therefore runs here too,
+    /// **before** the identity is resolved: a denial retains the finalizer and fails the cleanup,
+    /// so nothing is ever deleted by an unauthorized identity. `ferriscd.io/force-delete: "true"`
+    /// stays the documented escape hatch for an operator who needs the object gone anyway.
     async fn cleanup_inner(
         &self,
         app: &Application,
@@ -1583,9 +1855,18 @@ impl InventorySyncPipeline {
         }
 
         let options = app.spec.sync_options();
+        // Finding H1: authorize the identity *before* resolving it. With no `serviceAccountName`
+        // this is a no-op (the controller identity the cascade has always used).
+        self.check_cascade_service_account(app).await?;
+        // `T12.3`: the cascade runs as the *Application's* identity, like the sync that created
+        // the objects — a tenant `Application` must not be able to use the controller's privileges
+        // to delete (or to fail to delete) its own namespace's resources. `access_for` is the same
+        // resolution the sync path uses, so an unusable ServiceAccount fails here too (retaining
+        // the finalizer, with `ferriscd.io/force-delete` as the documented escape hatch).
+        let access = self.access_for(app)?;
         let pruner = OwnershipVerifiedPruner::new(
-            self.applier.as_ref(),
-            &self.reader,
+            access.applier(),
+            access.reader(),
             &self.discovery,
             &owner,
             &options,
@@ -1606,6 +1887,49 @@ impl InventorySyncPipeline {
         }
         Ok(CleanupOutcome::Completed)
     }
+
+    /// Enforces `AppProject.spec.allowedServiceAccounts` before the cascade resolves an identity
+    /// (finding H1).
+    ///
+    /// The project is read from the control-plane namespace, exactly like the sync path, and the
+    /// ServiceAccount is compared in `spec.destination.namespace` (ADR-007). An `Application` that
+    /// names no `serviceAccountName` is unaffected: it cascades with the controller identity, as it
+    /// always has, and there is no tenant identity to authorize.
+    ///
+    /// A denial is **terminal** ([`ReconcileError::Policy`]) so the reconcile stops, the finalizer
+    /// is retained, and the operator sees `Ready=False, reason=PolicyViolation` naming the
+    /// ServiceAccount. `ferriscd.io/force-delete: "true"` releases the finalizer without pruning
+    /// (`cleanup_disposition`), which is the documented way out of a project that no longer
+    /// authorizes the identity an `Application` is stuck with.
+    ///
+    /// # Errors
+    ///
+    /// [`ReconcileError::Policy`] when the project does not list the ServiceAccount,
+    /// [`ReconcileError::Policy`] (`ProjectNotFound`) when the project itself is gone, and any API
+    /// failure of the project read (retryable).
+    async fn check_cascade_service_account(&self, app: &Application) -> Result<(), ReconcileError> {
+        let service_account = app
+            .spec
+            .service_account_name
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
+        if service_account.is_empty() {
+            return Ok(());
+        }
+        let policy = self.load_project_policy(app).await?;
+        if policy.allows_service_account(&app.spec.destination.namespace, service_account) {
+            return Ok(());
+        }
+        Err(ReconcileError::Policy(
+            PolicyError::ServiceAccountNotAllowed {
+                application: format!("{}/{}", app.namespace().unwrap_or_default(), app.name_any()),
+                project: app.spec.project.clone(),
+                namespace: app.spec.destination.namespace.trim().to_owned(),
+                service_account: service_account.to_owned(),
+            },
+        ))
+    }
 }
 
 impl SyncPipeline for InventorySyncPipeline {
@@ -1625,14 +1949,23 @@ impl SyncPipeline for InventorySyncPipeline {
     }
 }
 
-/// Implements the [`HookCluster`] seam over the pipeline's own collaborators.
+/// Implements the [`HookCluster`] seam for **one pass**, over that pass's cluster access.
 ///
 /// Hooks are created with `Api::create` (see [`Applier::create`]) and are **not** stamped with a
 /// `ferriscd.io/tracking-id`: their lifetime belongs to their delete policy, not to the pruner. The
 /// health read deliberately goes through [`ClusterStateReader::get_object`] (no ownership
 /// classification), because a hook object is neither `OwnedBySelf` nor foreign — it is simply not
 /// part of Git.
-impl HookCluster for InventorySyncPipeline {
+///
+/// It is a wrapper rather than an implementation on the pipeline because a hook must be created and
+/// observed as the pass's identity (`T12.3`): a `PreSync` migration Job of a tenant `Application`
+/// runs as that tenant's ServiceAccount, not as the controller.
+struct PassHooks<'a> {
+    pipeline: &'a InventorySyncPipeline,
+    access: &'a ClusterAccess,
+}
+
+impl HookCluster for PassHooks<'_> {
     fn create_hook<'a>(
         &'a self,
         resource: &'a DesiredResource,
@@ -1643,8 +1976,9 @@ impl HookCluster for InventorySyncPipeline {
                 &resource.gvk.version,
                 &resource.gvk.kind,
             );
-            let (api_resource, _) = self.discovery.resolve(&gvk).await?;
-            self.applier
+            let (api_resource, _) = self.pipeline.discovery.resolve(&gvk).await?;
+            self.access
+                .applier()
                 .create(CreateRequest {
                     resource,
                     api_resource: &api_resource,
@@ -1660,8 +1994,12 @@ impl HookCluster for InventorySyncPipeline {
         version_hint: &'a str,
     ) -> BoxFuture<'a, Result<DeleteOutcome, ReconcileError>> {
         Box::pin(async move {
-            let api_resource = self.resolve_hook_resource(key, version_hint).await?;
-            self.applier
+            let api_resource = self
+                .pipeline
+                .resolve_hook_resource(key, version_hint)
+                .await?;
+            self.access
+                .applier()
                 .delete(DeleteRequest {
                     key,
                     api_resource: &api_resource,
@@ -1677,16 +2015,21 @@ impl HookCluster for InventorySyncPipeline {
         version_hint: &'a str,
     ) -> BoxFuture<'a, Result<Option<HealthStatus>, ReconcileError>> {
         Box::pin(async move {
-            let api_resource = self.resolve_hook_resource(key, version_hint).await?;
+            let api_resource = self
+                .pipeline
+                .resolve_hook_resource(key, version_hint)
+                .await?;
             let object = self
-                .reader
+                .access
+                .reader()
                 .get_object(&api_resource, key.namespace.as_deref(), &key.name)
                 .await?;
             let Some(object) = object else {
                 return Ok(None);
             };
             let inputs = [HealthInput::live(key, &object)];
-            let summary = health::assess(&inputs, &self.health, &self.health_config);
+            let summary =
+                health::assess(&inputs, &self.pipeline.health, &self.pipeline.health_config);
             Ok(summary.resources.first().map(|entry| entry.health.status))
         })
     }
@@ -2397,17 +2740,19 @@ mod tests {
         ApplicationStatus, CONDITION_READY, Condition, ConditionStatus, HealthState, HealthStatus,
     };
     use ferriscd_crd::{
-        ApplicationSpec, AutomatedSyncPolicy, DestinationSpec, GitSourceSpec, RendererSpec,
-        SourceSpec, SyncOptions, SyncPolicy,
+        AppProject, ApplicationSpec, AutomatedSyncPolicy, DestinationSpec, GitSourceSpec,
+        RendererSpec, SourceSpec, SyncOptions, SyncPolicy,
     };
     use ferriscd_engine::health::Observation;
     use ferriscd_engine::manifest::GroupVersionKind;
+    use ferriscd_engine::policy::ApplicationNamespaces;
     use ferriscd_engine::repo::{FakeGitClient, FakeGitClientConfig, RepoCacheConfig};
     use kube::api::GroupVersionKind as KubeGvk;
     use kube::discovery::{ApiCapabilities, Scope};
     use serde_json::json;
 
     use super::*;
+    use crate::credentials::CredentialError;
     use crate::discovery::{DiscoveryError, DiscoveryFuture, DiscoverySnapshot, DiscoverySource};
     use crate::dry_run::{DryRunFuture, DryRunOutcome, DryRunTarget};
     use crate::live_state::{FetchTarget, LiveFuture};
@@ -2940,6 +3285,9 @@ mod tests {
                 ("apps", "Deployment", Scope::Namespaced),
                 // Lifecycle hooks (T10.3) are `Job`s: scope normalization has to resolve them.
                 ("batch", "Job", Scope::Namespaced),
+                // `T12.1` trap guard: an unauthorized cluster-scoped kind must be resolvable (so the
+                // policy, not a scope lookup, is what rejects it).
+                ("rbac.authorization.k8s.io", "ClusterRole", Scope::Cluster),
                 (scope::APIEXTENSIONS_GROUP, scope::CRD_KIND, Scope::Cluster),
             ] {
                 snapshot = with_resource(snapshot, group, kind, scope);
@@ -3187,9 +3535,217 @@ mod tests {
         cluster: Arc<FakeCluster>,
         discovery: Arc<FakeDiscovery>,
         dry_run: Arc<FakeDryRun>,
+        /// Scripted `AppProject` store wired into the pipeline (`T12.1`).
+        projects: Arc<FakeProjectSource>,
+        /// Scripted `T12.3` identity seam (the pipeline may be wired without one).
+        impersonation: Option<Arc<FakeImpersonationSource>>,
         pipeline: InventorySyncPipeline,
         repo_url: String,
         _temp: tempfile::TempDir,
+    }
+
+    /// The shipped `default` `AppProject` (`deploy/manifests/default-project.yaml`).
+    ///
+    /// Using the real manifest keeps the fixtures honest: every pre-existing sync test now runs
+    /// through the *actual* single-tenant default project, so the manifest cannot drift away from
+    /// what the policy enforcer accepts.
+    const DEFAULT_PROJECT_MANIFEST: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/manifests/default-project.yaml"
+    ));
+
+    /// A project that permits any repository and only the `payments` destination, with a narrow
+    /// cluster-scoped allow-list (no `ClusterRole`, no `ClusterRoleBinding`).
+    fn payments_only_project(name: &str) -> AppProject {
+        serde_saphyr::from_str(&format!(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: {name}
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - "*"
+  sourceNamespaces:
+    - ferriscd-system
+    - team-a
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+  clusterResourceWhitelist:
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+"#
+        ))
+        .expect("test project must parse")
+    }
+
+    /// Scripted `AppProject` store: the `T12.1` fetch seam, without an API server.
+    #[derive(Default)]
+    struct FakeProjectSource {
+        projects: StdMutex<BTreeMap<String, AppProject>>,
+        /// Project names the pipeline looked up, in order.
+        reads: StdMutex<Vec<String>>,
+    }
+
+    impl FakeProjectSource {
+        fn with_project(self, project: AppProject) -> Self {
+            let name = project.name_any();
+            self.projects.lock().unwrap().insert(name, project);
+            self
+        }
+
+        fn reads(&self) -> Vec<String> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    impl ProjectSource for FakeProjectSource {
+        fn get<'a>(
+            &'a self,
+            name: &'a str,
+        ) -> BoxFuture<'a, Result<Option<AppProject>, ReconcileError>> {
+            self.reads.lock().unwrap().push(name.to_owned());
+            let project = self.projects.lock().unwrap().get(name).cloned();
+            Box::pin(async move { Ok(project) })
+        }
+    }
+
+    /// Scripted `T12.3` seam: resolves an impersonated identity onto the **same** fake cluster.
+    ///
+    /// The pass therefore behaves exactly as it would with the real pool — same live objects, same
+    /// applies, same dry-runs — while the identity it resolved is observable, which is what the
+    /// tests assert (and what proves the resolution order: policy first, identity second).
+    struct FakeImpersonationSource {
+        applier: Arc<dyn Applier>,
+        live: Arc<dyn LiveObjectSource>,
+        /// The impersonated identity's own dry-run recorder (see `build_fixture`).
+        dry_run: Arc<FakeDryRun>,
+        /// Impersonated users the pipeline resolved, in order.
+        identities: StdMutex<Vec<String>>,
+    }
+
+    impl FakeImpersonationSource {
+        fn identities(&self) -> Vec<String> {
+            self.identities.lock().unwrap().clone()
+        }
+
+        fn dry_runs(&self) -> usize {
+            self.dry_run.calls().len()
+        }
+    }
+
+    impl ImpersonationSource for FakeImpersonationSource {
+        fn access_for(
+            &self,
+            impersonation: &Impersonation,
+        ) -> Result<ClusterAccess, ReconcileError> {
+            self.identities
+                .lock()
+                .unwrap()
+                .push(impersonation.user().to_owned());
+            Ok(ClusterAccess::new(
+                ClusterIdentity::ServiceAccount(impersonation.clone()),
+                self.applier.clone(),
+                self.live.clone(),
+                self.dry_run.clone() as Arc<dyn DryRunApi>,
+            ))
+        }
+    }
+
+    /// Scripted [`CredentialSource`] (`T12.4`): answers per repository URL, records every lookup.
+    ///
+    /// The real store reads Kubernetes `Secret`s, which a hermetic test cannot do; this double
+    /// proves the *seam* — that `fetch_desired` asks it for the `Application`'s URL, hands the
+    /// answer to the Git client, and turns an unusable `Secret` into a terminal error instead of a
+    /// silent anonymous clone.
+    struct FakeCredentialSource {
+        /// Credentials returned for a matching URL key.
+        entries: BTreeMap<String, RepoCredentials>,
+        /// Credentials returned when no key matches (default: anonymous).
+        fallback: RepoCredentials,
+        /// When set, every lookup fails with this malformed-`Secret` reason.
+        malformed: Option<&'static str>,
+        /// Repository URLs looked up, in call order.
+        lookups: StdMutex<Vec<String>>,
+    }
+
+    impl Default for FakeCredentialSource {
+        fn default() -> Self {
+            Self {
+                entries: BTreeMap::new(),
+                fallback: RepoCredentials::Anonymous,
+                malformed: None,
+                lookups: StdMutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl FakeCredentialSource {
+        /// A source answering `credentials` for every URL.
+        fn returning(credentials: RepoCredentials) -> Self {
+            Self {
+                fallback: credentials,
+                ..Self::default()
+            }
+        }
+
+        /// A source whose every lookup fails like an unusable `Secret` does.
+        fn malformed(reason: &'static str) -> Self {
+            Self {
+                malformed: Some(reason),
+                ..Self::default()
+            }
+        }
+
+        /// Repository URLs this source was asked about, in call order.
+        fn lookups(&self) -> Vec<String> {
+            self.lookups.lock().unwrap().clone()
+        }
+    }
+
+    impl CredentialSource for FakeCredentialSource {
+        fn credentials_for<'a>(
+            &'a self,
+            repo_url: &'a str,
+        ) -> BoxFuture<'a, Result<RepoCredentials, ReconcileError>> {
+            Box::pin(async move {
+                self.lookups.lock().unwrap().push(repo_url.to_owned());
+                if let Some(reason) = self.malformed {
+                    return Err(ReconcileError::Credentials(CredentialError::Malformed {
+                        secret: "repo-creds".to_owned(),
+                        namespace: "ferriscd-system".to_owned(),
+                        reason: reason.to_owned(),
+                    }));
+                }
+                Ok(self
+                    .entries
+                    .get(repo_url)
+                    .cloned()
+                    .unwrap_or_else(|| self.fallback.clone()))
+            })
+        }
+    }
+
+    /// Whether a fixture wires the `T12.3` impersonation seam.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ImpersonationWiring {
+        /// Production wiring: an `Application` that names a ServiceAccount is impersonated.
+        Wired,
+        /// A pipeline with no pool: an `Application` that asks for impersonation must be refused.
+        NotWired,
+    }
+
+    fn default_project_source() -> FakeProjectSource {
+        let project: AppProject =
+            serde_saphyr::from_str(DEFAULT_PROJECT_MANIFEST).expect("default project must parse");
+        FakeProjectSource::default().with_project(project)
     }
 
     /// A parseable `metav1.Time` fixture.
@@ -3204,18 +3760,82 @@ mod tests {
     }
 
     fn fixture_with(cluster: FakeCluster, dry_run: FakeDryRun) -> Fixture {
-        build_fixture(cluster, dry_run, RendererBinaries::default())
+        build_fixture(
+            cluster,
+            dry_run,
+            RendererBinaries::default(),
+            default_project_source(),
+            None,
+            ImpersonationWiring::Wired,
+            None,
+        )
     }
 
     /// A fixture whose render pipeline executes `binaries` instead of the real tools.
     fn fixture_with_renderers(cluster: FakeCluster, binaries: RendererBinaries) -> Fixture {
-        build_fixture(cluster, FakeDryRun::default(), binaries)
+        build_fixture(
+            cluster,
+            FakeDryRun::default(),
+            binaries,
+            default_project_source(),
+            None,
+            ImpersonationWiring::Wired,
+            None,
+        )
+    }
+
+    /// A fixture whose pipeline enforces `projects` and `scope` (`T12.1`/`T12.2`) and wires the
+    /// impersonation seam (`T12.3`), like the production controller does.
+    fn fixture_with_policy(
+        cluster: FakeCluster,
+        projects: FakeProjectSource,
+        scope: ApplicationScope,
+    ) -> Fixture {
+        fixture_with_policy_and_impersonation(cluster, projects, scope, ImpersonationWiring::Wired)
+    }
+
+    /// The same fixture with an explicit impersonation wiring.
+    fn fixture_with_policy_and_impersonation(
+        cluster: FakeCluster,
+        projects: FakeProjectSource,
+        scope: ApplicationScope,
+        wiring: ImpersonationWiring,
+    ) -> Fixture {
+        build_fixture(
+            cluster,
+            FakeDryRun::default(),
+            RendererBinaries::default(),
+            projects,
+            Some(scope),
+            wiring,
+            None,
+        )
+    }
+
+    /// A fixture whose pipeline resolves Git credentials through `source` (`T12.4`).
+    fn fixture_with_credentials(
+        cluster: FakeCluster,
+        source: Arc<FakeCredentialSource>,
+    ) -> Fixture {
+        build_fixture(
+            cluster,
+            FakeDryRun::default(),
+            RendererBinaries::default(),
+            default_project_source(),
+            None,
+            ImpersonationWiring::Wired,
+            Some(source as Arc<dyn CredentialSource>),
+        )
     }
 
     fn build_fixture(
         cluster: FakeCluster,
         dry_run: FakeDryRun,
         binaries: RendererBinaries,
+        projects: FakeProjectSource,
+        scope: Option<ApplicationScope>,
+        wiring: ImpersonationWiring,
+        credentials: Option<Arc<dyn CredentialSource>>,
     ) -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let git = Arc::new(FakeGitClient::with_config(FakeGitClientConfig {
@@ -3225,32 +3845,66 @@ mod tests {
         let cluster = Arc::new(cluster);
         let discovery = Arc::new(FakeDiscovery::with_cluster_kinds());
         let dry_run = Arc::new(dry_run);
+        let projects = Arc::new(projects);
         let repos = Arc::new(RepoCache::new(
             git.clone(),
             RepoCacheConfig::new(temp.path().join("cache")),
         ));
+        let applier: Arc<dyn Applier> = Arc::new(FakeApplier {
+            cluster: cluster.clone(),
+            discovery: discovery.clone(),
+            crd_mode: cluster.crd_mode,
+        });
+        let live: Arc<dyn LiveObjectSource> = cluster.clone();
+        let impersonation = (wiring == ImpersonationWiring::Wired).then(|| {
+            Arc::new(FakeImpersonationSource {
+                applier: applier.clone(),
+                live: live.clone(),
+                // A *separate* recorder, so "the `dryRun=All` diff ran as the impersonated
+                // identity" is observable instead of indistinguishable from the controller's.
+                dry_run: Arc::new(FakeDryRun::default()),
+                identities: StdMutex::new(Vec::new()),
+            })
+        });
         let pipeline = InventorySyncPipeline::new(
             repos,
             cache(discovery.clone()),
-            cluster.clone(),
-            Arc::new(FakeApplier {
-                cluster: cluster.clone(),
-                discovery: discovery.clone(),
-                crd_mode: cluster.crd_mode,
-            }),
+            live,
+            applier,
             dry_run.clone(),
         )
         .with_url_policy(RepoUrlPolicy::AllowLocal)
         .with_renderer_binaries(binaries)
+        // `T12.1`: policy is enforced on every pass, so the fixture wires the real `default`
+        // project. Tests that need a narrower or missing project replace the store.
+        .with_project_source(projects.clone())
         // Hermetic: a scripted cluster never needs a bounded wait, and `without_waits` keeps the
         // suite free of timing sleeps.
         .with_execution_policy(ExecutionPolicy::without_waits());
+        let pipeline = match scope {
+            Some(scope) => pipeline.with_application_scope(scope),
+            None => pipeline,
+        };
+        // `T12.3`: the production controller always wires a pool, so the fixtures do too unless a
+        // test is specifically about a pipeline that cannot impersonate.
+        let pipeline = match &impersonation {
+            Some(source) => pipeline.with_impersonation_source(source.clone()),
+            None => pipeline,
+        };
+        // `T12.4`: the production controller always wires a credential store, so a fixture that
+        // cares about credentials does too; the rest keep the anonymous default on purpose.
+        let pipeline = match &credentials {
+            Some(source) => pipeline.with_credential_source(source.clone()),
+            None => pipeline,
+        };
         let repo_url = temp.path().join("repo.git").display().to_string();
         Fixture {
             git,
             cluster,
             discovery,
             dry_run,
+            projects,
+            impersonation,
             pipeline,
             repo_url,
             _temp: temp,
@@ -3258,6 +3912,22 @@ mod tests {
     }
 
     impl Fixture {
+        /// Impersonated users the pipeline resolved, in order (`T12.3`).
+        fn identities(&self) -> Vec<String> {
+            self.impersonation
+                .as_ref()
+                .map(|source| source.identities())
+                .unwrap_or_default()
+        }
+
+        /// `dryRun=All` predictions the impersonated identity issued.
+        fn impersonated_dry_runs(&self) -> usize {
+            self.impersonation
+                .as_ref()
+                .map(|source| source.dry_runs())
+                .unwrap_or_default()
+        }
+
         fn commit(&self, files: &[(&str, &str)]) -> String {
             self.git.add_commit("main", files.iter().copied())
         }
@@ -4089,6 +4759,160 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // Repository credentials (`T12.4`)
+    // ---------------------------------------------------------------------
+
+    /// **`T12.4`:** the credentials the pipeline resolved actually reach the Git client.
+    ///
+    /// Before this task `fetch_desired` hardcoded `RepoCredentials::Anonymous`, so a private
+    /// repository could never be cloned no matter what the operator put in a `Secret`. The fake
+    /// records the credential *kind* (never a value) of every resolve/checkout call, so this
+    /// asserts the seam rather than a log line.
+    #[tokio::test]
+    async fn resolved_repository_credentials_reach_the_git_client() {
+        let source = Arc::new(FakeCredentialSource::returning(
+            RepoCredentials::HttpToken {
+                token: "ghp_super_secret_token_987654".to_owned(),
+            },
+        ));
+        let fixture = fixture_with_credentials(
+            FakeCluster::default().with_namespace("payments"),
+            source.clone(),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+
+        fixture
+            .pipeline
+            .apply(&fixture.app("."))
+            .await
+            .expect("the fixture apply must succeed");
+
+        assert_eq!(
+            source.lookups(),
+            vec![fixture.repo_url.clone()],
+            "the lookup must ask for the Application's own spec.source.git.repoUrl"
+        );
+        assert_eq!(
+            fixture.git.credential_log(),
+            vec!["http-token".to_owned(), "http-token".to_owned()],
+            "both the revision resolve and the checkout must authenticate"
+        );
+        assert!(
+            !fixture
+                .git
+                .credential_log()
+                .iter()
+                .any(|kind| kind == "anonymous"),
+            "a configured credential must never be dropped for an anonymous clone"
+        );
+    }
+
+    /// A repository no `Secret` matches keeps working: `T12.4` must not break public repositories.
+    #[tokio::test]
+    async fn a_repository_no_secret_matches_is_cloned_anonymously() {
+        let source = Arc::new(FakeCredentialSource::default());
+        let fixture = fixture_with_credentials(
+            FakeCluster::default().with_namespace("payments"),
+            source.clone(),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+
+        fixture
+            .pipeline
+            .apply(&fixture.app("."))
+            .await
+            .expect("an unmatched repository must sync");
+
+        assert_eq!(source.lookups().len(), 1);
+        assert_eq!(
+            fixture.git.credential_log(),
+            vec!["anonymous".to_owned(), "anonymous".to_owned()],
+            "no match is anonymous, exactly as before T12.4"
+        );
+    }
+
+    /// The default pipeline (no store wired) still clones anonymously.
+    #[tokio::test]
+    async fn a_pipeline_without_a_credential_store_still_clones_anonymously() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+
+        fixture
+            .pipeline
+            .apply(&fixture.app("."))
+            .await
+            .expect("the fixture apply must succeed");
+
+        assert_eq!(
+            fixture.git.credential_log(),
+            vec!["anonymous".to_owned(), "anonymous".to_owned()]
+        );
+    }
+
+    /// **Trap guard:** an unusable credential `Secret` is a *terminal* error raised **before** the
+    /// clone starts. Falling back to an anonymous clone would turn "the operator's credential is
+    /// broken" into an unexplained `RepositoryNotFound`, and retrying it would churn the queue.
+    #[tokio::test]
+    async fn an_unusable_credential_secret_is_terminal_and_clones_nothing() {
+        let source = Arc::new(FakeCredentialSource::malformed(
+            "the \"url\" key is missing or empty",
+        ));
+        let fixture = fixture_with_credentials(
+            FakeCluster::default().with_namespace("payments"),
+            source.clone(),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+
+        let err = fixture
+            .pipeline
+            .apply(&fixture.app("."))
+            .await
+            .expect_err("an unusable credential Secret must stop the pass");
+
+        assert!(
+            matches!(&err, ReconcileError::Credentials(_)),
+            "expected a Credentials error, got {err:?}"
+        );
+        assert_eq!(err.failure_class(), FailureClass::Terminal);
+        let message = err.to_string();
+        assert!(message.contains("repo-creds"), "{message}");
+        assert!(message.contains("ferriscd-system"), "{message}");
+        assert_eq!(source.lookups().len(), 1);
+        assert_eq!(
+            fixture.git.resolve_calls(),
+            0,
+            "nothing may be cloned with a credential the operator did not finish configuring"
+        );
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    /// The pipeline's `Debug` says whether a credential store is wired — and nothing else about
+    /// it, since everything it holds is secret material.
+    #[test]
+    fn the_pipeline_debug_only_reports_whether_a_credential_store_is_wired() {
+        let plain = fixture(FakeCluster::default().with_namespace("payments"));
+        assert!(
+            format!("{:?}", plain.pipeline).contains("credentials: false"),
+            "the anonymous default must be visible in Debug"
+        );
+
+        let wired = fixture_with_credentials(
+            FakeCluster::default().with_namespace("payments"),
+            Arc::new(FakeCredentialSource::returning(
+                RepoCredentials::HttpBasic {
+                    username: "ci-user-secret".to_owned(),
+                    password: "ci-pass-secret".to_owned(),
+                },
+            )),
+        );
+        let debug = format!("{:?}", wired.pipeline);
+        assert!(debug.contains("credentials: true"), "{debug}");
+        for secret in ["ci-user-secret", "ci-pass-secret"] {
+            assert!(!debug.contains(secret), "{secret} leaked into {debug}");
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Rejections
     // ---------------------------------------------------------------------
 
@@ -4109,7 +4933,10 @@ mod tests {
                 crd_mode: CrdMode::Establish,
             }),
             Arc::new(FakeDryRun::default()),
-        );
+        )
+        // Policy is enforced before the repository is resolved (`T12.1`), so the wiring has to be
+        // complete for this test to reach the URL classification at all.
+        .with_project_source(Arc::new(default_project_source()));
         assert_eq!(pipeline.url_policy(), RepoUrlPolicy::Production);
 
         let app = application(
@@ -5424,6 +6251,134 @@ mod tests {
             vec!["/ConfigMap/payments/settings".to_owned()],
             "only OwnedBySelf entries may be deleted"
         );
+    }
+
+    /// **Finding H2(a):** the cascade deletes as the `Application`'s own ServiceAccount, not as
+    /// the controller. Reverting the cleanup path to the controller identity empties
+    /// [`Fixture::identities`] and fails the last assertion.
+    #[tokio::test]
+    async fn a_cascade_deletes_as_the_impersonated_service_account() {
+        let owned = config_map(
+            "settings",
+            Some("team-a/payments:/ConfigMap:payments/settings"),
+        );
+        let fixture = fixture_with_policy(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(owned),
+            FakeProjectSource::default().with_project(tenant_project()),
+            tenant_scope(&["team-a"]),
+        );
+        let mut app = tenant_application(&fixture, "team-a", Some("deployer"));
+        app.status = Some(status_with_inventory(&["/ConfigMap/payments/settings"]));
+
+        let outcome = fixture
+            .pipeline
+            .cleanup(&app, CleanupMode::Cascade)
+            .await
+            .expect("an authorized tenant cascade");
+        assert_eq!(outcome, CleanupOutcome::Completed);
+        assert_eq!(
+            fixture.cluster.deletes(),
+            vec!["/ConfigMap/payments/settings".to_owned()],
+            "the tracked object must be pruned through the pass's own applier"
+        );
+        assert_eq!(
+            fixture.identities(),
+            vec!["system:serviceaccount:payments:deployer".to_owned()],
+            "the cascade must resolve the tenant's ServiceAccount: deleting with the controller's \
+             identity is exactly the privilege escalation finding H1/H2(a) is about"
+        );
+    }
+
+    /// **Finding H1 + H2(b):** a tenant can retarget `spec.serviceAccountName` and then delete the
+    /// `Application`. The cascade must refuse an identity the project does not allow — *before*
+    /// resolving (and therefore before building) that impersonated client — and retain the
+    /// finalizer, with `ferriscd.io/force-delete` as the documented escape hatch.
+    #[tokio::test]
+    async fn a_cascade_with_an_unauthorized_service_account_retains_the_finalizer() {
+        let owned = config_map(
+            "settings",
+            Some("team-a/payments:/ConfigMap:payments/settings"),
+        );
+        let fixture = fixture_with_policy(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(owned),
+            FakeProjectSource::default().with_project(tenant_project()),
+            tenant_scope(&["team-a"]),
+        );
+        // The project lists `payments/deployer` only; this is the retargeted identity.
+        let mut app = tenant_application(&fixture, "team-a", Some("root-sa"));
+        app.status = Some(status_with_inventory(&["/ConfigMap/payments/settings"]));
+
+        let err = fixture
+            .pipeline
+            .cleanup(&app, CleanupMode::Cascade)
+            .await
+            .expect_err("an unauthorized ServiceAccount must never be used for a cascade");
+        assert!(
+            err.to_string().contains("root-sa"),
+            "the denial must name the refused ServiceAccount: {err}"
+        );
+        assert!(
+            err.to_string().contains("allowedServiceAccounts"),
+            "the denial must name the field to fix: {err}"
+        );
+        assert_eq!(
+            err.failure_class(),
+            crate::FailureClass::Terminal,
+            "no retry can authorize the identity"
+        );
+        assert_eq!(
+            crate::reconcile::failure_reason(&err),
+            crate::reconcile::REASON_POLICY_VIOLATION
+        );
+        // Ordering is policy → identity (finding H2b): no access bundle, no client, no delete.
+        assert!(
+            fixture.identities().is_empty(),
+            "an unauthorized ServiceAccount must be rejected before any impersonated access is \
+             resolved: {:?}",
+            fixture.identities()
+        );
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "nothing may be deleted by an unauthorized identity: {:?}",
+            fixture.cluster.deletes()
+        );
+        assert!(matches!(
+            err,
+            ReconcileError::Policy(PolicyError::ServiceAccountNotAllowed { .. })
+        ));
+
+        // The finalizer is retained unless the operator forces the deletion.
+        let denied = || {
+            ReconcileError::Policy(PolicyError::ServiceAccountNotAllowed {
+                application: "team-a/payments".to_owned(),
+                project: "payments".to_owned(),
+                namespace: "payments".to_owned(),
+                service_account: "root-sa".to_owned(),
+            })
+        };
+        match crate::reconcile::cleanup_disposition(&app, Err(denied())) {
+            crate::CleanupDisposition::Retain { error } => assert!(matches!(
+                error,
+                ReconcileError::Policy(PolicyError::ServiceAccountNotAllowed { .. })
+            )),
+            other => panic!("a denied identity must retain the finalizer, got {other:?}"),
+        }
+        let mut forced = app.clone();
+        forced
+            .annotations_mut()
+            .insert(annotations::FORCE_DELETE.to_owned(), "true".to_owned());
+        match crate::reconcile::cleanup_disposition(&forced, Err(denied())) {
+            crate::CleanupDisposition::Release { warning } => {
+                let warning = warning.expect("a forced release must be warned about");
+                assert!(warning.contains(annotations::FORCE_DELETE), "{warning}");
+                assert!(warning.contains("root-sa"), "{warning}");
+            }
+            other => panic!("force-delete must release the finalizer, got {other:?}"),
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -7110,6 +8065,713 @@ mod tests {
             args.windows(2)
                 .any(|window| window[0] == "--namespace" && window[1] == "payments"),
             "the destination namespace must reach helm template: {args:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 12: `AppProject` policy (`T12.1`) and the namespace scope (`T12.2`)
+    // ---------------------------------------------------------------------
+
+    /// A manifest set that the permissive `default` project accepts.
+    const POLICY_CONFIGMAP: &str = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+data:
+  key: value
+"#;
+
+    /// The same manifest, but hardcoding a namespace the project does not own: the classic
+    /// `AppProject` bypass (`spec.destination.namespace` is `payments`, the manifest says
+    /// `kube-system`).
+    const CONFIGMAP_IN_KUBE_SYSTEM: &str = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settings
+  namespace: kube-system
+data:
+  key: value
+"#;
+
+    /// A cluster-scoped resource no project whitelists by default.
+    const CLUSTER_ROLE: &str = r#"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: escalation
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+"#;
+
+    /// An `Application` in a tenant namespace, with an optional ServiceAccount (`T12.2`).
+    fn tenant_application(
+        fixture: &Fixture,
+        namespace: &str,
+        service_account: Option<&str>,
+    ) -> Application {
+        let mut app = fixture.app(".");
+        app.metadata.namespace = Some(namespace.to_owned());
+        app.spec.project = "payments".to_owned();
+        app.spec.service_account_name = service_account.map(str::to_owned);
+        app
+    }
+
+    fn tenant_scope(namespaces: &[&str]) -> ApplicationScope {
+        ApplicationScope::new(
+            "ferriscd-system",
+            ApplicationNamespaces::Listed(namespaces.iter().map(|ns| (*ns).to_owned()).collect()),
+        )
+    }
+
+    /// A `payments` project that additionally authorizes `team-a` and one ServiceAccount.
+    fn tenant_project() -> AppProject {
+        serde_saphyr::from_str(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: payments
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - "*"
+  sourceNamespaces:
+    - ferriscd-system
+    - team-a
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  allowedServiceAccounts:
+    # A ServiceAccount always resolves in the *destination* namespace, never in the tenant's own
+    # namespace (ADR-007 / MASTER_PLAN §5).
+    - payments/deployer
+"#,
+        )
+        .expect("tenant project must parse")
+    }
+
+    #[tokio::test]
+    async fn a_missing_project_is_a_terminal_denial_before_any_work() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default(),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let app = fixture.app(".");
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("a missing AppProject must never be treated as permissive");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Policy(PolicyError::ProjectNotFound { .. })
+            ),
+            "expected ProjectNotFound, got {err:?}"
+        );
+        assert_eq!(
+            err.failure_class(),
+            crate::FailureClass::Terminal,
+            "a policy violation is deterministic"
+        );
+        assert!(err.to_string().contains("default"), "{err}");
+        assert_eq!(fixture.projects.reads(), vec!["default".to_owned()]);
+        // Nothing was read from Git, diffed, or applied.
+        assert_eq!(fixture.git.resolve_calls(), 0);
+        assert!(fixture.dry_run.calls().is_empty());
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_without_a_project_source_refuses_to_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let cluster = Arc::new(FakeCluster::default().with_namespace("payments"));
+        let pipeline = InventorySyncPipeline::new(
+            Arc::new(RepoCache::new(
+                Arc::new(FakeGitClient::default()),
+                RepoCacheConfig::new(temp.path().join("cache")),
+            )),
+            discovery(),
+            cluster.clone(),
+            Arc::new(FakeApplier {
+                cluster: cluster.clone(),
+                discovery: Arc::new(FakeDiscovery::with_cluster_kinds()),
+                crd_mode: CrdMode::Establish,
+            }),
+            Arc::new(FakeDryRun::default()),
+        )
+        .with_url_policy(RepoUrlPolicy::AllowLocal);
+
+        let app = application(
+            &temp.path().join("repo").display().to_string(),
+            ".",
+            "payments",
+        );
+        let err = pipeline
+            .apply(&app)
+            .await
+            .expect_err("a pipeline that cannot enforce policy must not sync");
+        assert!(matches!(err, ReconcileError::Invalid { .. }), "{err:?}");
+        assert!(err.to_string().contains("AppProject"), "{err}");
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert!(cluster.applies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_repository_outside_source_repos_never_reaches_git() {
+        let project: AppProject = serde_saphyr::from_str(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - https://github.com/example/payments.git
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+"#,
+        )
+        .expect("project must parse");
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(project),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let app = fixture.app(".");
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("an unlisted repository must be rejected");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Policy(PolicyError::SourceRepoNotAllowed { .. })
+            ),
+            "expected SourceRepoNotAllowed, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("spec.source.git.repoURL"),
+            "the message must name the field: {err}"
+        );
+        assert_eq!(
+            fixture.git.resolve_calls(),
+            0,
+            "an unauthorized repository must never be cloned"
+        );
+        assert!(fixture.dry_run.calls().is_empty());
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_manifest_hardcoding_an_unlisted_namespace_is_rejected_before_the_dry_run() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(payments_only_project("default")),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP_IN_KUBE_SYSTEM)]);
+        let app = fixture.app(".");
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("`metadata.namespace: kube-system` must be rejected");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Policy(PolicyError::ResourceNamespaceNotAllowed { .. })
+            ),
+            "expected ResourceNamespaceNotAllowed, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("kube-system"), "{message}");
+        assert!(message.contains("spec.destinations"), "{message}");
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert!(
+            fixture.dry_run.calls().is_empty(),
+            "the denied resource must never receive a dryRun=All PATCH"
+        );
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unauthorized_cluster_scoped_kind_is_rejected_before_any_mutation() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(payments_only_project("default")),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("clusterrole.yaml", CLUSTER_ROLE)]);
+        let app = fixture.app(".");
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("an unlisted ClusterRole must be rejected");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Policy(PolicyError::ClusterResourceNotAllowed { .. })
+            ),
+            "expected ClusterResourceNotAllowed, got {err:?}"
+        );
+        assert!(err.to_string().contains("ClusterRole"), "{err}");
+        assert!(fixture.cluster.applies().is_empty());
+        assert!(fixture.cluster.deletes().is_empty());
+        assert_eq!(fixture.pipeline.mutating_applies(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_service_account_outside_allowed_service_accounts_is_rejected() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let mut app = tenant_application(&fixture, "ferriscd-system", Some("cluster-admin"));
+        app.spec.service_account_name = Some("root-sa".to_owned());
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("an unlisted ServiceAccount must be rejected");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Policy(PolicyError::ServiceAccountNotAllowed { .. })
+            ),
+            "expected ServiceAccountNotAllowed, got {err:?}"
+        );
+        assert!(fixture.cluster.applies().is_empty());
+        // Finding H2(b): the ordering is policy → identity. An unauthorized ServiceAccount is
+        // rejected before any impersonated client is built.
+        assert!(
+            fixture.identities().is_empty(),
+            "an unauthorized ServiceAccount must be refused before an impersonated client is \
+             built: {:?}",
+            fixture.identities()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_application_without_a_service_account_is_rejected() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            tenant_scope(&["team-a"]),
+        );
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let app = tenant_application(&fixture, "team-a", None);
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("a tenant Application must name its own ServiceAccount");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Policy(PolicyError::TenantServiceAccountRequired { .. })
+            ),
+            "expected TenantServiceAccountRequired, got {err:?}"
+        );
+        assert!(err.to_string().contains("serviceAccountName"), "{err}");
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert_eq!(fixture.git.resolve_calls(), 0);
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_authorized_tenant_application_reconciles() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            tenant_scope(&["team-a"]),
+        );
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let app = tenant_application(&fixture, "team-a", Some("deployer"));
+
+        fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("an authorized tenant Application must reconcile");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/ConfigMap/payments/settings".to_owned()],
+            "the rendered resource must reach the destination namespace"
+        );
+        assert_eq!(
+            fixture.identities(),
+            vec!["system:serviceaccount:payments:deployer".to_owned()],
+            "the pass must be resolved as the ServiceAccount, in the *destination* namespace"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 12: `T12.3` pooled ServiceAccount impersonation
+    // ---------------------------------------------------------------------
+
+    /// No `serviceAccountName` ⇒ the controller's own identity, and the impersonation seam is
+    /// never consulted (the pre-`T12.3` behaviour, bit for bit).
+    #[tokio::test]
+    async fn an_application_without_a_service_account_keeps_the_controller_identity() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let app = fixture.app(".");
+
+        fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("controller identity");
+        assert_eq!(
+            fixture.identities(),
+            Vec::<String>::new(),
+            "a non-impersonated Application must not touch the impersonation pool at all"
+        );
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/ConfigMap/payments/settings".to_owned()]
+        );
+        // Its dry-runs went through the pipeline's own seam.
+        assert_eq!(
+            fixture.impersonated_dry_runs(),
+            0,
+            "no diff may run as a ServiceAccount for a non-impersonated Application"
+        );
+    }
+
+    /// The whole pass — live read, `dryRun=All` diff, apply, prune — runs as the identity the
+    /// policy authorized, never as the controller.
+    #[tokio::test]
+    async fn a_tenant_pass_diffs_and_applies_as_its_service_account() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            tenant_scope(&["team-a"]),
+        );
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let app = tenant_application(&fixture, "team-a", Some("deployer"));
+
+        // Pass 1 creates the ConfigMap; nothing exists yet, so nothing is dry-run.
+        let first = fixture.pipeline.apply(&app).await.expect("first pass");
+        assert_eq!(fixture.impersonated_dry_runs(), 0);
+        assert_eq!(first.reason, REASON_SYNC_SUCCEEDED, "{}", first.message);
+        fixture.cluster.seed_applied();
+
+        // Pass 2 sees the live object, so the diff runs — as the impersonated identity.
+        let mut second_app = app.clone();
+        second_app.status = Some(ApplicationStatus {
+            sync: first.sync.clone(),
+            ..ApplicationStatus::default()
+        });
+        fixture
+            .pipeline
+            .apply(&second_app)
+            .await
+            .expect("second pass");
+        assert_eq!(
+            fixture.impersonated_dry_runs(),
+            1,
+            "the `dryRun=All` prediction must run as the ServiceAccount"
+        );
+        assert!(
+            fixture.dry_run.calls().is_empty(),
+            "no workload diff may be issued with the controller's identity: {:?}",
+            fixture.dry_run.calls()
+        );
+        assert_eq!(
+            fixture.identities(),
+            vec![
+                "system:serviceaccount:payments:deployer".to_owned(),
+                "system:serviceaccount:payments:deployer".to_owned(),
+            ],
+            "one resolution per pass, always in the destination namespace"
+        );
+    }
+
+    /// **Trap T12:** an `Application` that asks for a `ServiceAccount` when the pipeline has no pool
+    /// is refused. Falling back to the controller's identity would hand the tenant the
+    /// controller's privileges.
+    #[tokio::test]
+    async fn an_impersonating_application_is_refused_when_no_pool_is_wired() {
+        let fixture = fixture_with_policy_and_impersonation(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            tenant_scope(&["team-a"]),
+            ImpersonationWiring::NotWired,
+        );
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let app = tenant_application(&fixture, "team-a", Some("deployer"));
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("a ServiceAccount identity must never silently degrade");
+        assert!(
+            matches!(err, ReconcileError::Impersonation(_)),
+            "expected an Impersonation error, got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("system:serviceaccount:payments:deployer"),
+            "the message must name the identity that was requested: {err}"
+        );
+        assert_eq!(
+            err.failure_class(),
+            crate::FailureClass::Terminal,
+            "a missing pool is a wiring bug, not a transient failure"
+        );
+        // Nothing was cloned, rendered, diffed or applied.
+        assert_eq!(fixture.git.resolve_calls(), 0);
+        assert!(fixture.dry_run.calls().is_empty());
+        assert!(fixture.cluster.applies().is_empty());
+
+        // The very same pipeline still reconciles a controller-identity Application: the refusal
+        // is about the ServiceAccount, not about the controller.
+        let mut control_plane = fixture.app(".");
+        control_plane.spec.project = "payments".to_owned();
+        fixture
+            .pipeline
+            .apply(&control_plane)
+            .await
+            .expect("a control-plane Application needs no impersonation");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/ConfigMap/payments/settings".to_owned()]
+        );
+    }
+
+    /// A `ServiceAccount` name that Kubernetes could never have accepted is refused **before** any
+    /// cluster access — even when the project's allow-list (deliberately) uses a wildcard.
+    #[tokio::test]
+    async fn an_invalid_service_account_name_is_refused_before_any_work() {
+        let wildcard_service_accounts: AppProject = serde_saphyr::from_str(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: payments
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - "*"
+  sourceNamespaces:
+    - ferriscd-system
+    - team-a
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  allowedServiceAccounts:
+    - payments/*
+"#,
+        )
+        .expect("project must parse");
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(wildcard_service_accounts),
+            tenant_scope(&["team-a"]),
+        );
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        // The project's `payments/*` entry matches, so only the name validation can reject this.
+        let app = tenant_application(&fixture, "team-a", Some("Deployer"));
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("an invalid ServiceAccount name must be refused");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Impersonation(ImpersonationError::InvalidServiceAccountName { .. })
+            ),
+            "expected InvalidServiceAccountName, got {err:?}"
+        );
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert_eq!(fixture.git.resolve_calls(), 0);
+        assert!(fixture.cluster.applies().is_empty());
+        assert_eq!(
+            fixture.identities(),
+            Vec::<String>::new(),
+            "an unusable name never reaches the pool"
+        );
+    }
+
+    /// **Phase preservation:** impersonation is a transport identity, not a different sync. A
+    /// tenant `Application` still walks the wave/hook state machine — and its `PreSync` hook is
+    /// created as the tenant's ServiceAccount.
+    #[tokio::test]
+    async fn impersonation_preserves_the_wave_and_hook_phases() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            tenant_scope(&["team-a"]),
+        );
+        fixture.commit(&[
+            ("hook.yaml", PRE_SYNC_HOOK),
+            ("configmap.yaml", POLICY_CONFIGMAP),
+        ]);
+        let app = tenant_application(&fixture, "team-a", Some("deployer"));
+
+        // Pass 1: the `PreSync` hook is created (as the tenant) and the wave stays closed.
+        let first = fixture.pipeline.apply(&app).await.expect("the hook pass");
+        assert_eq!(fixture.cluster.creates(), vec!["migrate-abcde".to_owned()]);
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "wave 0 must wait for PreSync: {:?}",
+            fixture.cluster.applies()
+        );
+        let state = first.operation_state.clone().expect("operation state");
+        assert_eq!(state.sync_phase, Some(SyncPhase::PreSync));
+        assert_eq!(first.reason, REASON_SYNC_IN_PROGRESS);
+        assert_eq!(
+            fixture.identities(),
+            vec!["system:serviceaccount:payments:deployer".to_owned()]
+        );
+
+        // Pass 2: the hook completed, so the wave applies — still as the tenant.
+        fixture.cluster.complete_job("migrate-abcde");
+        let mut second_app = app.clone();
+        second_app.status = Some(ApplicationStatus {
+            operation_state: Some(state),
+            ..ApplicationStatus::default()
+        });
+        let second = fixture.pipeline.apply(&second_app).await.expect("wave 0");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/ConfigMap/payments/settings".to_owned()],
+            "the wave applies its own resources"
+        );
+        assert_eq!(
+            second
+                .operation_state
+                .as_ref()
+                .map(|state| state.sync_phase),
+            Some(Some(SyncPhase::Sync))
+        );
+        assert_eq!(
+            fixture.identities().len(),
+            2,
+            "each pass resolves its own identity"
+        );
+        assert!(
+            fixture
+                .identities()
+                .iter()
+                .all(|identity| identity == "system:serviceaccount:payments:deployer"),
+            "{:?}",
+            fixture.identities()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_scope_refuses_an_application_outside_the_control_plane_namespace() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        // The project *does* authorize `team-a`; only the watch scope does not, which proves the
+        // two layers are independent (finding C8).
+        let app = tenant_application(&fixture, "team-a", Some("deployer"));
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("the default scope watches only the control-plane namespace");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Policy(PolicyError::ApplicationNamespaceNotAllowed { .. })
+            ),
+            "expected ApplicationNamespaceNotAllowed, got {err:?}"
+        );
+        assert!(err.to_string().contains("ferriscd-system"), "{err}");
+        assert_eq!(fixture.git.resolve_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn wildcard_scope_still_requires_a_tenant_service_account() {
+        let wildcard = ApplicationScope::new("ferriscd-system", ApplicationNamespaces::All);
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            wildcard.clone(),
+        );
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+
+        // `*` widens the *watch*, never the tenancy guard.
+        let err = fixture
+            .pipeline
+            .apply(&tenant_application(&fixture, "team-a", None))
+            .await
+            .expect_err("`*` must not authorize an Application without a ServiceAccount");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Policy(PolicyError::TenantServiceAccountRequired { .. })
+            ),
+            "expected TenantServiceAccountRequired, got {err:?}"
+        );
+
+        // With its own (authorized) ServiceAccount the same Application reconciles.
+        fixture
+            .pipeline
+            .apply(&tenant_application(&fixture, "team-a", Some("deployer")))
+            .await
+            .expect("an authorized tenant Application must reconcile under `*`");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/ConfigMap/payments/settings".to_owned()]
+        );
+
+        // A namespace the project does not list in `spec.sourceNamespaces` is refused even under
+        // `*`: the scope is not the authorization.
+        let err = fixture
+            .pipeline
+            .apply(&tenant_application(&fixture, "team-b", Some("deployer")))
+            .await
+            .expect_err("`team-b` is not a project source namespace");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Policy(PolicyError::SourceNamespaceNotAllowed { .. })
+            ),
+            "expected SourceNamespaceNotAllowed, got {err:?}"
         );
     }
 }

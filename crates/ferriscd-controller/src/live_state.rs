@@ -448,6 +448,15 @@ impl ClusterStateReader {
         Self { source }
     }
 
+    /// The live-state source this reader reads through.
+    ///
+    /// Used to rebuild a reader for the same cluster with a different identity (`T12.3`): the
+    /// source is the only state a reader holds.
+    #[must_use]
+    pub fn source(&self) -> &Arc<dyn LiveObjectSource> {
+        &self.source
+    }
+
     /// Reads the live state of every requested key with bounded concurrency.
     ///
     /// Requests are de-duplicated by [`ResourceKey`] (first hint set wins) and executed with

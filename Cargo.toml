@@ -14,6 +14,17 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 futures = "0.3"
+# `http`/`hyper-util`/`hyper-timeout`/`tower` back the `T12.3` impersonation tower layer over the
+# controller's shared base HTTP/TLS connector. All four are already in the lock file (they are
+# `kube-client` dependencies); no new transitive dependency is introduced.
+http = "1"
+hyper-timeout = "0.5"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+# `rustls` itself, to pin the process-level `CryptoProvider`. Two providers are linked in this
+# workspace (`ring` via `kube`, `aws-lc-rs` via `gix`'s `reqwest`), and `rustls` refuses to guess
+# between them — see `ferriscd_controller::impersonation::ensure_crypto_provider`.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tower = { version = "0.5", features = ["retry", "util"] }
 gix = { version = "0.90", default-features = false, features = [
     "sha1",
     "max-performance",

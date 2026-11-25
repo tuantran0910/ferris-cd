@@ -79,6 +79,7 @@ fn controller_reconciles_an_application_and_keeps_the_inventory_of_a_removed_res
 
     install_crds();
     ensure_namespace(CONTROL_NAMESPACE);
+    ensure_default_project();
 
     // Best-effort cleanup even if an assertion below panics.
     let _cluster_cleanup = ClusterCleanup::new();
@@ -399,6 +400,22 @@ fn install_crds() {
     assert!(
         output.status.success(),
         "kubectl apply -f deploy/crds failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Applies the shipped `default` `AppProject` (`T12.1`).
+///
+/// Every `Application` is validated against the project it references and a missing project is a
+/// terminal denial, so the live suite has to install the same manifest an operator applies.
+/// Idempotent, and it must run *after* the control-plane namespace exists.
+fn ensure_default_project() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/manifests/default-project.yaml");
+    let output = kubectl(&["apply", "-f", &manifest.display().to_string()]);
+    assert!(
+        output.status.success(),
+        "kubectl apply -f deploy/manifests/default-project.yaml failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

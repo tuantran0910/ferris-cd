@@ -164,6 +164,13 @@ struct FakeState {
     resolve_log: Vec<String>,
     /// Requested SHA of every `checkout` call, in call order.
     checkout_log: Vec<String>,
+    /// Credential kind (`anonymous`, `http-token`, …) of every call, in call order.
+    ///
+    /// `T12.4` asserts through this that the credentials the pipeline resolved actually reached
+    /// the Git client, instead of the hardcoded `Anonymous` of the `v0.2` code. Only the *kind*
+    /// is recorded (never a value): the fake is a test double, and a log of secret material is
+    /// exactly what the real client must never produce.
+    credential_log: Vec<String>,
     /// Queued `resolve_revision` failures, consumed front-to-back.
     resolve_faults: VecDeque<RepoError>,
     /// Queued `checkout` failures, consumed front-to-back.
@@ -248,6 +255,7 @@ impl FakeGitClient {
                 work_root: config.work_root,
                 resolve_log: Vec::new(),
                 checkout_log: Vec::new(),
+                credential_log: Vec::new(),
                 resolve_faults: VecDeque::new(),
                 checkout_faults: VecDeque::new(),
                 ordinal: 0,
@@ -445,11 +453,18 @@ impl FakeGitClient {
         self.lock().checkout_log.clone()
     }
 
+    /// Returns the credential kind ([`RepoCredentials`]' `Display`) of every call, in call order.
+    #[must_use]
+    pub fn credential_log(&self) -> Vec<String> {
+        self.lock().credential_log.clone()
+    }
+
     /// Clears the resolve/checkout call logs (faults and commits are untouched).
     pub fn reset_call_log(&self) {
         let mut state = self.lock();
         state.resolve_log.clear();
         state.checkout_log.clear();
+        state.credential_log.clear();
     }
 
     /// Locks the fixture state, recovering from a poisoned mutex instead of panicking.
@@ -472,16 +487,22 @@ impl FakeGitClient {
     fn record_checkout(&self, sha: &str) {
         self.lock().checkout_log.push(sha.to_owned());
     }
+
+    /// Records the credential kind of one call (never the values).
+    fn record_credentials(&self, creds: &RepoCredentials) {
+        self.lock().credential_log.push(creds.to_string());
+    }
 }
 
 impl GitClient for FakeGitClient {
     fn resolve_revision<'a>(
         &'a self,
         src: &'a GitSource,
-        _creds: &'a RepoCredentials,
+        creds: &'a RepoCredentials,
     ) -> RepoFuture<'a, ResolvedRevision> {
         Box::pin(async move {
             self.record_resolve(&src.target_revision);
+            self.record_credentials(creds);
 
             // Validation first, exactly like `GixGitClient`: a rejected source never consumes a
             // queued fault, so tests can rely on the origin of the error they observe.
@@ -506,10 +527,11 @@ impl GitClient for FakeGitClient {
         &'a self,
         src: &'a GitSource,
         sha: &'a str,
-        _creds: &'a RepoCredentials,
+        creds: &'a RepoCredentials,
     ) -> RepoFuture<'a, RepoCheckout> {
         Box::pin(async move {
             self.record_checkout(sha);
+            self.record_credentials(creds);
 
             let policy = self.config().url_policy;
             src.validate(policy)?;
