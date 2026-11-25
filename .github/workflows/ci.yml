@@ -27,6 +27,9 @@ jobs:
         run: |
           ruby -ryaml -e '
             files = Dir.glob("{.github,deploy,examples}/**/*.{yml,yaml}")
+            # Helm chart templates are Go templates, not data YAML; `helm template` (and the
+            # ignored v0_4_renderers tests) validate them. Chart.yaml/values*/crds/ stay checked.
+            files.reject! { |f| f.start_with?("examples/helm/templates/") }
             abort("No YAML files found") if files.empty?
             files.sort.each do |f|
               YAML.load_stream(File.read(f))

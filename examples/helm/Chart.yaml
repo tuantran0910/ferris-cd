@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ferriscd-render-demo
+description: Phase 11 Helm v4 example chart rendered by FerrisCD (strictly offline `helm template`).
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

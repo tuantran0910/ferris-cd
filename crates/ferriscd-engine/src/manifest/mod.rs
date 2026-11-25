@@ -1,17 +1,42 @@
-//! Manifest engine: multi-document YAML 1.2 parsing, safe directory loading,
-//! and offline normalization of desired Kubernetes objects.
+//! Manifest engine: multi-document YAML 1.2 parsing, safe directory loading, offline
+//! normalization of desired Kubernetes objects, and the ecosystem renderers (Kustomize v5,
+//! Helm v4) that feed all of the above.
 //!
-//! Pipeline: [`loader::load`] -> [`yaml::parse_file`] -> [`normalize::normalize`].
+//! Plain pipeline: [`loader::load`] -> [`yaml::parse_file`] -> [`normalize::normalize`].
+//!
+//! Renderer pipeline: [`renderer::RenderContext`] -> [`renderer::ManifestRenderer::render`]
+//! (plain YAML, `kustomize build`, or `helm template`, the latter two sandboxed by [`exec`]) ->
+//! [`renderer::parse_and_normalize`] -> [`types::DesiredResource`].
+//!
+//! [`cache::RenderPipeline`] adds a collision-free LRU in front of the renderer pipeline so a
+//! periodic requeue at an unchanged commit costs a hash lookup instead of a subprocess.
 
+pub mod cache;
 pub mod error;
+pub mod exec;
+#[cfg(test)]
+mod fake_runner;
+pub mod helm;
+pub mod kustomize;
 pub mod loader;
 pub mod normalize;
+pub mod renderer;
 pub mod types;
 pub mod yaml;
 
+pub use cache::{
+    DEFAULT_CACHE_CAPACITY, RenderCache, RenderCacheKey, RenderCacheStats, RenderPipeline,
+};
 pub use error::ManifestError;
+pub use exec::{DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT, ExecError, SandboxedCommand};
+pub use helm::{HelmOptions, HelmRenderer};
+pub use kustomize::{KustomizeOptions, KustomizeRenderer};
 pub use loader::{ManifestFile, ManifestLoaderConfig, load};
 pub use normalize::{check_duplicate_keys, normalize};
+pub use renderer::{
+    ManifestRenderer, PlainYamlOptions, PlainYamlRenderer, RenderContext, RendererBinaries,
+    RendererConfig, RendererKind, detect_renderer, parse_and_normalize, render, render_desired,
+};
 pub use types::{DesiredResource, GroupVersionKind, ResourceKey};
 pub use yaml::parse_file;
 

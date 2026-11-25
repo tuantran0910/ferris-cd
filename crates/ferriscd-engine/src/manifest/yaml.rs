@@ -45,7 +45,7 @@ fn whole_stream_budget() -> serde_saphyr::Budget {
 
 /// Returns per-document deserialization options: duplicate-key rejection,
 /// YAML 1.2 scalar semantics, and tight alias-replay limits.
-fn parse_options() -> serde_saphyr::Options {
+pub(crate) fn parse_options() -> serde_saphyr::Options {
     serde_saphyr::options! {
         duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
         strict_booleans: true,

@@ -1,0 +1,5 @@
+# Production values file, referenced from `spec.source.renderer.helm.valueFiles`.
+replicaCount: 3
+
+appEnv: prod
+logLevel: warn
