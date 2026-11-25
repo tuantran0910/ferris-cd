@@ -27,7 +27,6 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,9 +40,14 @@ use kube::runtime::controller::{Action, Controller};
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::{PredicateConfig, WatchStreamExt, watcher};
 use kube::{Api, Client, ResourceExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::reconcile::{ControllerError, ReconcileContext, reconcile_instance};
-use crate::{ShutdownReason, lock_recover, predicate};
+use crate::sharding::{Sharding, shard_predicate};
+use crate::{lock_recover, predicate};
+
+#[cfg(test)]
+use crate::sharding::shard_of;
 
 /// Default number of concurrent reconciles **per watched namespace scope**.
 ///
@@ -106,6 +110,12 @@ pub struct ControllerConfig {
     pub concurrency: u16,
     /// How long in-flight reconciles may run after a shutdown signal.
     pub drain_timeout: Duration,
+    /// Deterministic sharding (`T13.3`): when set, this replica queues only its own shard.
+    ///
+    /// `None` (the default) reconciles every `Application` in the watched namespaces: the
+    /// pre-Phase-13 behaviour, unchanged. The filter runs on the watch stream, before the
+    /// controller schedules work — see [`build_controllers`].
+    pub shard: Option<Sharding>,
 }
 
 impl Default for ControllerConfig {
@@ -115,6 +125,7 @@ impl Default for ControllerConfig {
             application_namespaces: ApplicationNamespaces::ControlPlane,
             concurrency: DEFAULT_CONCURRENCY,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+            shard: None,
         }
     }
 }
@@ -148,6 +159,16 @@ impl ControllerConfig {
     #[must_use]
     pub fn drain_timeout(mut self, drain_timeout: Duration) -> Self {
         self.drain_timeout = drain_timeout;
+        self
+    }
+
+    /// Restricts this replica to `shard` (`T13.3`, builder style).
+    ///
+    /// The shard is validated at construction ([`Sharding::new`]), so an out-of-range index can
+    /// never reach the watch filter and silently reconcile nothing.
+    #[must_use]
+    pub fn with_shard(mut self, shard: Sharding) -> Self {
+        self.shard = Some(shard);
         self
     }
 
@@ -448,19 +469,22 @@ impl ApplicationControllers {
     }
 
     /// Turns every controller into its `run` stream, all of which are driven by [`run`].
+    ///
+    /// `stop` is the **only** shutdown input: a `SIGTERM` cancels it in the single-replica path,
+    /// and a lost leader lease cancels it in the `T13.2` path, so both stop the set identically.
     fn into_run_streams(
         self,
         ctx: Arc<ReconcileContext>,
-        announced: Arc<AtomicBool>,
+        stop: CancellationToken,
     ) -> Vec<BoxStream<'static, ControllerRunItem>> {
         self.controllers
             .into_iter()
             .map(|scope| {
-                let announced = announced.clone();
-                // One signal future per controller rather than a shared `Notify`: every scope must
+                // One trigger future per controller rather than a shared `Notify`: every scope must
                 // observe the same shutdown, and `notify_one` would wake exactly one of them.
+                let trigger = stop.clone();
                 let trigger = async move {
-                    shutdown_reason_once(&announced).await;
+                    trigger.cancelled().await;
                 };
                 scope
                     .controller
@@ -493,8 +517,16 @@ fn scope_api(client: &Client, namespace: Option<&str>) -> Api<Application> {
 /// `default_backoff` and the composite predicate are created here and nowhere else, so "one
 /// writer per store" holds by construction. Tests substitute a scripted event stream to prove
 /// that an `Init`/`InitDone` in one scope cannot remove another scope's objects.
+///
+/// `shard` adds the `T13.3` filter **on the stream**, i.e. before the controller enqueues anything:
+/// an `Application` owned by another shard is dropped here and costs no reconcile, no queue slot and
+/// no `/status` patch. It sits inside the same chain as the composite predicate
+/// ([`crate::predicate`]) rather than in the reconciler, because a post-queue filter would still
+/// schedule (and back off, and requeue) work this replica must never perform. `Err` items — watch
+/// errors — always pass ([`crate::sharding::ShardPredicate::keeps`]).
 fn scoped_store<E>(
     events: E,
+    shard: Option<Sharding>,
 ) -> (
     impl Stream<Item = Result<Application, watcher::Error>>,
     Store<Application>,
@@ -503,12 +535,23 @@ where
     E: Stream<Item = Result<watcher::Event<Application>, watcher::Error>> + Send + 'static,
 {
     let (reader, writer) = reflector::store();
+    // `ShardPredicate` is `Copy`, so the closure owns a plain value: no lock, no allocation per
+    // event, and the same decision every replica makes for the same object.
+    let shard_predicate = shard.map(shard_predicate);
     let stream = events
         // Per-scope reconnect backoff: a namespace whose watch keeps failing backs off on its own
         // schedule instead of starving every other namespace (finding C1).
         .default_backoff()
         .reflect(writer)
         .applied_objects()
+        // `T13.3`: drop other shards' work before it can be queued.
+        .filter(move |item| {
+            std::future::ready(
+                shard_predicate
+                    .map(|predicate| predicate.keeps(item))
+                    .unwrap_or(true),
+            )
+        })
         // Filter *before* the controller schedules work: a status-only patch then costs
         // zero reconciles instead of one wasted pass per status write.
         .predicate_filter(predicate::predicate(), PredicateConfig::default());
@@ -519,6 +562,10 @@ where
 ///
 /// The returned controllers are not yet running: [`run`] drives their `run` streams and waits for
 /// every store to be ready before declaring readiness.
+///
+/// `config.shard` (`T13.3`) reaches every scope: an `Application` is filtered by its own
+/// `(namespace, name)`, so the shard boundary is independent of which namespace scope the watch
+/// covers — including the cluster-wide `*` scope.
 #[must_use]
 pub fn build_controllers(client: Client, config: &ControllerConfig) -> ApplicationControllers {
     let scopes: Vec<Option<String>> = match config.watched_namespaces() {
@@ -531,7 +578,8 @@ pub fn build_controllers(client: Client, config: &ControllerConfig) -> Applicati
         .into_iter()
         .map(|namespace| {
             let api = scope_api(&client, namespace.as_deref());
-            let (stream, store) = scoped_store(watcher(api, watcher::Config::default()));
+            let (stream, store) =
+                scoped_store(watcher(api, watcher::Config::default()), config.shard);
             let controller = Controller::for_stream(stream, store).with_config(
                 kube::runtime::controller::Config::default().concurrency(config.concurrency),
             );
@@ -544,19 +592,22 @@ pub fn build_controllers(client: Client, config: &ControllerConfig) -> Applicati
     ApplicationControllers { controllers }
 }
 
-/// Awaits the process shutdown signal, logging it exactly once across every scope.
-async fn shutdown_reason_once(announced: &AtomicBool) -> ShutdownReason {
-    let reason = crate::shutdown_signal().await;
-    if !announced.swap(true, Ordering::SeqCst) {
+/// Listens for `SIGINT`/`SIGTERM` and cancels `stop`, logging the signal exactly once.
+fn spawn_shutdown_listener(stop: CancellationToken) {
+    tokio::spawn(async move {
+        let reason = crate::shutdown_signal().await;
         tracing::info!(
             signal = reason.as_str(),
             "graceful shutdown requested; draining in-flight reconciles"
         );
-    }
-    reason
+        stop.cancel();
+    });
 }
 
 /// Runs every per-namespace controller until `SIGINT`/`SIGTERM`, draining in-flight reconciles.
+///
+/// This is the single-replica behaviour (and the `T13.2` standby's *non*-leader behaviour): no
+/// `Lease` is involved, so exactly one replica must run.
 ///
 /// # Errors
 ///
@@ -568,6 +619,41 @@ pub async fn run(
     config: ControllerConfig,
     ctx: Arc<ReconcileContext>,
 ) -> Result<(), crate::ShutdownError> {
+    let stop = CancellationToken::new();
+    spawn_shutdown_listener(stop.clone());
+    run_until(client, config, ctx, stop).await
+}
+
+/// Runs the controller set for **one leader term** (`T13.2`).
+///
+/// `token` is cancelled when the leader lease is lost (or when the process is asked to stop while
+/// leading), and the set then drains exactly like a `SIGTERM`. The caller owns the standby loop:
+/// once this returns, the replica is a standby again and must re-acquire the lease.
+///
+/// # Errors
+///
+/// See [`run`].
+pub async fn run_as_leader(
+    client: Client,
+    config: ControllerConfig,
+    ctx: Arc<ReconcileContext>,
+    token: CancellationToken,
+) -> Result<(), crate::ShutdownError> {
+    run_until(client, config, ctx, token).await
+}
+
+/// Drives the controller set until `stop` is cancelled, then drains in-flight reconciles.
+///
+/// # Errors
+///
+/// Returns [`crate::ShutdownError::DrainTimeout`] when a reconcile is still running after
+/// `config.drain_timeout`.
+async fn run_until(
+    client: Client,
+    config: ControllerConfig,
+    ctx: Arc<ReconcileContext>,
+    stop: CancellationToken,
+) -> Result<(), crate::ShutdownError> {
     let drain_timeout = config.drain_timeout;
     let controllers = build_controllers(client, &config);
     let scopes: Vec<String> = controllers
@@ -576,22 +662,20 @@ pub async fn run(
         .map(|l| (*l).to_owned())
         .collect();
     let readiness = controllers.wait_until_ready();
-    let announced = Arc::new(AtomicBool::new(false));
-    let shutdown_announced = announced.clone();
 
     tracing::info!(
         namespace = %config.namespace,
         controllers = controllers.len(),
         scopes = ?scopes,
         concurrency = config.concurrency,
+        shard = ?config.shard,
         finalizer = crate::reconcile::FINALIZER,
         "application controller started (one controller and private store per watched namespace)"
     );
 
     // One merged result stream over N independent controllers. Each controller keeps its own
     // store, watch backoff and schedule; only the reporting is merged.
-    let mut results =
-        futures::stream::select_all(controllers.into_run_streams(ctx, announced.clone()));
+    let mut results = futures::stream::select_all(controllers.into_run_streams(ctx, stop.clone()));
 
     let drive = async move {
         while let Some(result) = results.next().await {
@@ -634,8 +718,7 @@ pub async fn run(
         let ((), ()) = tokio::join!(drive, readiness);
     };
     let shutdown = async move {
-        // One log line for the whole process, whichever of the N+1 signal listeners sees it first.
-        let _reason = shutdown_reason_once(&shutdown_announced).await;
+        stop.cancelled().await;
     };
     crate::await_drained(work, shutdown, drain_timeout).await
 }
@@ -983,8 +1066,8 @@ mod tests {
         // Exactly the production seam: `scoped_store` is the one place a scope's store is created.
         let (mut tx_a, rx_a) = futures::channel::mpsc::unbounded();
         let (mut tx_b, rx_b) = futures::channel::mpsc::unbounded();
-        let (stream_a, store_a) = scoped_store(rx_a);
-        let (stream_b, store_b) = scoped_store(rx_b);
+        let (stream_a, store_a) = scoped_store(rx_a, None);
+        let (stream_b, store_b) = scoped_store(rx_b, None);
         let mut stream_a = Box::pin(stream_a);
         let mut stream_b = Box::pin(stream_b);
 
@@ -1026,6 +1109,86 @@ mod tests {
         );
     }
 
+    /// The first `<namespace>/<name>` (scanning `app-0`, `app-1`, …) that `shard` assigns to
+    /// `shard_id`.
+    fn a_name_in_shard(namespace: &str, shard: Sharding, shard_id: u32) -> String {
+        (0..1_000)
+            .map(|index| format!("app-{index}"))
+            .find(|name| shard_of(namespace, name, shard.total_shards()) == shard_id)
+            .expect("every shard must hold at least one of the first 1000 names")
+    }
+
+    /// **`T13.3` wiring:** the shard filter runs on the watch stream, so another shard's
+    /// `Application` is never handed to the controller — no reconcile, no queue slot, no backoff —
+    /// while the store still reflects it (readiness must not depend on how many shards exist).
+    ///
+    /// The assertion is ordering-based rather than timeout-based: the two changes are sent
+    /// back-to-back, and the stream must yield the owned one next. A filter applied one stage later
+    /// (after the queue) would surface the foreign object first.
+    #[tokio::test]
+    async fn another_shards_application_is_never_queued() {
+        let shard = Sharding::new(0, 2).expect("valid shard");
+        let namespace = "ferriscd-system";
+        let owned = a_name_in_shard(namespace, shard, 0);
+        let foreign = a_name_in_shard(namespace, shard, 1);
+        assert_ne!(owned, foreign);
+
+        let (mut tx, rx) = futures::channel::mpsc::unbounded();
+        let (stream, store) = scoped_store(rx, Some(shard));
+        let mut stream = Box::pin(stream);
+
+        send(&mut tx, watcher::Event::Init);
+        send(
+            &mut tx,
+            watcher::Event::InitApply(scripted_application(namespace, &foreign, 1)),
+        );
+        send(
+            &mut tx,
+            watcher::Event::InitApply(scripted_application(namespace, &owned, 1)),
+        );
+        send(&mut tx, watcher::Event::InitDone);
+
+        let first = stream
+            .next()
+            .await
+            .expect("this shard's own Application must be queued")
+            .expect("a scripted event must not fail");
+        assert_eq!(
+            object_key(&first),
+            format!("{namespace}/{owned}"),
+            "another shard's Application must never reach the controller"
+        );
+
+        send(
+            &mut tx,
+            watcher::Event::Apply(scripted_application(namespace, &foreign, 2)),
+        );
+        send(
+            &mut tx,
+            watcher::Event::Apply(scripted_application(namespace, &owned, 2)),
+        );
+        let second = stream
+            .next()
+            .await
+            .expect("the next queued object must be this shard's")
+            .expect("a scripted event must not fail");
+        assert_eq!(object_key(&second), format!("{namespace}/{owned}"));
+        assert_eq!(
+            second.metadata.generation,
+            Some(2),
+            "the yielded object is the owned change, not the foreign one that was sent first"
+        );
+        // The store is *not* sharded: it holds everything the watch delivered (the `InitDone`
+        // swap happens upstream of the filter), so readiness and inventory reads do not depend on
+        // the shard count. Asserted here because a `Store` only reflects a list after `InitDone`
+        // has been consumed, which the two changes above prove.
+        assert_eq!(
+            store.len(),
+            2,
+            "only the queue is sharded; the private store still reflects every listed object"
+        );
+    }
+
     /// **Finding C1 (end to end):** two namespaces, one `Application` each — both are reconciled,
     /// from their own controller, over their own store.
     #[tokio::test]
@@ -1041,8 +1204,8 @@ mod tests {
             send(sender, watcher::Event::InitDone);
         }
 
-        let (stream_a, store_a) = scoped_store(rx_a);
-        let (stream_b, store_b) = scoped_store(rx_b);
+        let (stream_a, store_a) = scoped_store(rx_a, None);
+        let (stream_b, store_b) = scoped_store(rx_b, None);
         let reconciled = Arc::new(Mutex::new(Vec::new()));
 
         let record = {
@@ -1082,6 +1245,101 @@ mod tests {
             keys,
             vec!["team-a/demo".to_owned(), "team-b/demo".to_owned()],
             "each controller reconciles the Application of its own namespace"
+        );
+    }
+
+    /// A `/status` writer that records nothing: the shutdown contract is what this test pins.
+    struct DiscardingStatus;
+
+    impl crate::reconcile::StatusWriter for DiscardingStatus {
+        fn patch<'a>(
+            &'a self,
+            _app: &'a Application,
+            _status: ferriscd_crd::status::ApplicationStatus,
+        ) -> futures::future::BoxFuture<'a, Result<(), crate::reconcile::ReconcileError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// **Finding M5:** cancelling the leader token must end **every** namespace scope's run
+    /// stream, not one of them.
+    ///
+    /// The bug this pins: a shared `tokio::sync::Notify` plus `notify_one` wakes exactly one
+    /// waiter. The scope that is not woken keeps reconciling — with the controller's own
+    /// credentials — after the replica lost the `Lease`, which is precisely the split brain leader
+    /// election exists to prevent. A `CancellationToken` is a broadcast, so every scope observes it.
+    ///
+    /// The scopes are built over scripted watch streams (not an API server): an empty, completed
+    /// list makes each store ready, so the streams are live and quiet, and the only thing that can
+    /// end them is the shutdown input.
+    #[tokio::test]
+    async fn cancelling_the_leader_token_ends_every_namespace_scope() {
+        /// One scope over a scripted, completed and then quiet watch.
+        fn quiet_scope(namespace: &str) -> (NamespacedController, ScriptedSender) {
+            let (mut sender, receiver) = futures::channel::mpsc::unbounded();
+            send(&mut sender, watcher::Event::Init);
+            send(&mut sender, watcher::Event::InitDone);
+            let (stream, store) = scoped_store(receiver, None);
+            let controller = Controller::for_stream(stream, store);
+            let scope = NamespacedController {
+                namespace: Some(namespace.to_owned()),
+                controller,
+            };
+            (scope, sender)
+        }
+
+        let mut scopes = Vec::new();
+        let mut stores = Vec::new();
+        // The senders are held for the duration of the test, so no scope's watch ever ends on its
+        // own: the streams below can only stop because of the cancellation.
+        let mut senders = Vec::new();
+        for namespace in ["ferriscd-system", "team-a", "team-b"] {
+            let (scope, sender) = quiet_scope(namespace);
+            stores.push(scope.store());
+            scopes.push(scope);
+            senders.push(sender);
+        }
+        assert_eq!(
+            scopes.len(),
+            3,
+            "the test must cover more than one scope for the regression to mean anything"
+        );
+
+        let ctx = Arc::new(ReconcileContext::new(
+            Api::namespaced(offline_client(), "ferriscd-system"),
+            Arc::new(crate::reconcile::UnwiredSyncPipeline),
+            Arc::new(DiscardingStatus),
+        ));
+        let controllers = ApplicationControllers {
+            controllers: scopes,
+        };
+        let stop = CancellationToken::new();
+        let mut runs = futures::stream::select_all(controllers.into_run_streams(ctx, stop.clone()));
+        let mut ready = Box::pin(futures::future::join_all(
+            stores.iter().map(reflector::Store::wait_until_ready),
+        ));
+
+        // Drive every scope through its (empty) list first: a `Controller` holds its work until the
+        // store is ready, and a stream that is not polled never is.
+        loop {
+            tokio::select! {
+                _ = &mut ready => break,
+                item = runs.next() => assert!(item.is_none(), "an empty list yields no reconcile"),
+            }
+        }
+        assert_eq!(senders.len(), 3);
+
+        // The leader term ends (a lost renewal, or a graceful stop while leading).
+        stop.cancel();
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            while runs.next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "every scope's run stream must end when the leader token is cancelled: a \
+             `notify_one` would leave the other namespaces reconciling without authority"
         );
     }
 }

@@ -756,6 +756,8 @@ name = "ferriscd-controller"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "dashmap",
  "ferriscd-crd",
  "ferriscd-engine",
  "futures",
@@ -770,6 +772,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -3644,6 +3647,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "slab",

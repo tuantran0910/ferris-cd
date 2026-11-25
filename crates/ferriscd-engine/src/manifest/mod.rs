@@ -39,7 +39,7 @@ pub use renderer::{
     render_desired,
 };
 pub use types::{DesiredResource, GroupVersionKind, ResourceKey};
-pub use yaml::parse_file;
+pub use yaml::{YamlGuardError, parse_document, parse_file};
 
 #[cfg(test)]
 mod tests {

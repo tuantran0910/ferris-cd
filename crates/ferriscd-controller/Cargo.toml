@@ -11,6 +11,17 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# The `T13.1` cluster registry (`DashMap<ClusterName, Arc<ClusterHandle>>`) and the `T13.2`
+# leader-lease cancellation token. Both are already in the lock file.
+dashmap.workspace = true
+tokio-util.workspace = true
+# Base64-encodes the CA/client-certificate material of a cluster `Secret` into the kubeconfig
+# `*-data` fields kube's own loader expects (already a transitive dependency).
+base64.workspace = true
+# Parses the kubeconfig a `ferriscd.io/secret-type=cluster` Secret may carry. Reusing the YAML 1.2
+# parser means kube's own loader validates the document (and we avoid a direct `secrecy` dependency
+# for constructing `AuthInfo` by hand). Already in the lock file.
+serde-saphyr.workspace = true
 ferriscd-crd.workspace = true
 ferriscd-engine.workspace = true
 # Stream combinators for driving `kube_runtime::Controller` and boxing the

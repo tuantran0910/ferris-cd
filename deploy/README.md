@@ -189,6 +189,226 @@ Credential values never reach the logs or `Application.status`: the `Secret` nam
 credential *kind* are logged, the values are not, and repository URLs are quoted through the shared
 redaction helper (`https://robot:***@host/...`).
 
+### Remote clusters (`T13.1`) — Secret-registered, namespaced, TLS-verified
+
+A cluster an operator registers with a `Secret` is a *destination*: an `Application` names it in
+`spec.destination.cluster`, and the controller applies, diffs, prunes and cascades **over that
+cluster's own client and API discovery**. `in-cluster` always means the control plane's own client
+and needs no `Secret`.
+
+Cluster `Secret`s are read from the control-plane namespace only, through a **namespaced**
+`Api<Secret>` watch filtered by `ferriscd.io/secret-type=cluster` — the same rule the repository
+credentials follow. Never grant `secrets` cluster-wide for this.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferriscd-cluster-registry
+  namespace: ferriscd-system          # the control-plane namespace, never another one
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  # `T13.2`: the leader-election Lease lives in the same namespace.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferriscd-cluster-registry
+  namespace: ferriscd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferriscd-cluster-registry
+subjects:
+  - kind: ServiceAccount
+    name: ferriscd-controller
+    namespace: ferriscd-system
+```
+
+#### What a cluster `Secret` looks like
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: workload-prod               # the cluster name `spec.destination.cluster` refers to
+  namespace: ferriscd-system
+  labels:
+    ferriscd.io/secret-type: cluster
+stringData:
+  server: https://10.0.0.10:6443    # required unless a full `kubeconfig` is supplied
+  ca.crt: |                         # optional: the CA the API server certificate must chain to
+    -----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----
+  bearerToken: eyJhbGciOi…          # or: tls.crt + tls.key (client certificate), or kubeconfig
+```
+
+| Key | Meaning |
+|---|---|
+| `server` | absolute `https://` API server URL. Plaintext `http://` is refused unless the controller was started with the local-dev opt-in. |
+| `ca.crt` | CA bundle (PEM). Optional for a publicly-trusted endpoint; parsed strictly, so a placeholder is rejected at seed time. |
+| `bearerToken` | static bearer token. |
+| `tls.crt`, `tls.key` | client certificate + **unencrypted** private key (PEM). |
+| `kubeconfig` | a complete kubeconfig document. Mutually exclusive with the explicit keys. `exec`, `auth-provider`, `proxy-url`, `tokenFile` and every certificate *path* field are refused: whoever can write this `Secret` must not be able to make the controller run a binary or read a pod file. |
+| `name` | optional cluster-name override (defaults to the `Secret`'s name). `in-cluster` is reserved and cannot be registered. |
+| `insecureSkipTLSVerify` | `"true"` disables verification. Refused unless the controller runs with `--allow-insecure-cluster-tls` (local development only). |
+
+Changing a `Secret` rebuilds that cluster's client (its connector and every cached impersonated
+client are replaced); deleting it removes the cluster, and any `Application` still targeting it
+fails **terminally** with `Ready=False, reason=InvalidSpec` naming the missing registration. A
+`Secret` that becomes unusable (a rotated credential with a typo) invalidates the previous client
+instead of keeping the revoked credential alive.
+
+#### Credentials *on* the remote cluster
+
+The controller authenticates to the remote cluster **as the `Secret`'s credential**, then
+impersonates `spec.serviceAccountName` there exactly as it does in-cluster, with the remote
+cluster's own connector (one connector per cluster, shared by every identity on it). The remote
+credential therefore needs:
+
+* the `impersonate` verbs (`users`, `groups`, `serviceaccounts`) the control plane's `ClusterRole`
+  has, and
+* the workload verbs the project's `destinations` allow (or, with impersonation, nothing beyond
+  `impersonate` — the ServiceAccount's own RBAC bounds the deploy).
+
+`Application.status` and the `ferriscd.io/finalizer` always stay on the **control plane**: the
+remote credential is never asked to write a FerrisCD CR the remote cluster may not even serve.
+
+If the cluster `Secret` is deleted while an `Application` with `ferriscd.io/cascade-delete: "true"`
+is terminating, there is nothing left to delete with: the finalizer is **released with a warning**
+(`reason=CleanupSkipped`) rather than wedging the object in `Terminating` (finding C5). Recreate the
+`Secret` (with the same name and a working credential) and the cascade runs on the next reconcile if
+the object has not been deleted yet.
+
+`spec.destination.cluster` is still checked against `AppProject.spec.destinations` **before** the
+registry is consulted, so a tenant cannot use an `Application` to probe which clusters exist.
+
+### HA: `Lease` leader election (`T13.2`) — opt-in
+
+By default the controller runs as a single replica: run exactly one. Two replicas without leader
+election both reconcile the same objects (double applies, racing prunes).
+
+`--leader-election` makes every replica an active/standby candidate over a
+`coordination.k8s.io/v1` `Lease` (`ferriscd-controller-leader` in the control-plane namespace):
+
+```text
+ferriscd controller --leader-election   --leader-election-lease-name ferriscd-controller-leader   --leader-election-lease-duration-seconds 15   --leader-election-renew-interval-seconds 4
+```
+
+* Only the holder reconciles; a standby waits and takes over when the lease expires (a `SIGKILL`ed
+  leader is replaced within `leaseDurationSeconds` + a retry interval).
+* The renewal is an optimistic-concurrency write on `resourceVersion`, so a stale leader can never
+  overwrite the current holder: it re-reads, sees a different holder, and stops.
+* Losing the lease cancels reconciliation immediately (in-flight passes drain like a `SIGTERM`).
+* On `SIGTERM` the leader **releases** the lease (holder cleared, duration 1 s), so the standby takes
+  over at once instead of waiting out the full duration.
+* `--leader-election-renew-interval-seconds` must be strictly less than a third of
+  `--leader-election-lease-duration-seconds`, otherwise the controller refuses to start (a
+  configuration that would make a healthy leader oscillate).
+* **Control-plane nodes need NTP (or equivalent) time sync.** Lease expiry compares the leader's
+  `renewTime` against local elapsed time, so a standby only takes over correctly while the replicas'
+  clocks stay within a few seconds of each other — a large skew either delays failover or, worse,
+  hands the lease to a standby while the old leader still believes it holds it. Keep the nodes on the
+  same time source (`chrony`/`systemd-timesyncd`, or the cloud provider's clock service) and raise
+  `--leader-election-lease-duration-seconds` above the skew you are prepared to tolerate.
+
+The lease needs no extra `ClusterRole` rule: it is namespaced in `ferriscd-system`, so the
+`ferriscd-cluster-registry` `Role` above covers it.
+
+### Sharding: deterministic `Application` partitioning (`T13.3`) — opt-in
+
+Leader election keeps every replica but one **idle**. At large scale that single active leader is the
+bottleneck. `--shard-id`/`--total-shards` partition the `Application`s instead: replica `i` of `N`
+reconciles only the objects whose
+
+```text
+shard = sha256(namespace, name) % total-shards
+```
+
+is `i` — computed locally from the object's own identity, so every replica agrees without a
+coordinator and no restart ever reshuffles ownership.
+
+```text
+# three replicas, each with its own shard and its own leader Lease
+ferriscd controller --leader-election --shard-id 0 --total-shards 3
+ferriscd controller --leader-election --shard-id 1 --total-shards 3
+ferriscd controller --leader-election --shard-id 2 --total-shards 3
+```
+
+`FERRISCD_SHARD_ID` and `FERRISCD_TOTAL_SHARDS` are read when the flags are absent, which is what a
+`StatefulSet` needs (its pods already have a stable ordinal). The `apps.kubernetes.io/pod-index`
+label is the ordinal as a string, which is exactly what the environment variable expects:
+
+```yaml
+kind: StatefulSet
+spec:
+  replicas: 3
+  serviceName: ferriscd-controller
+  podManagementPolicy: Parallel      # every shard should start at once, not one at a time
+  template:
+    spec:
+      containers:
+        - name: ferriscd
+          command: ["ferriscd", "controller", "--leader-election"]
+          env:
+            - name: FERRISCD_SHARD_ID                # "0", "1", "2"
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            - name: FERRISCD_TOTAL_SHARDS
+              value: "3"
+```
+
+Rules the controller enforces at startup (it refuses to run otherwise):
+
+* **Sharding reduces apply work, not watch load.** Every replica still lists/watches every
+  `Application` it is configured to see and stores them (only the reconcile queue is filtered), so
+  API-server list/watch traffic and memory scale with replica count, not with `1/N`. Size the API
+  server and memory for the full object set per replica; use sharding to spread reconciliation and
+  apply work, not to partition the watch.
+* **Sharding requires `--leader-election`, and always uses a per-shard `Lease`**
+  (`ferriscd-leader-shard-<id>`). Two replicas started with the same `--shard-id` would both reconcile
+  that shard — the double apply the lease exists to prevent — so they compete for that shard's lease
+  instead, and only one of them leads it.
+* **`--shard-id` and `--total-shards` go together**, `--shard-id` must be `< --total-shards`, and
+  `--total-shards` must be `>= 1`. A half-specified pair is an error, never a default: a default
+  would silently put the whole fleet in one shard (or in a shard nobody owns).
+* **`--leader-election-lease-name` is refused together with `--shard-id`.** One shared `Lease` would
+  make exactly one replica a leader and leave every other shard unreconciled while its replicas stand
+  by — a *silent* loss of coverage, which is why the combination cannot be configured rather than
+  merely being discouraged.
+
+Operational notes:
+
+* Every replica must use the **same** `--total-shards`; shard indexes must be **unique**. Reusing an
+  index costs a standby (safe, wasteful); changing `--total-shards` on one replica only costs
+  *coverage* (the Applications that replica used to own are now owned by nobody), so the shard count
+  belongs in the same place as the replica count — one templated value, not a per-pod knob.
+* Sharding is a *capacity* decision, not a rebalancing algorithm. Changing `N` re-partitions every
+  `Application` on the next watch event of every replica: that is safe (each object still has exactly
+  one owner, and `ferriscd.io/tracking-id` ownership is unchanged) but it is a fleet-wide restart, and
+  in-flight reconciles on a shrinking shard are drained like a rolling update.
+* Shards do **not** partition `AppProject`s, cluster registrations or repository credentials: those
+  stay shared, read-on-demand lookups in the control-plane namespace, so the RBAC above is unchanged
+  (every per-shard `Lease` is namespaced in `ferriscd-system`, and the `leases` rule covers all of
+  them).
+* Nothing changes for the `Application`s themselves: each one is still reconciled, status-patched and
+  finalized by exactly one owner, and a shard reads `status.inventory` written by a previous owner
+  without special casing. A sharded replica also still *stores* every object its watches list (only
+  the queue is filtered), so readiness and inventory reads do not depend on the shard count.
+* Turning sharding on or off is a **stop-then-start**, never a rolling update: a sharded replica
+  leads `ferriscd-leader-shard-<id>` while an unsharded one leads `ferriscd-controller-leader`, and
+  neither `Lease` excludes the other, so overlapping replicas reconcile the same `Application`s
+  twice (double applies, racing prunes). Scale the old configuration to zero (or release its lease)
+  before starting the other. The same applies to changing `--total-shards`/`--shard-id` on a running
+  fleet.
+
 ### Multi-tenancy RBAC matrix
 
 | Controller verb (`T12.2`/`T12.3`) | Why | Scope |
@@ -237,12 +457,12 @@ Notes that matter operationally:
   the object with `ferriscd.io/force-delete: "true"` — the finalizer is then released **without
   pruning**, and any managed objects must be removed by hand. `kubectl describe application` shows
   the reason and the offending name.
-* **Remote clusters (`T13.1`)** will need the same `impersonate` rules on their own
-  kubeconfigs; the pool builds one connector per cluster and reuses it for every
-  ServiceAccount (no connector per reconcile, trap T12 / finding H5). At most 64 impersonated
-  clients are cached per cluster (finding M2): the cache key is
-  `(destination namespace, ServiceAccount)`, so it is bounded rather than tenant-controlled, and a
-  miss rebuilds a middleware stack over the same connector.
+* **Remote clusters (`T13.1`)** need the same `impersonate` rules on their own credentials; each
+  cluster has its own pool that builds one connector and reuses it for every ServiceAccount (no
+  connector per reconcile, trap T12 / finding H5). At most 64 impersonated clients are cached per
+  cluster (finding M2): the cache key is `(destination namespace, ServiceAccount)`, so it is
+  bounded rather than tenant-controlled, and a miss rebuilds a middleware stack over the same
+  connector.
 * **Repository credentials are controller-side only.** They are read from `ferriscd-system` under
   the controller's own identity, *before* a clone, and are never copied into a tenant namespace,
   an `Application`, or a `status` field — so a tenant's RBAC on its destination namespaces never

@@ -8,23 +8,33 @@ use std::time::Duration;
 use ferriscd_crd::Application;
 use kube::{Api, Client, ResourceExt};
 
+pub mod cluster_manager;
 pub mod controller;
 pub mod credentials;
 pub mod discovery;
 pub mod dry_run;
 pub mod hooks;
 pub mod impersonation;
+pub mod leader_election;
 pub mod live_state;
 pub mod predicate;
 pub mod project;
 pub mod prune;
 pub mod reconcile;
 pub mod scope;
+pub mod sharding;
 pub mod sync;
 pub mod sync_executor;
 pub mod sync_recovery;
 pub mod waves;
 
+pub use cluster_manager::{
+    ClusterAuth, ClusterChange, ClusterError, ClusterHandle, ClusterHandleBuilder, ClusterManager,
+    ClusterName, ClusterOptions, ClusterSecret, ClusterSecretEvent, ClusterSecretSource,
+    ClusterSource, ClusterTarget, ClusterWatchError, IN_CLUSTER, KEY_BEARER_TOKEN, KEY_CA_CRT,
+    KEY_INSECURE_SKIP_TLS_VERIFY, KEY_KUBECONFIG, KEY_SERVER, KEY_TLS_CRT, KEY_TLS_KEY,
+    KubeClusterBuilder, SECRET_TYPE_CLUSTER, SecretClusterSource,
+};
 pub use controller::{
     APPLICATION_NAMESPACES_ENV, ApplicationControllers, BackoffTracker, ConfigError,
     ControllerConfig, DEFAULT_CONCURRENCY, DEFAULT_DRAIN_TIMEOUT, FailureClass,
@@ -54,6 +64,12 @@ pub use impersonation::{
     ImpersonationLayer, ImpersonationPool, ImpersonationService, ImpersonationSource,
     MAX_CACHED_IDENTITIES,
 };
+pub use leader_election::{
+    AcquireOutcome, DEFAULT_LEASE_DURATION, DEFAULT_LEASE_NAME, DEFAULT_RENEW_INTERVAL,
+    DEFAULT_RETRY_INTERVAL, HoldOutcome, KubeLeaseApi, LeaderElection, LeaderElectionConfig,
+    LeaderElectionConfigError, LeaderElectionError, Leadership, LeaseApi, LeaseElector,
+    MAX_RETRY_INTERVAL, MIN_LEASE_DURATION,
+};
 pub use live_state::{
     ClusterStateReader, DynamicApiSource, FetchRequest, LiveObjectSource, LiveState,
     LiveStateError, TrackingOwner,
@@ -68,6 +84,10 @@ pub use reconcile::{
     ControllerError, FINALIZER, ReconcileContext, ReconcileError, StatusWriter, SyncPipeline,
 };
 pub use scope::{ClusterNamespacePolicy, InBundleCrd, ScopeError, normalize_scopes};
+pub use sharding::{
+    SHARD_ID_ENV, SHARD_LEASE_PREFIX, ShardOptions, ShardPredicate, Sharding, ShardingConfigError,
+    TOTAL_SHARDS_ENV, from_env_values, from_values, shard_lease_name, shard_of, shard_predicate,
+};
 pub use sync::{
     ApplicationPatch, Applier, ApplyRequest, CreateRequest, DeleteOutcome, DeleteRequest,
     DynamicApiApplier, InventorySyncPipeline, PENDING_REQUEUE, PROGRESSING_REQUEUE,
@@ -122,6 +142,169 @@ pub struct RunOptions {
     /// `None` uses `<system temp dir>/ferriscd-repos`. In a cluster this should be an
     /// `emptyDir` mounted by the Deployment.
     pub work_root: Option<std::path::PathBuf>,
+
+    /// Accept `insecureSkipTLSVerify` / plaintext `http://` cluster registrations (`T13.1`).
+    ///
+    /// Off by default: a remote cluster's manifests and credentials would otherwise cross an
+    /// unverified connection, where anything on the path can read and rewrite them.
+    pub allow_insecure_clusters: bool,
+
+    /// Run `coordination.k8s.io/v1` `Lease` leader election (`T13.2`).
+    ///
+    /// `None` (the default) keeps the pre-Phase-13 single-replica behaviour: exactly one controller
+    /// replica may run. Setting it makes this replica an active/standby candidate, which is what
+    /// allows `replicas: 2` without two reconcilers fighting over the same objects.
+    pub leader_election: Option<LeaderElectionOptions>,
+
+    /// Deterministic `Application` sharding (`T13.3`).
+    ///
+    /// Both halves unset (the default) means "no sharding": this replica reconciles every
+    /// `Application` in its watched namespaces, exactly as before Phase 13. When both are set the
+    /// replica reconciles only its shard, and it **must** also enable leader election — see
+    /// [`RunOptions::shard_config`].
+    pub shard: ShardOptions,
+}
+
+/// The `T13.2` knobs [`RunOptions::leader_election`] carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeaderElectionOptions {
+    /// `Lease` name (`ferriscd-controller-leader` by default).
+    pub lease_name: Option<String>,
+    /// Lease duration; `None` keeps [`leader_election::DEFAULT_LEASE_DURATION`].
+    pub lease_duration: Option<Duration>,
+    /// Renewal interval; `None` keeps [`leader_election::DEFAULT_RENEW_INTERVAL`].
+    pub renew_interval: Option<Duration>,
+    /// This replica's identity (`HOSTNAME`, then the pid, by default).
+    pub identity: Option<String>,
+}
+
+/// The validated `T13.2`/`T13.3` startup plan for this replica.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaPlan {
+    /// The leader-election configuration, or `None` when election is disabled.
+    pub leader_election: Option<LeaderElectionConfig>,
+    /// This replica's shard, or `None` when sharding is off.
+    pub shard: Option<Sharding>,
+}
+
+/// Errors raised while resolving a [`RunOptions::ha_plan`].
+///
+/// Both halves are terminal: a controller that switched on with an unusable lease/shard
+/// configuration would either oscillate between leaders or reconcile the wrong slice of the fleet.
+#[derive(Debug, thiserror::Error)]
+pub enum RunConfigError {
+    /// The leader-election timings or `Lease` name are unusable.
+    #[error(transparent)]
+    LeaderElection(#[from] LeaderElectionConfigError),
+
+    /// The sharding flags are unusable, or contradict the election mode (`T13.3`).
+    #[error(transparent)]
+    Sharding(#[from] ShardingConfigError),
+}
+
+impl RunOptions {
+    /// Validates and resolves leader election **and** sharding together.
+    ///
+    /// They are resolved in one place because they constrain each other (`T13.3`): sharding requires
+    /// election and *derives* the `Lease` name, so a plan that owns one without the other must be
+    /// impossible to construct.
+    ///
+    /// # Errors
+    ///
+    /// [`RunConfigError::Sharding`] for a half-specified or out-of-range shard, sharding without
+    /// leader election, or sharding combined with a `Lease` name other than the per-shard one;
+    /// [`RunConfigError::LeaderElection`] for timings that would make a healthy leader lose its
+    /// lease (see [`LeaderElectionConfig::validate`]).
+    pub fn ha_plan(&self, namespace: &str) -> Result<HaPlan, RunConfigError> {
+        // Sharding first: it decides the lease name, and a half-configured shard fleet must fail
+        // before anything is built from the lease configuration.
+        let shard = self.shard_config()?;
+        let Some(options) = self.leader_election.as_ref() else {
+            return Ok(HaPlan {
+                leader_election: None,
+                shard,
+            });
+        };
+        let identity = options
+            .identity
+            .clone()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .filter(|identity| !identity.trim().is_empty())
+            .unwrap_or_else(|| format!("ferriscd-controller-{}", std::process::id()));
+        let mut config = LeaderElectionConfig::new(namespace, identity);
+        if let Some(lease_name) = &options.lease_name {
+            config = config.with_lease_name(lease_name.clone());
+        }
+        if let Some(lease_duration) = options.lease_duration {
+            config = config.with_lease_duration(lease_duration);
+        }
+        if let Some(renew_interval) = options.renew_interval {
+            config = config.with_renew_interval(renew_interval);
+        }
+        if let Some(shard) = shard {
+            // The per-shard name always wins: `shard_config` already refused every other name, and
+            // re-applying it here means the lease the elector writes is the one the shard named,
+            // never the single-leader default (`ferriscd-controller-leader`).
+            config = config.with_lease_name(shard.lease_name());
+        }
+        config.validate()?;
+        Ok(HaPlan {
+            leader_election: Some(config),
+            shard,
+        })
+    }
+
+    /// Resolves this replica's shard (`T13.3`), or `None` when sharding is off.
+    ///
+    /// Also refuses the two combinations that cannot be deployed safely:
+    ///
+    /// * sharding without leader election — two replicas given the same `--shard-id` would both
+    ///   reconcile that shard (double applies, racing prunes), and
+    /// * sharding with any `Lease` other than its own `ferriscd-leader-shard-<id>` — one shared
+    ///   `Lease` makes exactly one replica a leader, so the other shards would never be reconciled
+    ///   while their replicas stand by.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardingConfigError`] for an incomplete/out-of-range configuration (see
+    /// [`sharding::from_values`]) or either refused combination above.
+    pub fn shard_config(&self) -> Result<Option<Sharding>, ShardingConfigError> {
+        let Some(shard) = sharding::resolve(self.shard.shard_id, self.shard.total_shards)? else {
+            return Ok(None);
+        };
+        let Some(options) = self.leader_election.as_ref() else {
+            return Err(ShardingConfigError::RequiresLeaderElection {
+                shard_id: shard.shard_id(),
+                total_shards: shard.total_shards(),
+                prefix: SHARD_LEASE_PREFIX,
+            });
+        };
+        if let Some(configured) = options.lease_name.as_deref() {
+            let configured = configured.trim();
+            if configured != shard.lease_name() {
+                return Err(ShardingConfigError::LeaseNameConflict {
+                    expected: shard.lease_name(),
+                    configured: configured.to_owned(),
+                });
+            }
+        }
+        Ok(Some(shard))
+    }
+
+    /// Builds the validated leader-election configuration, or `None` when it is disabled.
+    ///
+    /// A thin view over [`Self::ha_plan`]: the sharding validation runs either way, so a sharded
+    /// replica can never be started with an election configuration that ignores its shard.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::ha_plan`].
+    pub fn leader_election_config(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<LeaderElectionConfig>, RunConfigError> {
+        Ok(self.ha_plan(namespace)?.leader_election)
+    }
 }
 
 /// Runs the controller loop entrypoint with default [`RunOptions`].
@@ -154,8 +337,16 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
         api_group = ferriscd_crd::api_group(),
         log_format = log_format.as_str(),
         allow_local_repos = options.allow_local_repos,
+        leader_election = options.leader_election.is_some(),
         "ferriscd-controller starting"
     );
+    if options.leader_election.is_none() {
+        tracing::warn!(
+            "leader election is disabled: run exactly ONE controller replica. Two replicas without \
+             it both reconcile, which can double-apply and race on the same objects \
+             (--leader-election turns on the coordination.k8s.io/v1 Lease)"
+        );
+    }
 
     let namespace_value = match options.namespace.as_deref() {
         Some(namespace) => Some(namespace.to_owned()),
@@ -167,11 +358,33 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
         Some(value) => ApplicationNamespaces::parse(Some(value))?,
         None => ControllerConfig::application_namespaces_from_env()?,
     };
+    let namespace = controller::namespace_from_env_value(namespace_value.as_deref())?;
+    // `T13.2` finding M8 and `T13.3`: the lease/renewal combination **and** the shard assignment are
+    // validated together, before any client, pool or registry is built. A renewal interval that
+    // cannot keep a healthy leader alive, or a shard that contradicts the election mode, must be a
+    // startup failure — not a controller that acquires a lease and then oscillates, or one that
+    // quietly reconciles a slice nobody asked for.
+    let plan = options.ha_plan(&namespace)?;
+    let leader_election = plan.leader_election;
+    let shard = plan.shard;
     let config = ControllerConfig {
-        namespace: controller::namespace_from_env_value(namespace_value.as_deref())?,
+        namespace,
         application_namespaces,
+        shard,
         ..ControllerConfig::default()
     };
+    if let Some(shard) = shard {
+        tracing::info!(
+            shard_id = shard.shard_id(),
+            total_shards = shard.total_shards(),
+            shard = %shard,
+            lease = %shard.lease_name(),
+            "deterministic sharding enabled: this replica reconciles only the Applications whose \
+             sha256(namespace, name) falls in its shard, and holds the per-shard leader lease \
+             `ferriscd-leader-shard-<id>`; every --total-shards value must match across replicas and \
+             every --shard-id must be unique"
+        );
+    }
     // The `Config` is inferred once and shared: the controller's own client and the `T12.3`
     // impersonation pool are both built from it, so a tenant request authenticates with the same
     // credential material as the controller's.
@@ -234,14 +447,15 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
     // eagerly — not lazily on the first tenant `Application` — so a broken TLS configuration is a
     // startup failure instead of a reconcile that fails forever.
     let pool_config = kube_config.clone();
-    let pool =
+    let pool = Arc::new(
         tokio::task::spawn_blocking(move || impersonation::ImpersonationPool::new(&pool_config))
             .await
             .context("the impersonation connector task panicked")?
             .context(
                 "failed to build the ServiceAccount impersonation connector; tenant Applications \
              need it, and deploying them with the controller's own identity is never an option",
-            )?;
+            )?,
+    );
     tracing::info!(
         connectors = pool.connectors(),
         "ServiceAccount impersonation pool ready (one shared HTTP/TLS connector)"
@@ -252,8 +466,54 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
         "repository credentials: reading labeled Secrets from the control-plane namespace only \
          (namespaced list, never cluster-wide; no match clones anonymously)"
     );
+    // `T13.1`: the cluster registry. The in-cluster handle reuses the controller's own client, its
+    // own discovery cache and the pool built above — sharing the ONE connector — so answering
+    // `in-cluster` allocates nothing new. Remote clusters come from
+    // `ferriscd.io/secret-type=cluster` Secrets in the control-plane namespace, watched (never read
+    // per reconcile) by a namespaced `Api<Secret>`.
+    let cluster_options = if options.allow_insecure_clusters {
+        tracing::warn!(
+            "accepting insecure cluster registrations (--allow-insecure-cluster-tls): TLS \
+             verification of remote API servers can be disabled by a Secret. Never use this in \
+             production"
+        );
+        ClusterOptions::allowing_insecure()
+    } else {
+        ClusterOptions::strict()
+    };
+    let in_cluster = Arc::new(ClusterHandle::new(
+        ClusterName::in_cluster(),
+        client.clone(),
+        DiscoveryCache::new(client.clone()),
+        pool.clone(),
+    ));
+    let clusters = Arc::new(ClusterManager::new(
+        in_cluster,
+        config.namespace.clone(),
+        cluster_options,
+        Arc::new(KubeClusterBuilder::new(cluster_options)),
+    ));
+    // Seed from one initial list before the watch starts: an `Application` that already references
+    // a remote cluster must not fail terminally in the window between the watch being spawned and
+    // its first event arriving. The watch then owns every subsequent add/change/delete.
+    seed_registry(&clusters, client.clone(), &config.namespace).await;
+    let cluster_stop = tokio_util::sync::CancellationToken::new();
+    let cluster_watch = tokio::spawn(clusters.clone().run(
+        Arc::new(SecretClusterSource::new(
+            client.clone(),
+            config.namespace.clone(),
+        )),
+        cluster_stop.clone(),
+    ));
+    tracing::info!(
+        namespace = %config.namespace,
+        label = %SecretClusterSource::label_selector(),
+        allow_insecure = cluster_options.allow_insecure,
+        "remote clusters: watching labeled Secrets in the control-plane namespace only \
+         (namespaced watch, never cluster-wide); `in-cluster` is always available"
+    );
     let impersonation_source: Arc<dyn impersonation::ImpersonationSource> =
-        Arc::new(impersonation::ImpersonatingAccess::new(Arc::new(pool)));
+        Arc::new(impersonation::ImpersonatingAccess::new(pool.clone()));
 
     let pipeline = Arc::new(
         sync::InventorySyncPipeline::new(
@@ -284,12 +544,191 @@ pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
         .with_credential_source(Arc::new(credentials::SecretCredentialStore::new(
             client.clone(),
             &config.namespace,
-        ))),
+        )))
+        // `T13.1`: `spec.destination.cluster` is resolved through the registry. Without this every
+        // non-`in-cluster` destination is a terminal error, which is the pre-Phase-13 behaviour.
+        .with_cluster_source(clusters.clone()),
     );
     let ctx =
         Arc::new(ReconcileContext::new(apps_api, pipeline, status).with_client(client.clone()));
 
-    controller::run(client, config, ctx).await?;
+    let result: anyhow::Result<()> = match leader_election {
+        None => controller::run(client, config, ctx)
+            .await
+            .map_err(anyhow::Error::from),
+        Some(leader) => run_as_leader(client, config, ctx, leader, cluster_stop.clone()).await,
+    };
+    // The registry is a background watcher: stopping it is enough, nothing is buffered.
+    cluster_stop.cancel();
+    drop(cluster_watch);
+    result
+}
+
+/// Seeds the cluster registry from one label-filtered list of the control-plane namespace.
+///
+/// Failure is logged, never fatal: the watch performs the same reads and retries on its own.
+async fn seed_registry(clusters: &ClusterManager, client: Client, namespace: &str) {
+    let secrets: Api<k8s_openapi::api::core::v1::Secret> = Api::namespaced(client, namespace);
+    let params = kube::api::ListParams::default().labels(&SecretClusterSource::label_selector());
+    let listed = match secrets.list(&params).await {
+        Ok(listed) => listed,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                namespace = %namespace,
+                "could not list the cluster registration Secrets at startup; the watch will retry"
+            );
+            return;
+        }
+    };
+    let mut registered = 0_usize;
+    for secret in &listed.items {
+        match clusters.seed(secret).await {
+            Ok(_) => registered = registered.saturating_add(1),
+            Err(err) => tracing::warn!(
+                cluster = %secret.name_any(),
+                error = %err,
+                "a cluster registration Secret cannot be used; skipping it"
+            ),
+        }
+    }
+    tracing::info!(
+        namespace = %namespace,
+        registered,
+        clusters = ?clusters.names(),
+        "cluster registry seeded"
+    );
+}
+
+/// Which half of a leader term ended first.
+#[derive(Debug)]
+enum TermEnd<C> {
+    /// The controller set ended on its own; the term token was cancelled by [`race_term`].
+    Controllers(C),
+    /// The lease holder ended: leadership was lost, or a graceful stop released the lease.
+    Hold(Result<HoldOutcome, LeaderElectionError>),
+}
+
+/// Races the controller set against the lease holder for one leader term.
+///
+/// The two must **not** be joined (finding: `run_as_leader` join semantics). If the controller set
+/// ends while the term token is still live, `join!` would keep renewing the lease forever: this
+/// replica would hold leadership while reconciling nothing, and no standby could ever take over — a
+/// black hole. Racing them means "the controller set finished" ends the term, and cancelling the
+/// token here is what stops anything from scheduling more work under it.
+///
+/// The losing half is left untouched (only polled, never dropped by this helper), so the caller can
+/// still await it — the controller set has to drain after the lease is lost, exactly like a
+/// `SIGTERM`.
+async fn race_term<C>(
+    controllers: &mut C,
+    hold: &mut (impl Future<Output = Result<HoldOutcome, LeaderElectionError>> + Unpin),
+    token: &tokio_util::sync::CancellationToken,
+) -> TermEnd<C::Output>
+where
+    C: Future + Unpin,
+{
+    tokio::select! {
+        result = controllers => {
+            token.cancel();
+            TermEnd::Controllers(result)
+        }
+        result = hold => TermEnd::Hold(result),
+    }
+}
+
+/// Runs the active/standby loop (`T13.2`).
+///
+/// The standby waits for the `Lease`; the leader runs the controller set until the lease is lost
+/// (then it becomes a standby again) or the process is asked to stop (then it releases the lease
+/// voluntarily, so the standby takes over at once).
+async fn run_as_leader(
+    client: Client,
+    config: ControllerConfig,
+    ctx: Arc<ReconcileContext>,
+    leader: LeaderElectionConfig,
+    cluster_stop: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let election = LeaderElection::from_client(client.clone(), leader)?;
+    // The signal listener only cancels the token: releasing the lease (and cancelling the leader
+    // token) is `Leadership::hold`'s job, so the release happens in one place.
+    let stop = tokio_util::sync::CancellationToken::new();
+    let signal = stop.clone();
+    tokio::spawn(async move {
+        let reason = shutdown_signal().await;
+        tracing::info!(
+            signal = reason.as_str(),
+            "graceful shutdown requested; releasing the leader lease before draining"
+        );
+        signal.cancel();
+    });
+    tracing::info!(
+        lease = %election.elector().config().lease_name(),
+        namespace = %election.elector().config().namespace(),
+        identity = %election.elector().config().identity(),
+        lease_duration = ?election.elector().config().lease_duration(),
+        renew_interval = ?election.elector().config().renew_interval(),
+        "leader election enabled: this replica is an active/standby candidate"
+    );
+
+    loop {
+        let Some(term) = election
+            .campaign(&stop)
+            .await
+            .context("leader election failed")?
+        else {
+            break;
+        };
+        let token = term.token();
+        // Boxed so one `select!` can poll both halves without moving either: the controller set has
+        // to be awaited *after* the term ends, so in-flight passes drain like a `SIGTERM`.
+        let mut controllers = Box::pin(controller::run_as_leader(
+            client.clone(),
+            config.clone(),
+            ctx.clone(),
+            token.clone(),
+        ));
+        let mut hold = Box::pin(term.hold(&stop));
+        let outcome = match race_term(&mut controllers, &mut hold, &token).await {
+            TermEnd::Controllers(result) => {
+                // The controller set ended while the lease was still ours. Hand the lease back
+                // instead of renewing an idle term: a replica that holds leadership but runs no
+                // reconcilers is a black hole no standby can take over from.
+                drop(hold);
+                tracing::warn!(
+                    lease = %term.elector().config().lease_name(),
+                    identity = %term.elector().config().identity(),
+                    "the controller set ended before the leader term; releasing the leader lease so \
+                     a standby takes over instead of renewing an idle term"
+                );
+                if let Err(err) = term.elector().release().await {
+                    tracing::warn!(
+                        lease = %term.elector().config().lease_name(),
+                        error = %err,
+                        "failed to release the leader lease; the standby will wait for it to expire"
+                    );
+                }
+                // The controller set's own failure is reported after the lease is safely released.
+                result?;
+                HoldOutcome::Released
+            }
+            TermEnd::Hold(result) => {
+                let outcome = result.context("holding the leader lease failed")?;
+                // The term token is already cancelled (lost or released): let the controller set
+                // drain rather than abandoning in-flight applies and status patches.
+                controllers.await?;
+                outcome
+            }
+        };
+        if outcome == HoldOutcome::Lost {
+            tracing::warn!("standing by: another replica will take the leader lease");
+            continue;
+        }
+        break;
+    }
+    cluster_stop.cancel();
     Ok(())
 }
 
@@ -575,6 +1014,156 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // `T13.3`: sharding is per-shard leader election
+    // ---------------------------------------------------------------------
+
+    /// The pre-Phase-13 default: no election, no shard, no `leases` RBAC required.
+    #[test]
+    fn the_default_ha_plan_is_unchanged() {
+        let plan = RunOptions::default()
+            .ha_plan(ferriscd_crd::CONTROL_PLANE_NAMESPACE)
+            .expect("the defaults must be valid");
+        assert!(plan.leader_election.is_none(), "election stays opt-in");
+        assert!(plan.shard.is_none(), "sharding stays opt-in");
+        assert!(
+            RunOptions::default()
+                .shard_config()
+                .expect("no shard flags is valid")
+                .is_none()
+        );
+    }
+
+    /// **`T13.3` wiring:** a sharded replica's `Lease` is `ferriscd-leader-shard-<id>` — never the
+    /// single-leader default, which would leave every other shard unreconciled.
+    #[test]
+    fn sharding_derives_the_per_shard_lease() {
+        let options = RunOptions {
+            leader_election: Some(LeaderElectionOptions {
+                identity: Some("pod-1".to_owned()),
+                ..Default::default()
+            }),
+            shard: ShardOptions::new(Some(1), Some(3)),
+            ..Default::default()
+        };
+        let plan = options
+            .ha_plan(ferriscd_crd::CONTROL_PLANE_NAMESPACE)
+            .expect("a sharded replica with election is valid");
+        let shard = plan.shard.expect("sharding is on");
+        assert_eq!(shard.shard_id(), 1);
+        assert_eq!(shard.total_shards(), 3);
+        let lease = plan.leader_election.expect("election is on");
+        assert_eq!(lease.lease_name(), "ferriscd-leader-shard-1");
+        assert_ne!(lease.lease_name(), DEFAULT_LEASE_NAME);
+        assert_eq!(lease.identity(), "pod-1");
+        assert_eq!(lease.lease_duration(), DEFAULT_LEASE_DURATION);
+
+        // `--total-shards 1` is legal: one shard holds everything, and still has its own lease.
+        let single = RunOptions {
+            leader_election: Some(LeaderElectionOptions::default()),
+            shard: ShardOptions::new(Some(0), Some(1)),
+            ..Default::default()
+        }
+        .ha_plan(ferriscd_crd::CONTROL_PLANE_NAMESPACE)
+        .expect("one shard is valid");
+        assert_eq!(
+            single.leader_election.expect("election is on").lease_name(),
+            "ferriscd-leader-shard-0"
+        );
+        assert!(
+            single
+                .shard
+                .expect("sharding is on")
+                .owns("ferriscd-system", "any-application"),
+            "with one shard, this replica owns every Application"
+        );
+
+        // The "explicitly paired" mode: the shard's own name may be stated by hand.
+        let paired = RunOptions {
+            leader_election: Some(LeaderElectionOptions {
+                lease_name: Some(" ferriscd-leader-shard-1 ".to_owned()),
+                ..Default::default()
+            }),
+            shard: ShardOptions::new(Some(1), Some(3)),
+            ..Default::default()
+        };
+        assert_eq!(
+            paired
+                .ha_plan(ferriscd_crd::CONTROL_PLANE_NAMESPACE)
+                .expect("the per-shard name is correct, padding aside")
+                .leader_election
+                .expect("election is on")
+                .lease_name(),
+            "ferriscd-leader-shard-1"
+        );
+    }
+
+    /// **`T13.3` trap guard:** the two unsafe combinations are refused, and a half-specified pair is
+    /// never defaulted.
+    #[test]
+    fn sharding_cannot_be_combined_with_single_leader_election() {
+        // No election at all: two replicas with the same shard id would double-apply.
+        let err = RunOptions {
+            shard: ShardOptions::new(Some(0), Some(2)),
+            ..Default::default()
+        }
+        .ha_plan(ferriscd_crd::CONTROL_PLANE_NAMESPACE)
+        .expect_err("sharding without election must be refused");
+        assert!(
+            matches!(
+                err,
+                RunConfigError::Sharding(ShardingConfigError::RequiresLeaderElection { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("--leader-election"), "{err}");
+
+        // One shared lease: only one replica would ever lead, leaving the other shards unreconciled.
+        for lease_name in [DEFAULT_LEASE_NAME, "ferriscd-controller-leader", "custom"] {
+            let err = RunOptions {
+                leader_election: Some(LeaderElectionOptions {
+                    lease_name: Some(lease_name.to_owned()),
+                    ..Default::default()
+                }),
+                shard: ShardOptions::new(Some(1), Some(3)),
+                ..Default::default()
+            }
+            .ha_plan(ferriscd_crd::CONTROL_PLANE_NAMESPACE)
+            .expect_err("only the per-shard lease name is allowed");
+            assert!(
+                matches!(
+                    err,
+                    RunConfigError::Sharding(ShardingConfigError::LeaseNameConflict { .. })
+                ),
+                "{lease_name}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("ferriscd-leader-shard-1"),
+                "the refusal names the lease the shard needs: {err}"
+            );
+        }
+
+        // A half-specified pair, and an index that cannot exist.
+        for (shard_id, total_shards) in [
+            (Some(0), None),
+            (None, Some(4)),
+            (Some(4), Some(4)),
+            (Some(0), Some(0)),
+        ] {
+            let err = RunOptions {
+                leader_election: Some(LeaderElectionOptions::default()),
+                shard: ShardOptions::new(shard_id, total_shards),
+                ..Default::default()
+            }
+            .ha_plan(ferriscd_crd::CONTROL_PLANE_NAMESPACE)
+            .expect_err("an unusable shard must be refused");
+            assert!(
+                matches!(err, RunConfigError::Sharding(_)),
+                "{shard_id:?}/{total_shards:?}: {err:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn await_drained_returns_work_completed_before_shutdown() {
         let result = await_drained(
@@ -609,5 +1198,48 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Ok(9)));
+    }
+
+    /// **`run_as_leader` join semantics:** a controller set that ends on its own must end the leader
+    /// term (and the term token with it). Joining both halves instead would keep renewing a lease
+    /// this replica no longer exercises — leadership with no reconcilers, and no takeover.
+    #[tokio::test]
+    async fn a_controller_set_that_ends_first_ends_the_leader_term() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut controllers = Box::pin(async { Ok::<(), anyhow::Error>(()) });
+        let mut hold = Box::pin(std::future::pending::<
+            Result<HoldOutcome, LeaderElectionError>,
+        >());
+
+        match race_term(&mut controllers, &mut hold, &token).await {
+            TermEnd::Controllers(result) => assert!(result.is_ok()),
+            TermEnd::Hold(result) => {
+                panic!("the controller set ended first, not the lease holder: {result:?}");
+            }
+        }
+        assert!(
+            token.is_cancelled(),
+            "the term token must be cancelled when the controller set ends, so nothing keeps \
+             scheduling work under a lease the replica is about to release"
+        );
+    }
+
+    /// The other half of the race: a lost (or released) lease ends the term immediately, and the
+    /// controller set is left for the caller to drain — the cancellation is `hold`'s own job.
+    #[tokio::test]
+    async fn a_lost_lease_ends_the_term_before_the_controller_set_drains() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut controllers = Box::pin(std::future::pending::<anyhow::Result<()>>());
+        let mut hold =
+            Box::pin(async { Ok::<HoldOutcome, LeaderElectionError>(HoldOutcome::Lost) });
+
+        match race_term(&mut controllers, &mut hold, &token).await {
+            TermEnd::Hold(Ok(HoldOutcome::Lost)) => {}
+            other => panic!("expected a lost lease, got {other:?}"),
+        }
+        assert!(
+            !token.is_cancelled(),
+            "a lost lease ends the term without this helper cancelling the token"
+        );
     }
 }

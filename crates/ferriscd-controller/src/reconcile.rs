@@ -309,6 +309,15 @@ pub enum ReconcileError {
     #[error(transparent)]
     Credentials(#[from] crate::credentials::CredentialError),
 
+    /// The destination cluster is not registered, or its `Secret` cannot be used (`T13.1`).
+    ///
+    /// Terminal: the `Secret` registry is the only way a remote cluster becomes addressable, and
+    /// applying a remote `Application` to the control plane instead would deploy the manifests
+    /// into the wrong cluster. Every variant names the `Secret` or the cluster name; none carries
+    /// a credential value.
+    #[error(transparent)]
+    Cluster(#[from] crate::cluster_manager::ClusterError),
+
     /// A Server-Side Apply call failed for a specific resource.
     #[error("server-side apply failed for {resource}: {source}")]
     Apply {
@@ -418,7 +427,8 @@ impl ReconcileError {
             | Self::OwnershipConflict { .. }
             | Self::Policy(_)
             | Self::Impersonation(_)
-            | Self::Credentials(_) => false,
+            | Self::Credentials(_)
+            | Self::Cluster(_) => false,
             // A kind nobody serves means nothing is left to clean up.
             Self::Live(err) => matches!(err, LiveStateError::UnknownKind { .. }),
             Self::Repo(_) | Self::Manifest(_) | Self::Diff(_) => false,
@@ -452,7 +462,10 @@ impl ReconcileError {
             // A malformed or ambiguous repository credential `Secret` is a configuration error
             // only the operator can fix (`T12.4`); retrying would churn the queue while every
             // clone failed the same way.
-            | Self::Credentials(_) => FailureClass::Terminal,
+            | Self::Credentials(_)
+            // A cluster that is not registered (or whose Secret cannot be used) is a
+            // configuration state only an operator can change (`T13.1`): never retried.
+            | Self::Cluster(_) => FailureClass::Terminal,
             // The next pass picks the replacement up where this one stopped.
             Self::SyncRetry { .. } => FailureClass::Retryable,
             Self::Diff(err) => classify_engine_error(err.is_retryable()),
@@ -871,6 +884,9 @@ pub fn failure_reason(err: &ReconcileError) -> &'static str {
         // An unusable repository credential `Secret` is a spec/configuration problem too (`T12.4`):
         // the operator has to fix the `Secret` named in the message, and no retry can do that.
         ReconcileError::Credentials(_) => REASON_INVALID_SPEC,
+        // An unregistered cluster (or an unusable cluster `Secret`) is the same kind of problem
+        // (`T13.1`): the `Application`'s `spec.destination.cluster` or the `Secret` must change.
+        ReconcileError::Cluster(_) => REASON_INVALID_SPEC,
         _ => REASON_SYNC_ERROR,
     }
 }
