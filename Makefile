@@ -16,10 +16,13 @@ test:
 	cargo test --workspace
 
 # Single pre-review gate: mirrors the CI workflow exactly.
+# The `crd generate --check` step is the deterministic CRD drift check (finding M-10):
+# regenerating the committed manifests must be a no-op.
 gate:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-engine --features test-utils --all-targets -- -D warnings
+	cargo run -q -p ferriscd-cli -- crd generate --check
 	cargo test --workspace
 
 # Fast inner-loop check: formatting + lints only (no test run).

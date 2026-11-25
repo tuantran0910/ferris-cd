@@ -12,7 +12,9 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::application::MAX_REVISION_HISTORY_LIMIT;
+use crate::application::{
+    DEFAULT_TARGET_REVISION, MAX_REVISION_HISTORY_LIMIT, RendererSpec, SourceSpec,
+};
 
 /// Hard cap on `status.history` entries.
 ///
@@ -24,6 +26,12 @@ pub const MAX_RESOURCE_STATUSES: usize = 100;
 
 /// Maximum length (in `char`s) of a per-resource status message.
 pub const MAX_STATUS_MESSAGE_CHARS: usize = 200;
+
+/// Hard cap on `status.operationState.activeHooks` entries.
+///
+/// An operation tracks at most a handful of hooks; the cap only exists so a runaway controller can
+/// never grow `/status` past the `etcd` budget (trap T9).
+pub const MAX_ACTIVE_HOOKS: usize = 100;
 
 /// `Ready` condition type, set on every reconcile.
 pub const CONDITION_READY: &str = "Ready";
@@ -171,6 +179,29 @@ pub enum OperationPhase {
     Failed,
     /// The operation aborted with a terminal error.
     Error,
+}
+
+/// Phase of a multi-wave sync operation (`T10.1`).
+///
+/// `PreSync` -> `Sync(wave)` -> `PostSync` -> `Succeeded`, with any wave (or the whole operation)
+/// able to enter `SyncFail` -> `Failed`. The wave being applied is `currentWave`; this enum names
+/// only the phase, so the wire form stays a flat string (no tagged-union schema) and
+/// `kubectl get -o yaml` stays readable. The transition rules live in
+/// `ferriscd_engine::sync::state_machine`; this type only fixes the wire values.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+pub enum SyncPhase {
+    /// Running `PreSync` hooks (migrations, credential seeding).
+    PreSync,
+    /// Applying the resources of `currentWave`.
+    Sync,
+    /// Running `PostSync` hooks (smoke tests, notifications).
+    PostSync,
+    /// Every wave and hook completed successfully.
+    Succeeded,
+    /// A wave/hook failed or timed out; running the `SyncFail` hooks.
+    SyncFail,
+    /// The `SyncFail` hooks finished (or there were none): the operation is terminal.
+    Failed,
 }
 
 /// Sync observability for the last reconcile.
@@ -321,6 +352,62 @@ impl ResourceStatus {
     }
 }
 
+/// A lifecycle hook created by the running operation (`T10.3`, finding H2).
+///
+/// A hook carrying `metadata.generateName` only learns its name from the API server, and
+/// `generateName` hooks are **not** unique by Group/Kind/Namespace/Name (two `migrate-` Jobs of the
+/// same kind in the same namespace are different objects). The hook is therefore identified by a
+/// stable `hookId` derived from the rendered source (`<source file>#<ordinal>`, see
+/// `ferriscd_engine::graph::hooks`), and the created object's `generatedName` is recorded next to
+/// it: that is what lets the next requeue observe the exact `Job` instead of creating a second one.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveHook {
+    /// Phase the hook runs in.
+    pub phase: SyncPhase,
+
+    /// Wave the hook is ordered in (`0` when it carries no `ferriscd.io/sync-wave`).
+    #[serde(default)]
+    pub wave: i32,
+
+    /// Stable identity of the rendered hook resource (`<source file>#<ordinal>`).
+    pub hook_id: String,
+
+    /// Name of the created object (for a `generateName` hook: the name the API server generated).
+    #[serde(default)]
+    pub generated_name: String,
+
+    /// Health last observed for the created hook object.
+    #[serde(default)]
+    pub health: HealthStatus,
+}
+
+impl ActiveHook {
+    /// Builds an active-hook record.
+    #[must_use]
+    pub fn new(
+        phase: SyncPhase,
+        wave: i32,
+        hook_id: impl Into<String>,
+        generated_name: impl Into<String>,
+        health: HealthStatus,
+    ) -> Self {
+        Self {
+            phase,
+            wave,
+            hook_id: hook_id.into(),
+            generated_name: generated_name.into(),
+            health,
+        }
+    }
+
+    /// Returns whether the hook object is `Healthy` (the hook has completed).
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.health == HealthStatus::Healthy
+    }
+}
+
 /// Re-entrant operation state, persisted so requeues never restart a multi-wave sync.
 ///
 /// `v1alpha1` keeps only cross-requeue progress (phase, wave, revision, timestamps).
@@ -332,13 +419,36 @@ pub struct OperationState {
     /// Current phase.
     pub phase: OperationPhase,
 
+    /// Sync phase of a running operation (`T10.1`); `None` on states written before Phase 10.
+    ///
+    /// [`OperationPhase::Running`] covers three distinct sync phases (`PreSync`, `Sync`, `PostSync`)
+    /// plus the failure path (`SyncFail`), so the phase a reconcile must resume at is persisted
+    /// separately instead of being re-derived from a health read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_phase: Option<SyncPhase>,
+
     /// Sync wave currently being applied (default `0`).
     #[serde(default)]
     pub current_wave: i32,
 
+    /// When the current sync phase/wave was dispatched.
+    ///
+    /// This is the base of the per-wave timeout: a slow wave must be measured from the moment it
+    /// started, not from the start of the whole operation (`T10.1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_started_at: Option<Time>,
+
     /// Revision being operated on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+
+    /// Hooks this operation has created and must keep tracking (`T10.3`, finding H2).
+    ///
+    /// Hooks are **never** part of `status.inventory`; this list is the operation-scoped tracking
+    /// record that lets a requeue observe a `generateName` hook instead of creating a duplicate.
+    /// It is bounded by [`MAX_ACTIVE_HOOKS`] and additive on the wire (`[]`/absent in older states).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_hooks: Vec<ActiveHook>,
 
     /// Bounded human-readable progress/error message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -350,6 +460,55 @@ pub struct OperationState {
     /// When the operation finished (`None` while `phase` is `Running`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<Time>,
+}
+
+impl OperationState {
+    /// The tracked hook with `hook_id`, if this operation created it.
+    #[must_use]
+    pub fn active_hook(&self, hook_id: &str) -> Option<&ActiveHook> {
+        self.active_hooks
+            .iter()
+            .find(|hook| hook.hook_id == hook_id)
+    }
+
+    /// The generated/created object name of a tracked hook, if it is known.
+    #[must_use]
+    pub fn generated_hook_name(&self, hook_id: &str) -> Option<&str> {
+        self.active_hook(hook_id)
+            .map(|hook| hook.generated_name.as_str())
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Records (or refreshes) the tracking entry of one hook, keyed by `hook_id`.
+    ///
+    /// Idempotent by construction: re-recording the same `hook_id` replaces the entry instead of
+    /// appending, so a requeue never duplicates a hook in `/status` and the created name recorded
+    /// by the first pass survives. Returns `false` when the entry had to be dropped because
+    /// [`MAX_ACTIVE_HOOKS`] was reached (only reachable for a pathological bundle).
+    pub fn record_active_hook(&mut self, hook: ActiveHook) -> bool {
+        if let Some(existing) = self
+            .active_hooks
+            .iter_mut()
+            .find(|existing| existing.hook_id == hook.hook_id)
+        {
+            *existing = hook;
+            return true;
+        }
+        if self.active_hooks.len() >= MAX_ACTIVE_HOOKS {
+            return false;
+        }
+        self.active_hooks.push(hook);
+        true
+    }
+
+    /// Forgets a hook (its deletion policy deleted it, or it left the operation).
+    ///
+    /// Returns whether an entry was removed.
+    pub fn forget_active_hook(&mut self, hook_id: &str) -> bool {
+        let before = self.active_hooks.len();
+        self.active_hooks.retain(|hook| hook.hook_id != hook_id);
+        self.active_hooks.len() != before
+    }
 }
 
 /// Metadata-only deployment history entry (never stores manifest content).
@@ -365,17 +524,82 @@ pub struct RevisionHistoryEntry {
 
     /// When the revision was deployed.
     pub deployed_at: Time,
+
+    /// Which source (repository, path, renderer, requested revision) produced that commit.
+    ///
+    /// Metadata only: it never carries rendered manifests. Recording it makes a history entry
+    /// self-describing, so "what was deployed" survives an `Application` spec edit that has since
+    /// moved to another path or renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_summary: Option<SourceSummary>,
 }
 
 impl RevisionHistoryEntry {
-    /// Builds a history entry.
+    /// Builds a history entry without a source summary.
     #[must_use]
     pub fn new(id: i64, revision: Option<String>, deployed_at: Time) -> Self {
         Self {
             id,
             revision,
             deployed_at,
+            source_summary: None,
         }
+    }
+
+    /// Records which source produced the deployed revision (builder style).
+    #[must_use]
+    pub fn with_source_summary(mut self, source_summary: Option<SourceSummary>) -> Self {
+        self.source_summary = source_summary;
+        self
+    }
+}
+
+/// Metadata-only description of the source that produced a deployed revision (`T10.5`).
+///
+/// Field-for-field mirror of the parts of `spec.source` that change what a revision renders
+/// (`repoURL`, `path`, `renderer`, `targetRevision`), so a history entry can explain *why* two
+/// deployments of the same repository differ. It never contains rendered manifests or credentials
+/// (the source spec carries none; credentials live in a `Repository` secret).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSummary {
+    /// Repository clone URL (Kubernetes spelling: `repoURL`, as in `spec.source.git.repoURL`).
+    #[serde(rename = "repoURL", default, skip_serializing_if = "String::is_empty")]
+    pub repo_url: String,
+
+    /// Manifest sub-path inside the repository (`""` means the repository root).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+
+    /// Renderer that turned the path into manifests (`spec.source.renderer`).
+    #[serde(default)]
+    pub renderer: RendererSpec,
+
+    /// Branch, tag, `HEAD`, or commit SHA the sync was requested for.
+    #[serde(default = "default_target_revision")]
+    pub target_revision: String,
+}
+
+fn default_target_revision() -> String {
+    DEFAULT_TARGET_REVISION.to_owned()
+}
+
+impl SourceSummary {
+    /// Summarizes an [`ApplicationSpec`](crate::application::ApplicationSpec) source.
+    #[must_use]
+    pub fn from_source(source: &SourceSpec) -> Self {
+        Self {
+            repo_url: source.git.repo_url.clone(),
+            path: source.git.path.clone(),
+            renderer: source.renderer.clone(),
+            target_revision: source.git.target_revision.clone(),
+        }
+    }
+}
+
+impl From<&SourceSpec> for SourceSummary {
+    fn from(source: &SourceSpec) -> Self {
+        Self::from_source(source)
     }
 }
 
@@ -560,6 +784,10 @@ fn truncate_chars(value: &mut String, max_chars: usize) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    use serde_json::json;
+
+    use crate::application::{GitSourceSpec, KustomizeRenderer, RendererSpec};
 
     use super::*;
 
@@ -853,5 +1081,283 @@ mod tests {
         assert_eq!(json, serde_json::json!({}));
         assert_eq!(status.conditions.len(), 0);
         assert!(!status.is_ready());
+    }
+
+    #[test]
+    fn sync_phases_are_stable_wire_words() {
+        let mut seen = BTreeSet::new();
+        for (phase, wire) in [
+            (SyncPhase::PreSync, "PreSync"),
+            (SyncPhase::Sync, "Sync"),
+            (SyncPhase::PostSync, "PostSync"),
+            (SyncPhase::Succeeded, "Succeeded"),
+            (SyncPhase::SyncFail, "SyncFail"),
+            (SyncPhase::Failed, "Failed"),
+        ] {
+            let value = serde_json::to_value(phase).expect("phase must serialize");
+            assert_eq!(value, serde_json::json!(wire));
+            assert_eq!(
+                serde_json::from_value::<SyncPhase>(value).expect("phase must deserialize"),
+                phase
+            );
+            assert!(seen.insert(wire), "duplicate sync phase {wire}");
+        }
+        assert_eq!(seen.len(), 6, "every SyncPhase must be pinned above");
+    }
+
+    /// A status written before Phase 10 carries no `syncPhase`/`phaseStartedAt`; it must still
+    /// deserialize (the fields are additive) and must not emit them when untouched.
+    #[test]
+    fn operation_state_is_backward_compatible_and_omits_empty_phase_fields() {
+        let legacy = serde_json::json!({
+            "phase": "Running",
+            "currentWave": -1,
+            "revision": "8f3a1c2e9d4b5a60718293a4b5c6d7e8f9012345",
+            "startedAt": "2026-11-24T12:00:00Z",
+        });
+        let state: OperationState =
+            serde_json::from_value(legacy).expect("legacy operationState must deserialize");
+        assert_eq!(state.sync_phase, None);
+        assert_eq!(state.phase_started_at, None);
+        assert_eq!(state.current_wave, -1);
+        assert_eq!(state.finished_at, None);
+
+        let serialized = serde_json::to_value(&state).expect("state must serialize");
+        assert!(
+            serialized.get("syncPhase").is_none(),
+            "unset syncPhase must not churn /status: {serialized}"
+        );
+        assert!(serialized.get("phaseStartedAt").is_none());
+        assert_eq!(serialized["currentWave"], serde_json::json!(-1));
+        assert!(
+            serialized.get("activeHooks").is_none(),
+            "an operation without hooks must not emit activeHooks: {serialized}"
+        );
+
+        // A Phase 10 state round-trips through /status byte-identically.
+        let mut phase_state = state.clone();
+        phase_state.sync_phase = Some(SyncPhase::Sync);
+        phase_state.phase_started_at = Some(ts("2026-11-24T12:05:00Z"));
+        phase_state.message = Some("applying wave -1".to_owned());
+        let value = serde_json::to_value(&phase_state).expect("state must serialize");
+        assert_eq!(value["syncPhase"], serde_json::json!("Sync"));
+        assert_eq!(
+            value["phaseStartedAt"],
+            serde_json::json!("2026-11-24T12:05:00Z")
+        );
+        assert_eq!(
+            serde_json::from_value::<OperationState>(value).expect("state must deserialize"),
+            phase_state
+        );
+    }
+
+    fn operation_state() -> OperationState {
+        OperationState {
+            phase: OperationPhase::Running,
+            sync_phase: Some(SyncPhase::PreSync),
+            current_wave: -1,
+            phase_started_at: Some(ts("2026-11-24T12:00:00Z")),
+            revision: Some("8f3a1c2e9d4b5a60718293a4b5c6d7e8f9012345".to_owned()),
+            active_hooks: Vec::new(),
+            message: None,
+            started_at: ts("2026-11-24T12:00:00Z"),
+            finished_at: None,
+        }
+    }
+
+    /// `activeHooks` is the only place a `generateName` hook can be tracked (finding H2): the
+    /// generated name must survive a `/status` round-trip, because that is the only way the next
+    /// requeue can observe the object instead of creating a second `Job`.
+    #[test]
+    fn active_hooks_round_trip_through_the_status_subresource() {
+        let mut state = operation_state();
+        assert_eq!(state.generated_hook_name("migrate-0.yaml#0"), None);
+
+        assert!(state.record_active_hook(ActiveHook::new(
+            SyncPhase::PreSync,
+            -1,
+            "migrations/migrate.yaml#0",
+            "migrate-7f9c2",
+            HealthStatus::Progressing,
+        )));
+        let json = serde_json::to_value(&state).expect("state must serialize");
+        let hook = &json["activeHooks"][0];
+        assert_eq!(hook["phase"], serde_json::json!("PreSync"));
+        assert_eq!(hook["wave"], serde_json::json!(-1));
+        assert_eq!(
+            hook["hookId"],
+            serde_json::json!("migrations/migrate.yaml#0")
+        );
+        assert_eq!(hook["generatedName"], serde_json::json!("migrate-7f9c2"));
+        assert_eq!(hook["health"], serde_json::json!("Progressing"));
+
+        let rehydrated: OperationState =
+            serde_json::from_value(json).expect("state must deserialize");
+        assert_eq!(rehydrated, state);
+        assert_eq!(
+            rehydrated.generated_hook_name("migrations/migrate.yaml#0"),
+            Some("migrate-7f9c2"),
+            "the generated name must survive the round-trip"
+        );
+
+        // Re-recording the same hook refreshes health but never appends a duplicate.
+        let before = rehydrated.clone();
+        let mut refreshed = before.clone();
+        assert!(refreshed.record_active_hook(ActiveHook::new(
+            SyncPhase::PreSync,
+            -1,
+            "migrations/migrate.yaml#0",
+            "migrate-7f9c2",
+            HealthStatus::Healthy,
+        )));
+        assert_eq!(refreshed.active_hooks.len(), 1);
+        assert!(refreshed.active_hooks[0].is_healthy());
+
+        // A second `generateName` hook of the same kind/ns is a distinct `hookId`.
+        assert!(refreshed.record_active_hook(ActiveHook::new(
+            SyncPhase::PreSync,
+            -1,
+            "migrations/migrate.yaml#1",
+            "migrate-8ab31",
+            HealthStatus::Progressing,
+        )));
+        assert_eq!(refreshed.active_hooks.len(), 2);
+
+        // Forgetting one leaves the other.
+        assert!(refreshed.forget_active_hook("migrations/migrate.yaml#0"));
+        assert!(!refreshed.forget_active_hook("migrations/migrate.yaml#0"));
+        assert_eq!(
+            refreshed
+                .active_hooks
+                .iter()
+                .map(|hook| hook.hook_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["migrations/migrate.yaml#1"]
+        );
+
+        // The list is bounded, so a runaway controller cannot bloat `/status` (trap T9).
+        let mut bounded = operation_state();
+        for index in 0..(MAX_ACTIVE_HOOKS + 3) {
+            let kept = bounded.record_active_hook(ActiveHook::new(
+                SyncPhase::PostSync,
+                0,
+                format!("hooks.yaml#{index}"),
+                format!("smoke-{index}"),
+                HealthStatus::Progressing,
+            ));
+            assert_eq!(kept, index < MAX_ACTIVE_HOOKS, "index {index}");
+        }
+        assert_eq!(bounded.active_hooks.len(), MAX_ACTIVE_HOOKS);
+    }
+
+    /// A `generateName` hook has no `metadata.name`, so its GKNN key is not an identity; the
+    /// `hookId` is what the operation tracks. Pinned here because the engine derives it.
+    #[test]
+    fn a_generate_name_hook_is_identified_by_its_hook_id_not_its_key() {
+        let state = operation_state();
+        assert_eq!(state.generated_hook_name("not-tracked"), None);
+        assert!(state.active_hooks.is_empty());
+
+        let hook = ActiveHook::new(
+            SyncPhase::Sync,
+            0,
+            "hooks/inline.yaml#0",
+            "",
+            HealthStatus::Unknown,
+        );
+        assert_eq!(hook.health, HealthStatus::Unknown);
+        assert!(!hook.is_healthy());
+        assert_eq!(
+            state.generated_hook_name(&hook.hook_id),
+            None,
+            "an empty generated name is not a usable tracked name"
+        );
+    }
+
+    /// Finding H4: a history entry gained `sourceSummary`; older entries (and older controllers)
+    /// must keep working, and an entry without a summary must not emit the key.
+    #[test]
+    fn revision_history_entries_carry_an_optional_source_summary() {
+        let legacy = serde_json::json!({
+            "id": 3,
+            "revision": "8f3a1c2e9d4b5a60718293a4b5c6d7e8f9012345",
+            "deployedAt": "2026-11-24T12:00:00Z",
+        });
+        let entry: RevisionHistoryEntry =
+            serde_json::from_value(legacy).expect("legacy history entry must deserialize");
+        assert_eq!(entry.source_summary, None);
+        let serialized = serde_json::to_value(&entry).expect("entry must serialize");
+        assert!(
+            serialized.get("sourceSummary").is_none(),
+            "an entry without a source summary must not emit the key: {serialized}"
+        );
+        assert_eq!(
+            RevisionHistoryEntry::new(
+                3,
+                Some("8f3a1c2e9d4b5a60718293a4b5c6d7e8f9012345".to_owned()),
+                ts("2026-11-24T12:00:00Z")
+            ),
+            entry
+        );
+
+        // A partial summary falls back to the documented defaults instead of failing.
+        let partial = serde_json::json!({ "repoURL": "https://example.com/repo.git" });
+        let summary: SourceSummary =
+            serde_json::from_value(partial).expect("partial summary must deserialize");
+        assert_eq!(summary.repo_url, "https://example.com/repo.git");
+        assert_eq!(summary.path, "");
+        assert_eq!(summary.renderer, RendererSpec::default());
+        assert_eq!(summary.target_revision, DEFAULT_TARGET_REVISION);
+
+        let entry =
+            RevisionHistoryEntry::new(4, Some("sha".to_owned()), ts("2026-11-24T12:00:00Z"))
+                .with_source_summary(Some(summary));
+        let value = serde_json::to_value(&entry).expect("entry must serialize");
+        assert_eq!(
+            value["sourceSummary"]["repoURL"],
+            "https://example.com/repo.git"
+        );
+        assert_eq!(
+            value["sourceSummary"]["targetRevision"],
+            json!(DEFAULT_TARGET_REVISION)
+        );
+        assert_eq!(
+            serde_json::from_value::<RevisionHistoryEntry>(value).expect("entry must deserialize"),
+            entry
+        );
+    }
+
+    #[test]
+    fn source_summaries_mirror_the_spec_source_shape() {
+        let source = SourceSpec {
+            git: GitSourceSpec {
+                repo_url: "https://example.com/repo.git".to_owned(),
+                target_revision: "release-1.4".to_owned(),
+                path: "deploy/production".to_owned(),
+            },
+            renderer: RendererSpec::Kustomize(KustomizeRenderer {
+                kustomization_path: Some("overlays/prod".to_owned()),
+                images: vec!["api=ghcr.io/example/api:v2".to_owned()],
+            }),
+        };
+
+        let summary = SourceSummary::from_source(&source);
+        assert_eq!(summary, SourceSummary::from(&source));
+        assert_eq!(summary.repo_url, source.git.repo_url);
+        assert_eq!(summary.path, source.git.path);
+        assert_eq!(summary.target_revision, source.git.target_revision);
+        assert_eq!(summary.renderer, source.renderer);
+
+        // The wire form reuses the spec's spellings, so a summary can be copy-pasted into a spec.
+        let value = serde_json::to_value(&summary).expect("summary must serialize");
+        assert_eq!(value["repoURL"], json!(source.git.repo_url));
+        assert_eq!(value["targetRevision"], json!("release-1.4"));
+        assert_eq!(
+            value["renderer"]["kustomize"]["kustomizationPath"],
+            json!("overlays/prod")
+        );
+
+        // Nothing secret or bulky is copied: a summary of a full spec stays tiny.
+        assert!(value.to_string().len() < 512, "{value}");
     }
 }

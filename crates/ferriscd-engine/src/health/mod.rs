@@ -607,8 +607,9 @@ fn summary_message(status: HealthStatus, resources: &[ResourceAssessment]) -> St
 /// Truncates `message` to [`MAX_STATUS_MESSAGE_CHARS`] on a UTF-8 boundary.
 ///
 /// `/status` is capped by `etcd`, and a third-party controller's condition message is unbounded
-/// free-form text, so the engine bounds it before it ever reaches `Application.status`.
-fn truncate_message(message: &str) -> String {
+/// free-form text, so the engine bounds it before it ever reaches `Application.status`. Shared with
+/// the Phase 10 operation/history writers, which put messages in the same budgeted `/status`.
+pub(crate) fn truncate_message(message: &str) -> String {
     if message.chars().count() <= MAX_STATUS_MESSAGE_CHARS {
         return message.to_owned();
     }

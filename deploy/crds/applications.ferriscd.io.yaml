@@ -397,6 +397,86 @@ spec:
                       description: Revision (commit SHA) that was deployed.
                       nullable: true
                       type: string
+                    sourceSummary:
+                      description: |-
+                        Which source (repository, path, renderer, requested revision) produced that commit.
+
+                        Metadata only: it never carries rendered manifests. Recording it makes a history entry
+                        self-describing, so "what was deployed" survives an `Application` spec edit that has since
+                        moved to another path or renderer.
+                      nullable: true
+                      properties:
+                        path:
+                          description: Manifest sub-path inside the repository (`""` means the repository root).
+                          type: string
+                        renderer:
+                          default:
+                            auto: {}
+                          description: Renderer that turned the path into manifests (`spec.source.renderer`).
+                          oneOf:
+                          - required:
+                            - auto
+                          - required:
+                            - plainYaml
+                          - required:
+                            - kustomize
+                          - required:
+                            - helm
+                          properties:
+                            auto:
+                              description: Automatic renderer detection based on the files present in the source path.
+                              type: object
+                            helm:
+                              description: Helm chart rendering (CRDs are not installed unless `includeCRDs` is set).
+                              properties:
+                                includeCRDs:
+                                  default: false
+                                  description: Install CRDs shipped in the chart's `crds/` directory (default `false`).
+                                  type: boolean
+                                releaseName:
+                                  description: Release name used for rendering; defaults to the `Application` name.
+                                  nullable: true
+                                  type: string
+                                valueFiles:
+                                  default: []
+                                  description: Additional values files, relative to `spec.source.git.path`.
+                                  items:
+                                    type: string
+                                  type: array
+                              type: object
+                            kustomize:
+                              description: Kustomize overlay (remote resources are rejected).
+                              properties:
+                                images:
+                                  default: []
+                                  description: Image overrides applied to the rendered output (`name=newImage:tag`).
+                                  items:
+                                    type: string
+                                  type: array
+                                kustomizationPath:
+                                  description: >-
+                                    Overlay directory (relative to `spec.source.git.path`); defaults to the source
+                                    path.
+                                  nullable: true
+                                  type: string
+                              type: object
+                            plainYaml:
+                              description: Literal multi-document YAML/JSON manifests.
+                              properties:
+                                recursive:
+                                  default: true
+                                  description: Recurse into sub-directories of `spec.source.git.path` (default `true`).
+                                  type: boolean
+                              type: object
+                          type: object
+                        repoURL:
+                          description: "Repository clone URL (Kubernetes spelling: `repoURL`, as in `spec.source.git.repoURL`)."
+                          type: string
+                        targetRevision:
+                          default: HEAD
+                          description: Branch, tag, `HEAD`, or commit SHA the sync was requested for.
+                          type: string
+                      type: object
                   required:
                   - deployedAt
                   - id
@@ -437,6 +517,62 @@ spec:
                 description: Persisted operation state (multi-wave / hook / rollback progress).
                 nullable: true
                 properties:
+                  activeHooks:
+                    description: |-
+                      Hooks this operation has created and must keep tracking (`T10.3`, finding H2).
+
+                      Hooks are **never** part of `status.inventory`; this list is the operation-scoped tracking
+                      record that lets a requeue observe a `generateName` hook instead of creating a duplicate.
+                      It is bounded by [`MAX_ACTIVE_HOOKS`] and additive on the wire (`[]`/absent in older states).
+                    items:
+                      description: |-
+                        A lifecycle hook created by the running operation (`T10.3`, finding H2).
+
+                        A hook carrying `metadata.generateName` only learns its name from the API server, and
+                        `generateName` hooks are **not** unique by Group/Kind/Namespace/Name (two `migrate-` Jobs of the
+                        same kind in the same namespace are different objects). The hook is therefore identified by a
+                        stable `hookId` derived from the rendered source (`<source file>#<ordinal>`, see
+                        `ferriscd_engine::graph::hooks`), and the created object's `generatedName` is recorded next to
+                        it: that is what lets the next requeue observe the exact `Job` instead of creating a second one.
+                      properties:
+                        generatedName:
+                          default: ""
+                          description: "Name of the created object (for a `generateName` hook: the name the API server generated)."
+                          type: string
+                        health:
+                          default: Unknown
+                          description: Health last observed for the created hook object.
+                          enum:
+                          - Healthy
+                          - Progressing
+                          - Degraded
+                          - Suspended
+                          - Missing
+                          - Unknown
+                          type: string
+                        hookId:
+                          description: Stable identity of the rendered hook resource (`<source file>#<ordinal>`).
+                          type: string
+                        phase:
+                          description: Phase the hook runs in.
+                          enum:
+                          - PreSync
+                          - Sync
+                          - PostSync
+                          - Succeeded
+                          - SyncFail
+                          - Failed
+                          type: string
+                        wave:
+                          default: 0
+                          description: Wave the hook is ordered in (`0` when it carries no `ferriscd.io/sync-wave`).
+                          format: int32
+                          type: integer
+                      required:
+                      - hookId
+                      - phase
+                      type: object
+                    type: array
                   currentWave:
                     default: 0
                     description: Sync wave currently being applied (default `0`).
@@ -459,6 +595,15 @@ spec:
                     - Failed
                     - Error
                     type: string
+                  phaseStartedAt:
+                    description: |-
+                      When the current sync phase/wave was dispatched.
+
+                      This is the base of the per-wave timeout: a slow wave must be measured from the moment it
+                      started, not from the start of the whole operation (`T10.1`).
+                    format: date-time
+                    nullable: true
+                    type: string
                   revision:
                     description: Revision being operated on.
                     nullable: true
@@ -466,6 +611,24 @@ spec:
                   startedAt:
                     description: When the operation started.
                     format: date-time
+                    type: string
+                  syncPhase:
+                    description: |-
+                      Phase of a multi-wave sync operation (`T10.1`).
+
+                      `PreSync` -> `Sync(wave)` -> `PostSync` -> `Succeeded`, with any wave (or the whole operation)
+                      able to enter `SyncFail` -> `Failed`. The wave being applied is `currentWave`; this enum names
+                      only the phase, so the wire form stays a flat string (no tagged-union schema) and
+                      `kubectl get -o yaml` stays readable. The transition rules live in
+                      `ferriscd_engine::sync::state_machine`; this type only fixes the wire values.
+                    enum:
+                    - PreSync
+                    - Sync
+                    - PostSync
+                    - Succeeded
+                    - SyncFail
+                    - Failed
+                    nullable: true
                     type: string
                 required:
                 - phase
