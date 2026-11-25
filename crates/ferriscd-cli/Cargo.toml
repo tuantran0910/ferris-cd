@@ -19,9 +19,15 @@ clap.workspace = true
 ferriscd-controller.workspace = true
 ferriscd-crd.workspace = true
 ferriscd-engine.workspace = true
+ferriscd-server.workspace = true
+tokio-util.workspace = true
 k8s-openapi = { workspace = true, features = ["v1_35"] }
 kube.workspace = true
 serde-saphyr.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# Asserts the exported OpenAPI document is the JSON the server serves.
+serde_json.workspace = true

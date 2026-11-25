@@ -128,8 +128,8 @@ use crate::live_state::{
 use crate::project::ProjectSource;
 use crate::prune::{OwnershipVerifiedPruner, PruneResult};
 use crate::reconcile::{
-    ApplyOutcome, CleanupMode, CleanupOutcome, REASON_PENDING, REASON_SYNC_SKIPPED, ReconcileError,
-    SyncPipeline, now,
+    ApplyOutcome, CleanupMode, CleanupOutcome, DiffPreview, REASON_PENDING, REASON_SYNC_SKIPPED,
+    ReconcileError, SyncPipeline, now,
 };
 use crate::scope::{self, InBundleCrd};
 use crate::sync_executor::{
@@ -578,6 +578,47 @@ struct RollbackRequested {
     decision: RollbackDecision,
 }
 
+/// Whether a prepared pass may write to the cluster (`T14.1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassMode {
+    /// A full reconcile: applies, prunes, `/status` patches, and the documented rollback spec edit.
+    Apply,
+    /// A read-only preview (`SyncPipeline::diff`): **nothing** may be written, so a rollback keeps
+    /// its revision pin but does not clear `spec.syncPolicy.automated` here — that write belongs to
+    /// the reconcile that actually redeploys the pin.
+    Preview,
+}
+
+/// Everything one pass learns before it writes anything (`T14.1`).
+///
+/// Shared by [`InventorySyncPipeline::sync_apply`] and [`InventorySyncPipeline::diff_preview`], so
+/// the API's diff and the controller's reconcile cannot diverge: both resolve policy, cluster,
+/// identity, render, live state and the SSA dry-run through this one path.
+struct PreparedPass {
+    owner: TrackingOwner,
+    access: ClusterAccess,
+    /// The destination cluster (`T13.1`): its discovery cache answers every kind lookup.
+    target: ClusterTarget,
+    options: SyncOptions,
+    prev_inventory: Inventory,
+    previous_status: ApplicationStatus,
+    pass_started: Time,
+    rollback: Option<RollbackRequested>,
+    revision: String,
+    bundle: BundleWaves,
+    live: LiveStateMap,
+    diffs: Vec<ResourceDiff>,
+    summary: DiffSummary,
+    spec_hash: String,
+    decision: SyncDecision,
+    statuses: BTreeMap<ResourceKey, DiffStatus>,
+    orphans: Vec<OrphanCandidate>,
+    deferred: BTreeSet<ResourceKey>,
+    prune_enabled: bool,
+    desired_inventory: Inventory,
+    invalid_ignore_pointers: usize,
+}
+
 /// The wired [`SyncPipeline`].
 pub struct InventorySyncPipeline {
     repos: Arc<RepoCache>,
@@ -978,6 +1019,196 @@ impl InventorySyncPipeline {
     /// * anything with several waves, a lifecycle hook, or an operation that is already running is
     ///   driven by [`SyncMachine`] across requeues ([`Self::run_operation`]).
     async fn sync_apply(&self, app: &Application) -> Result<ApplyOutcome, ReconcileError> {
+        let prepared = self.prepare_pass(app, PassMode::Apply).await?;
+
+        // --- Phase 08/10: execute -------------------------------------------------------
+        let request = PassRequest {
+            app,
+            access: prepared.access.clone(),
+            discovery: prepared.target.discovery(),
+            owner: &prepared.owner,
+            revision: &prepared.revision,
+            bundle: &prepared.bundle,
+            live: &prepared.live,
+            statuses: &prepared.statuses,
+            deferred: &prepared.deferred,
+            orphans: &prepared.orphans,
+            options: &prepared.options,
+            decision: prepared.decision,
+            prune_enabled: prepared.prune_enabled,
+            prev_inventory: &prepared.prev_inventory,
+            now: &prepared.pass_started,
+        };
+        let pass = if prepared
+            .bundle
+            .needs_operation(BundleWaves::operation_running(app.status.as_ref()))
+        {
+            self.run_operation(&request).await?
+        } else {
+            self.run_single_pass(&request).await
+        };
+        // The zero-mutation seam (T07.5): only the SSA applies are counted, never a
+        // `dryRun=All` prediction.
+        self.mutating_applies
+            .fetch_add(pass.apply_calls(), Ordering::SeqCst);
+
+        // Crash-safe inventory: `next_inventory = (prev \ pruned_ok) ∪ (applied_ok ∪ synced)`.
+        let next_inventory = inventory::next_inventory(
+            &prepared.prev_inventory,
+            &pass.confirmed(),
+            &pass.pruned_ok(),
+        );
+
+        if let Some(failure) = pass.first_failure() {
+            // A policy failure (immutable field without `Replace`, an unlisted field manager, a
+            // foreign owner) can never be fixed by retrying; everything else is a partial sync the
+            // next pass converges from. Both carry the inventory that is already true, so a create
+            // that succeeded never becomes an untracked orphan (finding C1). The retryable case also
+            // carries the `operationState` this pass reached (finding M4): its `activeHooks` records
+            // are the only thing that keeps the next pass from creating a second `generateName` hook
+            // (a second database migration) instead of observing the one that already exists.
+            let message = failure.error.to_string();
+            let operation = pass.operation.clone().map(Box::new);
+            return Err(match failure.error.failure_class() {
+                FailureClass::Terminal => ReconcileError::SyncConflict {
+                    message,
+                    inventory: next_inventory,
+                    revision: Some(prepared.revision.clone()),
+                    // Finding H-A: a terminal failure drops nothing either. The state (and with it
+                    // `activeHooks`) has to reach `/status` for both failure classes, or the next
+                    // pass sees a hook that already exists as untracked.
+                    operation,
+                },
+                FailureClass::Retryable => ReconcileError::PartialSync {
+                    message,
+                    inventory: next_inventory,
+                    revision: Some(prepared.revision.clone()),
+                    operation,
+                },
+            });
+        }
+
+        // --- Phase 10: history, and consuming a completed rollback request ---------------
+        let deployment_is_new = prepared
+            .previous_status
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.last_synced_revision.as_deref())
+            != Some(prepared.revision.as_str());
+        let operation = pass.operation.clone().or_else(|| {
+            // A single-pass sync is an operation too (`T10.5`): recording it is what makes a later
+            // `{"rollback":{"id":N}}` possible for an application that has no waves.
+            pass.settled.then(|| {
+                succeeded_operation(
+                    &prepared.revision,
+                    &prepared.pass_started,
+                    prepared.bundle.plan.last_wave(),
+                )
+            })
+        });
+        let history = match (&operation, pass.settled && deployment_is_new) {
+            (Some(operation), true) => record_history(&prepared.previous_status, app, operation),
+            _ => None,
+        };
+        if pass.settled
+            && let Some(value) = honoured_operation(app)
+        {
+            // The request has been honoured: consuming it keeps it from re-triggering forever. A
+            // rollback's pin now lives in `/status`, next to its warning condition; a manual sync has
+            // no trace at all, and `manual_operation()` reads this annotation, so leaving it behind
+            // would keep bypassing `automated: None` on every requeue (finding `P14-C1`).
+            self.consume_operation(app, value, prepared.rollback.as_ref())
+                .await?;
+        }
+
+        // --- Phase 09: health --------------------------------------------------------------
+        // Assessed from the pass-level live read on **every** pass, including a `Skip` one: health
+        // and sync are orthogonal (T09.5 trap guard). A `Deployment` can be `Synced` and
+        // `ImagePullBackOff` at the same time, and it can be `OutOfSync` (an HPA owns
+        // `spec.replicas`) while every pod is serving.
+        let assessment = self.assess_health(
+            prepared.bundle.hooks.permanent(),
+            &prepared.live,
+            &pass.confirmed(),
+            &waves::scheduled_keys(&prepared.bundle.plan, pass.operation.as_ref()),
+        );
+        let counts = SyncCounts {
+            desired: prepared.desired_inventory.len(),
+            applied: pass.applied(),
+            pruned: pass.pruned_ok().len(),
+            // A retained orphan is either a `Skip` the plan refused (foreign, unmanaged,
+            // rail-protected, pruning disabled) or a prune the pruner declined at delete time.
+            retained_orphans: pass.retained,
+            pending: pass.pending().len(),
+            invalid_ignore_pointers: prepared.invalid_ignore_pointers,
+            prune_enabled: prepared.prune_enabled,
+            health: assessment.status,
+            settled: pass.settled,
+            phase: pass.operation.as_ref().map(|state| {
+                waves::step_label(
+                    state.sync_phase.unwrap_or(SyncPhase::Sync),
+                    state.current_wave,
+                )
+            }),
+            requeue: pass.requeue,
+        };
+        tracing::debug!(
+            app.namespace = %prepared.owner.namespace,
+            app.name = %prepared.owner.name,
+            decision = %prepared.decision,
+            waves = prepared.bundle.plan.wave_count(),
+            hooks = prepared.bundle.hooks.hooks().len(),
+            out_of_sync = prepared.summary.out_of_sync,
+            missing = prepared.summary.missing,
+            synced = prepared.summary.synced,
+            health = %health::status_label(assessment.status),
+            "completed a reconcile pass"
+        );
+        let outcome = build_outcome(
+            app,
+            prepared.decision,
+            &prepared.summary,
+            &prepared.spec_hash,
+            counts,
+            prepared.revision.clone(),
+            next_inventory,
+        )
+        .with_health(
+            HealthState {
+                status: assessment.status,
+                message: Some(assessment.message.clone()),
+            },
+            resource_statuses(&assessment, &prepared.desired_inventory),
+        )
+        .with_operation_state(operation)
+        .with_history(history);
+        Ok(match &prepared.rollback {
+            Some(rollback) => outcome.with_warning(rollback.decision.condition.clone()),
+            None => outcome,
+        })
+    }
+
+    /// Collects everything a pass learns **before** it writes anything (`T14.1`).
+    ///
+    /// This is the whole read-only half of a reconcile: tenancy policy, the destination cluster and
+    /// identity, the desired bundle (resolved commit → render → normalize → scope), the live read of
+    /// `desired ∪ status.inventory`, the ownership gate, and the SSA `dryRun=All` diff. Nothing here
+    /// applies, prunes, or patches anything (except the documented rollback spec edit, which
+    /// [`PassMode::Preview`] suppresses), so the control-plane API's `GET .../diff` can run the very
+    /// same code in-process instead of duplicating the engine (finding C9) — a preview can therefore
+    /// never disagree with the reconcile that follows it.
+    ///
+    /// # Errors
+    ///
+    /// Every refusal a sync would report before touching the cluster: invalid `spec`, a denied
+    /// `AppProject` (a missing project is terminal), an unreachable/unknown destination cluster, an
+    /// unusable repository or revision, a render/parse failure, a foreign owner, an unusable
+    /// credential, a diff that the API server could not answer, or the empty-desired safety rail.
+    async fn prepare_pass(
+        &self,
+        app: &Application,
+        mode: PassMode,
+    ) -> Result<PreparedPass, ReconcileError> {
         app.spec.validate().map_err(|err| ReconcileError::Invalid {
             message: err.to_string(),
         })?;
@@ -1013,7 +1244,7 @@ impl InventorySyncPipeline {
         // applied `HEAD` and then "rolled back" would have mutated the cluster towards the wrong
         // commit (and, with `selfHeal`, fought itself on every requeue).
         let rollback = self
-            .plan_rollback(app, &previous_status, &pass_started)
+            .plan_rollback(app, &previous_status, &pass_started, mode)
             .await?;
         let pinned_revision = rollback
             .as_ref()
@@ -1155,155 +1386,60 @@ impl InventorySyncPipeline {
             .collect();
         let prune_enabled = prune_enabled(app);
 
-        // --- Phase 08/10: execute -------------------------------------------------------
-        let request = PassRequest {
-            app,
+        Ok(PreparedPass {
+            owner,
             access,
-            discovery: target.discovery(),
-            owner: &owner,
-            revision: &revision,
-            bundle: &bundle,
-            live: &live,
-            statuses: &statuses,
-            deferred: &deferred,
-            orphans: &orphans,
-            options: &options,
-            decision,
-            prune_enabled,
-            prev_inventory: &prev_inventory,
-            now: &pass_started,
-        };
-        let pass = if bundle.needs_operation(BundleWaves::operation_running(app.status.as_ref())) {
-            self.run_operation(&request).await?
-        } else {
-            self.run_single_pass(&request).await
-        };
-        // The zero-mutation seam (T07.5): only the SSA applies are counted, never a
-        // `dryRun=All` prediction.
-        self.mutating_applies
-            .fetch_add(pass.apply_calls(), Ordering::SeqCst);
-
-        // Crash-safe inventory: `next_inventory = (prev \ pruned_ok) ∪ (applied_ok ∪ synced)`.
-        let next_inventory =
-            inventory::next_inventory(&prev_inventory, &pass.confirmed(), &pass.pruned_ok());
-
-        if let Some(failure) = pass.first_failure() {
-            // A policy failure (immutable field without `Replace`, an unlisted field manager, a
-            // foreign owner) can never be fixed by retrying; everything else is a partial sync the
-            // next pass converges from. Both carry the inventory that is already true, so a create
-            // that succeeded never becomes an untracked orphan (finding C1). The retryable case also
-            // carries the `operationState` this pass reached (finding M4): its `activeHooks` records
-            // are the only thing that keeps the next pass from creating a second `generateName` hook
-            // (a second database migration) instead of observing the one that already exists.
-            let message = failure.error.to_string();
-            let operation = pass.operation.clone().map(Box::new);
-            return Err(match failure.error.failure_class() {
-                FailureClass::Terminal => ReconcileError::SyncConflict {
-                    message,
-                    inventory: next_inventory,
-                    revision: Some(revision),
-                    // Finding H-A: a terminal failure drops nothing either. The state (and with it
-                    // `activeHooks`) has to reach `/status` for both failure classes, or the next
-                    // pass sees a hook that already exists as untracked.
-                    operation,
-                },
-                FailureClass::Retryable => ReconcileError::PartialSync {
-                    message,
-                    inventory: next_inventory,
-                    revision: Some(revision),
-                    operation,
-                },
-            });
-        }
-
-        // --- Phase 10: history, and consuming a completed rollback request ---------------
-        let deployment_is_new = previous_status
-            .sync
-            .as_ref()
-            .and_then(|sync| sync.last_synced_revision.as_deref())
-            != Some(revision.as_str());
-        let operation = pass.operation.clone().or_else(|| {
-            // A single-pass sync is an operation too (`T10.5`): recording it is what makes a later
-            // `{"rollback":{"id":N}}` possible for an application that has no waves.
-            pass.settled
-                .then(|| succeeded_operation(&revision, &pass_started, bundle.plan.last_wave()))
-        });
-        let history = match (&operation, pass.settled && deployment_is_new) {
-            (Some(operation), true) => record_history(&previous_status, app, operation),
-            _ => None,
-        };
-        if let Some(rollback) = &rollback
-            && pass.settled
-        {
-            // The request has been honoured: consuming it keeps a stale annotation from pinning the
-            // application forever (the pin now lives in `/status`, next to its warning condition).
-            self.consume_operation(app, rollback).await?;
-        }
-
-        // --- Phase 09: health --------------------------------------------------------------
-        // Assessed from the pass-level live read on **every** pass, including a `Skip` one: health
-        // and sync are orthogonal (T09.5 trap guard). A `Deployment` can be `Synced` and
-        // `ImagePullBackOff` at the same time, and it can be `OutOfSync` (an HPA owns
-        // `spec.replicas`) while every pod is serving.
-        let assessment = self.assess_health(
-            bundle.hooks.permanent(),
-            &live,
-            &pass.confirmed(),
-            &waves::scheduled_keys(&bundle.plan, pass.operation.as_ref()),
-        );
-        let counts = SyncCounts {
-            desired: desired_inventory.len(),
-            applied: pass.applied(),
-            pruned: pass.pruned_ok().len(),
-            // A retained orphan is either a `Skip` the plan refused (foreign, unmanaged,
-            // rail-protected, pruning disabled) or a prune the pruner declined at delete time.
-            retained_orphans: pass.retained,
-            pending: pass.pending().len(),
-            invalid_ignore_pointers,
-            prune_enabled,
-            health: assessment.status,
-            settled: pass.settled,
-            phase: pass.operation.as_ref().map(|state| {
-                waves::step_label(
-                    state.sync_phase.unwrap_or(SyncPhase::Sync),
-                    state.current_wave,
-                )
-            }),
-            requeue: pass.requeue,
-        };
-        tracing::debug!(
-            app.namespace = %owner.namespace,
-            app.name = %owner.name,
-            decision = %decision,
-            waves = bundle.plan.wave_count(),
-            hooks = bundle.hooks.hooks().len(),
-            out_of_sync = summary.out_of_sync,
-            missing = summary.missing,
-            synced = summary.synced,
-            health = %health::status_label(assessment.status),
-            "completed a reconcile pass"
-        );
-        let outcome = build_outcome(
-            app,
-            decision,
-            &summary,
-            &spec_hash,
-            counts,
+            target,
+            options,
+            prev_inventory,
+            previous_status,
+            pass_started,
+            rollback,
             revision,
-            next_inventory,
-        )
-        .with_health(
-            HealthState {
-                status: assessment.status,
-                message: Some(assessment.message.clone()),
-            },
-            resource_statuses(&assessment, &desired_inventory),
-        )
-        .with_operation_state(operation)
-        .with_history(history);
-        Ok(match rollback {
-            Some(rollback) => outcome.with_warning(rollback.decision.condition),
-            None => outcome,
+            bundle,
+            live,
+            diffs,
+            summary,
+            spec_hash,
+            decision,
+            statuses,
+            orphans,
+            deferred,
+            prune_enabled,
+            desired_inventory,
+            invalid_ignore_pointers,
+        })
+    }
+
+    /// Computes the read-only diff preview the control-plane API serves (`T14.1`).
+    ///
+    /// It is [`Self::prepare_pass`] in [`PassMode::Preview`] and nothing else: no apply, no prune,
+    /// no `/status` patch, no annotation patch, no counter for mutating applies. The returned
+    /// [`DiffPreview`] carries the engine's own [`ResourceDiff`]s — the only type that can be built
+    /// from live/predicted payloads, which is what keeps `Secret` values out of the API response.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::prepare_pass`]: a preview refuses exactly what a sync would refuse.
+    async fn diff_preview(&self, app: &Application) -> Result<DiffPreview, ReconcileError> {
+        let prepared = self.prepare_pass(app, PassMode::Preview).await?;
+        tracing::debug!(
+            app.namespace = %prepared.owner.namespace,
+            app.name = %prepared.owner.name,
+            revision = %prepared.revision,
+            desired = prepared.desired_inventory.len(),
+            out_of_sync = prepared.summary.out_of_sync,
+            missing = prepared.summary.missing,
+            synced = prepared.summary.synced,
+            decision = %prepared.decision,
+            "computed a read-only diff preview"
+        );
+        Ok(DiffPreview {
+            revision: prepared.revision,
+            diffs: prepared.diffs,
+            summary: prepared.summary,
+            desired: prepared.desired_inventory.len(),
+            would_sync: prepared.decision.is_execute(),
         })
     }
 
@@ -1631,6 +1767,7 @@ impl InventorySyncPipeline {
         app: &Application,
         status: &ApplicationStatus,
         now: &Time,
+        mode: PassMode,
     ) -> Result<Option<RollbackRequested>, ReconcileError> {
         let Some(raw) = app.annotations().get(annotations::OPERATION).cloned() else {
             return Ok(None);
@@ -1653,6 +1790,20 @@ impl InventorySyncPipeline {
         // Idempotent: a spec that is already manual-only is not patched again.
         let mut spec = app.spec.clone();
         if decision.apply_to_spec(&mut spec) {
+            if mode == PassMode::Preview {
+                // A preview must not write: `GET .../diff` reports the pin and the warning the
+                // reconcile will produce, and the reconcile that redeploys it is what actually
+                // disables automation (`T14.1`).
+                tracing::debug!(
+                    app.namespace = %app.namespace().unwrap_or_default(),
+                    app.name = %app.name_any(),
+                    history_id = decision.target.history_id,
+                    revision = %decision.pinned_revision(),
+                    "diff preview: the reconcile this previews would disable \
+                     spec.syncPolicy.automated so self-heal cannot overwrite the pinned revision"
+                );
+                return Ok(Some(RollbackRequested { decision }));
+            }
             let owner =
                 TrackingOwner::for_application(app).ok_or_else(|| ReconcileError::Invalid {
                     message: "the Application has no metadata.namespace, so its spec cannot be \
@@ -1680,14 +1831,25 @@ impl InventorySyncPipeline {
         Ok(Some(RollbackRequested { decision }))
     }
 
-    /// Consumes the `ferriscd.io/operation` annotation of a rollback that has been applied.
+    /// Consumes the `ferriscd.io/operation` annotation a settled pass has honoured.
     ///
-    /// The pin and its `Warning` condition now live in `/status`, so leaving the annotation behind
-    /// would keep asking for the same rollback on every requeue (and keep forcing a manual sync).
+    /// One path for both operations, because both are the same annotation slot and both are
+    /// one-shot requests:
+    ///
+    /// * a rollback's pin and its `Warning` condition now live in `/status`, so leaving the request
+    ///   behind would keep asking for the same rollback on every requeue (`T10.5`);
+    /// * a manual sync leaves no trace at all, and [`manual_operation`] reads this annotation — so
+    ///   leaving it behind would keep bypassing `automated: None` (and `selfHeal: false`) on every
+    ///   requeue forever, and an API `POST .../sync` would block every later sync/rollback (finding
+    ///   `P14-C1`).
+    ///
+    /// `value` is the exact annotation value that was read, which is what the log line reports; it is
+    /// never interpreted here.
     async fn consume_operation(
         &self,
         app: &Application,
-        rollback: &RollbackRequested,
+        value: &str,
+        rollback: Option<&RollbackRequested>,
     ) -> Result<(), ReconcileError> {
         let owner = TrackingOwner::for_application(app).ok_or_else(|| ReconcileError::Invalid {
             message: "the Application has no metadata.namespace, so its annotations cannot be \
@@ -1703,13 +1865,22 @@ impl InventorySyncPipeline {
                 }),
             })
             .await?;
-        tracing::info!(
-            app.namespace = %owner.namespace,
-            app.name = %owner.name,
-            history_id = rollback.decision.target.history_id,
-            revision = %rollback.decision.pinned_revision(),
-            "rollback applied: consumed the ferriscd.io/operation annotation"
-        );
+        match rollback {
+            Some(rollback) => tracing::info!(
+                app.namespace = %owner.namespace,
+                app.name = %owner.name,
+                operation = %value,
+                history_id = rollback.decision.target.history_id,
+                revision = %rollback.decision.pinned_revision(),
+                "rollback applied: consumed the ferriscd.io/operation annotation"
+            ),
+            None => tracing::info!(
+                app.namespace = %owner.namespace,
+                app.name = %owner.name,
+                operation = %value,
+                "manual sync settled: consumed the ferriscd.io/operation annotation"
+            ),
+        }
         Ok(())
     }
 
@@ -2049,6 +2220,13 @@ impl SyncPipeline for InventorySyncPipeline {
     ) -> BoxFuture<'a, Result<CleanupOutcome, ReconcileError>> {
         Box::pin(self.cleanup_inner(app, mode))
     }
+
+    fn diff<'a>(
+        &'a self,
+        app: &'a Application,
+    ) -> BoxFuture<'a, Result<DiffPreview, ReconcileError>> {
+        Box::pin(self.diff_preview(app))
+    }
 }
 
 /// Implements the [`HookCluster`] seam for **one pass**, over that pass's cluster access.
@@ -2380,15 +2558,29 @@ fn status_inventory(app: &Application) -> Result<Inventory, ReconcileError> {
 ///
 /// `ferriscd.io/refresh` is deliberately **not** a manual operation: it only asks for an
 /// immediate reconcile (the composite watch predicate), and the diff gate must still decide
-/// whether anything is applied. Whether an operation annotation came from this reconcile or a
-/// previous one is not trackable until `T10.x` persists and clears `status.operationState`; until
-/// then "present operation ⇒ manual" is the conservative reading (it can only cause an extra
-/// idempotent apply, never a missed sync).
+/// whether anything is applied.
+///
+/// A present operation used to mean "manual, forever": nothing consumed it, so one request kept
+/// every later reconcile executing (and, through the API, made every later sync/rollback a
+/// conflict). [`Pipeline::consume_operation`] now clears the annotation once a pass has settled, so
+/// "present" really means "pending": the request is honoured **once**, by the pass
+/// [`honoured_operation`] identifies.
 #[must_use]
 pub fn manual_operation(app: &Application) -> bool {
+    honoured_operation(app).is_some()
+}
+
+/// The `ferriscd.io/operation` request a settled pass has honoured, if any.
+///
+/// This is the complement of [`manual_operation`]: the same non-blank annotation, so what one
+/// function treats as a request the other consumes. It covers a manual sync (`{"sync":{...}}`) and,
+/// conservatively, any other non-rollback value — a rollback request is consumed by the same code
+/// path (`prepared.rollback` says which), so the caller only needs the raw value.
+fn honoured_operation(app: &Application) -> Option<&str> {
     app.annotations()
         .get(annotations::OPERATION)
-        .is_some_and(|value| !value.trim().is_empty())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
 }
 
 /// Indexes a diff pass by resource key.
@@ -6807,7 +6999,8 @@ spec:
         assert!(fixture.cluster.app_patches().is_empty());
     }
 
-    /// `{"sync":{...}}` (and any other non-rollback operation) stays a manual sync request.
+    /// `{"sync":{...}}` (and any other non-rollback operation) stays a manual sync request — and a
+    /// settled one consumes its own annotation, never touching `spec` (finding `P14-C1`).
     #[tokio::test]
     async fn a_non_rollback_operation_annotation_is_a_manual_sync() {
         let fixture = fixture(FakeCluster::default().with_namespace("payments"));
@@ -6827,9 +7020,103 @@ spec:
             "a manual operation applies the desired set"
         );
         assert!(outcome.warnings.is_empty());
+        assert_eq!(
+            fixture.cluster.app_patches(),
+            vec![serde_json::json!({"metadata": {"annotations": {annotations::OPERATION: null}}})],
+            "a manual sync consumes its annotation and never patches the spec"
+        );
+    }
+
+    /// **Finding `P14-C1`:** a settled manual sync clears its own `ferriscd.io/operation`, so the
+    /// manual escape hatch cannot stay switched on. The next pass therefore obeys `automated: None`
+    /// again — `Skip(AutomatedDisabled)` — and a later sync/rollback request is not a conflict.
+    ///
+    /// Non-vacuous: the same application *with* the annotation is asserted to apply (the pass
+    /// above), and the second pass is asserted to write no annotation patch of its own.
+    #[tokio::test]
+    async fn a_settled_manual_sync_consumes_its_annotation_and_the_next_pass_skips() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+        app.spec.sync_policy = None;
+        app.metadata.annotations = Some(operation_annotation());
+        assert!(
+            manual_operation(&app),
+            "the fixture must really carry a pending request"
+        );
+
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec![CONFIGMAP_KEY.to_owned()],
+            "the pending request is honoured once"
+        );
+        assert_eq!(
+            fixture.cluster.app_patches(),
+            vec![serde_json::json!({"metadata": {"annotations": {annotations::OPERATION: null}}})],
+            "a settled manual sync consumes the annotation: {:#?}",
+            fixture.cluster.app_patches()
+        );
+        assert_eq!(ready(&status).reason, REASON_SYNC_SUCCEEDED);
+
+        // Exactly what the consume patch left behind: no annotation, automation still off.
+        app.metadata.annotations = None;
+        assert!(!manual_operation(&app));
+        let applies_before = fixture.cluster.applies().len();
+        let patches_before = fixture.cluster.app_patches().len();
+        let (err, status) = reconcile_pass(&fixture, &mut app).await;
+        assert!(err.is_none(), "{err:?}");
+        let condition = ready(&status);
+        assert_eq!(
+            condition.reason, REASON_SYNC_SKIPPED,
+            "with the request consumed, automated: None decides again: {condition:?}"
+        );
+        assert!(
+            condition.message.contains("automated sync is disabled"),
+            "the skip reason must be `AutomatedDisabled`, not a drift-free pass: {}",
+            condition.message
+        );
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            applies_before,
+            "a skipped pass applies nothing"
+        );
+        assert_eq!(
+            fixture.cluster.app_patches().len(),
+            patches_before,
+            "and it has no annotation left to consume"
+        );
+    }
+
+    /// The consume is a **settled**-pass event: a pass that fails (here: the destination cluster
+    /// refuses the apply) must leave the request in place, or the retried reconcile would silently
+    /// turn into a skipped one.
+    #[tokio::test]
+    async fn an_unsettled_manual_sync_keeps_its_annotation() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .fail_apply_retryably(CONFIGMAP_KEY),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+        app.spec.sync_policy = None;
+        app.metadata.annotations = Some(operation_annotation());
+
+        let (err, _) = reconcile_pass(&fixture, &mut app).await;
+        assert!(
+            matches!(err, Some(ReconcileError::PartialSync { .. })),
+            "the retryable failure must surface: {err:?}"
+        );
         assert!(
             fixture.cluster.app_patches().is_empty(),
-            "a manual sync never patches the spec"
+            "a failed pass must not consume the request: {:?}",
+            fixture.cluster.app_patches()
+        );
+        assert!(
+            manual_operation(&app),
+            "the request is still pending after the failure"
         );
     }
 
@@ -9428,5 +9715,153 @@ spec:
             ),
             "expected SourceNamespaceNotAllowed, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `T14.1`: the read-only diff preview the control-plane API serves
+    // -----------------------------------------------------------------
+
+    /// **`T14.1` trap guard:** a preview renders, reads live state and classifies the diff — and
+    /// writes **nothing**. No apply, no prune, no `Application` patch, and the zero-mutation counter
+    /// (T07.5) stays at zero, so `GET .../diff` can never change the cluster it reports on.
+    #[tokio::test]
+    async fn a_diff_preview_is_read_only_and_reports_what_a_pass_would_see() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let sha = fixture.commit(&[
+            ("configmap.yaml", CONFIGMAP),
+            ("deployment.yaml", DEPLOYMENT),
+        ]);
+        let app = fixture.app(".");
+
+        let preview = fixture
+            .pipeline
+            .diff(&app)
+            .await
+            .expect("the preview must succeed");
+        assert_eq!(
+            preview.revision, sha,
+            "the preview renders the resolved commit"
+        );
+        assert_eq!(preview.desired, 2);
+        assert_eq!(preview.diffs.len(), 2);
+        assert_eq!(
+            preview
+                .diffs
+                .iter()
+                .map(|diff| diff.key().canonical())
+                .collect::<Vec<_>>(),
+            vec![
+                "/ConfigMap/payments/settings".to_owned(),
+                "apps/Deployment/payments/api".to_owned(),
+            ],
+            "the same GKNN set a pass would apply, in tier order"
+        );
+        assert!(
+            preview.diffs.iter().all(|diff| diff.status().is_missing()),
+            "nothing exists yet, so everything is Missing: {:?}",
+            preview.diffs
+        );
+        assert_eq!(preview.summary.missing, 2);
+        assert!(
+            preview.would_sync,
+            "spec.syncPolicy.automated.selfHeal executes a first pass, and the preview must say so"
+        );
+
+        // Read-only: nothing was written, in any form.
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "a preview must never apply: {:?}",
+            fixture.cluster.applies()
+        );
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "a preview must never prune"
+        );
+        assert!(
+            fixture.cluster.app_patches().is_empty(),
+            "a preview must never patch the Application: {:?}",
+            fixture.cluster.app_patches()
+        );
+        assert!(
+            fixture.cluster.creates().is_empty(),
+            "a preview creates no hook"
+        );
+        assert_eq!(fixture.pipeline.mutating_applies(), 0);
+    }
+
+    /// A preview of an **existing** object runs the real `dryRun=All` classification against live
+    /// state: it is a prediction, never a guess, and it still writes nothing.
+    #[tokio::test]
+    async fn a_preview_of_a_live_application_uses_the_dry_run() {
+        // The live object is exactly what Git renders (plus the tracking id an apply would add), so
+        // the prediction echoes it and the ConfigMap is `Synced`.
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(config_map(
+                    "settings",
+                    Some("ferriscd-system/payments:/ConfigMap:payments/settings"),
+                )),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP_WITH_DATA)]);
+        let mut app = fixture.app(".");
+        app.status = Some(status_with_inventory(&[CONFIGMAP_KEY]));
+
+        let preview = fixture
+            .pipeline
+            .diff(&app)
+            .await
+            .expect("the preview succeeds");
+        assert_eq!(preview.diffs.len(), 1);
+        assert_eq!(preview.diffs[0].key().canonical(), CONFIGMAP_KEY);
+        assert!(
+            preview.diffs[0].status().is_synced(),
+            "a live object that matches the rendered body previews as Synced: {:?}",
+            preview.diffs[0]
+        );
+        assert_eq!(preview.summary.synced, 1);
+        assert!(
+            !fixture.dry_run.calls().is_empty(),
+            "a preview of an existing object must issue the `dryRun=All` prediction"
+        );
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "the preview applied nothing"
+        );
+        assert_eq!(fixture.pipeline.mutating_applies(), 0);
+    }
+
+    /// A preview refuses exactly what a sync refuses, so the API cannot report a diff for an
+    /// application the controller would reject (finding C9's other half).
+    #[tokio::test]
+    async fn a_preview_refuses_the_same_applications_a_sync_refuses() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.app(".");
+        app.spec.project = "nope".to_owned();
+
+        let preview_error = fixture
+            .pipeline
+            .diff(&app)
+            .await
+            .expect_err("an unknown AppProject is a terminal denial");
+        let sync_error = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("the same application must be refused by a sync");
+        assert!(
+            matches!(
+                preview_error,
+                ReconcileError::Policy(PolicyError::ProjectNotFound { .. })
+            ),
+            "expected ProjectNotFound, got {preview_error:?}"
+        );
+        assert_eq!(
+            preview_error.to_string(),
+            sync_error.to_string(),
+            "the API must report the same refusal a reconcile would"
+        );
+        assert!(fixture.cluster.applies().is_empty());
     }
 }

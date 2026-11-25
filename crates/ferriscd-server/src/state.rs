@@ -1,0 +1,652 @@
+//! The seams the control-plane API talks to, and the shared state every handler receives.
+//!
+//! The server owns **no** cache and **no** cluster connection of its own (finding C9): every seam
+//! below is implemented in-process over the collaborators [`ferriscd_controller::ControlPlane`]
+//! already built, so `GET .../diff` and `GET .../resources` compute live answers through the very
+//! same `RepoCache`, renderer cache, `ClusterManager`, `DiscoveryCache` and `DiffEngine` the next
+//! reconcile uses.
+//!
+//! The traits exist so the *entire* router is testable with `tower::ServiceExt::oneshot` and no
+//! cluster: a test substitutes a fake source/pipeline and asserts the response. Production wiring is
+//! [`crate::kube`] (one thin adapter per trait).
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use ferriscd_crd::{AppProject, Application};
+use ferriscd_engine::manifest::ResourceKey;
+use futures::future::BoxFuture;
+
+use crate::auth::AuthPolicy;
+use crate::error::ApiError;
+use crate::webhooks::{DeliveryDedupe, FanOut, RefreshSink, WebhookConfig};
+
+/// A boxed fallible future, so the seams stay object-safe.
+pub type SeamFuture<'a, T> = BoxFuture<'a, Result<T, ApiError>>;
+
+/// How many namespace-scoped `list` calls **one** `GET .../resources` request may issue.
+///
+/// The endpoint's cost is otherwise a function of the caller's cluster: one listing per traversed
+/// workload is `O(deployments)` sequential API calls, which a large application (or a caller who
+/// opens the graph in a loop) turns into a request storm against the API server (finding `P14-H2`).
+/// The traversal caches per `(cluster, namespace, kind)`, so a normal application needs two
+/// listings; this is the hard ceiling for a pathological one, and the response reports
+/// `truncated: true` when it is reached.
+pub const MAX_GRAPH_LIST_REQUESTS: usize = 16;
+
+/// The `ListParams::limit` of each of those listings.
+///
+/// A namespace with 10 000 pods must not be able to make one HTTP request allocate 10 000 nodes:
+/// the listing is bounded, and everything discovered from it is bounded again by
+/// [`crate::api::MAX_GRAPH_NODES`].
+pub const GRAPH_LIST_LIMIT: u32 = 500;
+
+/// One object discovered by a namespace-scoped `list`, reduced to what owner matching needs.
+///
+/// Deliberately not the object body: the traversal only ever compares
+/// `metadata.ownerReferences`, and holding whole `Pod`s would multiply the memory a single request
+/// needs by the size of the namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedNode {
+    /// `metadata.name` of the child.
+    pub name: String,
+    /// `(kind, name)` of every `metadata.ownerReferences` entry.
+    pub owners: Vec<(String, String)>,
+}
+
+impl ListedNode {
+    /// Builds a node from a name and its `metadata.ownerReferences`.
+    pub fn new(name: impl Into<String>, owners: Vec<(String, String)>) -> Self {
+        Self {
+            name: name.into(),
+            owners,
+        }
+    }
+
+    /// Whether this node is owned by `kind` `name`.
+    #[must_use]
+    pub fn owned_by(&self, kind: &str, name: &str) -> bool {
+        self.owners
+            .iter()
+            .any(|(owner_kind, owner_name)| owner_kind == kind && owner_name == name)
+    }
+}
+
+/// The `(cluster, namespace, kind)` one listing answers — the per-request cache key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ListKey {
+    cluster: String,
+    namespace: String,
+    kind: &'static str,
+}
+
+impl ListKey {
+    pub(crate) fn new(cluster: &str, namespace: &str, kind: &'static str) -> Self {
+        Self {
+            cluster: cluster.to_owned(),
+            namespace: namespace.to_owned(),
+            kind,
+        }
+    }
+}
+
+/// One `GET .../resources` traversal: its listing cache and its request-wide read budget.
+///
+/// The handler builds exactly one per request, which is what makes `Deployment -> ReplicaSet -> Pod`
+/// cost **one** `ReplicaSet` list plus **one** `Pod` list per `(cluster, namespace)` however many
+/// workloads the application owns — instead of re-listing the same namespace once per workload
+/// (finding `P14-H2`). Nothing is shared between requests: the next request re-reads the cluster,
+/// because a cached listing is exactly the stale live state ADR-004 forbids.
+#[derive(Debug)]
+pub struct GraphTraversal {
+    id: u64,
+    listings: Mutex<BTreeMap<ListKey, Arc<Vec<ListedNode>>>>,
+    issued: AtomicUsize,
+    exhausted: AtomicBool,
+}
+
+impl Default for GraphTraversal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GraphTraversal {
+    /// Starts a traversal for one request.
+    #[must_use]
+    pub fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            listings: Mutex::new(BTreeMap::new()),
+            issued: AtomicUsize::new(0),
+            exhausted: AtomicBool::new(false),
+        }
+    }
+
+    /// A stable identity for this request's traversal.
+    ///
+    /// Only for correlation (the budget warning names it) and for asserting in a test that one
+    /// request shares one traversal: it is never sent to a client and never persisted.
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// How many cluster `list` calls this request has issued so far.
+    #[must_use]
+    pub fn listings_issued(&self) -> usize {
+        self.issued.load(Ordering::SeqCst)
+    }
+
+    /// Whether the request-wide budget cut the traversal short.
+    ///
+    /// The handler reports this as `truncated`, so a response that stopped early never looks
+    /// complete.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
+    }
+
+    /// The cached listing for `key`, issuing `list` **at most once** per request.
+    ///
+    /// `list` is only called on a cache miss (a cache hit costs one map lookup, never an API call).
+    /// `Ok(None)` means the request's listing budget is spent: this parent reports no children and
+    /// [`Self::is_exhausted`] becomes true.
+    pub(crate) async fn listing<F, Fut>(
+        &self,
+        key: ListKey,
+        list: F,
+    ) -> Result<Option<Arc<Vec<ListedNode>>>, ApiError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<ListedNode>, ApiError>>,
+    {
+        if let Some(cached) = self.cached(&key) {
+            return Ok(Some(cached));
+        }
+        if !self.charge() {
+            return Ok(None);
+        }
+        let listed = Arc::new(list().await?);
+        let mut listings = self.lock();
+        listings.insert(key, Arc::clone(&listed));
+        Ok(Some(listed))
+    }
+
+    fn cached(&self, key: &ListKey) -> Option<Arc<Vec<ListedNode>>> {
+        self.lock().get(key).map(Arc::clone)
+    }
+
+    /// Charges one listing to the request budget; `false` when it is spent.
+    fn charge(&self) -> bool {
+        let mut current = self.issued.load(Ordering::SeqCst);
+        loop {
+            if current >= MAX_GRAPH_LIST_REQUESTS {
+                self.exhausted.store(true, Ordering::SeqCst);
+                return false;
+            }
+            match self.issued.compare_exchange(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<ListKey, Arc<Vec<ListedNode>>>> {
+        // A poisoned listing cache is still usable: the worst case is one extra cluster read.
+        self.listings.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Reads `Application` objects (`GET /api/v1/applications[/ns/name]`, operation handlers, and the
+/// webhook matcher).
+///
+/// Reads only: the API never mutates an `Application` except through
+/// [`OperationWriter`] (`ferriscd.io/operation`) and [`RefreshSink`] (`ferriscd.io/refresh`), and
+/// both patch annotations instead of spec/status so a manual request can never fight the
+/// always-update-status contract.
+pub trait ApplicationSource: Send + Sync + 'static {
+    /// Lists every `Application` this control plane watches.
+    fn list(&self) -> SeamFuture<'_, Vec<Application>>;
+
+    /// Reads one `Application`, or `Ok(None)` when it does not exist.
+    fn get(&self, namespace: &str, name: &str) -> SeamFuture<'_, Option<Application>>;
+}
+
+/// Reads `AppProject` objects (`GET /api/v1/projects`).
+pub trait ProjectCatalog: Send + Sync + 'static {
+    /// Lists every `AppProject` of the control-plane namespace.
+    fn list(&self) -> SeamFuture<'_, Vec<AppProject>>;
+}
+
+/// One registered cluster, as `GET /api/v1/clusters` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterEntry {
+    /// `spec.destination.cluster` name (`in-cluster` for the control plane's own cluster).
+    pub name: String,
+    /// Whether this is the cluster the control plane runs in.
+    pub in_cluster: bool,
+}
+
+/// Lists the cluster registry (`GET /api/v1/clusters`, `T13.1`).
+pub trait ClusterCatalog: Send + Sync + 'static {
+    /// Every addressable cluster name, `in-cluster` first.
+    fn list(&self) -> Vec<ClusterEntry>;
+}
+
+/// A manual operation the API can request (`POST .../sync`, `POST .../rollback`).
+///
+/// Only the documented `ferriscd.io/operation` payloads exist; the controller parses them and the
+/// **controller** decides what happens (the API never syncs anything itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationRequest {
+    /// `{"sync":{}}`: reconcile now, even with `syncPolicy.automated` unset.
+    Sync,
+    /// `{"rollback":{"id":N}}`: redeploy the commit recorded for history entry `N`.
+    Rollback {
+        /// `status.history[].id` to redeploy.
+        id: i64,
+    },
+}
+
+impl OperationRequest {
+    /// The exact annotation value the controller parses (`ferriscd.io/operation`).
+    ///
+    /// The JSON is canonical: `{"sync":{}}` carries no `rollback` key, so
+    /// `ferriscd_engine::sync::parse_rollback_request` reports `NotARollback` and the reconcile
+    /// treats it as the documented manual-sync request; a rollback carries exactly
+    /// `{"rollback":{"id":N}}`.
+    #[must_use]
+    pub fn annotation_value(&self) -> String {
+        match self {
+            Self::Sync => r#"{"sync":{}}"#.to_owned(),
+            Self::Rollback { id } => format!(r#"{{"rollback":{{"id":{id}}}}}"#),
+        }
+    }
+
+    /// A stable label for responses and logs.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Rollback { .. } => "rollback",
+        }
+    }
+}
+
+/// Patches `ferriscd.io/operation` onto an `Application` (`T14.1`).
+pub trait OperationWriter: Send + Sync + 'static {
+    /// Requests `operation` on `namespace/name`.
+    ///
+    /// `resource_version` is the compare-and-swap precondition: when the object changed since it was
+    /// read, the write fails with [`ApiError::Conflict`] instead of overwriting a request somebody
+    /// else just made.
+    fn request<'a>(
+        &'a self,
+        namespace: &'a str,
+        name: &'a str,
+        resource_version: Option<&'a str>,
+        operation: OperationRequest,
+    ) -> SeamFuture<'a, ()>;
+}
+
+/// One resource of `status.inventory`, as the live cluster sees it right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveResourceState {
+    /// Version-agnostic GKNN key (`group/kind/namespace/name`).
+    pub key: ResourceKey,
+    /// Whether the object exists in the destination cluster right now.
+    pub present: bool,
+    /// Ownership verdict for a present object: `OwnedBySelf`, `Unmanaged`, or `OwnedByForeign`.
+    pub ownership: Option<&'static str>,
+}
+
+/// Reads the live state of an `Application`'s inventory (`GET .../resources`).
+///
+/// **On demand, never an informer** (ADR-004): a request costs one scoped read per inventory key on
+/// the destination cluster and nothing is cached between requests.
+pub trait InventoryReader: Send + Sync + 'static {
+    /// Reads every key of `app.status.inventory` for `app`.
+    fn read<'a>(&'a self, app: &'a Application) -> SeamFuture<'a, Vec<LiveResourceState>>;
+}
+
+/// One child discovered by `metadata.ownerReferences` traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildNode {
+    /// GKNN of the child.
+    pub key: ResourceKey,
+    /// The cluster the child was read from (`spec.destination.cluster`).
+    pub cluster: String,
+}
+
+/// The parent whose children are requested.
+#[derive(Debug, Clone, Copy)]
+pub struct GraphRequest<'a> {
+    /// Destination cluster (`spec.destination.cluster`).
+    pub cluster: &'a str,
+    /// Namespace of the parent object (always `spec.destination.namespace` for a workload).
+    pub namespace: &'a str,
+    /// Parent kind (`Deployment`, `ReplicaSet`, `StatefulSet`, ...).
+    pub kind: &'a str,
+    /// Parent name.
+    pub name: &'a str,
+}
+
+/// Lists the live children of one workload node (`Deployment -> ReplicaSet -> Pod`, `T14.1`).
+pub trait WorkloadGraphSource: Send + Sync + 'static {
+    /// Lists the children of `parent` through `metadata.ownerReferences`.
+    ///
+    /// `traversal` is **one request's** scope: an implementation must cache its cluster reads on it,
+    /// so a request that walks twenty `Deployment`s lists the namespace's `ReplicaSet`s once, not
+    /// twenty times, and must respect its listing budget (finding `P14-H2`).
+    ///
+    /// A kind with no children (a `ConfigMap`, a `Service`) returns an empty list, never an error.
+    fn children<'a>(
+        &'a self,
+        traversal: &'a GraphTraversal,
+        parent: &GraphRequest<'_>,
+    ) -> SeamFuture<'a, Vec<ChildNode>>;
+}
+
+/// Computes the live, Secret-redacted diff of an `Application` (`GET .../diff`).
+pub trait DiffSource: Send + Sync + 'static {
+    /// Returns the diff preview.
+    ///
+    /// The preview is the read-only prefix of a reconcile, so a refusal here is the same refusal the
+    /// next sync would report (`PolicyViolation`, a bad revision, an unreachable cluster).
+    fn diff<'a>(&'a self, app: &'a Application)
+    -> SeamFuture<'a, ferriscd_controller::DiffPreview>;
+}
+
+/// Reports whether the API server should receive traffic (`GET /readyz`).
+pub trait Readiness: Send + Sync + 'static {
+    /// Whether the process is ready.
+    fn is_ready(&self) -> bool;
+
+    /// Why it is not ready (secret-free), for the `/readyz` body.
+    fn reason(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Always ready: the API is serving and nothing else is known yet.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServingReadiness;
+
+impl Readiness for ServingReadiness {
+    fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+/// Never ready: used to prove `/readyz` really gates traffic on the seam.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NotReady;
+
+impl Readiness for NotReady {
+    fn is_ready(&self) -> bool {
+        false
+    }
+
+    fn reason(&self) -> Option<String> {
+        Some("the control-plane watches have not completed their initial list".to_owned())
+    }
+}
+
+/// Everything the router needs.
+///
+/// Deliberately a bag of seams: one `AppState` is built by [`crate::Server`] from the shared
+/// [`ferriscd_controller::ControlPlane`], and a test builds one from fakes — the handlers cannot
+/// tell the difference, which is what makes the whole API testable without a cluster.
+#[derive(Clone)]
+pub struct AppState {
+    /// `Application` reads.
+    pub applications: Arc<dyn ApplicationSource>,
+    /// `AppProject` reads.
+    pub projects: Arc<dyn ProjectCatalog>,
+    /// The cluster registry.
+    pub clusters: Arc<dyn ClusterCatalog>,
+    /// `ferriscd.io/operation` writes.
+    pub operations: Arc<dyn OperationWriter>,
+    /// Live inventory reads.
+    pub inventory: Arc<dyn InventoryReader>,
+    /// `metadata.ownerReferences` traversal.
+    pub graph: Arc<dyn WorkloadGraphSource>,
+    /// Live diff computation.
+    pub diffs: Arc<dyn DiffSource>,
+    /// `/readyz`.
+    pub readiness: Arc<dyn Readiness>,
+    /// `T14.3` authentication seam (pass-through today, default-deny tomorrow).
+    pub auth: AuthPolicy,
+    /// `T14.2` webhook configuration (secrets, caps, debounce).
+    pub webhooks: WebhookConfig,
+    /// `T14.2` bounded replay cache for `X-GitHub-Delivery` ids.
+    pub dedupe: Arc<DeliveryDedupe>,
+    /// The `ferriscd.io/refresh` writer the webhook fan-out uses.
+    pub refreshes: Arc<dyn RefreshSink>,
+    /// Per-repository debounce + jittered fan-out (`T14.2`).
+    pub fan_out: Arc<FanOut>,
+}
+
+impl fmt::Debug for AppState {
+    /// Never prints a webhook secret, an application object, or a diff: this type is cloned into
+    /// every request and a stray `{:?}` must stay safe.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppState")
+            .field("auth", &self.auth)
+            .field("webhooks", &self.webhooks)
+            .field("readiness", &self.readiness.is_ready())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppState {
+    /// Builds a state from explicit seams (production: [`AppState::from_control_plane`]).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        applications: Arc<dyn ApplicationSource>,
+        projects: Arc<dyn ProjectCatalog>,
+        clusters: Arc<dyn ClusterCatalog>,
+        operations: Arc<dyn OperationWriter>,
+        inventory: Arc<dyn InventoryReader>,
+        graph: Arc<dyn WorkloadGraphSource>,
+        diffs: Arc<dyn DiffSource>,
+        readiness: Arc<dyn Readiness>,
+    ) -> Self {
+        let webhooks = WebhookConfig::default();
+        let dedupe = Arc::new(DeliveryDedupe::new(
+            webhooks.dedupe_capacity,
+            webhooks.dedupe_ttl,
+        ));
+        let refreshes: Arc<dyn RefreshSink> = Arc::new(crate::webhooks::UnconfiguredRefreshSink);
+        let fan_out = Arc::new(FanOut::new(&webhooks, refreshes.clone()));
+        Self {
+            applications,
+            projects,
+            clusters,
+            operations,
+            inventory,
+            graph,
+            diffs,
+            readiness,
+            auth: AuthPolicy::default(),
+            webhooks,
+            dedupe,
+            refreshes,
+            fan_out,
+        }
+    }
+
+    /// Replaces the webhook configuration (and rebuilds the fan-out around it).
+    #[must_use]
+    pub fn with_webhooks(mut self, webhooks: WebhookConfig) -> Self {
+        self.fan_out = Arc::new(FanOut::new(&webhooks, self.refreshes.clone()));
+        self.dedupe = Arc::new(DeliveryDedupe::new(
+            webhooks.dedupe_capacity,
+            webhooks.dedupe_ttl,
+        ));
+        self.webhooks = webhooks;
+        self
+    }
+
+    /// Replaces the `ferriscd.io/refresh` writer.
+    #[must_use]
+    pub fn with_refresh_sink(mut self, refreshes: Arc<dyn RefreshSink>) -> Self {
+        self.fan_out = Arc::new(FanOut::new(&self.webhooks, refreshes.clone()));
+        self.refreshes = refreshes;
+        self
+    }
+
+    /// Replaces the authentication seam.
+    #[must_use]
+    pub fn with_auth(mut self, auth: AuthPolicy) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// Replaces the readiness probe.
+    #[must_use]
+    pub fn with_readiness(mut self, readiness: Arc<dyn Readiness>) -> Self {
+        self.readiness = readiness;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_operation_payloads_are_the_documented_ones() {
+        assert_eq!(OperationRequest::Sync.annotation_value(), r#"{"sync":{}}"#);
+        assert_eq!(
+            OperationRequest::Rollback { id: 7 }.annotation_value(),
+            r#"{"rollback":{"id":7}}"#
+        );
+        assert_eq!(OperationRequest::Sync.label(), "sync");
+        assert_eq!(OperationRequest::Rollback { id: 1 }.label(), "rollback");
+    }
+
+    /// The sync payload must not look like a rollback to the controller's parser, and the rollback
+    /// payload must parse as one: the API and the controller share one contract.
+    #[test]
+    fn the_payloads_parse_exactly_as_the_controller_expects() {
+        assert!(
+            matches!(
+                ferriscd_engine::sync::parse_rollback_request(
+                    &OperationRequest::Sync.annotation_value()
+                ),
+                Err(ferriscd_engine::sync::RollbackError::NotARollback)
+            ),
+            "a manual sync is not a rollback"
+        );
+        let request = ferriscd_engine::sync::parse_rollback_request(
+            &OperationRequest::Rollback { id: 4 }.annotation_value(),
+        )
+        .expect("a rollback payload must parse");
+        assert_eq!(request.id, 4);
+    }
+
+    #[test]
+    fn a_rollback_id_is_never_reformatted_into_something_else() {
+        for id in [0_i64, 1, 19, i64::MAX] {
+            let value = OperationRequest::Rollback { id }.annotation_value();
+            let parsed = ferriscd_engine::sync::parse_rollback_request(&value)
+                .expect("every history id the API writes must parse back");
+            assert_eq!(parsed.id, id);
+        }
+    }
+
+    /// **Finding `P14-H2`:** the cache is per `(cluster, namespace, kind)` and it really prevents the
+    /// read — a hit must not call the lister at all (a hit that re-listed would prove nothing).
+    #[tokio::test]
+    async fn a_listing_is_issued_once_per_cluster_namespace_and_kind() {
+        let traversal = GraphTraversal::new();
+        let key = ListKey::new("in-cluster", "payments", "ReplicaSet");
+
+        let first = traversal
+            .listing(key.clone(), || async {
+                Ok(vec![ListedNode::new(
+                    "api-abc",
+                    vec![("Deployment".to_owned(), "api".to_owned())],
+                )])
+            })
+            .await
+            .expect("the first listing")
+            .expect("inside the budget");
+        assert_eq!(traversal.listings_issued(), 1);
+        assert_eq!(first[0].name, "api-abc");
+        assert!(first[0].owned_by("Deployment", "api"));
+        assert!(!first[0].owned_by("Deployment", "worker"));
+
+        // The same key again: served from the cache, so the lister is never called (it would panic).
+        let second = traversal
+            .listing(key, || async {
+                panic!("a cached listing must not re-read the cluster");
+            })
+            .await
+            .expect("the cached listing")
+            .expect("and it is inside the budget");
+        assert_eq!(second[0].name, "api-abc");
+        assert_eq!(traversal.listings_issued(), 1);
+
+        // A different namespace (or cluster, or kind) is a different read.
+        for key in [
+            ListKey::new("in-cluster", "other", "ReplicaSet"),
+            ListKey::new("eu-prod", "payments", "ReplicaSet"),
+            ListKey::new("in-cluster", "payments", "Pod"),
+        ] {
+            traversal
+                .listing(key, || async { Ok(Vec::new()) })
+                .await
+                .expect("a listing")
+                .expect("inside the budget");
+        }
+        assert_eq!(traversal.listings_issued(), 4);
+        assert!(!traversal.is_exhausted());
+    }
+
+    /// The request-wide budget is a hard ceiling: once it is spent every further listing answers
+    /// `None` and the request reports itself truncated.
+    #[tokio::test]
+    async fn the_listing_budget_is_enforced() {
+        let traversal = GraphTraversal::new();
+        for index in 0..MAX_GRAPH_LIST_REQUESTS {
+            let key = ListKey::new("in-cluster", &format!("namespace-{index}"), "Pod");
+            assert!(
+                traversal
+                    .listing(key, || async { Ok(Vec::new()) })
+                    .await
+                    .expect("a listing")
+                    .is_some(),
+                "listing {index} is inside the budget"
+            );
+        }
+        assert_eq!(traversal.listings_issued(), MAX_GRAPH_LIST_REQUESTS);
+        assert!(!traversal.is_exhausted());
+
+        let over = traversal
+            .listing(ListKey::new("in-cluster", "one-more", "Pod"), || async {
+                panic!("a spent budget must not reach the cluster");
+            })
+            .await
+            .expect("an exhausted traversal is not an error");
+        assert!(over.is_none(), "no listing, no children, no error");
+        assert!(traversal.is_exhausted(), "and the response says so");
+        assert_eq!(
+            traversal.listings_issued(),
+            MAX_GRAPH_LIST_REQUESTS,
+            "a refused listing is not charged"
+        );
+    }
+}

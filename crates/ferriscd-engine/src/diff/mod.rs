@@ -40,7 +40,7 @@ pub mod compare;
 pub mod decision;
 pub mod ignore;
 pub mod redact;
-pub(crate) mod sha256;
+pub mod sha256;
 pub mod types;
 
 pub use compare::{
