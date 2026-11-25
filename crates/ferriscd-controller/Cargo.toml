@@ -11,6 +11,10 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# `T15.1`: the dedicated `/metrics` listener. `axum`/`hyper` are already in the lock file (the API
+# server uses them), so serving the scrape endpoint here adds no package — and it has to live in
+# this crate because `ferriscd controller` (no API server) serves it too.
+axum.workspace = true
 # The `T13.1` cluster registry (`DashMap<ClusterName, Arc<ClusterHandle>>`) and the `T13.2`
 # leader-lease cancellation token. Both are already in the lock file.
 dashmap.workspace = true
@@ -42,6 +46,8 @@ k8s-openapi = { workspace = true, features = ["v1_35"] }
 kube = { workspace = true, features = ["unstable-runtime"] }
 # Merge-patch bodies for the always-update-status wrapper.
 serde_json.workspace = true
+# `T15.1`: the metric families, their typed label sets, and the text (0.0.4) exposition.
+prometheus-client.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

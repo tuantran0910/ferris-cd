@@ -409,6 +409,68 @@ Operational notes:
   before starting the other. The same applies to changing `--total-shards`/`--shard-id` on a running
   fleet.
 
+### Prometheus metrics (`T15.1`) — its **own** port, low cardinality
+
+`ferriscd` serves `GET /metrics` on a **dedicated internal listener**. That listener is never on the API/webhook port:
+`ferriscd server` refuses a `--metrics-addr` on the `--api-addr` port (any address), and the API router
+(`/api/v1/*`, `/healthz`, `/readyz`, `/webhooks/*`) contains no metrics route at all: Prometheus
+needs no bearer token, and a scraper's network has access to nothing else.
+
+| Knob | Default | Notes |
+|---|---|---|
+| `--metrics-addr` | `0.0.0.0:9090` | `HOST:PORT`. `FERRISCD_METRICS_ADDR` is the env fallback (prefer it over the flag in a manifest). |
+| `:0` | — | binds an ephemeral port and logs the real one (tests/local use). |
+| path | `/metrics` | classic Prometheus text (`text/plain; version=0.0.4`). |
+
+`0.0.0.0:9090` is the default because Prometheus scrapes the **pod IP**; a loopback default would
+ship an endpoint nobody can scrape. The exposition holds application names and statuses only — no
+`Secret` value, diff or token — and `--metrics-addr 127.0.0.1:9090` (or a `NetworkPolicy` allowing
+port 9090 only from the monitoring namespace) narrows it if your platform requires that.
+
+```yaml
+# prometheus.yml (or a ServiceMonitor selecting the controller's pods)
+scrape_configs:
+  - job_name: ferriscd
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      # Publish a `metrics` container port (containerPort 9090) in the pod template, then keep the
+      # pods that expose it.
+      - source_labels: [__meta_kubernetes_pod_container_port_number]
+        regex: "9090"
+        action: keep
+    metrics_path: /metrics
+```
+
+Exposed families — and nothing else:
+
+| Family | Type | Labels |
+|---|---|---|
+| `ferriscd_reconcile_duration_seconds` | histogram | `result` = `success` \| `retryable` \| `terminal` |
+| `ferriscd_reconcile_total` | counter | `result` (same three values) |
+| `ferriscd_app_sync_status` | gauge | `app_namespace`, `app_name`, `status` = `Synced` \| `OutOfSync` \| `Unknown` |
+| `ferriscd_app_health_status` | gauge | `app_namespace`, `app_name`, `status` = `Healthy` \| `Progressing` \| `Degraded` \| `Suspended` \| `Missing` \| `Unknown` |
+| `ferriscd_git_fetch_duration_seconds` | histogram | *(none)* |
+| `ferriscd_render_cache_total` | counter | `outcome` = `hit` \| `miss` |
+| `ferriscd_active_reconciles` | gauge | *(none)* |
+
+Operational notes:
+
+* **Cardinality is fixed by construction.** No `commit_sha`, `error_message`, repository URL or
+  resource name is ever a label — the `result`/`status`/`outcome` values come from closed enums and
+  the only free-form labels are the `Application`'s own `metadata.namespace`/`metadata.name`. Series
+  therefore grow with the number of `Application`s, never with commits, failures, resources or
+  scrapes. The two per-`Application` families exist **after a pass has observed that
+  `Application`** (a status nobody observed is never invented); the other five are exported from
+  startup with zero values, so a "no data yet" alert does not fire on a fresh pod.
+* **Prometheus scraping fails loudly if the listener dies.** The metrics server is an independent
+  Tokio task, and its failure cancels the controller's own shutdown path instead of leaving a
+  reconciling process with a dead endpoint.
+* **Render-cache counters are the engine's**, bridged by delta: `ferriscd_render_cache_total` is
+  `RenderCache::stats()`'s `hits`/`misses`, so it can never disagree with the cache.
+* `--metrics-addr` reaches the controller through `ferriscd server` too (the controller flags are
+  flattened into `ferriscd server`), so both entrypoints expose the same surface.
+
 ### Multi-tenancy RBAC matrix
 
 | Controller verb (`T12.2`/`T12.3`) | Why | Scope |

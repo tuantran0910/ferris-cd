@@ -231,3 +231,40 @@ fn the_sharding_flags_and_per_shard_leases_are_documented() {
         "sharding is per-shard leader election, never a replacement for it"
     );
 }
+
+/// **`T15.1`:** the metrics listener is a documented, separate port with an env fallback, and the
+/// cardinality trap guard is stated where an operator (or a future contributor) reads it — the seven
+/// families must all be listed, or a dashboard is built against metrics nothing exports.
+#[test]
+fn the_metrics_listener_and_its_cardinality_contract_are_documented() {
+    for expected in [
+        "--metrics-addr",
+        "FERRISCD_METRICS_ADDR",
+        "0.0.0.0:9090",
+        "/metrics",
+        "ferriscd_reconcile_duration_seconds",
+        "ferriscd_reconcile_total",
+        "ferriscd_app_sync_status",
+        "ferriscd_app_health_status",
+        "ferriscd_git_fetch_duration_seconds",
+        "ferriscd_render_cache_total",
+        "ferriscd_active_reconciles",
+    ] {
+        assert!(
+            README.contains(expected),
+            "deploy/README.md must document {expected:?}"
+        );
+    }
+    for forbidden in ["commit_sha", "error_message", "resource name"] {
+        assert!(
+            README.contains(forbidden),
+            "the trap guard must name {forbidden:?}: an operator has to be told why the label is \
+             absent, not left to add it"
+        );
+    }
+    // The listener is documented as its own port, never the API one.
+    assert!(
+        README.contains("never on the API/webhook port"),
+        "the README must state that `/metrics` is not served on the API port"
+    );
+}
