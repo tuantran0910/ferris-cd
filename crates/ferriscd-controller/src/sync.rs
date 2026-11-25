@@ -19,6 +19,7 @@
 //! | CRD `Established` wait | bounded poll + `DiscoveryCache::invalidate_and_refresh()` before the CRs, so a CRD + CR pair lands on the **first** sync (T08.3) |
 //! | `createNamespace: true` | `SyncPlan::pre_create_namespace`: the namespace is SSA-applied (unstamped, so never prunable) before the first step |
 //! | Waves/hooks | rejected with an actionable message instead of being mis-ordered (`T10.x`) |
+//! | Rendering | `spec.source.renderer` via the Phase 11 `RenderPipeline` (auto-detected plain/YAML, Kustomize, or Helm; one parse+normalize funnel; tier-sorted; cached per render tuple) |
 //! | Destination clusters | `in-cluster` only; anything else is rejected (`T12.x` credentials) |
 //! | Git credentials | anonymous only (`T12.x`) |
 //! | Health | evaluated from the pass-level live read on **every** pass (including a `Skip`), into `status.health` + `status.resources`, and drives the adaptive requeue (`T09.5`; `T10.x` gates waves/hooks on it) |
@@ -71,13 +72,16 @@ use ferriscd_engine::diff::{
     DiffStatus, DiffSummary, IgnoreRuleSet, ResourceDiff, SyncDecision, should_sync,
     source_spec_hash,
 };
-use ferriscd_engine::graph::{sort_by_tier, sort_keys_prune_order};
+use ferriscd_engine::graph::sort_keys_prune_order;
 use ferriscd_engine::health::{
     self, HealthConfig, HealthInput, HealthRegistry, HealthStatus, HealthSummary,
 };
 use ferriscd_engine::inventory::{self, Inventory, Ownership};
-use ferriscd_engine::manifest::{self, DesiredResource, ManifestLoaderConfig, ResourceKey};
-use ferriscd_engine::repo::{GitSource, RepoCache, RepoCheckout, RepoCredentials, RepoUrlPolicy};
+use ferriscd_engine::manifest::{
+    self, DesiredResource, ManifestLoaderConfig, RenderContext, RenderPipeline, RendererBinaries,
+    ResourceKey,
+};
+use ferriscd_engine::repo::{GitSource, RepoCache, RepoCredentials, RepoUrlPolicy};
 use ferriscd_engine::sync::{OrphanCandidate, OrphanOwnership, PlanRequest, SyncPlan};
 use futures::future::BoxFuture;
 use kube::ResourceExt;
@@ -338,6 +342,12 @@ pub struct InventorySyncPipeline {
     reader: ClusterStateReader,
     applier: Arc<dyn Applier>,
     dry_run: Arc<dyn DryRunApi>,
+    /// Phase 11 render pipeline: `spec.source.renderer` (auto-detected by default) → raw manifests
+    /// → Phase 03/04 parse + normalize → tier-sorted `DesiredResource`s, with a collision-free
+    /// render cache in front of the subprocess.
+    render: RenderPipeline,
+    /// `kustomize`/`helm` binary overrides handed to every render context.
+    renderer_binaries: RendererBinaries,
     loader: ManifestLoaderConfig,
     url_policy: RepoUrlPolicy,
     /// Phase 09 health registry: `(group, kind)` -> evaluator, unknown kinds falling back to the
@@ -354,6 +364,8 @@ impl std::fmt::Debug for InventorySyncPipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InventorySyncPipeline")
             .field("discovery", &self.discovery)
+            .field("render", &self.render)
+            .field("renderer_binaries", &self.renderer_binaries)
             .field("loader", &self.loader)
             .field("url_policy", &self.url_policy)
             .field("health", &self.health)
@@ -382,6 +394,8 @@ impl InventorySyncPipeline {
             reader: ClusterStateReader::new(live),
             applier,
             dry_run,
+            render: RenderPipeline::default(),
+            renderer_binaries: RendererBinaries::default(),
             loader: ManifestLoaderConfig::default(),
             url_policy: RepoUrlPolicy::Production,
             health: HealthRegistry::builtin(),
@@ -418,6 +432,23 @@ impl InventorySyncPipeline {
     pub fn with_loader_config(mut self, loader: ManifestLoaderConfig) -> Self {
         self.loader = loader;
         self
+    }
+
+    /// Overrides the `kustomize`/`helm` binaries used to render `Application`s.
+    ///
+    /// Operators normally pin the renderers by container image, so this exists for non-standard
+    /// images and for hermetic tests (a fake renderer script instead of the real tool). Each entry
+    /// must be an absolute path or a bare `PATH` name; the sandbox rejects relative paths.
+    #[must_use]
+    pub fn with_renderer_binaries(mut self, binaries: RendererBinaries) -> Self {
+        self.renderer_binaries = binaries;
+        self
+    }
+
+    /// Render-cache counters (`hits`/`misses`/`entries`), for Phase 15 metrics and tests.
+    #[must_use]
+    pub fn render_cache_stats(&self) -> ferriscd_engine::manifest::RenderCacheStats {
+        self.render.cache().stats()
     }
 
     /// Overrides the health tunables (`T09.5`).
@@ -756,7 +787,14 @@ impl InventorySyncPipeline {
             .map_err(ReconcileError::Diff)
     }
 
-    /// Resolves the revision and loads the desired manifest set off the worker pool.
+    /// Resolves the revision and renders the desired manifest set.
+    ///
+    /// Rendering goes through the Phase 11 pipeline (`T11.1`): the renderer is selected by
+    /// `spec.source.renderer` (`Auto` → `Chart.yaml`/`kustomization.yaml` detection, else plain
+    /// YAML) and every byte it produces flows through the same Phase 03 parse and Phase 04
+    /// normalize steps a plain-YAML bundle does. The pipeline returns the bundle already tier
+    /// sorted, and its result cache is keyed on the full render tuple, so a periodic requeue at an
+    /// unchanged commit costs one hash lookup instead of a `kustomize`/`helm` subprocess.
     async fn fetch_desired(
         &self,
         app: &Application,
@@ -778,18 +816,26 @@ impl InventorySyncPipeline {
             .checkout(&source, &resolved.commit_sha, &credentials)
             .await?;
 
-        let source_path = app.spec.source.git.path.clone();
-        let loader = self.loader.clone();
-        // All manifest file I/O and YAML parsing runs off the Tokio worker pool.
-        let resources = tokio::task::spawn_blocking(move || {
-            load_desired_resources(&checkout, &source_path, &loader)
-        })
-        .await
-        .map_err(|err| ReconcileError::Invalid {
-            message: format!("manifest loading task failed: {err}"),
-        })??;
+        // Helm's `.Capabilities.KubeVersion` must match the destination cluster, so the discovery
+        // snapshot has to be populated *before* the render. This is TTL-gated: an already-fresh
+        // snapshot costs no API call.
+        self.discovery.ensure_fresh().await?;
 
-        Ok((resolved.commit_sha, resources))
+        let context = RenderContext::for_application(
+            checkout.root_dir().to_path_buf(),
+            app,
+            &self.discovery.kube_version(),
+        )
+        .with_commit_sha(resolved.commit_sha.clone())
+        .with_loader_config(self.loader.clone())
+        .with_binaries(self.renderer_binaries.clone());
+
+        // File I/O, YAML parsing, and the renderer subprocess all run off the Tokio worker pool
+        // inside the pipeline.
+        let rendered = self.render.render(&context).await?;
+        // The pipeline hands back a shared, already-normalized bundle; stamping ownership below
+        // mutates the resources, so this pass needs its own copy.
+        Ok((resolved.commit_sha, rendered.as_ref().clone()))
     }
 
     /// Rejects unsupported manifests, collects in-bundle CRDs/namespaces, refreshes discovery
@@ -1349,26 +1395,6 @@ fn reject_unsupported(resource: &DesiredResource) -> Result<(), ReconcileError> 
         });
     }
     Ok(())
-}
-
-/// Loads, parses, normalizes and tier-sorts the desired manifest set (blocking).
-///
-/// A free function so it can run inside `tokio::task::spawn_blocking` holding no `&self`.
-fn load_desired_resources(
-    checkout: &RepoCheckout,
-    source_path: &str,
-    loader: &ManifestLoaderConfig,
-) -> Result<Vec<DesiredResource>, ReconcileError> {
-    let files = manifest::load(checkout.root_dir(), source_path, loader)?;
-
-    let mut resources = Vec::new();
-    for file in files {
-        resources.extend(manifest::parse_file(&file.source_file, &file.contents)?);
-    }
-
-    let resources = manifest::normalize(resources)?;
-    manifest::check_duplicate_keys(resources.iter())?;
-    Ok(sort_by_tier(resources))
 }
 
 #[cfg(test)]
@@ -1968,6 +1994,19 @@ mod tests {
     }
 
     fn fixture_with(cluster: FakeCluster, dry_run: FakeDryRun) -> Fixture {
+        build_fixture(cluster, dry_run, RendererBinaries::default())
+    }
+
+    /// A fixture whose render pipeline executes `binaries` instead of the real tools.
+    fn fixture_with_renderers(cluster: FakeCluster, binaries: RendererBinaries) -> Fixture {
+        build_fixture(cluster, FakeDryRun::default(), binaries)
+    }
+
+    fn build_fixture(
+        cluster: FakeCluster,
+        dry_run: FakeDryRun,
+        binaries: RendererBinaries,
+    ) -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let git = Arc::new(FakeGitClient::with_config(FakeGitClientConfig {
             url_policy: RepoUrlPolicy::AllowLocal,
@@ -1992,6 +2031,7 @@ mod tests {
             dry_run.clone(),
         )
         .with_url_policy(RepoUrlPolicy::AllowLocal)
+        .with_renderer_binaries(binaries)
         // Hermetic: a scripted cluster never needs a bounded wait, and `without_waits` keeps the
         // suite free of timing sleeps.
         .with_execution_policy(ExecutionPolicy::without_waits());
@@ -2015,6 +2055,61 @@ mod tests {
         fn app(&self, path: &str) -> Application {
             application(&self.repo_url, path, "payments")
         }
+    }
+
+    /// A fake `kustomize`/`helm` binary: a POSIX shell script that records its invocations and
+    /// prints `stdout`.
+    ///
+    /// `make gate` must stay hermetic (no `kustomize`/`helm` on `PATH` required), so the controller
+    /// tests that render through the CR point the pipeline at one of these.
+    #[cfg(unix)]
+    struct FakeRenderer {
+        dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl FakeRenderer {
+        fn new(name: &str, stdout: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(name);
+            let script = format!(
+                "#!/bin/sh\n\
+                 printf 'x\\n' >> \"$(dirname \"$0\")/invocations\"\n\
+                 {{ printf '%s\\n' \"$@\"; printf -- '---\\n'; }} >> \"$(dirname \"$0\")/args\"\n\
+                 cat <<'FERRISCD_FAKE_STDOUT'\n{stdout}\nFERRISCD_FAKE_STDOUT\n"
+            );
+            std::fs::write(&path, script).unwrap();
+            make_executable(&path);
+            Self { dir, path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn invocations(&self) -> usize {
+            match std::fs::read_to_string(self.dir.path().join("invocations")) {
+                Ok(contents) => contents.lines().filter(|line| !line.is_empty()).count(),
+                Err(_) => 0,
+            }
+        }
+
+        fn recorded_args(&self) -> Vec<String> {
+            match std::fs::read_to_string(self.dir.path().join("args")) {
+                Ok(contents) => contents
+                    .lines()
+                    .filter(|line| !line.is_empty() && *line != "---")
+                    .map(str::to_owned)
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     const CONFIGMAP: &str = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n";
@@ -4468,5 +4563,126 @@ mod tests {
         assert!(status.inventory.is_empty());
         assert!(status.sync.is_none());
         assert!(status.conditions.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 11: rendering through the Application CR (`T11.1`)
+    // ---------------------------------------------------------------------
+
+    /// A committed kustomization is *not* a raw manifest: the pre-Phase-11 controller tried to
+    /// parse `kustomization.yaml` as a Kubernetes object and failed with a missing-`kind`
+    /// validation error. Rendering through the CR must instead run the renderer, parse its output,
+    /// and apply the rendered resource.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_kustomize_application_renders_through_the_cr() {
+        let fake = FakeRenderer::new(
+            "kustomize",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  key: rendered\n",
+        );
+        let fixture = fixture_with_renderers(
+            FakeCluster::default().with_namespace("payments"),
+            RendererBinaries {
+                kustomize: Some(fake.path().to_path_buf()),
+                ..RendererBinaries::default()
+            },
+        );
+        fixture.commit(&[
+            (
+                "kustomization.yaml",
+                "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - configmap.yaml\n",
+            ),
+            ("configmap.yaml", CONFIGMAP),
+        ]);
+
+        let mut app = fixture.app(".");
+        app.spec.source.renderer = RendererSpec::Kustomize(ferriscd_crd::KustomizeRenderer {
+            kustomization_path: None,
+            images: Vec::new(),
+        });
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a kustomize Application must render through the CR");
+
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec![CONFIGMAP_KEY.to_owned()],
+            "the rendered resource must be applied"
+        );
+        assert_eq!(
+            outcome.inventory.as_ref().expect("inventory").len(),
+            1,
+            "the rendered resource — not `kustomization.yaml` — is what enters the inventory"
+        );
+        assert_eq!(fake.invocations(), 1, "the renderer must have been invoked");
+
+        // The render cache is wired into the controller: an unchanged commit renders once.
+        fixture.pipeline.apply(&app).await.expect("second pass");
+        assert_eq!(
+            fake.invocations(),
+            1,
+            "a repeated pass at the same commit must hit the render cache"
+        );
+        let stats = fixture.pipeline.render_cache_stats();
+        assert_eq!(stats.misses, 1, "{stats:?}");
+        assert!(stats.hits >= 1, "{stats:?}");
+    }
+
+    /// The Helm path renders offline with the **discovered** cluster version, so
+    /// `.Capabilities.KubeVersion` matches the destination instead of helm's built-in default.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helm_application_renders_with_the_discovered_kube_version() {
+        let fake = FakeRenderer::new(
+            "helm",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: render-settings\n  namespace: payments\n",
+        );
+        let fixture = fixture_with_renderers(
+            FakeCluster::default().with_namespace("payments"),
+            RendererBinaries {
+                helm: Some(fake.path().to_path_buf()),
+                ..RendererBinaries::default()
+            },
+        );
+        fixture.commit(&[
+            ("Chart.yaml", "apiVersion: v2\nname: demo\nversion: 0.1.0\n"),
+            ("values.yaml", "replicaCount: 1\n"),
+        ]);
+
+        let mut app = fixture.app(".");
+        app.spec.source.renderer = RendererSpec::Helm(ferriscd_crd::HelmRenderer {
+            release_name: None,
+            value_files: Vec::new(),
+            include_crds: false,
+        });
+
+        fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a helm Application must render through the CR");
+
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/ConfigMap/payments/render-settings".to_owned()],
+            "the rendered object must reach the applier"
+        );
+
+        // Finding H2/M3: the render argv carries the *discovered* cluster version, so
+        // `.Capabilities.KubeVersion` reflects the destination cluster instead of helm's default.
+        let args = fake.recorded_args();
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == "--kube-version" && window[1] == "v1.35.0"),
+            "the discovered kube version must reach helm template: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == "--namespace" && window[1] == "payments"),
+            "the destination namespace must reach helm template: {args:?}"
+        );
     }
 }

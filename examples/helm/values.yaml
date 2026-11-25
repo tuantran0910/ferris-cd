@@ -1,0 +1,9 @@
+# Default values for the Phase 11 Helm example.
+replicaCount: 1
+
+image:
+  repository: nginx
+  tag: "1.27-alpine"
+
+appEnv: dev
+logLevel: info

@@ -28,6 +28,11 @@ pub struct ManifestLoaderConfig {
     pub max_files: usize,
     /// Maximum cumulative byte size of manifest content.
     pub max_total_bytes: u64,
+    /// Descend into sub-directories of `source_path` (default `true`).
+    ///
+    /// `spec.source.renderer.plainYaml.recursive: false` maps to `false`, which loads only the
+    /// manifest files directly inside `source_path` (or the single file it names).
+    pub recursive: bool,
 }
 
 impl Default for ManifestLoaderConfig {
@@ -35,6 +40,7 @@ impl Default for ManifestLoaderConfig {
         Self {
             max_files: DEFAULT_MAX_FILES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            recursive: true,
         }
     }
 }
@@ -57,6 +63,13 @@ impl ManifestLoaderConfig {
     #[must_use]
     pub fn with_max_total_bytes(mut self, max_total_bytes: u64) -> Self {
         self.max_total_bytes = max_total_bytes;
+        self
+    }
+
+    /// Sets whether sub-directories of the source path are walked.
+    #[must_use]
+    pub fn with_recursive(mut self, recursive: bool) -> Self {
+        self.recursive = recursive;
         self
     }
 }
@@ -146,7 +159,13 @@ pub fn load(
         ));
     } else if metadata.is_dir() {
         visited.insert(canonical_target.clone());
-        collect_manifest_files(&canonical_root, &canonical_target, &mut files, &mut visited)?;
+        collect_manifest_files(
+            &canonical_root,
+            &canonical_target,
+            &mut files,
+            &mut visited,
+            config.recursive,
+        )?;
     } else {
         return Err(ManifestError::InvalidPath {
             path: canonical_target.display().to_string(),
@@ -206,12 +225,14 @@ pub fn load(
 ///
 /// Intra-repo symlinks are followed (both file and directory targets) after verifying
 /// their canonical target stays inside `root`. `visited` holds canonical directory paths
-/// already entered so a symlink cycle cannot recurse forever.
+/// already entered so a symlink cycle cannot recurse forever. `recursive == false` stops at the
+/// first level: sub-directories (including symlinked ones) are not descended into.
 fn collect_manifest_files(
     root: &Path,
     dir: &Path,
     out: &mut Vec<(String, PathBuf)>,
     visited: &mut HashSet<PathBuf>,
+    recursive: bool,
 ) -> Result<(), ManifestError> {
     let read_dir = std::fs::read_dir(dir).map_err(|source| ManifestError::Io {
         context: format!("reading manifest directory '{}'", dir.display()),
@@ -235,11 +256,14 @@ fn collect_manifest_files(
         })?;
 
         if file_type.is_symlink() {
-            collect_symlink_entry(root, &path, out, visited)?;
+            collect_symlink_entry(root, &path, out, visited, recursive)?;
         } else if file_type.is_dir() {
             let name = entry.file_name();
             if name.to_string_lossy().starts_with('.') {
                 // Hidden dot-directories (.git, .kustomize, ...) are never traversed.
+                continue;
+            }
+            if !recursive {
                 continue;
             }
             let canonical = std::fs::canonicalize(&path).map_err(|source| ManifestError::Io {
@@ -247,7 +271,7 @@ fn collect_manifest_files(
                 source,
             })?;
             if visited.insert(canonical.clone()) {
-                collect_manifest_files(root, &canonical, out, visited)?;
+                collect_manifest_files(root, &canonical, out, visited, recursive)?;
             }
         } else if file_type.is_file() && has_manifest_extension(&path) {
             out.push((source_file_name(&path, root), path));
@@ -268,6 +292,7 @@ fn collect_symlink_entry(
     link: &Path,
     out: &mut Vec<(String, PathBuf)>,
     visited: &mut HashSet<PathBuf>,
+    recursive: bool,
 ) -> Result<(), ManifestError> {
     let canonical = match std::fs::canonicalize(link) {
         Ok(path) => path,
@@ -296,8 +321,8 @@ fn collect_symlink_entry(
             out.push((source_file_name(&canonical, root), canonical));
         }
     } else if metadata.is_dir() {
-        if visited.insert(canonical.clone()) {
-            collect_manifest_files(root, &canonical, out, visited)?;
+        if recursive && visited.insert(canonical.clone()) {
+            collect_manifest_files(root, &canonical, out, visited, recursive)?;
         }
     } else {
         return Err(ManifestError::InvalidPath {
@@ -328,7 +353,7 @@ fn has_manifest_extension(path: &Path) -> bool {
 
 /// Lexically resolves `.` and `..` components (never touching the filesystem) so a
 /// `..` traversal can be detected even when the target path does not exist.
-fn lexically_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexically_normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -467,6 +492,32 @@ mod tests {
             load(temp.path(), ".", &ManifestLoaderConfig::default()).expect("load directory");
         let names: Vec<&str> = files.iter().map(|f| f.source_file.as_str()).collect();
         assert_eq!(names, vec!["visible.yaml"]);
+    }
+
+    #[test]
+    fn non_recursive_load_only_returns_top_level_manifests() {
+        let temp = TempDir::new().expect("tempdir");
+        write(
+            temp.path(),
+            "top.yaml",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: top\n",
+        );
+        write(
+            temp.path(),
+            "nested/deep.yaml",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: deep\n",
+        );
+
+        let config = ManifestLoaderConfig::default().with_recursive(false);
+        let files = load(temp.path(), ".", &config).expect("non-recursive load");
+        let names: Vec<&str> = files.iter().map(|f| f.source_file.as_str()).collect();
+        assert_eq!(names, vec!["top.yaml"]);
+
+        // The default stays recursive, so Phase 03 behaviour is unchanged.
+        let files =
+            load(temp.path(), ".", &ManifestLoaderConfig::default()).expect("recursive load");
+        let names: Vec<&str> = files.iter().map(|f| f.source_file.as_str()).collect();
+        assert_eq!(names, vec!["nested/deep.yaml", "top.yaml"]);
     }
 
     #[test]

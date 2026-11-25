@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Production overlay for the Phase 11 Kustomize example.
+#
+# `resources: [../../base]` is a *local* kustomization reference: it stays inside the checkout, so
+# FerrisCD's SSRF/path-jail guard accepts it (an `http(s)://`, `git::`, or `../../..`-escaping
+# reference would be rejected before `kustomize` runs).
+#
+# The `namePrefix`/`images` transforms are intentionally NOT applied here: the renderer applies them
+# through a scratch overlay (see `KustomizeOptions`), which keeps this file identical to what a user
+# would commit for `kustomize build` by hand.
+resources:
+  - ../../base
+
+# A local patch file, again inside the checkout.
+patches:
+  - path: deployment-replicas.yaml

@@ -79,15 +79,68 @@ pub enum ManifestError {
         /// Second source file defining the key.
         file_b: String,
     },
+
+    /// A renderer cannot render the selected source path at all.
+    #[error("{renderer} renderer rejected the source: {message}")]
+    RendererRejected {
+        /// Renderer name (`auto`, `plainYaml`, `kustomize`, `helm`).
+        renderer: String,
+        /// Why the source was rejected.
+        message: String,
+    },
+
+    /// An external renderer command could not be spawned, was killed, or exited non-zero.
+    #[error("{renderer} renderer failed: {message}")]
+    RendererFailed {
+        /// Renderer name (`kustomize`, `helm`, or `manifest` for pipeline join failures).
+        renderer: String,
+        /// Failure description (bounded command output, never controller secrets).
+        message: String,
+    },
+
+    /// An external renderer exceeded its execution deadline and was killed.
+    #[error("{renderer} renderer timed out after {millis}ms and was killed")]
+    RendererTimeout {
+        /// Renderer name (`kustomize`, `helm`).
+        renderer: String,
+        /// Deadline that was exceeded, in milliseconds.
+        millis: u64,
+    },
+
+    /// An external renderer produced more output than the configured cap.
+    #[error("{renderer} renderer {stream} exceeded the {limit}-byte output limit")]
+    RendererOutputLimit {
+        /// Renderer name (`kustomize`, `helm`).
+        renderer: String,
+        /// Stream that breached the cap (`stdout` or `stderr`).
+        stream: String,
+        /// Configured cap in bytes.
+        limit: u64,
+    },
+
+    /// A manifest or kustomization reference points at a remote URL, an absolute host path, or
+    /// a location outside the checkout root.
+    #[error("{file}: {field} reference '{reference}' is not allowed: {reason}")]
+    UnsafeReference {
+        /// Repository-relative file that contains the reference.
+        file: String,
+        /// Field holding the reference (`resources`, `bases`, `patches`, `valueFiles`, ...).
+        field: String,
+        /// The offending reference, quoted verbatim.
+        reference: String,
+        /// Why it was rejected.
+        reason: String,
+    },
 }
 
 impl ManifestError {
     /// Returns `true` for transient failures that are safe to retry.
     ///
-    /// Manifest parsing, validation, budget, path-escape, limit, and duplicate-key
-    /// failures are all deterministic (terminal). Filesystem I/O is retryable **except**
-    /// [`std::io::ErrorKind::InvalidData`], which a non-UTF-8 manifest produces and which
-    /// can never be fixed by retrying.
+    /// Manifest parsing, validation, budget, path-escape, limit, duplicate-key, and every
+    /// renderer failure are deterministic (terminal): the same commit and the same renderer
+    /// configuration can only produce the same result, so a retry loop would never converge.
+    /// Filesystem I/O is retryable **except** [`std::io::ErrorKind::InvalidData`], which a
+    /// non-UTF-8 manifest produces and which can never be fixed by retrying.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -165,6 +218,44 @@ mod tests {
                     key: "v1/ConfigMap/ns/a".into(),
                     file_a: "a.yaml".into(),
                     file_b: "b.yaml".into(),
+                },
+                false,
+            ),
+            (
+                ManifestError::RendererRejected {
+                    renderer: "kustomize".into(),
+                    message: "unsupported source".into(),
+                },
+                false,
+            ),
+            (
+                ManifestError::RendererFailed {
+                    renderer: "helm".into(),
+                    message: "exit 1".into(),
+                },
+                false,
+            ),
+            (
+                ManifestError::RendererTimeout {
+                    renderer: "helm".into(),
+                    millis: 60_000,
+                },
+                false,
+            ),
+            (
+                ManifestError::RendererOutputLimit {
+                    renderer: "kustomize".into(),
+                    stream: "stdout".into(),
+                    limit: 20 * 1024 * 1024,
+                },
+                false,
+            ),
+            (
+                ManifestError::UnsafeReference {
+                    file: "kustomization.yaml".into(),
+                    field: "resources".into(),
+                    reference: "http://169.254.169.254/latest/meta-data/".into(),
+                    reason: "remote references are disabled".into(),
                 },
                 false,
             ),

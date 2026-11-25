@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: render-config
+  namespace: ferriscd-render
+  labels:
+    app.kubernetes.io/name: render-app
+    app.kubernetes.io/part-of: ferriscd-render-demo
+data:
+  APP_ENV: "base"
+  LOG_LEVEL: "info"
