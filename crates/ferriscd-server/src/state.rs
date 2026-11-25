@@ -20,8 +20,9 @@ use ferriscd_crd::{AppProject, Application};
 use ferriscd_engine::manifest::ResourceKey;
 use futures::future::BoxFuture;
 
-use crate::auth::AuthPolicy;
+use crate::auth::{AuthPolicy, IdentityCache, TokenAuthenticator, UnconfiguredTokenAuthenticator};
 use crate::error::ApiError;
+use crate::rbac::RbacPolicy;
 use crate::webhooks::{DeliveryDedupe, FanOut, RefreshSink, WebhookConfig};
 
 /// A boxed fallible future, so the seams stay object-safe.
@@ -425,8 +426,14 @@ pub struct AppState {
     pub diffs: Arc<dyn DiffSource>,
     /// `/readyz`.
     pub readiness: Arc<dyn Readiness>,
-    /// `T14.3` authentication seam (pass-through today, default-deny tomorrow).
+    /// `T14.3` authentication policy (`TokenReview` by default).
     pub auth: AuthPolicy,
+    /// `T14.3` bearer-token validator (`TokenReview` in production).
+    pub tokens: Arc<dyn TokenAuthenticator>,
+    /// `T14.3` positive-only `TokenReview` cache, keyed by token SHA-256.
+    pub identities: Arc<IdentityCache>,
+    /// `T14.4` project-scoped authorization policy (empty = deny every authenticated caller).
+    pub rbac: Arc<RbacPolicy>,
     /// `T14.2` webhook configuration (secrets, caps, debounce).
     pub webhooks: WebhookConfig,
     /// `T14.2` bounded replay cache for `X-GitHub-Delivery` ids.
@@ -443,6 +450,8 @@ impl fmt::Debug for AppState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppState")
             .field("auth", &self.auth)
+            .field("identities", &self.identities)
+            .field("rbac_rules", &self.rbac.rule_count())
             .field("webhooks", &self.webhooks)
             .field("readiness", &self.readiness.is_ready())
             .finish_non_exhaustive()
@@ -480,6 +489,9 @@ impl AppState {
             diffs,
             readiness,
             auth: AuthPolicy::default(),
+            tokens: Arc::new(UnconfiguredTokenAuthenticator),
+            identities: Arc::new(IdentityCache::default()),
+            rbac: Arc::new(RbacPolicy::empty()),
             webhooks,
             dedupe,
             refreshes,
@@ -511,6 +523,27 @@ impl AppState {
     #[must_use]
     pub fn with_auth(mut self, auth: AuthPolicy) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Replaces the bearer-token validator (`T14.3`).
+    #[must_use]
+    pub fn with_token_authenticator(mut self, tokens: Arc<dyn TokenAuthenticator>) -> Self {
+        self.tokens = tokens;
+        self
+    }
+
+    /// Replaces the positive `TokenReview` cache (a test uses a zero TTL to count reviews).
+    #[must_use]
+    pub fn with_identity_cache(mut self, identities: Arc<IdentityCache>) -> Self {
+        self.identities = identities;
+        self
+    }
+
+    /// Replaces the project-scoped authorization policy (`T14.4`).
+    #[must_use]
+    pub fn with_rbac(mut self, rbac: Arc<RbacPolicy>) -> Self {
+        self.rbac = rbac;
         self
     }
 

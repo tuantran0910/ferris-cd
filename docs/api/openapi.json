@@ -14,12 +14,12 @@
         "tags": [
           "applications"
         ],
-        "summary": "Lists every `Application` this control plane watches.",
-        "description": "Every `Application` this control plane watches, with its sync/health verdict.",
+        "summary": "Lists every `Application` this control plane watches, filtered to the caller's projects.",
+        "description": "Every `Application` this control plane watches, with its sync/health verdict. Filtered to the projects the caller is authorized for: anything outside them is absent, exactly as if it did not exist.",
         "operationId": "list_applications",
         "responses": {
           "200": {
-            "description": "Every watched Application",
+            "description": "Every watched Application the caller may see",
             "content": {
               "application/json": {
                 "schema": {
@@ -62,7 +62,7 @@
           "applications"
         ],
         "summary": "Reads one `Application`.",
-        "description": "One `Application`, with its conditions, deployment history, and running operation.",
+        "description": "One `Application`, with its conditions, deployment history, and running operation. An application in a project the caller may not see answers exactly the 404 a nonexistent one answers.",
         "operationId": "get_application",
         "parameters": [
           {
@@ -105,8 +105,18 @@
               }
             }
           },
+          "403": {
+            "description": "The caller may see this Application but not read it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "404": {
-            "description": "No such Application",
+            "description": "No such Application, or none visible to the caller",
             "content": {
               "application/json": {
                 "schema": {
@@ -182,8 +192,18 @@
               }
             }
           },
+          "403": {
+            "description": "The caller may see this Application but not diff it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "404": {
-            "description": "No such Application",
+            "description": "No such Application, or none visible to the caller",
             "content": {
               "application/json": {
                 "schema": {
@@ -259,8 +279,18 @@
               }
             }
           },
+          "403": {
+            "description": "The caller may see this Application but not read it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "404": {
-            "description": "No such Application",
+            "description": "No such Application, or none visible to the caller",
             "content": {
               "application/json": {
                 "schema": {
@@ -356,8 +386,18 @@
               }
             }
           },
+          "403": {
+            "description": "The caller may see this Application but not roll it back",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "404": {
-            "description": "No such Application",
+            "description": "No such Application, or none visible to the caller",
             "content": {
               "application/json": {
                 "schema": {
@@ -497,8 +537,18 @@
               }
             }
           },
+          "403": {
+            "description": "The caller may see this Application but not sync it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "404": {
-            "description": "No such Application",
+            "description": "No such Application, or none visible to the caller",
             "content": {
               "application/json": {
                 "schema": {
@@ -634,7 +684,7 @@
         "tags": [
           "platform"
         ],
-        "summary": "Lists every `AppProject` of the control-plane namespace.",
+        "summary": "Lists every `AppProject` of the control-plane namespace the caller may see.",
         "description": "Every `AppProject` of the control-plane namespace, with its repository, namespace, destination, and ServiceAccount allow-lists.",
         "operationId": "list_projects",
         "responses": {
@@ -878,7 +928,7 @@
     "schemas": {
       "ApiErrorBody": {
         "type": "object",
-        "description": "The body of a failed request.",
+        "description": "The body of a failed request.\n\n`Deserialize` as well as `Serialize` because it is the contract in **both** directions: the\n`ferriscd` CLI (`T14.5`) maps a refused request back onto this shape instead of re-inventing one.",
         "required": [
           "error"
         ],

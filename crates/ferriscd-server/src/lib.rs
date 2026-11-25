@@ -28,24 +28,24 @@
 //!
 //! # Security posture of this phase
 //!
-//! * `/healthz`, `/readyz` and `/api/v1/webhooks/*` are separate route groups from the
-//!   bearer-protected `/api/v1/*` ([`auth`]); today the protected group runs
-//!   [`auth::AuthPolicy::PassThrough`], `--auth-policy=deny-all` already refuses every protected
-//!   request, and `T14.3` adds `TokenReview` there. Because pass-through cannot authenticate
-//!   anybody, the default bind is loopback ([`DEFAULT_API_ADDR`]) and a non-loopback bind in that
-//!   mode logs a startup warning.
-//! * Webhooks verify an HMAC/token in constant time and deduplicate GitHub delivery ids
-//!   ([`webhooks`]).
-//! * A 1 MiB body cap is installed on the router before any parsing.
-//! * No payload, log line, or error carries a `Secret` value, a credential, or a webhook secret:
-//!   diffs come from the engine's only redacting constructor, repository URLs go through
-//!   `redact_repo_url`, and [`webhooks::WebhookSecret`] redacts its own `Debug`.
+//! | Layer | What it does |
+//! |---|---|
+//! | [`auth`] (`T14.3`) | Default-deny `TokenReview` on every protected `/api/v1/*` route; `401` without a valid bearer token. `/healthz`, `/readyz` and `/api/v1/webhooks/*` are separate groups (probes carry no credential; webhooks authenticate with their own secret). |
+//! | [`rbac`] (`T14.4`) | Project-scoped `(user\|group, project, action)` policy from `ferriscd-rbac-cm`, deny-by-default; unauthorized reads cannot distinguish "forbidden" from "missing". |
+//! | [`webhooks`] (`T14.2`) | Constant-time HMAC/token verification, `X-GitHub-Delivery` replay cache, per-repository debounce. |
+//! | Router | A 1 MiB body cap installed before any parsing. |
+//! | Everywhere | No payload, log line, or error carries a `Secret` value, a credential, a bearer token, or a webhook secret: diffs come from the engine's only redacting constructor, repository URLs go through `redact_repo_url`, tokens are cached and logged only as a SHA-256 fingerprint, and [`webhooks::WebhookSecret`] redacts its own `Debug`. |
+//!
+//! `--auth-policy pass-through` is an explicit development escape hatch and logs a warning on a
+//! non-loopback bind ([`auth::exposes_unauthenticated_api`]); `--auth-policy deny-all` is a
+//! lockdown switch that refuses every protected request without even calling the API server.
 
 pub mod api;
 pub mod auth;
 pub mod error;
 pub mod kube;
 pub mod openapi;
+pub mod rbac;
 pub mod state;
 pub mod webhooks;
 
@@ -55,8 +55,16 @@ use std::net::SocketAddr;
 use axum::Router;
 
 pub use api::router;
-pub use auth::{AuthPolicy, UnknownAuthPolicy};
+pub use auth::{
+    AuthPolicy, AuthenticatedIdentity, BearerError, BearerToken, DEFAULT_IDENTITY_CACHE_TTL,
+    IdentityCache, TokenAuthenticator, UnconfiguredTokenAuthenticator, UnknownAuthPolicy,
+    fingerprint_label, token_fingerprint,
+};
 pub use error::{ApiError, ApiErrorBody, ApiErrorDetail};
+pub use rbac::{
+    Action, Actor, DEFAULT_RBAC_NAMESPACE, Grant, RBAC_CONFIGMAP_KEY, RBAC_CONFIGMAP_NAME,
+    RbacPolicy, RbacPolicyError, Rule, SubjectKind,
+};
 pub use state::{
     AppState, ApplicationSource, ClusterCatalog, ClusterEntry, DiffSource, GraphRequest,
     GraphTraversal, InventoryReader, LiveResourceState, OperationRequest, OperationWriter,
@@ -66,14 +74,14 @@ pub use webhooks::{FanOut, RefreshSink, RefreshTarget, WebhookConfig, WebhookSec
 
 /// Default bind address of the API server (`--api-addr`).
 ///
-/// **Loopback** (`127.0.0.1:8080`): until `T14.3` gives the protected routes a `TokenReview`
-/// identity, the API cannot tell one caller from another, so it must not be reachable from the
-/// cluster network by default — on loopback only the pod itself (and a `kubectl port-forward`) can
-/// reach it. An operator opts into a wider bind with `--api-addr`; the binary then warns when the
-/// bind is combined with the pass-through policy (`auth::exposes_unauthenticated_api`).
+/// **Loopback** (`127.0.0.1:8080`). With [`AuthPolicy::TokenReview`] as the default the protected
+/// routes are authenticated, so a wider bind is no longer *dangerous* — but publishing an API is a
+/// deliberate act, not a default, and loopback costs an operator exactly one `--api-addr` flag (or a
+/// `Service` + `kubectl port-forward` while evaluating FerrisCD). The binary warns when a wider bind
+/// is combined with the pass-through policy ([`auth::exposes_unauthenticated_api`]).
 ///
 /// Port `8080` is deliberately not `9090`: that is reserved for the `T15.1` metrics listener, so
-/// metrics never share an unauthenticated listener with the API.
+/// metrics never share a listener with the API.
 pub const DEFAULT_API_ADDR: &str = "127.0.0.1:8080";
 
 /// Why the API server stopped.
@@ -142,11 +150,29 @@ where
     tracing::info!(
         addr = %local,
         auth = state.auth.as_str(),
+        rbac_rules = state.rbac.rule_count(),
         webhooks_configured,
         debounce = ?state.webhooks.debounce,
         body_limit = state.webhooks.max_body_bytes(),
         "ferriscd-server listening (REST API, OpenAPI, and Git webhooks)"
     );
+    // **`T14.4` fail-closed footgun:** `TokenReview` authenticates callers, but an empty RBAC policy
+    // authorizes none of them, so every protected request answers `404`/`403` while `healthz` says
+    // the server is fine. Say so where the address is known, instead of leaving an operator to
+    // discover it from a `403` nobody expected.
+    if state.auth == AuthPolicy::TokenReview && state.rbac.is_empty() {
+        tracing::warn!(
+            auth = state.auth.as_str(),
+            configmap = %format!("{}/{}", rbac::DEFAULT_RBAC_NAMESPACE, rbac::RBAC_CONFIGMAP_NAME),
+            key = rbac::RBAC_CONFIGMAP_KEY,
+            "the RBAC policy is EMPTY (default-deny): every authenticated request will be refused \
+             unless a policy rule grants it. Publish the `{}` ConfigMap in the control-plane \
+             namespace (default `{}`) with a `{}` document",
+            rbac::RBAC_CONFIGMAP_NAME,
+            rbac::DEFAULT_RBAC_NAMESPACE,
+            rbac::RBAC_CONFIGMAP_KEY,
+        );
+    }
     // **Finding `P14-H1`:** pass-through cannot authenticate anybody, so a bind that anyone but the
     // pod itself can reach would expose every `/api/v1/*` route — sync and rollback included — to
     // any workload on the cluster network. Warn where the combination is decided and the real
@@ -158,10 +184,10 @@ where
         tracing::warn!(
             addr = %addr,
             auth = state.auth.as_str(),
-            "the protected API is UNAUTHENTICATED: --auth-policy=pass-through (the pre-T14.3 \
-             default) is serving /api/v1/* on a non-loopback address, so any client that can reach \
-             it can read diffs and request syncs/rollbacks. Pass --auth-policy=deny-all, bind \
-             --api-addr to 127.0.0.1, or wait for T14.3 (TokenReview authentication)"
+            "the protected API is UNAUTHENTICATED: --auth-policy=pass-through (a development \
+             escape hatch) is serving /api/v1/* on a non-loopback address, so any client that can \
+             reach it can read diffs and request syncs/rollbacks. Drop --auth-policy to use the \
+             default TokenReview authentication, or bind --api-addr to 127.0.0.1"
         );
     }
     axum::serve(listener, router(state))
@@ -182,8 +208,9 @@ mod tests {
     use super::*;
     use crate::state::NotReady;
 
-    /// **Finding `P14-H1`:** the default bind is loopback (the API cannot authenticate anybody
-    /// before `T14.3`) and it is not the metrics port.
+    /// **Finding `P14-H1`:** the default bind is loopback (publishing an API is a deliberate act)
+    /// and it is not the metrics port. With `T14.3`'s `TokenReview` default the shipped combination
+    /// is authenticated *and* unreachable from the cluster network.
     #[test]
     fn the_default_address_is_loopback_and_not_the_metrics_port() {
         let addr: SocketAddr = DEFAULT_API_ADDR.parse().expect("a valid socket address");
@@ -191,7 +218,12 @@ mod tests {
         assert_ne!(addr.port(), 9090, ":9090 is the T15.1 metrics listener");
         assert!(
             addr.ip().is_loopback(),
-            "the default bind must stay on loopback until T14.3 lands: {addr}"
+            "the default bind must stay on loopback: {addr}"
+        );
+        assert_eq!(
+            AuthPolicy::default(),
+            AuthPolicy::TokenReview,
+            "the shipped default must authenticate every protected request"
         );
         assert!(
             !crate::auth::exposes_unauthenticated_api(addr, AuthPolicy::default()),

@@ -36,9 +36,10 @@ pub struct ServerArgs {
 
     /// Address the REST API listens on (health/readiness probes included).
     ///
-    /// Defaults to loopback: until `T14.3` adds `TokenReview` authentication, the API cannot tell one
-    /// caller from another, so it must not be reachable from the cluster network by default. Bind
-    /// `0.0.0.0:8080` explicitly to publish it — and read the startup warning that comes with it.
+    /// Defaults to loopback: publishing an API is a deliberate act, not a default. The protected
+    /// routes authenticate with `TokenReview` (`--auth-policy token-review`), so binding `0.0.0.0`
+    /// is defensible in a cluster — do it explicitly, and put a TLS-terminating `Service`/Ingress in
+    /// front of it.
     #[arg(
         long = "api-addr",
         value_name = "ADDR",
@@ -48,15 +49,19 @@ pub struct ServerArgs {
 
     /// How the bearer-protected `/api/v1/*` routes are authenticated.
     ///
-    /// `pass-through` is the pre-`T14.3` behaviour: every protected request is allowed and annotated
-    /// anonymous, so the API must stay on a loopback address (`--api-addr`). `deny-all` refuses every
-    /// protected request with `401` — the honest setting for a published listener until `T14.3`.
-    /// Falls back to `FERRISCD_AUTH_POLICY`.
+    /// `token-review` (the default) validates `Authorization: Bearer <token>` with a Kubernetes
+    /// `TokenReview`, caching a successful review for 30 s. `pass-through` is an explicit
+    /// **development** escape hatch: every protected request is allowed and annotated anonymous, so
+    /// it must stay on a loopback address. `deny-all` is a lockdown that refuses every protected
+    /// request with `401` without calling the API server. Falls back to `FERRISCD_AUTH_POLICY`.
+    ///
+    /// A `token-review` server also needs the `ferriscd-rbac-cm` ConfigMap (project-scoped
+    /// authorization, `T14.4`); without it every authenticated request is refused (default-deny).
     #[arg(
         long = "auth-policy",
         value_name = "POLICY",
         env = "FERRISCD_AUTH_POLICY",
-        default_value = "pass-through"
+        default_value = "token-review"
     )]
     pub auth_policy: AuthPolicy,
 
@@ -245,17 +250,31 @@ async fn serve(args: ServerArgs) -> Result<()> {
     // The ONE control plane: the same caches, registry, pipeline and discovery every handler and
     // every reconcile uses (finding C9).
     let plane = ferriscd_controller::prepare(run_options(args.controller)).await?;
-    let state = ferriscd_server::kube::app_state(&plane, webhooks).with_auth(args.auth_policy);
+    // `T14.4`: the project-scoped policy is a startup snapshot read from `ferriscd-rbac-cm` in the
+    // control-plane namespace. A missing or malformed policy is deny-all with a loud log, never
+    // allow-all (`fallback_to_deny_all`).
+    let rbac = ferriscd_server::kube::load_rbac_policy(&plane).await;
+    let state = ferriscd_server::kube::app_state(&plane, webhooks)
+        .with_auth(args.auth_policy)
+        .with_rbac(std::sync::Arc::new(rbac));
     if ferriscd_server::auth::exposes_unauthenticated_api(address, args.auth_policy) {
         // Before the listener exists, so the operator sees it even if the bind then fails. The
         // listener logs it again with the address it really bound (`serve_listener`).
         tracing::warn!(
             addr = %address,
             auth = args.auth_policy.as_str(),
-            "the protected API is UNAUTHENTICATED: --auth-policy=pass-through (the pre-T14.3 \
-             default) is binding {address}, which is not loopback, so any client that can reach it \
-             can read diffs and request syncs/rollbacks. Pass --auth-policy=deny-all, bind \
-             --api-addr 127.0.0.1:<port>, or wait for T14.3 (TokenReview authentication)"
+            "the protected API is UNAUTHENTICATED: --auth-policy=pass-through (a development \
+             escape hatch, not the default) is binding {address}, which is not loopback, so any \
+             client that can reach it can read diffs and request syncs/rollbacks. Drop \
+             --auth-policy to use TokenReview, or bind --api-addr 127.0.0.1:<port>"
+        );
+    }
+    if ferriscd_server::kube::denies_every_authenticated_caller(&state) {
+        tracing::warn!(
+            auth = state.auth.as_str(),
+            "the RBAC policy is empty: every authenticated request will be refused (default-deny). \
+             Publish the ferriscd-rbac-cm ConfigMap (key policy.yaml) in the control-plane \
+             namespace and restart the server"
         );
     }
     if !state.webhooks.is_configured() {
@@ -349,10 +368,9 @@ mod tests {
         // The controller flags are inherited, including their owner.
         assert!(args.controller.namespace.is_none());
         assert!(!args.controller.allow_local_repos);
-        // **Finding `P14-H1`:** the default policy is still the pre-T14.3 pass-through, but it is
-        // only ever paired with the loopback default bind — the combination the binary warns about
-        // cannot be produced by defaults.
-        assert_eq!(args.auth_policy, AuthPolicy::PassThrough);
+        // **`T14.3`:** the default policy authenticates every protected request with a
+        // `TokenReview`, and the default bind is loopback — the safe combination, from defaults.
+        assert_eq!(args.auth_policy, AuthPolicy::TokenReview);
         let address: SocketAddr = args.api_addr.parse().expect("a socket address");
         assert!(
             !ferriscd_server::auth::exposes_unauthenticated_api(address, args.auth_policy),
@@ -371,6 +389,10 @@ mod tests {
         assert_eq!(
             parse(&["ferriscd", "server", "--auth-policy", " pass-through "]).auth_policy,
             AuthPolicy::PassThrough
+        );
+        assert_eq!(
+            parse(&["ferriscd", "server", "--auth-policy", "token-review"]).auth_policy,
+            AuthPolicy::TokenReview
         );
 
         let rejected = Harness::try_parse_from(["ferriscd", "server", "--auth-policy", "open"]);
@@ -399,8 +421,8 @@ mod tests {
                 .iter()
                 .map(|value| value.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
-            vec!["pass-through".to_owned()],
-            "the default must stay the documented pass-through policy until T14.3"
+            vec!["token-review".to_owned()],
+            "the default must authenticate: pass-through is an explicit development escape hatch"
         );
     }
 
@@ -464,7 +486,7 @@ mod tests {
             rendered.contains(ferriscd_server::DEFAULT_API_ADDR),
             "{rendered}"
         );
-        assert!(rendered.contains("PassThrough"), "{rendered}");
+        assert!(rendered.contains("TokenReview"), "{rendered}");
 
         // Nothing at all when no credential is configured.
         let none = format!("{:?}", parse(&["ferriscd", "server"]));
@@ -558,7 +580,9 @@ mod tests {
             "--api-addr",
             "--auth-policy",
             "FERRISCD_AUTH_POLICY",
+            "token-review",
             "deny-all",
+            "ferriscd-rbac-cm",
             "--github-webhook-secret",
             "--gitlab-webhook-token",
             "FERRISCD_GITHUB_WEBHOOK_SECRET",
