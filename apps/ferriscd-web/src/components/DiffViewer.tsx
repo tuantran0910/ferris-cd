@@ -361,7 +361,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
           tone="rose"
         />
         <SummaryStat
-          label="OwnerConflict"
+          label="OwnershipConflict"
           value={summary.ownershipConflicts}
           tone="fuchsia"
         />
@@ -369,9 +369,12 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
 
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-xs">
         <div className="flex flex-wrap items-center gap-3 text-slate-300">
-          <span>
+          <span className="min-w-0">
             Revision:{" "}
-            <code className="rounded bg-slate-950 px-1.5 py-0.5 font-mono text-indigo-300">
+            <code
+              className="break-all rounded bg-slate-950 px-1.5 py-0.5 font-mono text-indigo-300"
+              title={diff.revision}
+            >
               {diff.revision}
             </code>
           </span>
@@ -453,8 +456,13 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
       </div>
 
       {filteredResources.length === 0 ? (
-        <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-8 text-center text-sm text-slate-400">
-          No diff entries match the selected filter.
+        <div
+          data-testid="diff-empty-state"
+          className="rounded-xl border border-slate-800 bg-slate-900/50 p-8 text-center text-sm text-slate-400"
+        >
+          {resources.length === 0
+            ? "No resources were diffed: the rendered bundle and the tracked inventory are both empty."
+            : "No diff entries match the selected filter."}
         </div>
       ) : (
         <div className="space-y-3">

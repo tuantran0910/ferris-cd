@@ -12,6 +12,36 @@
       Roboto,
       sans-serif;
   }
+
+  /*
+   * Tailwind Preflight resets `button` to the default arrow cursor. Anything
+   * clickable must show the hand so hoverable controls are discoverable.
+   */
+  :where(
+    button:not(:disabled),
+    select:not(:disabled),
+    summary,
+    [role="button"]:not([aria-disabled="true"])
+  ) {
+    cursor: pointer;
+  }
+
+  /*
+   * Keyboard focus must be visible on every interactive element. Components
+   * that opt out of the browser default (`focus:outline-none`) still get this
+   * ring, and it never appears for mouse users.
+   */
+  :where(
+    a,
+    button,
+    input,
+    select,
+    textarea,
+    [tabindex]:not([tabindex="-1"])
+  ):focus-visible {
+    outline: 2px solid #818cf8;
+    outline-offset: 2px;
+  }
 }
 
 /* React Flow dark theme adjustments */

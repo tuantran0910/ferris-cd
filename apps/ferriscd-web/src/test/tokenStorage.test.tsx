@@ -59,6 +59,47 @@ describe("Token storage & auth security (Trap Guard T16.1)", () => {
     expect(normalizeBaseUrl("ftp://files.example.com")).toBe("");
   });
 
+  it("drops credentials from the API base URL and refuses protocol-relative hosts (H5)", () => {
+    expect(normalizeBaseUrl("https://user:pass@ferriscd.internal:8443/x/")).toBe(
+      "https://ferriscd.internal:8443/x",
+    );
+    // `//host` is not a path prefix: accepting it would send the bearer token
+    // to whatever host a pasted string names.
+    expect(normalizeBaseUrl("//evil.example/ferriscd")).toBe("");
+    expect(normalizeBaseUrl("\\\\evil.example")).toBe("");
+  });
+
+  it("trims a whitespace-padded token read back from sessionStorage (L1)", () => {
+    window.sessionStorage.setItem(
+      "ferriscd.auth.token",
+      "  padded-token-value  ",
+    );
+    resetTokenMemoryCache();
+    expect(getStoredToken()).toBe("padded-token-value");
+  });
+
+  it("refuses to sign in with an unusable API Server URL instead of silently using same-origin (H4)", async () => {
+    const user = userEvent.setup();
+    render(<App clientOverride={createMockApiClient()} />);
+
+    await user.type(
+      screen.getByLabelText(/Kubernetes Bearer Token/i),
+      "valid-session-token-123",
+    );
+    await user.clear(screen.getByLabelText(/API Server URL/i));
+    await user.type(
+      screen.getByLabelText(/API Server URL/i),
+      "javascript:alert(1)",
+    );
+    await user.click(screen.getByRole("button", { name: /Sign In/i }));
+
+    expect(screen.getByText(/must be an http\(s\) URL/i)).toBeInTheDocument();
+    expect(
+      screen.getByLabelText(/Kubernetes Bearer Token/i),
+    ).toBeInTheDocument();
+    expect(window.sessionStorage.getItem("ferriscd.auth.token")).toBeNull();
+  });
+
   it("completes token login and logout flows via LoginScreen without writing to localStorage", async () => {
     const user = userEvent.setup();
     const mockClient = createMockApiClient();

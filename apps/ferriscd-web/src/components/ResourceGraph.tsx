@@ -130,10 +130,24 @@ export function ResourceGraph({
   );
 
   useEffect(() => {
-    if (!userPickedMode && graph.nodes.length >= LARGE_GRAPH_THRESHOLD) {
-      setViewMode("table");
+    if (userPickedMode) {
+      return;
     }
+    // Follow the graph size until the operator makes an explicit choice: a big
+    // app defaults to the table, and one that shrank back gets the canvas again
+    // (otherwise it would sit on the table with no banner explaining why).
+    setViewMode(
+      graph.nodes.length >= LARGE_GRAPH_THRESHOLD ? "table" : "graph",
+    );
   }, [graph.nodes.length, userPickedMode]);
+
+  useEffect(() => {
+    if (selectedKey && !graph.nodes.some((node) => node.key === selectedKey)) {
+      // The inspected resource disappeared from a poll response: close the
+      // inspector rather than leave a stale panel open on a vanished node.
+      setSelectedKey(null);
+    }
+  }, [graph.nodes, selectedKey]);
 
   const handleSelectViewMode = (mode: "graph" | "table") => {
     setUserPickedMode(true);
@@ -153,10 +167,16 @@ export function ResourceGraph({
     return Array.from(kinds).sort();
   }, [graph.nodes]);
 
+  // A poll can remove every node of the filtered kind. Without this guard the
+  // <select> would silently fall back to its first option while the state stayed
+  // on the vanished kind, leaving a permanently empty table.
+  const effectiveKindFilter =
+    kindFilter === "ALL" || uniqueKinds.includes(kindFilter) ? kindFilter : "ALL";
+
   const filteredTableNodes = useMemo(() => {
     const q = tableSearch.trim().toLowerCase();
     return graph.nodes.filter((n) => {
-      if (kindFilter !== "ALL" && n.kind !== kindFilter) {
+      if (effectiveKindFilter !== "ALL" && n.kind !== effectiveKindFilter) {
         return false;
       }
       if (!q) {
@@ -170,7 +190,7 @@ export function ResourceGraph({
         (n.health ?? "").toLowerCase().includes(q)
       );
     });
-  }, [graph.nodes, kindFilter, tableSearch]);
+  }, [graph.nodes, effectiveKindFilter, tableSearch]);
 
   return (
     <div className="space-y-4">
@@ -181,11 +201,13 @@ export function ResourceGraph({
           </span>
           <span>•</span>
           <span>
-            Cluster: <code className="text-slate-300">{graph.cluster}</code>
+            Cluster:{" "}
+            <code className="break-all text-slate-300">{graph.cluster}</code>
           </span>
           <span>•</span>
           <span>
-            Namespace: <code className="text-slate-300">{graph.namespace}</code>
+            Namespace:{" "}
+            <code className="break-all text-slate-300">{graph.namespace}</code>
           </span>
         </div>
 
@@ -276,7 +298,12 @@ export function ResourceGraph({
             nodes={layout.nodes}
             edges={layout.edges}
             nodeTypes={nodeTypes}
+            // The topology is a read-only view: no dragging (a drag is lost on
+            // the next 10s poll anyway), no connecting, no edge editing.
             nodesConnectable={false}
+            nodesDraggable={false}
+            edgesFocusable={false}
+            edgesReconnectable={false}
             fitView
             fitViewOptions={{ padding: 0.2 }}
             minZoom={0.2}
@@ -318,7 +345,7 @@ export function ResourceGraph({
             </div>
             <select
               aria-label="Filter by resource kind"
-              value={kindFilter}
+              value={effectiveKindFilter}
               onChange={(e) => setKindFilter(e.target.value)}
               className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
             >
@@ -355,16 +382,30 @@ export function ResourceGraph({
                   return (
                     <tr
                       key={node.key}
+                      tabIndex={0}
+                      aria-label={`Inspect ${node.kind} ${node.name}`}
                       onClick={() => setSelectedKey(node.key)}
-                      className="cursor-pointer transition hover:bg-slate-800/60"
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setSelectedKey(node.key);
+                        }
+                      }}
+                      className="cursor-pointer transition hover:bg-slate-800/60 focus-visible:bg-slate-800/60"
                     >
                       <td className="whitespace-nowrap px-4 py-2.5 font-medium text-indigo-300">
                         {node.kind}
                       </td>
-                      <td className="px-4 py-2.5 font-mono text-slate-100">
+                      <td
+                        className="max-w-[220px] truncate px-4 py-2.5 font-mono text-slate-100"
+                        title={node.name}
+                      >
                         {node.name}
                       </td>
-                      <td className="px-4 py-2.5 font-mono text-slate-400">
+                      <td
+                        className="max-w-[160px] truncate px-4 py-2.5 font-mono text-slate-400"
+                        title={node.namespace ?? undefined}
+                      >
                         {node.namespace ?? "—"}
                       </td>
                       <td className="whitespace-nowrap px-4 py-2.5">
@@ -373,7 +414,10 @@ export function ResourceGraph({
                       <td className="whitespace-nowrap px-4 py-2.5">
                         <HealthStatusBadge status={healthStatus} compact />
                       </td>
-                      <td className="max-w-xs truncate px-4 py-2.5 text-slate-400">
+                      <td
+                        className="max-w-xs truncate px-4 py-2.5 text-slate-400"
+                        title={node.healthMessage ?? undefined}
+                      >
                         {node.healthMessage ?? "—"}
                       </td>
                     </tr>

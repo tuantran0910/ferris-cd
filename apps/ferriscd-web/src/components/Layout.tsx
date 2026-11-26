@@ -32,11 +32,11 @@ export function Layout() {
 
           <div className="flex items-center gap-3">
             <span
-              className="hidden items-center gap-1.5 rounded-md border border-slate-800 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-400 sm:inline-flex"
-              title="Connected FerrisCD API endpoint"
+              className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-slate-800 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-400 sm:inline-flex"
+              title={`Connected FerrisCD API endpoint: ${baseUrl || "same-origin"}`}
             >
-              <Server className="h-3.5 w-3.5 text-emerald-400" />
-              {baseUrl || "same-origin"}
+              <Server className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+              <span className="truncate">{baseUrl || "same-origin"}</span>
             </span>
             <button
               type="button"

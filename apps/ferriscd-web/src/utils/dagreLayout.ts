@@ -52,6 +52,45 @@ export function buildResourceGraphElements(
     nodeMap.set(r.key, r);
   }
 
+  // Usable owner edges only: a parent that is actually rendered, and never a
+  // self-loop (`resource.parent === resource.key`).
+  const parentOf = new Map<string, string>();
+  for (const r of nodeMap.values()) {
+    if (r.parent && r.parent !== r.key && nodeMap.has(r.parent)) {
+      parentOf.set(r.key, r.parent);
+    }
+  }
+
+  // A cyclic owner chain (`A -> B -> A`) has no resource root, so every node in
+  // it would otherwise be unreachable from the synthetic Application node and
+  // would float, disconnected, in the canvas. Such nodes are attached to the
+  // Application instead, which keeps the graph a single connected tree.
+  const terminatesCache = new Map<string, boolean>();
+  const terminatesAtRoot = (start: string): boolean => {
+    const path: string[] = [];
+    const seen = new Set<string>();
+    let current: string | undefined = start;
+    let terminates = true;
+    while (current !== undefined) {
+      const cached = terminatesCache.get(current);
+      if (cached !== undefined) {
+        terminates = cached;
+        break;
+      }
+      if (seen.has(current)) {
+        terminates = false;
+        break;
+      }
+      seen.add(current);
+      path.push(current);
+      current = parentOf.get(current);
+    }
+    for (const key of path) {
+      terminatesCache.set(key, terminates);
+    }
+    return terminates;
+  };
+
   const rawNodes: Array<{ id: string; data: ResourceFlowNodeData }> = [
     {
       id: rootId,
@@ -98,12 +137,9 @@ export function buildResourceGraphElements(
       },
     });
 
+    const parentKey = parentOf.get(resource.key);
     const sourceId =
-      resource.parent &&
-      resource.parent !== resource.key &&
-      nodeMap.has(resource.parent)
-        ? resource.parent
-        : rootId;
+      parentKey !== undefined && terminatesAtRoot(parentKey) ? parentKey : rootId;
     edges.push({
       id: `${sourceId}->${resource.key}`,
       source: sourceId,

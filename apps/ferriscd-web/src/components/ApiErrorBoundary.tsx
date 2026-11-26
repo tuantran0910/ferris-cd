@@ -103,6 +103,14 @@ export function ApiErrorAlert({
   const apiError = error instanceof ApiClientError ? error : null;
   const message =
     error instanceof Error ? error.message : "Failed to load data from API.";
+  // `status === 0` means the request never reached the server: showing
+  // "HTTP_0 (HTTP 0)" would send the operator looking for an HTTP problem.
+  const networkError = apiError !== null && apiError.status === 0;
+  const heading = networkError
+    ? "API Server Unreachable"
+    : apiError
+      ? `${apiError.code} (HTTP ${apiError.status})`
+      : "API Request Failed";
 
   return (
     <div
@@ -112,13 +120,13 @@ export function ApiErrorAlert({
       <div className="flex items-start justify-between gap-4">
         <div className="flex items-start gap-2.5">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
-          <div>
-            <p className="font-medium text-rose-100">
-              {apiError
-                ? `${apiError.code} (HTTP ${apiError.status})`
-                : "API Request Failed"}
+          <div className="min-w-0">
+            <p className="font-medium text-rose-100">{heading}</p>
+            <p className="mt-0.5 break-words text-rose-200/90">
+              {networkError
+                ? "The FerrisCD API server could not be reached. Check the API Server URL and your connection, then retry."
+                : message}
             </p>
-            <p className="mt-0.5 text-rose-200/90">{message}</p>
           </div>
         </div>
         {onRetry && (

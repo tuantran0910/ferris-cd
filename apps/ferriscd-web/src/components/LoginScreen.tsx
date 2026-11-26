@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { KeyRound, Lock, Server, ShieldCheck } from "lucide-react";
 import { useAuth } from "../auth/AuthContext";
+import { normalizeBaseUrl } from "../auth/tokenStorage";
 
 export function LoginScreen() {
   const { baseUrl, authNotice, login } = useAuth();
@@ -13,6 +14,16 @@ export function LoginScreen() {
     const trimmed = tokenInput.trim();
     if (!trimmed) {
       setValidationError("Please enter a Kubernetes ServiceAccount bearer token.");
+      return;
+    }
+    const trimmedUrl = serverInput.trim();
+    if (trimmedUrl && normalizeBaseUrl(trimmedUrl) === "") {
+      // Silently falling back to same-origin here would send the operator's
+      // bearer token somewhere they did not point at, and the failure would
+      // only show up as a confusing 401 later.
+      setValidationError(
+        "API Server URL must be an http(s) URL or a path prefix such as /ferriscd.",
+      );
       return;
     }
     setValidationError(null);

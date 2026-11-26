@@ -16,7 +16,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useParams } from "react-router-dom";
 import { ApiClientError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { ApiErrorAlert } from "../components/ApiErrorBoundary";
@@ -25,6 +25,7 @@ import { ResourceGraph } from "../components/ResourceGraph";
 import { RollbackModal } from "../components/RollbackModal";
 import { HealthStatusBadge, SyncStatusBadge } from "../components/StatusBadges";
 import { SyncModal } from "../components/SyncModal";
+import { commitWebUrl, formatTimestamp, repoWebUrl, shortRevision } from "../utils/format";
 
 type DetailTab = "resources" | "diff" | "conditions" | "history";
 
@@ -64,6 +65,12 @@ function ApplicationDetailContent({
 }) {
   const { apiClient } = useAuth();
   const queryClient = useQueryClient();
+  const location = useLocation();
+  // The list hands its filter/search state over so "Back to Applications"
+  // restores the exact view the operator left.
+  const listSearch = (
+    location.state as { listSearch?: string } | null
+  )?.listSearch ?? "";
 
   const [activeTab, setActiveTab] = useState<DetailTab>("resources");
   const [diffFilterKey, setDiffFilterKey] = useState("");
@@ -108,7 +115,7 @@ function ApplicationDetailContent({
     return (
       <div className="space-y-4">
         <Link
-          to="/"
+          to={{ pathname: "/", search: listSearch }}
           className="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-400 hover:text-indigo-300"
         >
           <ArrowLeft className="h-3.5 w-3.5" />
@@ -146,7 +153,7 @@ function ApplicationDetailContent({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="space-y-2">
           <Link
-            to="/"
+            to={{ pathname: "/", search: listSearch }}
             className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-400 hover:text-indigo-300"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
@@ -154,13 +161,16 @@ function ApplicationDetailContent({
           </Link>
 
           <div className="flex flex-wrap items-center gap-3">
-            <h1 className="text-2xl font-bold tracking-tight text-slate-100">
+            <h1
+              className="max-w-full break-all text-2xl font-bold tracking-tight text-slate-100"
+              title={app.name}
+            >
               {app.name}
             </h1>
-            <span className="rounded-md border border-slate-700 bg-slate-900 px-2 py-0.5 font-mono text-xs text-slate-300">
+            <span className="max-w-full truncate rounded-md border border-slate-700 bg-slate-900 px-2 py-0.5 font-mono text-xs text-slate-300">
               {app.namespace}
             </span>
-            <span className="rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 font-mono text-xs text-indigo-300">
+            <span className="max-w-full truncate rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 font-mono text-xs text-indigo-300">
               project: {app.project}
             </span>
           </div>
@@ -232,30 +242,50 @@ function ApplicationDetailContent({
       {operation && (
         <section
           aria-label="Active operation state"
-          className="rounded-xl border border-indigo-500/40 bg-indigo-950/30 px-4 py-3 text-xs text-indigo-100"
+          data-testid="operation-banner"
+          className={`rounded-xl border px-4 py-3 text-xs ${
+            operation.phase === "Failed" || operation.phase === "Error"
+              ? "border-rose-500/40 bg-rose-950/30 text-rose-100"
+              : operation.phase === "Succeeded"
+                ? "border-emerald-500/40 bg-emerald-950/25 text-emerald-100"
+                : "border-indigo-500/40 bg-indigo-950/30 text-indigo-100"
+          }`}
         >
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <Activity className="h-4 w-4 text-indigo-400" />
+            <div className="flex flex-wrap items-center gap-2">
+              <Activity className="h-4 w-4 shrink-0" aria-hidden="true" />
               <span className="font-semibold">
                 Operation: {operation.phase}
               </span>
-              <span className="rounded bg-indigo-500/20 px-1.5 py-0.5 font-mono text-[11px]">
+              <span className="rounded bg-black/20 px-1.5 py-0.5 font-mono text-[11px]">
                 wave {operation.currentWave}
               </span>
-              {operation.revision && (
-                <code className="font-mono text-indigo-200">
-                  {operation.revision.slice(0, 12)}
-                </code>
-              )}
+              {operation.revision &&
+                (commitWebUrl(app.source.repoUrl, operation.revision) ? (
+                  <a
+                    href={commitWebUrl(app.source.repoUrl, operation.revision)!}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-mono underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-indigo-200"
+                    title={`${operation.revision} — open commit`}
+                  >
+                    {shortRevision(operation.revision, 12)}
+                  </a>
+                ) : (
+                  <code className="font-mono" title={operation.revision}>
+                    {shortRevision(operation.revision, 12)}
+                  </code>
+                ))}
             </div>
-            <span className="font-mono text-[11px] text-indigo-300">
-              Started: {operation.startedAt}
-              {operation.finishedAt ? ` • Finished: ${operation.finishedAt}` : ""}
+            <span className="font-mono text-[11px] opacity-80">
+              Started: {formatTimestamp(operation.startedAt)}
+              {operation.finishedAt
+                ? ` • Finished: ${formatTimestamp(operation.finishedAt)}`
+                : ""}
             </span>
           </div>
           {operation.message && (
-            <p className="mt-1.5 text-indigo-200/90">{operation.message}</p>
+            <p className="mt-1.5 break-words opacity-90">{operation.message}</p>
           )}
         </section>
       )}
@@ -272,23 +302,47 @@ function ApplicationDetailContent({
           <dl className="mt-3 space-y-1.5">
             <div>
               <dt className="text-slate-500">Repository</dt>
-              <dd className="break-all font-mono text-slate-200">
-                {app.source.repoUrl}
+              <dd
+                className="break-all font-mono text-slate-200"
+                title={app.source.repoUrl}
+              >
+                {repoWebUrl(app.source.repoUrl) ? (
+                  <a
+                    href={repoWebUrl(app.source.repoUrl)!}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-indigo-300 hover:decoration-indigo-400"
+                  >
+                    {app.source.repoUrl}
+                  </a>
+                ) : (
+                  app.source.repoUrl
+                )}
               </dd>
             </div>
-            <div className="flex justify-between gap-2">
-              <dt className="text-slate-500">Path</dt>
-              <dd className="font-mono text-slate-200">{app.source.path}</dd>
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Path</dt>
+              <dd
+                className="min-w-0 break-all text-right font-mono text-slate-200"
+                title={app.source.path}
+              >
+                {app.source.path}
+              </dd>
             </div>
-            <div className="flex justify-between gap-2">
-              <dt className="text-slate-500">Target Revision</dt>
-              <dd className="font-mono text-slate-200">
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Target Revision</dt>
+              <dd
+                className="min-w-0 break-all text-right font-mono text-slate-200"
+                title={app.source.targetRevision}
+              >
                 {app.source.targetRevision}
               </dd>
             </div>
-            <div className="flex justify-between gap-2">
-              <dt className="text-slate-500">Renderer</dt>
-              <dd className="font-mono text-slate-200">{app.source.renderer}</dd>
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Renderer</dt>
+              <dd className="min-w-0 break-all text-right font-mono text-slate-200">
+                {app.source.renderer}
+              </dd>
             </div>
           </dl>
         </div>
@@ -299,24 +353,24 @@ function ApplicationDetailContent({
             Destination
           </p>
           <dl className="mt-3 space-y-1.5">
-            <div className="flex justify-between gap-2">
-              <dt className="text-slate-500">Cluster</dt>
-              <dd className="font-mono text-slate-200">
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Cluster</dt>
+              <dd className="min-w-0 break-all text-right font-mono text-slate-200">
                 {app.destination.cluster}
               </dd>
             </div>
-            <div className="flex justify-between gap-2">
-              <dt className="text-slate-500">Namespace</dt>
-              <dd className="font-mono text-slate-200">
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Namespace</dt>
+              <dd className="min-w-0 break-all text-right font-mono text-slate-200">
                 {app.destination.namespace}
               </dd>
             </div>
-            <div className="flex justify-between gap-2">
-              <dt className="text-slate-500">Tracked Resources</dt>
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Tracked Resources</dt>
               <dd className="font-mono text-slate-200">{app.resourceCount}</dd>
             </div>
-            <div className="flex justify-between gap-2">
-              <dt className="text-slate-500">Observed Generation</dt>
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Observed Generation</dt>
               <dd className="font-mono text-slate-200">
                 {app.observedGeneration ?? "—"}
               </dd>
@@ -330,24 +384,61 @@ function ApplicationDetailContent({
             Sync Metadata
           </p>
           <dl className="mt-3 space-y-1.5">
-            <div className="flex justify-between gap-2">
-              <dt className="text-slate-500">Rendered Revision</dt>
-              <dd className="font-mono text-slate-200">
-                {app.sync?.revision ? app.sync.revision.slice(0, 12) : "—"}
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Rendered Revision</dt>
+              <dd
+                className="min-w-0 break-all text-right font-mono text-slate-200"
+                title={app.sync?.revision ?? undefined}
+              >
+                {commitWebUrl(app.source.repoUrl, app.sync?.revision) ? (
+                  <a
+                    href={commitWebUrl(app.source.repoUrl, app.sync?.revision)!}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-indigo-300 hover:decoration-indigo-400"
+                  >
+                    {shortRevision(app.sync?.revision, 12)}
+                  </a>
+                ) : (
+                  shortRevision(app.sync?.revision, 12)
+                )}
               </dd>
             </div>
-            <div className="flex justify-between gap-2">
-              <dt className="text-slate-500">Last Synced Revision</dt>
-              <dd className="font-mono text-slate-200">
-                {app.sync?.lastSyncedRevision
-                  ? app.sync.lastSyncedRevision.slice(0, 12)
-                  : "—"}
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Last Synced Revision</dt>
+              <dd
+                className="min-w-0 break-all text-right font-mono text-slate-200"
+                title={app.sync?.lastSyncedRevision ?? undefined}
+              >
+                {commitWebUrl(
+                  app.source.repoUrl,
+                  app.sync?.lastSyncedRevision,
+                ) ? (
+                  <a
+                    href={
+                      commitWebUrl(
+                        app.source.repoUrl,
+                        app.sync?.lastSyncedRevision,
+                      )!
+                    }
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-indigo-300 hover:decoration-indigo-400"
+                  >
+                    {shortRevision(app.sync?.lastSyncedRevision, 12)}
+                  </a>
+                ) : (
+                  shortRevision(app.sync?.lastSyncedRevision, 12)
+                )}
               </dd>
             </div>
-            <div className="flex justify-between gap-2">
-              <dt className="text-slate-500">Last Synced At</dt>
-              <dd className="font-mono text-slate-200">
-                {app.sync?.lastSyncedAt ?? "—"}
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Last Synced At</dt>
+              <dd
+                className="text-right font-mono text-slate-200"
+                title={app.sync?.lastSyncedAt ?? undefined}
+              >
+                {formatTimestamp(app.sync?.lastSyncedAt)}
               </dd>
             </div>
           </dl>
@@ -464,22 +555,26 @@ function ApplicationDetailContent({
                         )}
                       </span>
                       <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <span className="font-semibold text-slate-100">
                             {cond.type}
                           </span>
                           <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[11px] text-slate-300">
                             status={cond.status}
                           </span>
-                          <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 font-mono text-[11px] text-indigo-300">
+                          <span className="max-w-full truncate rounded bg-indigo-500/15 px-1.5 py-0.5 font-mono text-[11px] text-indigo-300">
                             {cond.reason}
                           </span>
                         </div>
-                        <time className="font-mono text-[11px] text-slate-400">
-                          {cond.lastTransitionTime}
+                        <time
+                          dateTime={cond.lastTransitionTime}
+                          title={cond.lastTransitionTime}
+                          className="font-mono text-[11px] text-slate-400"
+                        >
+                          {formatTimestamp(cond.lastTransitionTime)}
                         </time>
                       </div>
-                      <p className="mt-2 leading-relaxed text-slate-300">
+                      <p className="mt-2 break-words leading-relaxed text-slate-300">
                         {cond.message}
                       </p>
                     </li>
@@ -518,11 +613,32 @@ function ApplicationDetailContent({
                         <td className="px-4 py-3 font-mono font-semibold text-slate-100">
                           #{entry.id}
                         </td>
-                        <td className="px-4 py-3 font-mono text-indigo-300">
-                          {entry.revision ?? "—"}
+                        <td
+                          className="max-w-[280px] truncate px-4 py-3 font-mono text-indigo-300"
+                          title={entry.revision ?? undefined}
+                        >
+                          {commitWebUrl(app.source.repoUrl, entry.revision) ? (
+                            <a
+                              href={
+                                commitWebUrl(app.source.repoUrl, entry.revision)!
+                              }
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="underline decoration-indigo-500/40 decoration-dotted underline-offset-2 hover:text-indigo-200 hover:decoration-indigo-300"
+                            >
+                              {shortRevision(entry.revision, 12)}
+                            </a>
+                          ) : (
+                            shortRevision(entry.revision, 12)
+                          )}
                         </td>
-                        <td className="px-4 py-3 font-mono text-slate-400">
-                          {entry.deployedAt}
+                        <td className="whitespace-nowrap px-4 py-3 font-mono text-slate-400">
+                          <time
+                            dateTime={entry.deployedAt}
+                            title={entry.deployedAt}
+                          >
+                            {formatTimestamp(entry.deployedAt)}
+                          </time>
                         </td>
                         <td className="px-4 py-3 text-right">
                           <button

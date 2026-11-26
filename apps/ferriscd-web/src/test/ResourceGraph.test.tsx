@@ -189,6 +189,33 @@ describe("ResourceGraph & dagre layout (T16.3 & Trap Guard T16.3)", () => {
     );
   });
 
+  it("closes the ResourceInspector on a backdrop click and on Escape", async () => {
+    const user = userEvent.setup();
+    const graph = make15NodeResourceGraph();
+
+    render(
+      <ResourceGraph
+        appNamespace="ferriscd-system"
+        appName="payments-api"
+        graph={graph}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: /Resource Table View/i }),
+    );
+    await user.click(screen.getByText("payments-api-7f8d9-ccc"));
+    expect(screen.getByTestId("resource-inspector")).toBeInTheDocument();
+
+    await user.click(screen.getByTestId("resource-inspector-backdrop"));
+    expect(screen.queryByTestId("resource-inspector")).not.toBeInTheDocument();
+
+    await user.click(screen.getByText("payments-api-7f8d9-ccc"));
+    expect(screen.getByTestId("resource-inspector")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("resource-inspector")).not.toBeInTheDocument();
+  });
+
   it("triggers auto-Table View at the exact 100-resource threshold and keeps 99 resources in Graph View", () => {
     const graph99 = makeLargeResourceGraph(99);
     const { unmount } = render(
@@ -217,6 +244,144 @@ describe("ResourceGraph & dagre layout (T16.3 & Trap Guard T16.3)", () => {
     expect(
       screen.queryByTestId("resource-graph-canvas"),
     ).not.toBeInTheDocument();
+  });
+
+  it("attaches cyclic owner chains to the Application root so nothing floats disconnected (M2)", () => {
+    const base = make15NodeResourceGraph();
+    const cyclicA = {
+      key: "apps/Deployment/payments/cycle-a",
+      group: "apps",
+      kind: "Deployment",
+      namespace: "payments",
+      name: "cycle-a",
+      present: true,
+      health: "Healthy",
+      healthMessage: null,
+      ownership: "Owned",
+      parent: "apps/Deployment/payments/cycle-b",
+    };
+    const cyclicB = {
+      ...cyclicA,
+      key: "apps/Deployment/payments/cycle-b",
+      name: "cycle-b",
+      parent: "apps/Deployment/payments/cycle-a",
+    };
+
+    const { nodes, edges } = buildResourceGraphElements(
+      "ferriscd-system",
+      "payments-api",
+      { ...base, nodes: [cyclicA, cyclicB] },
+      "LR",
+    );
+
+    const root = nodes.find((n) => n.id === "__app__/ferriscd-system/payments-api");
+    expect(root?.data.hasChildren).toBe(true);
+    expect(edges).toEqual([
+      expect.objectContaining({
+        source: "__app__/ferriscd-system/payments-api",
+        target: cyclicA.key,
+      }),
+      expect.objectContaining({
+        source: "__app__/ferriscd-system/payments-api",
+        target: cyclicB.key,
+      }),
+    ]);
+  });
+
+  it("resets the kind filter when a poll removes every node of the filtered kind (H2)", async () => {
+    const user = userEvent.setup();
+    const graph = make15NodeResourceGraph();
+    const { rerender } = render(
+      <ResourceGraph
+        appNamespace="ferriscd-system"
+        appName="payments-api"
+        graph={graph}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: /Resource Table View/i }),
+    );
+    const kindSelect = screen.getByLabelText(
+      /Filter by resource kind/i,
+    ) as HTMLSelectElement;
+    await user.selectOptions(kindSelect, "Pod");
+    expect(screen.getByText("Showing 5 of 15")).toBeInTheDocument();
+
+    // The Pods disappear from the inventory on the next poll.
+    const withoutPods = {
+      ...graph,
+      nodes: graph.nodes.filter((n) => n.kind !== "Pod"),
+    };
+    rerender(
+      <ResourceGraph
+        appNamespace="ferriscd-system"
+        appName="payments-api"
+        graph={withoutPods}
+      />,
+    );
+
+    expect(kindSelect.value).toBe("ALL");
+    expect(screen.getByText("Showing 10 of 10")).toBeInTheDocument();
+    expect(
+      screen.queryByText("No resources match your search filter."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("closes the inspector when the inspected resource disappears from a poll (M3)", async () => {
+    const user = userEvent.setup();
+    const graph = make15NodeResourceGraph();
+    const { rerender } = render(
+      <ResourceGraph
+        appNamespace="ferriscd-system"
+        appName="payments-api"
+        graph={graph}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: /Resource Table View/i }),
+    );
+    await user.click(screen.getByText("payments-api-7f8d9-ccc"));
+    expect(screen.getByTestId("resource-inspector")).toBeInTheDocument();
+
+    rerender(
+      <ResourceGraph
+        appNamespace="ferriscd-system"
+        appName="payments-api"
+        graph={{
+          ...graph,
+          nodes: graph.nodes.filter(
+            (n) => n.key !== "/Pod/payments/payments-api-7f8d9-ccc",
+          ),
+        }}
+      />,
+    );
+
+    expect(screen.queryByTestId("resource-inspector")).not.toBeInTheDocument();
+  });
+
+  it("returns to the graph automatically when a large app shrinks below the threshold", () => {
+    const large = makeLargeResourceGraph(100);
+    const { rerender } = render(
+      <ResourceGraph
+        appNamespace="ferriscd-system"
+        appName="shrinking"
+        graph={large}
+      />,
+    );
+    expect(screen.getByTestId("resource-table-view")).toBeInTheDocument();
+
+    rerender(
+      <ResourceGraph
+        appNamespace="ferriscd-system"
+        appName="shrinking"
+        graph={makeLargeResourceGraph(40)}
+      />,
+    );
+
+    expect(screen.getByTestId("resource-graph-canvas")).toBeInTheDocument();
+    expect(screen.queryByTestId("large-graph-banner")).not.toBeInTheDocument();
   });
 
   it("handles 120-resource apps gracefully: auto-defaults to searchable Resource Table View and allows toggling to Graph View (Trap Guard T16.3)", async () => {

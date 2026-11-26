@@ -13,7 +13,14 @@ function AuthenticatedRoutes() {
   const { isAuthenticated, logout } = useAuth();
 
   if (!isAuthenticated) {
-    return <LoginScreen />;
+    // The sign-in screen gets the same error boundary as the authenticated
+    // tree: a render crash there would otherwise leave a blank page with no
+    // way back.
+    return (
+      <ApiErrorBoundary>
+        <LoginScreen />
+      </ApiErrorBoundary>
+    );
   }
 
   return (

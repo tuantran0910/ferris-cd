@@ -238,6 +238,41 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
     expect(screen.getByLabelText(/Filter diff resources/i)).toHaveValue("");
   });
 
+  it("returns to the filtered list view via the back link carried in router state (H6)", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider clientOverride={createMockApiClient()}>
+          <MemoryRouter
+            initialEntries={[
+              {
+                pathname: "/applications/ferriscd-system/payments-api",
+                state: { listSearch: "?project=payments&view=table" },
+              },
+            ]}
+          >
+            <Routes>
+              <Route
+                path="/applications/:namespace/:name"
+                element={<ApplicationDetailPage />}
+              />
+            </Routes>
+          </MemoryRouter>
+        </AuthProvider>
+      </QueryClientProvider>,
+    );
+
+    const backLinks = await screen.findAllByRole("link", {
+      name: /Applications/i,
+    });
+    expect(backLinks[0]).toHaveAttribute(
+      "href",
+      "/?project=payments&view=table",
+    );
+  });
+
   it("stops detail polling when the server returns 403 or 404 (M8)", async () => {
     vi.useFakeTimers();
 

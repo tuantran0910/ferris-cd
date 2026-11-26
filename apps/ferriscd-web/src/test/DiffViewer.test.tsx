@@ -67,4 +67,33 @@ describe("DiffViewer (T16.4)", () => {
       screen.queryByTestId("diff-resource-/Service/payments/payments-svc"),
     ).not.toBeInTheDocument();
   });
+
+  it("distinguishes an empty diff from an over-narrow filter and tolerates a missing resources array (M9)", () => {
+    const emptyDiff = {
+      revision: "deadbeef",
+      desired: 0,
+      wouldSync: false,
+      summary: {
+        total: 0,
+        synced: 0,
+        outOfSync: 0,
+        missing: 0,
+        orphaned: 0,
+        ownershipConflicts: 0,
+        fieldConflicts: 0,
+      },
+      resources: [],
+    };
+    const { unmount } = render(<DiffViewer diff={emptyDiff} />);
+    expect(screen.getByTestId("diff-empty-state")).toHaveTextContent(
+      /both empty/i,
+    );
+    unmount();
+
+    // `resources` is optional in the OpenAPI schema: an absent array must not
+    // crash the page.
+    const { resources: _omit, ...withoutResources } = emptyDiff;
+    render(<DiffViewer diff={withoutResources} />);
+    expect(screen.getByTestId("diff-empty-state")).toBeInTheDocument();
+  });
 });

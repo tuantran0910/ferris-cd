@@ -1,7 +1,8 @@
 import { AlertTriangle, Info, RefreshCw, ShieldOff, X } from "lucide-react";
-import { useEffect, useState } from "react";
-import { ApiClientError } from "../api/client";
+import { useEffect, useRef, useState } from "react";
 import type { OperationResponse, SyncRequestBody } from "../api/types";
+import { describeOperationError } from "../utils/apiErrorText";
+import { useModalBehavior } from "./useModalBehavior";
 
 export interface SyncModalProps {
   open: boolean;
@@ -28,15 +29,18 @@ export function SyncModal({
 }: SyncModalProps) {
   const [dryRun, setDryRun] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [error, setError] = useState<{ title: string; detail: string } | null>(
+    null,
+  );
   const [forbidden, setForbidden] = useState(disabledByRbac);
   const [successResponse, setSuccessResponse] =
     useState<OperationResponse | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (open) {
       setDryRun(false);
-      setErrorMessage(null);
+      setError(null);
       setSuccessResponse(null);
       setForbidden(disabledByRbac);
     }
@@ -44,6 +48,8 @@ export function SyncModal({
     // disabledByRbac flips true in response to a 403 inside the open modal.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  useModalBehavior(open, dialogRef, onClose, { dismissible: !submitting });
 
   if (!open) {
     return null;
@@ -59,24 +65,18 @@ export function SyncModal({
     }
     if (isForbidden || submitting) return;
     setSubmitting(true);
-    setErrorMessage(null);
+    setError(null);
     try {
       const body: SyncRequestBody = {};
       const result = await onConfirm(body);
       setSuccessResponse(result);
     } catch (err) {
-      if (err instanceof ApiClientError && err.isForbidden) {
+      const described = describeOperationError(err, "sync");
+      if (described.forbidden) {
         setForbidden(true);
-        setErrorMessage(
-          err.message ||
-            "Permission denied (403 Forbidden): your role cannot sync this application.",
-        );
         onForbidden?.();
-      } else if (err instanceof Error) {
-        setErrorMessage(err.message);
-      } else {
-        setErrorMessage("Failed to trigger manual sync.");
       }
+      setError({ title: described.title, detail: described.detail });
     } finally {
       setSubmitting(false);
     }
@@ -87,9 +87,14 @@ export function SyncModal({
       role="dialog"
       aria-modal="true"
       aria-labelledby="sync-modal-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm"
+      aria-describedby="sync-modal-description"
+      className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/80 p-4 backdrop-blur-sm"
     >
-      <div className="w-full max-w-lg rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl">
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        className="w-full max-w-lg rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl focus:outline-none"
+      >
         <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
           <div className="flex items-center gap-2">
             <RefreshCw className="h-4 w-4 text-indigo-400" />
@@ -111,13 +116,13 @@ export function SyncModal({
         </div>
 
         <div className="space-y-4 px-5 py-5 text-sm">
-          <p className="text-slate-300">
+          <p id="sync-modal-description" className="break-words text-slate-300">
             Request a manual reconcile for{" "}
-            <code className="rounded bg-slate-950 px-1.5 py-0.5 font-mono text-xs text-indigo-300">
+            <code className="break-all rounded bg-slate-950 px-1.5 py-0.5 font-mono text-xs text-indigo-300">
               {namespace}/{name}
             </code>{" "}
             at revision{" "}
-            <code className="rounded bg-slate-950 px-1.5 py-0.5 font-mono text-xs text-slate-200">
+            <code className="break-all rounded bg-slate-950 px-1.5 py-0.5 font-mono text-xs text-slate-200">
               {targetRevision}
             </code>
             .
@@ -162,7 +167,7 @@ export function SyncModal({
             </label>
 
             {onPreviewDiff && (
-              <div className="flex items-center justify-between border-t border-slate-800 pt-2.5 text-slate-400">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800 pt-2.5 text-slate-400">
                 <span className="flex items-center gap-1.5">
                   <Info className="h-3.5 w-3.5 text-sky-400" />
                   Want to preview SSA dry-run changes first?
@@ -192,21 +197,27 @@ export function SyncModal({
                 <p className="font-semibold text-rose-100">
                   RBAC Permission Required (403 Forbidden)
                 </p>
-                <p className="mt-0.5">
-                  {errorMessage ??
+                <p className="mt-0.5 break-words">
+                  {error?.detail ??
                     "Your current Kubernetes identity has read-only access and is not permitted to trigger a sync on this project."}
                 </p>
               </div>
             </div>
           )}
 
-          {!isForbidden && errorMessage && (
+          {!isForbidden && error && (
             <div
               role="alert"
+              data-testid="sync-error"
               className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-950/40 p-3 text-xs text-amber-200"
             >
               <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
-              <span>{errorMessage}</span>
+              <div>
+                <p className="font-semibold text-amber-100">{error.title}</p>
+                <p className="mt-0.5 break-words text-amber-200/90">
+                  {error.detail}
+                </p>
+              </div>
             </div>
           )}
 
@@ -216,9 +227,18 @@ export function SyncModal({
               data-testid="sync-success-banner"
               className="rounded-lg border border-emerald-500/40 bg-emerald-950/40 p-3 text-xs text-emerald-200"
             >
-              Sync request <strong>{successResponse.status}</strong>. The
-              controller has been notified via{" "}
-              <code className="font-mono">{successResponse.request}</code>.
+              <p>
+                Sync request <strong>{successResponse.status}</strong> — the
+                controller has been notified and will reconcile{" "}
+                <code className="break-all font-mono">
+                  {successResponse.namespace}/{successResponse.name}
+                </code>
+                .
+              </p>
+              <p className="mt-1 text-emerald-200/80">
+                Polling for the Sync badge and diff to update; this dialog can
+                be closed.
+              </p>
             </div>
           )}
         </div>
