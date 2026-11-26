@@ -75,3 +75,35 @@ jobs:
       - name: Run tests
         if: steps.workspace.outputs.has_cargo == 'true'
         run: cargo test --workspace
+
+  web-ui:
+    name: Web UI Typecheck, Test & Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/ferriscd-web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/ferriscd-web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check OpenAPI TypeScript schema drift
+        run: |
+          npm run generate-api
+          git diff --exit-code src/api/schema.d.ts
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm run test
+
+      - name: Build production bundle
+        run: npm run build
