@@ -36,9 +36,13 @@ export function LoginScreen() {
     <div className="flex min-h-screen items-center justify-center bg-slate-950 px-4 py-12">
       <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900/90 p-8 shadow-2xl motion-scale-in">
         <div className="flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-orange-500 to-rose-600 font-bold text-white shadow-lg">
-            F
-          </div>
+          <img
+            src="/ferriscd-mark.svg"
+            alt=""
+            width={44}
+            height={44}
+            className="h-11 w-11 drop-shadow-lg"
+          />
           <div>
             <h1 className="text-xl font-bold tracking-tight text-slate-100">
               FerrisCD

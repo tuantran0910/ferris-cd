@@ -35,9 +35,13 @@ export function Layout() {
               to="/"
               className="flex items-center gap-2.5 font-semibold tracking-tight text-slate-100 transition-colors hover:text-white"
             >
-              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-orange-500 to-rose-600 text-xs font-bold text-white">
-                F
-              </span>
+              <img
+                src="/ferriscd-mark.svg"
+                alt=""
+                width={28}
+                height={28}
+                className="h-7 w-7"
+              />
               <span>FerrisCD</span>
             </Link>
             <nav aria-label="Primary" className="flex items-center gap-1">

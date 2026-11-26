@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 64" role="img" aria-labelledby="title">
+  <title id="title">FerrisCD</title>
+  <style>
+    .mark { fill: #DC4A2B; }
+    .wordmark { fill: #191B24; }
+    @media (prefers-color-scheme: dark) {
+      .mark { fill: #FF7657; }
+      .wordmark { fill: #F6F7FB; }
+    }
+  </style>
+  <path class="mark" d="M8 22 22 8H50L58 16 50 24H28L20 32H8Z M8 40 21 35 28 29H41L48 36 41 43H23V51L15 59 8 52Z" />
+  <text class="wordmark" x="69" y="46" textLength="162" lengthAdjust="spacingAndGlyphs"
+        font-family="system-ui, sans-serif" font-size="40" font-weight="700" letter-spacing="-1">FerrisCD</text>
+</svg>
