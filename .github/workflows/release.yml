@@ -1,0 +1,329 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run_version:
+        description: "Version string used for dry-run artifacts (no images pushed or GitHub Release published)"
+        required: false
+        default: "0.0.0-dryrun"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  metadata:
+    name: Resolve Release Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      is_tag: ${{ steps.meta.outputs.is_tag }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      repo_lower: ${{ steps.meta.outputs.repo_lower }}
+    steps:
+      - name: Compute version and mode
+        id: meta
+        env:
+          DRY_RUN_VERSION: ${{ inputs.dry_run_version }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            IS_TAG="true"
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+          else
+            IS_TAG="false"
+            VERSION="${DRY_RUN_VERSION:-0.0.0-dryrun}"
+            VERSION="${VERSION#v}"
+            TAG="v${VERSION}"
+          fi
+
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: version '${VERSION}' must be valid single-line SemVer (X.Y.Z or X.Y.Z-prerelease)" >&2
+            exit 1
+          fi
+
+          if [[ "${VERSION}" == *-* ]]; then
+            IS_PRERELEASE="true"
+          else
+            IS_PRERELEASE="false"
+          fi
+
+          REPO_LOWER="$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
+          {
+            echo "is_tag=${IS_TAG}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "repo_lower=${REPO_LOWER}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build-binaries:
+    name: Build CLI/Server Binary (${{ matrix.target }})
+    needs: metadata
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install native Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config
+
+      - name: Build release binary
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" -p ferriscd-cli
+          BINARY="target/${{ matrix.target }}/release/ferriscd"
+          "${BINARY}" --version
+
+      - name: Package tarball and SHA-256 checksum
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          STAGE_DIR="dist/ferriscd-${VERSION}-${TARGET}"
+          mkdir -p "${STAGE_DIR}"
+          cp "target/${TARGET}/release/ferriscd" "${STAGE_DIR}/ferriscd"
+          cp LICENSE README.md "${STAGE_DIR}/"
+
+          ARCHIVE="ferriscd-${VERSION}-${TARGET}.tar.gz"
+          tar -C dist -czf "dist/${ARCHIVE}" "ferriscd-${VERSION}-${TARGET}"
+
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            else
+              shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            fi
+            cat "${ARCHIVE}.sha256"
+          )
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            dist/ferriscd-*.tar.gz
+            dist/ferriscd-*.tar.gz.sha256
+          if-no-files-found: error
+
+  package-helm:
+    name: Package Helm Chart
+    needs: metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint and package Helm chart
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          helm lint deploy/helm/ferriscd
+          helm lint deploy/helm/ferriscd -f deploy/helm/ferriscd/values-ha.yaml
+          mkdir -p dist/helm
+          helm package deploy/helm/ferriscd \
+            --version "${VERSION}" \
+            --app-version "${VERSION}" \
+            --destination dist/helm
+          (
+            cd dist/helm
+            sha256sum ferriscd-*.tgz > "ferriscd-${VERSION}.tgz.sha256"
+            cat "ferriscd-${VERSION}.tgz.sha256"
+          )
+
+      - name: Upload Helm chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: |
+            dist/helm/ferriscd-*.tgz
+            dist/helm/ferriscd-*.tgz.sha256
+          if-no-files-found: error
+
+  container-control-plane:
+    name: Build Multi-Arch Control Plane Image
+    needs: metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: docker-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ needs.metadata.outputs.repo_lower }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ needs.metadata.outputs.is_tag == 'true' && needs.metadata.outputs.is_prerelease == 'false' }}
+            type=raw,value=${{ needs.metadata.outputs.version }},enable=${{ needs.metadata.outputs.is_tag != 'true' }}
+
+      - name: Build and push multi-arch control-plane image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.metadata.outputs.is_tag == 'true' }}
+          tags: ${{ steps.docker-meta.outputs.tags }}
+          labels: ${{ steps.docker-meta.outputs.labels }}
+          cache-from: type=gha,scope=control-plane
+          cache-to: type=gha,mode=max,scope=control-plane
+
+  container-web:
+    name: Build Multi-Arch Web UI Image
+    needs: metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: docker-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ needs.metadata.outputs.repo_lower }}-web
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ needs.metadata.outputs.is_tag == 'true' && needs.metadata.outputs.is_prerelease == 'false' }}
+            type=raw,value=${{ needs.metadata.outputs.version }},enable=${{ needs.metadata.outputs.is_tag != 'true' }}
+
+      - name: Build and push multi-arch web UI image
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/ferriscd-web
+          file: apps/ferriscd-web/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.metadata.outputs.is_tag == 'true' }}
+          tags: ${{ steps.docker-meta.outputs.tags }}
+          labels: ${{ steps.docker-meta.outputs.labels }}
+          cache-from: type=gha,scope=web-ui
+          cache-to: type=gha,mode=max,scope=web-ui
+
+  publish-release:
+    name: Assemble Checksums & Publish GitHub Release
+    needs:
+      - metadata
+      - build-binaries
+      - package-helm
+      - container-control-plane
+      - container-web
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Assemble unified SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          rm -f *.sha256
+          LC_ALL=C sha256sum ferriscd-*.tar.gz ferriscd-*.tgz | sort -k2 > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload dry-run release bundle
+        if: needs.metadata.outputs.is_tag != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dryrun-${{ needs.metadata.outputs.version }}
+          path: |
+            release-artifacts/ferriscd-*.tar.gz
+            release-artifacts/ferriscd-*.tgz
+            release-artifacts/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          name: FerrisCD ${{ needs.metadata.outputs.tag }}
+          prerelease: ${{ needs.metadata.outputs.is_prerelease == 'true' }}
+          generate_release_notes: true
+          files: |
+            release-artifacts/ferriscd-*.tar.gz
+            release-artifacts/ferriscd-*.tgz
+            release-artifacts/SHA256SUMS.txt
