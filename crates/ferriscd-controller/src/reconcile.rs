@@ -22,12 +22,13 @@ use std::time::Duration;
 
 use ferriscd_crd::status::{
     ApplicationStatus, Condition, ConditionStatus, HealthState, MAX_STATUS_MESSAGE_CHARS,
-    OperationState, REASON_SYNC_ERROR, ResourceStatus, RevisionHistoryEntry, SyncState, SyncStatus,
+    OperationState, REASON_SYNC_ERROR, REASON_SYNC_SUCCEEDED, ResourceStatus, RevisionHistoryEntry,
+    SyncState, SyncStatus,
 };
 use ferriscd_crd::{Application, annotations};
 use ferriscd_engine::diff::{DiffSummary, ResourceDiff};
 use ferriscd_engine::inventory::Inventory;
-use ferriscd_engine::manifest::ManifestError;
+use ferriscd_engine::manifest::{ManifestError, ResourceKey};
 use ferriscd_engine::repo::RepoError;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -41,6 +42,7 @@ use tracing::Instrument;
 
 use crate::controller::{BackoffTracker, FailureClass, object_key};
 use crate::discovery::DiscoveryError;
+use crate::events::EventRecorder;
 use crate::live_state::LiveStateError;
 use crate::scope::ScopeError;
 
@@ -134,6 +136,8 @@ pub struct ApplyOutcome {
     pub history: Option<Vec<RevisionHistoryEntry>>,
     /// Conditions to add or refresh (the `T10.5` rollback warning).
     pub warnings: Vec<Condition>,
+    /// Canonical GKNN keys confirmed pruned during this pass (`T15.2` `ResourcePruned` event).
+    pub pruned: Vec<ResourceKey>,
 }
 
 impl ApplyOutcome {
@@ -151,6 +155,7 @@ impl ApplyOutcome {
             operation_state: None,
             history: None,
             warnings: Vec::new(),
+            pruned: Vec::new(),
         }
     }
 
@@ -201,6 +206,13 @@ impl ApplyOutcome {
     #[must_use]
     pub fn with_warning(mut self, condition: Condition) -> Self {
         self.warnings.push(condition);
+        self
+    }
+
+    /// Attaches the confirmed pruned GKNN keys for `Normal ResourcePruned` event emission (`T15.2`).
+    #[must_use]
+    pub fn with_pruned(mut self, pruned: Vec<ResourceKey>) -> Self {
+        self.pruned = pruned;
         self
     }
 }
@@ -768,6 +780,8 @@ pub struct ReconcileContext {
     backoff: BackoffTracker,
     /// `T15.1`: the Prometheus recorder, or `None` when metrics are disabled.
     metrics: Option<crate::metrics::Metrics>,
+    /// `T15.2`: rate-limited Kubernetes Event recorder (defaults to a no-op publisher in tests).
+    events: EventRecorder,
 }
 
 impl ReconcileContext {
@@ -785,6 +799,7 @@ impl ReconcileContext {
             status,
             backoff: BackoffTracker::new(),
             metrics: None,
+            events: EventRecorder::noop(),
         }
     }
 
@@ -808,6 +823,19 @@ impl ReconcileContext {
     #[must_use]
     pub fn metrics(&self) -> Option<&crate::metrics::Metrics> {
         self.metrics.as_ref()
+    }
+
+    /// Wires the rate-limited Kubernetes Event recorder (`T15.2`).
+    #[must_use]
+    pub fn with_events(mut self, events: EventRecorder) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// The rate-limited Kubernetes Event recorder (`T15.2`).
+    #[must_use]
+    pub fn events(&self) -> &EventRecorder {
+        &self.events
     }
 
     /// Resolves the `Application` API per object namespace instead of a fixed one (`T12.2`).
@@ -1000,7 +1028,7 @@ const MIN_OPAQUE_RUN: usize = 40;
 /// so an `Apply`/`Live` error message may contain a `Secret` `.data` value, and `/status` is
 /// readable by anyone allowed to `get` the `Application`. Only runs of payload characters are
 /// touched, so actionable prose (which names managers, annotations, and reasons) survives intact.
-fn redact_payloads(message: &str) -> String {
+pub(crate) fn redact_payloads(message: &str) -> String {
     fn is_payload_char(c: char) -> bool {
         c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')
     }
@@ -1117,6 +1145,26 @@ pub async fn apply_once(
     pipeline: &dyn SyncPipeline,
     status_writer: &dyn StatusWriter,
 ) -> Result<Action, ReconcileError> {
+    apply_once_with_events(app, pipeline, status_writer, &EventRecorder::noop()).await
+}
+
+/// Runs the apply pipeline under the always-update-status wrapper and emits rate-limited
+/// Kubernetes Events (`T15.2`: `Normal SyncSucceeded`, `Normal ResourcePruned`, and
+/// `Warning SyncFailed`).
+///
+/// Event emission is strictly best-effort: a publisher error is logged at `warn!` and never fails
+/// reconciliation.
+///
+/// # Errors
+///
+/// Returns the pipeline error after the status patch was attempted, or the status-patch error when
+/// the apply itself succeeded.
+pub async fn apply_once_with_events(
+    app: &Application,
+    pipeline: &dyn SyncPipeline,
+    status_writer: &dyn StatusWriter,
+    events: &EventRecorder,
+) -> Result<Action, ReconcileError> {
     let generation = app.metadata.generation;
     let mut status = app.status.clone().unwrap_or_default();
     match pipeline.apply(app).await {
@@ -1144,7 +1192,20 @@ pub async fn apply_once(
                     "cleared the rollback warning: spec.syncPolicy.automated is enabled again"
                 );
             }
-            status_writer.patch(app, status).await?;
+            if let Err(patch_err) = status_writer.patch(app, status).await {
+                events
+                    .emit_sync_failed(app, failure_reason(&patch_err), &patch_err.to_string())
+                    .await;
+                return Err(patch_err);
+            }
+            if !outcome.pruned.is_empty() {
+                events.emit_resource_pruned(app, &outcome.pruned).await;
+            }
+            // Emit `Normal SyncSucceeded` only when a sync execution actually settled — never on
+            // no-op `SyncSkipped` periodic passes or mid-wave `SyncInProgress` passes.
+            if outcome.reason == REASON_SYNC_SUCCEEDED {
+                events.emit_sync_succeeded(app, &outcome.message).await;
+            }
             Ok(Action::requeue(outcome.requeue.unwrap_or(DEFAULT_REQUEUE)))
         }
         Err(err) => {
@@ -1181,6 +1242,9 @@ pub async fn apply_once(
                     "failed to patch status after a reconcile error"
                 );
             }
+            events
+                .emit_sync_failed(app, failure_reason(&err), &err.to_string())
+                .await;
             Err(err)
         }
     }
@@ -1267,6 +1331,22 @@ pub async fn cleanup_once(
     pipeline: &dyn SyncPipeline,
     status_writer: &dyn StatusWriter,
 ) -> Result<Action, ReconcileError> {
+    cleanup_once_with_events(app, pipeline, status_writer, &EventRecorder::noop()).await
+}
+
+/// Runs the cleanup pipeline through the finalizer gate and clears per-`Application` event
+/// deduplication state when the finalizer is released (`T15.2`).
+///
+/// # Errors
+///
+/// Returns the cleanup error while the finalizer must be retained; a released finalizer always
+/// returns `Ok`.
+pub async fn cleanup_once_with_events(
+    app: &Application,
+    pipeline: &dyn SyncPipeline,
+    status_writer: &dyn StatusWriter,
+    events: &EventRecorder,
+) -> Result<Action, ReconcileError> {
     let generation = app.metadata.generation;
     let mode = cleanup_mode(app);
     let result = pipeline.cleanup(app, mode).await;
@@ -1303,9 +1383,10 @@ pub async fn cleanup_once(
                     "failed to patch status while releasing the finalizer"
                 );
             }
-            // The object is going away, so whatever this writer remembers about it must go too
-            // (`T15.1`: the per-`Application` gauges would otherwise stay in the exposition).
+            // The object is going away, so whatever this writer and the event deduplicator
+            // remember about it must go too (`T15.1` gauges, `T15.2` warning dedup state).
             status_writer.forget_app(app);
+            events.forget_app(app);
             Ok(Action::await_change())
         }
         CleanupDisposition::Retain { error } => {
@@ -1370,8 +1451,14 @@ async fn reconcile_gate(
         let ctx = inner_ctx.clone();
         async move {
             match event {
-                Event::Apply(object) => apply_once(&object, ctx.pipeline(), ctx.status()).await,
-                Event::Cleanup(object) => cleanup_once(&object, ctx.pipeline(), ctx.status()).await,
+                Event::Apply(object) => {
+                    apply_once_with_events(&object, ctx.pipeline(), ctx.status(), ctx.events())
+                        .await
+                }
+                Event::Cleanup(object) => {
+                    cleanup_once_with_events(&object, ctx.pipeline(), ctx.status(), ctx.events())
+                        .await
+                }
             }
         }
         .boxed()
@@ -2992,5 +3079,118 @@ mod tests {
 
         let wrapped = ControllerError::from_reconcile(ReconcileError::Api(api_error(500)));
         assert_eq!(wrapped.failure(), FailureClass::Retryable);
+    }
+
+    /// **`T15.2`:** `apply_once_with_events` emits `Normal SyncSucceeded` and `Normal ResourcePruned`
+    /// on settled syncs, suppresses `Normal SyncSucceeded` on no-op `SyncSkipped` passes, and
+    /// ignores publisher failures so observability never breaks reconciliation.
+    #[tokio::test]
+    async fn apply_once_with_events_emits_normal_events_and_tolerates_publish_errors() {
+        use crate::events::{
+            AppEventType, EVENT_REASON_RESOURCE_PRUNED, EVENT_REASON_SYNC_SUCCEEDED,
+            RecordingEventPublisher,
+        };
+
+        let app = application(&[]);
+        let writer = RecordingStatusWriter::default();
+        let publisher = Arc::new(RecordingEventPublisher::new());
+        let events = EventRecorder::new(publisher.clone());
+
+        // Settled sync with a pruned key -> emits both ResourcePruned and SyncSucceeded.
+        let pruned_key = ResourceKey::new("", "ConfigMap", Some("payments".to_owned()), "stale-cm");
+        let pruned_key_clone = pruned_key.clone();
+        let pipeline = FakePipeline {
+            apply: Box::new(move || {
+                Ok(ApplyOutcome::ready(
+                    REASON_SYNC_SUCCEEDED,
+                    "applied 1 of 1 resource(s), pruned 1",
+                )
+                .with_pruned(vec![pruned_key_clone.clone()]))
+            }),
+            ..FakePipeline::ready()
+        };
+        apply_once_with_events(&app, &pipeline, &writer, &events)
+            .await
+            .expect("settled sync must succeed");
+
+        let recorded = publisher.events();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].type_, AppEventType::Normal);
+        assert_eq!(recorded[0].reason, EVENT_REASON_RESOURCE_PRUNED);
+        assert!(recorded[0].note.contains(&pruned_key.canonical()));
+        assert_eq!(recorded[1].type_, AppEventType::Normal);
+        assert_eq!(recorded[1].reason, EVENT_REASON_SYNC_SUCCEEDED);
+
+        // No-op `SyncSkipped` pass -> emits zero events (no spam on periodic requeues).
+        publisher.clear();
+        let skipped = FakePipeline {
+            apply: Box::new(|| {
+                Ok(ApplyOutcome::ready(
+                    REASON_SYNC_SKIPPED,
+                    "no sync performed",
+                ))
+            }),
+            ..FakePipeline::ready()
+        };
+        apply_once_with_events(&app, &skipped, &writer, &events)
+            .await
+            .expect("skipped pass must succeed");
+        assert!(
+            publisher.events().is_empty(),
+            "no-op SyncSkipped passes must not spam Normal SyncSucceeded"
+        );
+
+        // Failing event publisher must NEVER fail reconciliation.
+        let failing_events =
+            EventRecorder::new(Arc::new(RecordingEventPublisher::failing("403 Forbidden")));
+        apply_once_with_events(&app, &FakePipeline::ready(), &writer, &failing_events)
+            .await
+            .expect("event publish failure must not abort reconciliation");
+    }
+
+    /// **`T15.2`:** `apply_once_with_events` rate-limits repeated `Warning SyncFailed` events and
+    /// `cleanup_once_with_events` clears the app's dedup state when the finalizer is released.
+    #[tokio::test]
+    async fn apply_once_with_events_rate_limits_warnings_and_clears_on_cleanup() {
+        use crate::events::test_support::ManualClock;
+        use crate::events::{AppEventType, EVENT_REASON_SYNC_FAILED, RecordingEventPublisher};
+
+        let app = application(&[]);
+        let writer = RecordingStatusWriter::default();
+        let clock = Arc::new(ManualClock::new());
+        let publisher = Arc::new(RecordingEventPublisher::new());
+        let events = EventRecorder::new(publisher.clone()).with_clock(clock.clone());
+        let failing = FakePipeline::failing(|| ReconcileError::Invalid {
+            message: "bad manifest https://bot:secret@git.example.com/repo.git".to_owned(),
+        });
+
+        // Two failures within 5 minutes -> only 1 Warning SyncFailed emitted, with URL redacted.
+        assert!(
+            apply_once_with_events(&app, &failing, &writer, &events)
+                .await
+                .is_err()
+        );
+        clock.advance(Duration::from_secs(60));
+        assert!(
+            apply_once_with_events(&app, &failing, &writer, &events)
+                .await
+                .is_err()
+        );
+        let recorded = publisher.events();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].type_, AppEventType::Warning);
+        assert_eq!(recorded[0].reason, EVENT_REASON_SYNC_FAILED);
+        assert!(!recorded[0].note.contains("secret"), "{}", recorded[0].note);
+        assert_eq!(events.tracked_apps(), 1);
+
+        // Releasing the finalizer clears the dedup table entry for the deleted app.
+        cleanup_once_with_events(&app, &FakePipeline::ready(), &writer, &events)
+            .await
+            .expect("cleanup releases finalizer");
+        assert_eq!(
+            events.tracked_apps(),
+            0,
+            "deleting an Application must drop its warning dedup entry"
+        );
     }
 }

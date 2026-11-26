@@ -111,7 +111,7 @@ use futures::future::BoxFuture;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::ResourceExt;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
-use tracing::warn;
+use tracing::{Instrument as _, warn};
 
 use crate::cluster_manager::{ClusterError, ClusterSource, ClusterTarget};
 use crate::controller::FailureClass;
@@ -1056,25 +1056,33 @@ impl InventorySyncPipeline {
             prev_inventory: &prepared.prev_inventory,
             now: &prepared.pass_started,
         };
-        let pass = if prepared
-            .bundle
-            .needs_operation(BundleWaves::operation_running(app.status.as_ref()))
-        {
-            self.run_operation(&request).await?
-        } else {
-            self.run_single_pass(&request).await
-        };
+        let sync_span = tracing::info_span!(
+            "sync_execute",
+            decision = %prepared.decision,
+            waves = prepared.bundle.plan.wave_count(),
+            prune_enabled = prepared.prune_enabled,
+        );
+        let pass = async {
+            if prepared
+                .bundle
+                .needs_operation(BundleWaves::operation_running(app.status.as_ref()))
+            {
+                self.run_operation(&request).await
+            } else {
+                Ok(self.run_single_pass(&request).await)
+            }
+        }
+        .instrument(sync_span)
+        .await?;
         // The zero-mutation seam (T07.5): only the SSA applies are counted, never a
         // `dryRun=All` prediction.
         self.mutating_applies
             .fetch_add(pass.apply_calls(), Ordering::SeqCst);
 
         // Crash-safe inventory: `next_inventory = (prev \ pruned_ok) ∪ (applied_ok ∪ synced)`.
-        let next_inventory = inventory::next_inventory(
-            &prepared.prev_inventory,
-            &pass.confirmed(),
-            &pass.pruned_ok(),
-        );
+        let pruned_ok = pass.pruned_ok();
+        let next_inventory =
+            inventory::next_inventory(&prepared.prev_inventory, &pass.confirmed(), &pruned_ok);
 
         if let Some(failure) = pass.first_failure() {
             // A policy failure (immutable field without `Replace`, an unlisted field manager, a
@@ -1152,7 +1160,7 @@ impl InventorySyncPipeline {
         let counts = SyncCounts {
             desired: prepared.desired_inventory.len(),
             applied: pass.applied(),
-            pruned: pass.pruned_ok().len(),
+            pruned: pruned_ok.len(),
             // A retained orphan is either a `Skip` the plan refused (foreign, unmanaged,
             // rail-protected, pruning disabled) or a prune the pruner declined at delete time.
             retained_orphans: pass.retained,
@@ -1198,7 +1206,8 @@ impl InventorySyncPipeline {
             resource_statuses(&assessment, &prepared.desired_inventory),
         )
         .with_operation_state(operation)
-        .with_history(history);
+        .with_history(history)
+        .with_pruned(pruned_ok);
         Ok(match &prepared.rollback {
             Some(rollback) => outcome.with_warning(rollback.decision.condition.clone()),
             None => outcome,
@@ -1331,6 +1340,11 @@ impl InventorySyncPipeline {
         }
 
         let requests = plan_fetch(&desired_inventory, &prev_inventory);
+        let live_span = tracing::info_span!(
+            "live_state_fetch",
+            resources = requests.len(),
+            cluster = %target.name(),
+        );
         let live = access
             .reader()
             .fetch_live(
@@ -1343,6 +1357,7 @@ impl InventorySyncPipeline {
                 &in_bundle_namespaces,
                 &owner,
             )
+            .instrument(live_span)
             .await?;
 
         // Trap guard: ownership is verified for the whole bundle *before* any mutation — and
@@ -1365,6 +1380,11 @@ impl InventorySyncPipeline {
         let orphan_keys = inventory::orphans(&desired_inventory, &prev_inventory);
         let rules = IgnoreRuleSet::from_ignore_differences(&app.spec.ignore_differences);
         let invalid_ignore_pointers = report_invalid_pointers(&rules, &owner);
+        let diff_span = tracing::info_span!(
+            "diff_evaluate",
+            desired = bundle.hooks.permanent().len(),
+            orphans = orphan_keys.len(),
+        );
         let diffs = self
             .evaluate_diff(
                 &access,
@@ -1374,6 +1394,7 @@ impl InventorySyncPipeline {
                 &live,
                 &rules,
             )
+            .instrument(diff_span)
             .await?;
         let summary = DiffSummary::from_diffs(&diffs);
         let spec_hash = source_spec_hash(&app.spec).map_err(|err| ReconcileError::Invalid {
@@ -2015,6 +2036,11 @@ impl InventorySyncPipeline {
         // recorded for a failed fetch too — the latency of a timeout is exactly what an operator
         // needs — and the histogram has no label, so neither the URL nor the error can widen it.
         let fetch_started = std::time::Instant::now();
+        let git_span = tracing::info_span!(
+            "git_fetch",
+            repo = %manifest::redact_repo_url(&source.repo_url),
+            target_revision = %source.target_revision,
+        );
         let fetched: Result<_, ReconcileError> = async {
             let resolved = self.repos.resolve_revision(&source, &credentials).await?;
             let checkout = self
@@ -2023,6 +2049,7 @@ impl InventorySyncPipeline {
                 .await?;
             Ok((resolved, checkout))
         }
+        .instrument(git_span)
         .await;
         if let Some(metrics) = &self.metrics {
             metrics.record_git_fetch(fetch_started.elapsed());
@@ -2046,7 +2073,12 @@ impl InventorySyncPipeline {
 
         // File I/O, YAML parsing, and the renderer subprocess all run off the Tokio worker pool
         // inside the pipeline.
-        let rendered = self.render.render(&context).await;
+        let render_span = tracing::info_span!(
+            "manifest_render",
+            commit_sha = %resolved.commit_sha,
+            path = %app.spec.source.git.path,
+        );
+        let rendered = self.render.render(&context).instrument(render_span).await;
         // `T15.1`: the render cache owns the `hits`/`misses` counters; the recorder turns the
         // increase into `ferriscd_render_cache_total{outcome="hit|miss"}`. Sampled on a failed
         // render too, because a miss is counted before the renderer runs.
@@ -10002,5 +10034,139 @@ spec:
             "the API must report the same refusal a reconcile would"
         );
         assert!(fixture.cluster.applies().is_empty());
+    }
+
+    /// **`T15.2` end-to-end:** wired `InventorySyncPipeline` + `apply_once_with_events` emits
+    /// `Normal SyncSucceeded`, `Normal ResourcePruned`, and rate-limited `Warning SyncFailed`
+    /// without spamming on no-op `SyncSkipped` passes or failing when event publishing fails.
+    #[tokio::test]
+    async fn wired_pipeline_emits_sync_succeeded_resource_pruned_and_rate_limited_sync_failed() {
+        use crate::events::test_support::ManualClock;
+        use crate::events::{
+            AppEventType, EVENT_REASON_RESOURCE_PRUNED, EVENT_REASON_SYNC_FAILED,
+            EVENT_REASON_SYNC_SUCCEEDED, EventRecorder, RecordingEventPublisher,
+        };
+        use crate::reconcile::apply_once_with_events;
+
+        const SECOND_CONFIGMAP: &str = "\
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: extra
+data:
+  key: value
+";
+
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&[
+            ("configmap.yaml", CONFIGMAP_WITH_DATA),
+            ("extra.yaml", SECOND_CONFIGMAP),
+        ]);
+
+        let clock = Arc::new(ManualClock::new());
+        let publisher = Arc::new(RecordingEventPublisher::new());
+        let events = EventRecorder::new(publisher.clone()).with_clock(clock.clone());
+        let writer = RecordingStatus::default();
+
+        // Pass 1: initial sync of 2 ConfigMaps -> emits 1 Normal SyncSucceeded.
+        let mut app = fixture.app(".");
+        app.spec.sync_policy = Some(ferriscd_crd::SyncPolicy {
+            automated: Some(ferriscd_crd::AutomatedSyncPolicy {
+                prune: true,
+                self_heal: true,
+            }),
+            ..Default::default()
+        });
+        apply_once_with_events(&app, &fixture.pipeline, &writer, &events)
+            .await
+            .expect("initial sync succeeds");
+
+        let pass1_events = publisher.events();
+        assert_eq!(pass1_events.len(), 1, "{pass1_events:?}");
+        assert_eq!(pass1_events[0].type_, AppEventType::Normal);
+        assert_eq!(pass1_events[0].reason, EVENT_REASON_SYNC_SUCCEEDED);
+
+        // Pass 2: already synced (`Skip`) -> emits zero new events (no spam).
+        fixture.cluster.seed_applied();
+        publisher.clear();
+        app.status = writer.last();
+        apply_once_with_events(&app, &fixture.pipeline, &writer, &events)
+            .await
+            .expect("already-synced pass succeeds");
+        assert!(
+            publisher.events().is_empty(),
+            "already-synced Skip pass must not spam Normal SyncSucceeded: {:?}",
+            publisher.events()
+        );
+
+        // Pass 3: remove `extra.yaml` so prune deletes `/ConfigMap/payments/extra` -> emits
+        // `Normal ResourcePruned` (naming the GKNN key) AND `Normal SyncSucceeded`.
+        publisher.clear();
+        fixture.commit(&[("configmap.yaml", CONFIGMAP_WITH_DATA)]);
+        app.status = writer.last();
+        apply_once_with_events(&app, &fixture.pipeline, &writer, &events)
+            .await
+            .expect("prune pass succeeds");
+
+        let pass3_events = publisher.events();
+        assert_eq!(pass3_events.len(), 2, "{pass3_events:?}");
+        assert_eq!(pass3_events[0].type_, AppEventType::Normal);
+        assert_eq!(pass3_events[0].reason, EVENT_REASON_RESOURCE_PRUNED);
+        assert!(
+            pass3_events[0].note.contains("/ConfigMap/payments/extra"),
+            "ResourcePruned note must list the pruned GKNN key: {}",
+            pass3_events[0].note
+        );
+        assert_eq!(pass3_events[1].type_, AppEventType::Normal);
+        assert_eq!(pass3_events[1].reason, EVENT_REASON_SYNC_SUCCEEDED);
+
+        // Pass 4 & 5: repeated failure within 5 minutes -> only 1 Warning SyncFailed; after 5 min
+        // emits again.
+        publisher.clear();
+        let mut broken = app.clone();
+        broken.spec.project = "does-not-exist".to_owned();
+        assert!(
+            apply_once_with_events(&broken, &fixture.pipeline, &writer, &events)
+                .await
+                .is_err()
+        );
+        clock.advance(Duration::from_secs(120));
+        assert!(
+            apply_once_with_events(&broken, &fixture.pipeline, &writer, &events)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            publisher.events().len(),
+            1,
+            "second failure inside 5-minute window must be deduplicated"
+        );
+        assert_eq!(publisher.events()[0].type_, AppEventType::Warning);
+        assert_eq!(publisher.events()[0].reason, EVENT_REASON_SYNC_FAILED);
+
+        clock.advance(Duration::from_secs(180));
+        assert!(
+            apply_once_with_events(&broken, &fixture.pipeline, &writer, &events)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            publisher.events().len(),
+            2,
+            "failure after 5-minute window must emit again"
+        );
+
+        // Pass 6: publisher failure must never fail a real sync pass.
+        let failing_events = EventRecorder::new(Arc::new(RecordingEventPublisher::failing(
+            "events API unavailable",
+        )));
+        fixture.commit(&[
+            ("configmap.yaml", CONFIGMAP_WITH_DATA),
+            ("extra.yaml", SECOND_CONFIGMAP),
+        ]);
+        app.status = writer.last();
+        apply_once_with_events(&app, &fixture.pipeline, &writer, &failing_events)
+            .await
+            .expect("sync must succeed even when event publishing fails");
     }
 }

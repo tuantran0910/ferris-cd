@@ -13,6 +13,7 @@ pub mod controller;
 pub mod credentials;
 pub mod discovery;
 pub mod dry_run;
+pub mod events;
 pub mod hooks;
 pub mod impersonation;
 pub mod leader_election;
@@ -27,6 +28,7 @@ pub mod sharding;
 pub mod sync;
 pub mod sync_executor;
 pub mod sync_recovery;
+pub mod telemetry;
 pub mod waves;
 
 pub use cluster_manager::{
@@ -52,6 +54,13 @@ pub use discovery::{CachedDiscovery, DiscoveryCache, DiscoveryError, ScopeLookup
 pub use dry_run::{
     DRY_RUN_CONCURRENCY, DryRunApi, DryRunError, DryRunEvaluator, DryRunFuture, DryRunOutcome,
     DryRunTarget, DynamicDryRunApi, MAX_FIELD_CONFLICTS, parse_conflict_status,
+};
+pub use events::{
+    AppEvent, AppEventType, DEFAULT_MAX_TRACKED_APPS, DEFAULT_WARNING_DEDUP_WINDOW,
+    EVENT_ACTION_PRUNE, EVENT_ACTION_SYNC, EVENT_REASON_RESOURCE_PRUNED, EVENT_REASON_SYNC_FAILED,
+    EVENT_REASON_SYNC_SUCCEEDED, EmitOutcome, EventClock, EventError, EventPublisher,
+    EventRecorder, KubeEventPublisher, MAX_EVENT_ACTION_CHARS, MAX_EVENT_NOTE_BYTES,
+    MAX_EVENT_REASON_CHARS, NoopEventPublisher, RecordingEventPublisher, SystemClock,
 };
 pub use ferriscd_engine::policy::{
     ALL_NAMESPACES, AppProjectPolicy, ApplicationNamespaces, ApplicationScope,
@@ -89,7 +98,7 @@ pub use prune::{
 pub use reconcile::{
     ApiStatusWriter, ApplyOutcome, CleanupDisposition, CleanupMode, CleanupOutcome,
     ControllerError, DiffPreview, FINALIZER, ReconcileContext, ReconcileError, StatusWriter,
-    SyncPipeline,
+    SyncPipeline, apply_once_with_events, cleanup_once_with_events,
 };
 pub use scope::{ClusterNamespacePolicy, InBundleCrd, ScopeError, normalize_scopes};
 pub use sharding::{
@@ -111,6 +120,11 @@ pub use sync_recovery::{
     DEFAULT_REPLACE_INTERVAL, DEFAULT_REPLACE_TIMEOUT, IMMUTABLE_MESSAGE_MARKERS,
     REPLACE_ANNOTATION, REPLACE_HINT, Recovery, ReplacePolicy, ReplaceRecovery, TAKEOVER_FIELD,
     classify_apply_failure, conflicting_managers, is_immutable_field_error, log_takeover,
+};
+pub use telemetry::{
+    DEFAULT_SERVICE_NAME, OTEL_EXPORTER_OTLP_ENDPOINT_ENV, OTEL_SERVICE_NAME_ENV, OtlpConfig,
+    TelemetryError, TelemetryGuard, build_tracer_provider, init_telemetry, init_telemetry_with,
+    redact_endpoint_url,
 };
 pub use waves::{BundleWaves, merge_hook_records, step_health};
 
@@ -376,6 +390,8 @@ pub struct ControlPlane {
     metrics_listener: Option<tokio::net::TcpListener>,
     /// The address the metrics listener actually bound (`:0` resolves to the real port).
     metrics_addr: Option<std::net::SocketAddr>,
+    /// `T15.2`: owns the optional OpenTelemetry `SdkTracerProvider` so spans flush on shutdown.
+    telemetry: telemetry::TelemetryGuard,
     cluster_stop: tokio_util::sync::CancellationToken,
     cluster_watch: tokio::task::JoinHandle<()>,
 }
@@ -391,6 +407,7 @@ impl std::fmt::Debug for ControlPlane {
             .field("clusters", &self.clusters.names())
             .field("leader_election", &self.leader_election.is_some())
             .field("metrics_addr", &self.metrics_addr)
+            .field("otlp_enabled", &self.telemetry.otlp_enabled())
             .finish_non_exhaustive()
     }
 }
@@ -445,6 +462,12 @@ impl ControlPlane {
     #[must_use]
     pub fn metrics_addr(&self) -> Option<std::net::SocketAddr> {
         self.metrics_addr
+    }
+
+    /// The process-lifetime telemetry guard (`T15.2`: logging format + optional OTLP provider).
+    #[must_use]
+    pub fn telemetry(&self) -> &telemetry::TelemetryGuard {
+        &self.telemetry
     }
 
     /// Runs the controller loop until `SIGINT`/`SIGTERM`, then stops the cluster registry watch.
@@ -524,6 +547,13 @@ impl ControlPlane {
             None => Ok(()),
             Some(task) => task.await.context("the metrics listener task panicked")?,
         };
+        // `T15.2`: flush buffered OpenTelemetry spans off the async worker pool before returning.
+        if let Err(err) = self.telemetry.shutdown_async().await {
+            tracing::warn!(
+                error = %err,
+                "failed to flush OpenTelemetry traces on shutdown"
+            );
+        }
         result?;
         served.map_err(anyhow::Error::from)
     }
@@ -566,7 +596,10 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     // HTTPS client — the controller's own included — is built.
     impersonation::ensure_crypto_provider();
 
-    let log_format = init_logging()?;
+    // `T15.2`: install structured logging plus optional OpenTelemetry OTLP export (disabled with
+    // zero exporter overhead unless `OTEL_EXPORTER_OTLP_ENDPOINT` is configured).
+    let telemetry = telemetry::init_telemetry()?;
+    let log_format = telemetry.log_format();
     // `T15.1`: the metrics registry is built (and its listener bound) before any client, so an
     // unusable `--metrics-addr` fails the startup instead of leaving a reconciling process that
     // cannot be scraped. `None` keeps the process metrics-free (hermetic/live tests, library use).
@@ -594,6 +627,8 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         allow_local_repos = options.allow_local_repos,
         leader_election = options.leader_election.is_some(),
         metrics_addr = ?metrics_addr.map(|addr| addr.to_string()),
+        otlp_enabled = telemetry.otlp_enabled(),
+        otlp_endpoint = ?telemetry.redacted_endpoint(),
         "ferriscd-controller starting"
     );
     if options.leader_election.is_none() {
@@ -810,12 +845,18 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         // the pipeline, so it is the last builder call).
         .with_metrics(metrics.clone()),
     );
+    // `T15.2`: rate-limited Kubernetes Events on `Application` CRs (deduplicates identical
+    // consecutive `Warning` reasons within 5 minutes before calling `Recorder::publish`).
+    let events = events::EventRecorder::for_client(client.clone());
     let ctx = Arc::new(
         ReconcileContext::new(apps_api, pipeline.clone(), status)
             .with_client(client.clone())
             // `T15.1`: reconcile start/end/result plus the per-`Application` sync/health gauges,
             // recorded from the `/status` the pass actually persisted.
-            .with_metrics(metrics.clone()),
+            .with_metrics(metrics.clone())
+            // `T15.2`: `Normal SyncSucceeded`, `Normal ResourcePruned`, and rate-limited
+            // `Warning SyncFailed` events on `Application` CRs.
+            .with_events(events),
     );
 
     Ok(ControlPlane {
@@ -828,6 +869,7 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         metrics,
         metrics_listener,
         metrics_addr,
+        telemetry,
         cluster_stop,
         cluster_watch,
     })
@@ -1228,24 +1270,19 @@ pub fn log_format_from_env() -> Result<LogFormat, LogFormatError> {
     log_format_from_env_value(value.as_deref())
 }
 
-/// Installs the global tracing subscriber using [`LOG_FORMAT_ENV`] and `RUST_LOG`.
+/// Installs the global tracing subscriber using [`LOG_FORMAT_ENV`] and `RUST_LOG` (logging only,
+/// without OpenTelemetry OTLP export).
 ///
-/// Called once from the binary; returning the selected format lets the caller log it.
+/// Kept for backward compatibility; prefer [`telemetry::init_telemetry`], which also wires optional
+/// OTLP export and returns a [`TelemetryGuard`] to flush spans on shutdown.
 ///
 /// # Errors
 ///
 /// Fails for an unknown format or when a global subscriber is already installed.
 pub fn init_logging() -> anyhow::Result<LogFormat> {
     let format = log_format_from_env()?;
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    let installed = match format {
-        LogFormat::Json => builder.json().try_init(),
-        LogFormat::Pretty => builder.try_init(),
-    };
-    installed.map_err(|err| anyhow::anyhow!("failed to install tracing subscriber: {err}"))?;
-    Ok(format)
+    let guard = telemetry::init_telemetry_with(format, None)?;
+    Ok(guard.log_format())
 }
 
 #[cfg(test)]

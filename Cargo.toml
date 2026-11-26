@@ -68,6 +68,19 @@ reqwest = { version = "0.13", default-features = false, features = [
 # task adds; the exposition format (text 0.0.4) and the histogram/counter/gauge primitives all
 # come from it, so the label sets are typed (`EncodeLabelSet`) instead of formatted by hand.
 prometheus-client = "0.26"
+# `T15.2`: optional OpenTelemetry OTLP trace export, enabled only when `OTEL_EXPORTER_OTLP_ENDPOINT`
+# is set. `reqwest-blocking-client` (not `reqwest-client`) is deliberate: `BatchSpanProcessor` runs
+# on its own background OS thread without a Tokio reactor, and `reqwest-rustls` shares the
+# process-level `ring` TLS crypto provider installed at startup.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+] }
+tracing-opentelemetry = "0.34"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

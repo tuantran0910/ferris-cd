@@ -45,6 +45,13 @@ rules:
     resources: ["appprojects"]
     verbs: ["get"]
 
+  # --- Kubernetes Events (`T15.2`) --------------------------------------------------
+  # Rate-limited `Normal SyncSucceeded`, `Normal ResourcePruned` and `Warning SyncFailed`
+  # events attached to each `Application` (`kubectl describe application`).
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
   # --- The workloads the Applications declare (`T06`–`T08`) -------------------------
   # Enumerated on purpose. Do NOT write `apiGroups: ["*"] / resources: ["*"]` here: that also
   # grants `secrets` **cluster-wide**, which is precisely the grant the repository-credential
@@ -470,6 +477,25 @@ Operational notes:
   `RenderCache::stats()`'s `hits`/`misses`, so it can never disagree with the cache.
 * `--metrics-addr` reaches the controller through `ferriscd server` too (the controller flags are
   flattened into `ferriscd server`), so both entrypoints expose the same surface.
+
+### OpenTelemetry OTLP tracing & Kubernetes Events (`T15.2`)
+
+* **OpenTelemetry OTLP traces (opt-in):** set `OTEL_EXPORTER_OTLP_ENDPOINT` (e.g.
+  `http://otel-collector.monitoring:4318`) and optionally `OTEL_SERVICE_NAME` (default
+  `ferriscd-controller`). When `OTEL_EXPORTER_OTLP_ENDPOINT` is unset or blank, zero OTLP exporter
+  or background thread is constructed. Spans cover `reconcile`, `git_fetch`, `manifest_render`,
+  `live_state_fetch`, `diff_evaluate`, and `sync_execute`, never carrying Secret payloads or raw
+  credentials; any credentials embedded in an OTLP URL are redacted from logs and errors, and
+  buffered spans flush on graceful shutdown.
+* **Rate-limited Kubernetes Events (`events.k8s.io/v1`):** the controller emits
+  `Normal SyncSucceeded` (on settled sync execution, not on no-op `SyncSkipped` passes),
+  `Normal ResourcePruned` (summarizing pruned GKNN keys without secret data), and
+  `Warning SyncFailed` (redacted and bounded to Kubernetes's 1 KiB note limit). Identical
+  consecutive `Warning` reasons for the same `Application` are deduplicated within a 5-minute
+  window in front of `kube::runtime::events::Recorder` so a failing app cannot spam `etcd`;
+  publishing errors are logged as warnings and never fail reconciliation. Grant
+  `apiGroups: ["events.k8s.io"], resources: ["events"], verbs: ["create", "patch"]` (included in
+  the `ClusterRole` above).
 
 ### Multi-tenancy RBAC matrix
 
