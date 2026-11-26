@@ -276,6 +276,7 @@ export function ResourceGraph({
             nodes={layout.nodes}
             edges={layout.edges}
             nodeTypes={nodeTypes}
+            nodesConnectable={false}
             fitView
             fitViewOptions={{ padding: 0.2 }}
             minZoom={0.2}
