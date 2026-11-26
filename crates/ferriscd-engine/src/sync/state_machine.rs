@@ -16,7 +16,7 @@
 //! |---|---|---|
 //! | any running step | all resources `Healthy` | the next step of the schedule (`Execute`) |
 //! | any running step | some resource `Progressing`/`Missing`/`Unknown` | same step (`Wait`, requeue hint) |
-//! | any running step | nothing observed yet | same step (`Execute`, apply is idempotent) |
+//! | any running step | some expected resource not observed yet (nothing, or a partial wave) | same step (`Execute`, apply is idempotent) |
 //! | any running step | any resource `Degraded` | `SyncFail` (hooks), then `Failed` |
 //! | any running step | step or operation elapsed >= timeout | `SyncFail`, then `Failed` |
 //! | `SyncFail` | `SyncFail` hooks done (or failed/absent) | `Failed` |
@@ -370,10 +370,21 @@ impl StepHealth {
         &self.observed
     }
 
-    /// Returns whether nothing has been observed for this step yet.
+    /// Returns whether **any** expected resource has not been observed yet.
+    ///
+    /// An expected-but-unobserved resource has not been written (a live read of an absent object
+    /// yields no observation), so the step must be re-dispatched. Checking only "nothing observed
+    /// at all" misses a *partially applied* wave — resource #1 landed, then the pass failed or the
+    /// worker was killed before resource #2 — and would wait on health that can never arrive until
+    /// the wave timeout. Re-dispatching is safe: Server-Side Apply is idempotent, and the re-dispatch
+    /// keeps `phaseStartedAt`, so the wave timeout still bounds the step.
+    ///
+    /// A step that expects nothing is trivially satisfied, hence never unobserved.
     #[must_use]
     pub fn is_unobserved(&self) -> bool {
-        self.observed.is_empty() && !self.expected.is_empty()
+        self.expected
+            .iter()
+            .any(|key| !self.observed.contains_key(key))
     }
 
     /// The known-failing (`Degraded`) resources, sorted by [`ResourceKey`].
@@ -1785,11 +1796,14 @@ mod tests {
         assert_eq!(health.aggregate(), HealthStatus::Healthy);
 
         health.observe(api.clone(), HealthStatus::Degraded);
-        assert!(!health.is_unobserved());
+        // `service` has still not been observed, so the step is still partially unwritten.
+        assert!(health.is_unobserved());
         assert_eq!(health.degraded(), vec![api.clone()]);
         assert_eq!(health.aggregate(), HealthStatus::Degraded);
         assert_eq!(health.expected().len(), 2);
         assert_eq!(health.observed().len(), 1);
+        health.observe(service.clone(), HealthStatus::Healthy);
+        assert!(!health.is_unobserved());
 
         // An empty step is trivially healthy (a hook phase with no hooks).
         assert!(!StepHealth::empty().is_unobserved());
@@ -1800,6 +1814,94 @@ mod tests {
         let wave = StepHealth::wave([api.clone(), service]);
         assert!(wave.is_unobserved());
         assert_eq!(wave.expected().len(), 2);
+    }
+
+    /// Chaos finding (`T15.4`): a wave whose resource #1 landed but whose resource #2 was never
+    /// written (transient failure, or a `SIGKILL` between the two applies) must be re-dispatched,
+    /// not waited on until the wave timeout.
+    #[test]
+    fn a_partially_applied_wave_is_redispatched_not_waited_on() {
+        let machine = SyncMachine::default();
+        let schedule = SyncSchedule::from_waves([0]);
+        let settings = key("ConfigMap", "settings");
+        let api = key("Deployment", "api");
+        let t0 = at("2026-11-24T12:00:00Z");
+        let t1 = at("2026-11-24T12:00:05Z");
+
+        let started = machine.start(Some("rev-a".to_owned()), &t0);
+        let outcome = step(
+            &machine,
+            &restart(&started.state),
+            &schedule,
+            &StepHealth::empty(),
+            &t0,
+        );
+        assert_eq!(execute_step(outcome.action), SyncStep::sync(0));
+        let state = restart(&outcome.state);
+
+        // Only `settings` exists; `api` was never written.
+        let mut partial = StepHealth::wave([settings.clone(), api.clone()]);
+        partial.observe(settings.clone(), HealthStatus::Healthy);
+        assert!(partial.is_unobserved());
+
+        let outcome = step(&machine, &state, &schedule, &partial, &t1);
+        assert_eq!(execute_step(outcome.action), SyncStep::sync(0));
+        assert_eq!(
+            outcome.state.phase_started_at, state.phase_started_at,
+            "a re-dispatch is the same step: it must not reset the wave timeout"
+        );
+
+        // A mixed `Progressing` + not-yet-written wave is also re-dispatched.
+        let mut mixed = StepHealth::wave([settings.clone(), api.clone()]);
+        mixed.observe(settings.clone(), HealthStatus::Progressing);
+        assert_eq!(
+            execute_step(step(&machine, &state, &schedule, &mixed, &t1).action),
+            SyncStep::sync(0)
+        );
+
+        // Once every expected resource is observed and still converging, the machine waits.
+        let converging =
+            StepHealth::uniform([settings.clone(), api.clone()], HealthStatus::Progressing);
+        assert_eq!(
+            wait_step(step(&machine, &state, &schedule, &converging, &t1).action),
+            SyncStep::sync(0)
+        );
+
+        // A known-`Degraded` resource still fails the step even though another is unwritten.
+        let mut degraded = StepHealth::wave([settings.clone(), api]);
+        degraded.observe(settings, HealthStatus::Degraded);
+        assert_eq!(
+            step(&machine, &state, &schedule, &degraded, &t1).phase(),
+            SyncPhase::SyncFail
+        );
+    }
+
+    /// Re-dispatching a partial wave must not make it immortal: the wave timeout still fires.
+    #[test]
+    fn a_partially_applied_wave_still_times_out() {
+        let machine = SyncMachine::default();
+        let schedule = SyncSchedule::from_waves([0]);
+        let settings = key("ConfigMap", "settings");
+        let api = key("Deployment", "api");
+        let t0 = at("2026-11-24T12:00:00Z");
+        let late = at("2026-11-24T12:11:00Z");
+
+        let started = machine.start(Some("rev-a".to_owned()), &t0);
+        let outcome = step(
+            &machine,
+            &restart(&started.state),
+            &schedule,
+            &StepHealth::empty(),
+            &t0,
+        );
+        let state = restart(&outcome.state);
+
+        let mut partial = StepHealth::wave([settings.clone(), api]);
+        partial.observe(settings, HealthStatus::Healthy);
+        assert_eq!(
+            step(&machine, &state, &schedule, &partial, &late).phase(),
+            SyncPhase::SyncFail
+        );
     }
 
     /// Finding M-1: an empty expected set is trivially satisfied, so a `Sync` wave must never be
