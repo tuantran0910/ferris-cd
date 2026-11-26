@@ -630,6 +630,15 @@ pub trait StatusWriter: Send + Sync + 'static {
         app: &'a Application,
         status: ApplicationStatus,
     ) -> BoxFuture<'a, Result<(), ReconcileError>>;
+
+    /// Called once the object is going away (the finalizer was released).
+    ///
+    /// A no-op by default: a writer that holds no state keyed by the object has nothing to forget.
+    /// [`MetricsStatusWriter`](crate::metrics::MetricsStatusWriter) overrides it to drop the
+    /// `Application`'s status gauges, which would otherwise outlive the object forever (`T15.1`).
+    fn forget_app(&self, app: &Application) {
+        let _ = app;
+    }
 }
 
 /// [`StatusWriter`] backed by `Api::patch_status`.
@@ -757,6 +766,8 @@ pub struct ReconcileContext {
     pipeline: Arc<dyn SyncPipeline>,
     status: Arc<dyn StatusWriter>,
     backoff: BackoffTracker,
+    /// `T15.1`: the Prometheus recorder, or `None` when metrics are disabled.
+    metrics: Option<crate::metrics::Metrics>,
 }
 
 impl ReconcileContext {
@@ -773,7 +784,30 @@ impl ReconcileContext {
             pipeline,
             status,
             backoff: BackoffTracker::new(),
+            metrics: None,
         }
+    }
+
+    /// Wires the Prometheus recorder (`T15.1`).
+    ///
+    /// Two things happen at once, on purpose: the reconcile start/end instrumentation is enabled,
+    /// and the `/status` writer is wrapped in [`MetricsStatusWriter`](crate::metrics::MetricsStatusWriter)
+    /// so the per-`Application` sync/health gauges always describe the status a pass **persisted**.
+    /// Wiring one without the other would leave the gauges describing a state nobody applied.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: crate::metrics::Metrics) -> Self {
+        self.status = Arc::new(crate::metrics::MetricsStatusWriter::new(
+            self.status.clone(),
+            metrics.clone(),
+        ));
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// The Prometheus recorder, or `None` when metrics are disabled.
+    #[must_use]
+    pub fn metrics(&self) -> Option<&crate::metrics::Metrics> {
+        self.metrics.as_ref()
     }
 
     /// Resolves the `Application` API per object namespace instead of a fixed one (`T12.2`).
@@ -1269,6 +1303,9 @@ pub async fn cleanup_once(
                     "failed to patch status while releasing the finalizer"
                 );
             }
+            // The object is going away, so whatever this writer remembers about it must go too
+            // (`T15.1`: the per-`Application` gauges would otherwise stay in the exposition).
+            status_writer.forget_app(app);
             Ok(Action::await_change())
         }
         CleanupDisposition::Retain { error } => {
@@ -1305,10 +1342,28 @@ async fn reconcile_inner(
     app: Arc<Application>,
     ctx: Arc<ReconcileContext>,
 ) -> Result<Action, ControllerError> {
-    let key = object_key(&app);
+    // `T15.1`: the reconcile histogram/counter and the in-flight gauge. Without a wired recorder
+    // (hermetic tests, `RunOptions::metrics_addr = None`) the pass runs exactly as before.
+    let Some(metrics) = ctx.metrics().cloned() else {
+        return reconcile_gate(&app, &ctx).await;
+    };
+    let guard = metrics.start_reconcile();
+    let result = reconcile_gate(&app, &ctx).await;
+    // The result label comes only from the retry classification (`success|retryable|terminal`),
+    // never from the error message.
+    guard.finish(crate::metrics::ReconcileResult::of(&result));
+    result
+}
+
+/// The finalizer gate itself: [`apply_once`]/[`cleanup_once`] wrapped in the object's own API.
+async fn reconcile_gate(
+    app: &Arc<Application>,
+    ctx: &Arc<ReconcileContext>,
+) -> Result<Action, ControllerError> {
+    let key = object_key(app);
     // The finalizer helper patches the object it was handed, so it must use that object's own
     // namespace: a tenant `Application` (`T12.2`) does not live in the control-plane namespace.
-    let api = ctx.apps_api_for(&app);
+    let api = ctx.apps_api_for(app);
     let inner_ctx = ctx.clone();
 
     let result = finalizer::finalizer(&api, FINALIZER, app.clone(), move |event| {
@@ -1978,6 +2033,239 @@ mod tests {
             status.sync.is_none(),
             "a denial must not claim a sync state it never reached"
         );
+    }
+
+    /// **`T15.1` wiring:** the sync/health gauges describe the `/status` a pass **persisted** (via
+    /// [`crate::metrics::MetricsStatusWriter`]), for a successful and a failed pass alike — those
+    /// are the two paths the always-update-status contract patches.
+    #[tokio::test]
+    async fn the_metrics_status_writer_records_the_persisted_sync_and_health_status() {
+        use crate::metrics::{Metrics, MetricsStatusWriter};
+
+        let app = application(&[]);
+        let metrics = Metrics::with_fixed_series();
+        let writer =
+            MetricsStatusWriter::new(Arc::new(RecordingStatusWriter::default()), metrics.clone());
+        let pipeline = FakePipeline {
+            apply: Box::new(|| {
+                Ok(ApplyOutcome::ready("SyncSucceeded", "applied")
+                    .with_sync(SyncState::new(
+                        SyncStatus::OutOfSync,
+                        Some("deadbeef".to_owned()),
+                    ))
+                    .with_health(HealthState::new(HealthStatus::Degraded), Vec::new()))
+            }),
+            ..FakePipeline::ready()
+        };
+
+        apply_once(&app, &pipeline, &writer)
+            .await
+            .expect("apply must succeed");
+
+        let body = metrics.encode().expect("the registry encodes");
+        let samples = crate::metrics::exposition::parse(&body);
+        for (family, status) in [
+            (crate::metrics::APP_SYNC_STATUS, "OutOfSync"),
+            (crate::metrics::APP_HEALTH_STATUS, "Degraded"),
+        ] {
+            assert_eq!(
+                crate::metrics::exposition::value_of(
+                    &samples,
+                    family,
+                    &[
+                        ("app_namespace", "ferriscd-system"),
+                        ("app_name", "demo-app"),
+                        ("status", status),
+                    ],
+                    &body
+                ),
+                "1",
+                "{family} must report the status the pass persisted:\n{body}"
+            );
+        }
+
+        // A failed pass still patches `/status` (trap T3), and its message routinely names a commit
+        // or a URL. None of that may become a label, and a pass that reports no sync/health state
+        // must not invent one: the gauges stay empty rather than claiming a status nobody observed.
+        let failed_metrics = Metrics::with_fixed_series();
+        let failed_writer = MetricsStatusWriter::new(
+            Arc::new(RecordingStatusWriter::default()),
+            failed_metrics.clone(),
+        );
+        let failing = FakePipeline::failing(|| ReconcileError::Invalid {
+            message: "commit_sha=deadbeef is not reachable".to_owned(),
+        });
+        assert!(
+            apply_once(&app, &failing, &failed_writer).await.is_err(),
+            "the failure must surface"
+        );
+        let body = failed_metrics.encode().expect("the registry encodes");
+        assert!(
+            !body.contains("commit_sha"),
+            "the error message must never reach a label:\n{body}"
+        );
+        assert!(
+            crate::metrics::exposition::samples_of(
+                &crate::metrics::exposition::parse(&body),
+                crate::metrics::APP_SYNC_STATUS
+            )
+            .is_empty(),
+            "a pass that reported no sync state must not create a status series:\n{body}"
+        );
+    }
+
+    /// A `kube::Client` over a service that never dials out.
+    ///
+    /// The finalizer helper's `PATCH` is issued and its empty response body fails to decode, so a
+    /// `reconcile_instance` over it runs every wiring step (including the metrics guard) and ends
+    /// in an error instead of needing a cluster.
+    fn offline_client() -> Client {
+        Client::new(
+            tower::service_fn(|_request| async {
+                Ok::<_, std::convert::Infallible>(http::Response::new(kube::client::Body::empty()))
+            }),
+            "ferriscd-system",
+        )
+    }
+
+    /// **Verification bullet (`T15.1`, reconcile path):** a whole pass through
+    /// [`reconcile_instance`] is recorded by the recorder wired into the context — one `result`
+    /// observation, one histogram count, and an `active_reconciles` gauge that returned to zero.
+    ///
+    /// Removing the guard from `reconcile_inner` (or the `.with_metrics`) leaves every series at
+    /// zero, and the removed guard is the only thing that would ever produce `active_reconciles 1`.
+    #[tokio::test]
+    async fn a_reconcile_is_counted_through_the_wired_recorder() {
+        use std::collections::BTreeSet;
+
+        use crate::metrics::exposition::Sample;
+        use crate::metrics::{
+            ACTIVE_RECONCILES, APP_HEALTH_STATUS, APP_SYNC_STATUS, GIT_FETCH_DURATION_SECONDS,
+            Metrics, RECONCILE_DURATION_SECONDS, RECONCILE_TOTAL, RENDER_CACHE_TOTAL, exposition,
+        };
+
+        let metrics = Metrics::with_fixed_series();
+        let ctx = Arc::new(
+            ReconcileContext::new(
+                Api::namespaced(offline_client(), "ferriscd-system"),
+                Arc::new(UnwiredSyncPipeline),
+                Arc::new(RecordingStatusWriter::default()),
+            )
+            .with_metrics(metrics.clone()),
+        );
+
+        // An `Err` is the expected outcome: adding the finalizer is the first write of the pass, and
+        // the offline client answers it with a body that does not decode.
+        let result = reconcile_instance(Arc::new(application(&[])), ctx).await;
+        assert!(
+            result.is_err(),
+            "the offline API cannot patch the finalizer: {result:?}"
+        );
+
+        let body = metrics.encode().expect("the registry encodes");
+        let samples = exposition::parse(&body);
+
+        // Exactly one `result` series carries the pass (the others stay at the zero
+        // `with_fixed_series` prepared), and the value is exactly one observation.
+        let counted: Vec<(&str, &str)> = samples
+            .iter()
+            .filter(|sample| sample.name == RECONCILE_TOTAL)
+            .filter_map(|sample| {
+                sample
+                    .label("result")
+                    .map(|result| (result, sample.value.as_str()))
+            })
+            .filter(|(_, value)| *value != "0")
+            .collect();
+        assert_eq!(
+            counted.len(),
+            1,
+            "one pass must be counted exactly once:\n{body}"
+        );
+        assert_eq!(
+            counted[0].1, "1",
+            "the counter is incremented once:\n{body}"
+        );
+        assert_eq!(
+            exposition::value_of(
+                &samples,
+                &format!("{RECONCILE_DURATION_SECONDS}_count"),
+                &[("result", counted[0].0)],
+                &body
+            ),
+            "1",
+            "the histogram observed the same single pass:\n{body}"
+        );
+        assert_eq!(
+            exposition::value_of(&samples, ACTIVE_RECONCILES, &[], &body),
+            "0",
+            "the guard must release the in-flight gauge:\n{body}"
+        );
+
+        // Every pre-instantiated family is exposed, and the per-`Application` ones are not: this
+        // pass persisted no sync/health state, so no status series may be invented.
+        let families: BTreeSet<&str> = samples.iter().map(Sample::family).collect();
+        let expected: BTreeSet<&str> = [
+            RECONCILE_DURATION_SECONDS,
+            RECONCILE_TOTAL,
+            GIT_FETCH_DURATION_SECONDS,
+            RENDER_CACHE_TOTAL,
+            ACTIVE_RECONCILES,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(families, expected, "{body}");
+        assert!(
+            !body.contains(APP_SYNC_STATUS) && !body.contains(APP_HEALTH_STATUS),
+            "no status was persisted, so no status gauge may exist:\n{body}"
+        );
+    }
+
+    /// **`T15.1` (deletion):** releasing the finalizer drops the object's status gauges, so a
+    /// deleted `Application` cannot leave a series in the exposition forever.
+    #[tokio::test]
+    async fn a_released_cleanup_forgets_the_application_gauges() {
+        use crate::metrics::{APP_HEALTH_STATUS, APP_SYNC_STATUS, Metrics, MetricsStatusWriter};
+
+        let metrics = Metrics::with_fixed_series();
+        let app = application(&[]);
+        metrics.record_app_status(
+            "ferriscd-system",
+            "demo-app",
+            &ApplicationStatus {
+                sync: Some(SyncState::new(
+                    SyncStatus::Synced,
+                    Some("deadbeef".to_owned()),
+                )),
+                health: Some(HealthState::new(HealthStatus::Healthy)),
+                ..ApplicationStatus::default()
+            },
+        );
+        let body = metrics.encode().expect("encodes");
+        assert_eq!(
+            crate::metrics::exposition::samples_of(
+                &crate::metrics::exposition::parse(&body),
+                APP_SYNC_STATUS
+            )
+            .len(),
+            3,
+            "the gauges exist while the object does:\n{body}"
+        );
+
+        let writer =
+            MetricsStatusWriter::new(Arc::new(RecordingStatusWriter::default()), metrics.clone());
+        cleanup_once(&app, &FakePipeline::ready(), &writer)
+            .await
+            .expect("a completed cleanup releases the finalizer");
+
+        let body = metrics.encode().expect("encodes");
+        let samples = crate::metrics::exposition::parse(&body);
+        for family in [APP_SYNC_STATUS, APP_HEALTH_STATUS] {
+            assert!(
+                crate::metrics::exposition::samples_of(&samples, family).is_empty(),
+                "a deleted Application must not keep a {family} series:\n{body}"
+            );
+        }
     }
 
     #[tokio::test]

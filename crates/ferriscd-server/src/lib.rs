@@ -216,6 +216,13 @@ mod tests {
         let addr: SocketAddr = DEFAULT_API_ADDR.parse().expect("a valid socket address");
         assert_eq!(addr.port(), 8080);
         assert_ne!(addr.port(), 9090, ":9090 is the T15.1 metrics listener");
+        // `T15.1`: the metrics listener really is a *different* socket, so `/metrics` is never
+        // routed by this crate's API router (it lives in `ferriscd-controller`).
+        let metrics: SocketAddr = ferriscd_controller::DEFAULT_METRICS_ADDR
+            .parse()
+            .expect("the metrics default is a socket address");
+        assert_eq!(metrics.port(), 9090);
+        assert_ne!(metrics, addr, "the two listeners must never share a port");
         assert!(
             addr.ip().is_loopback(),
             "the default bind must stay on loopback: {addr}"

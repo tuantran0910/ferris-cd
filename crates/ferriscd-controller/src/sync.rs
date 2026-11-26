@@ -662,6 +662,10 @@ pub struct InventorySyncPipeline {
     /// `None` means only `in-cluster` is addressable, and any other name is a terminal error —
     /// never a silent fallback to the control plane, which would deploy into the wrong cluster.
     clusters: Option<Arc<dyn ClusterSource>>,
+    /// `T15.1`: the Prometheus recorder, or `None` (metrics disabled). It observes the Git fetch
+    /// duration and bridges the render cache's own counters — nothing else in the pipeline is
+    /// instrumented, so the metric surface stays small and matching the roadmap's families.
+    metrics: Option<crate::metrics::Metrics>,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -679,6 +683,7 @@ impl std::fmt::Debug for InventorySyncPipeline {
             .field("impersonation", &self.impersonation.is_some())
             .field("credentials", &self.credentials.is_some())
             .field("clusters", &self.clusters.is_some())
+            .field("metrics", &self.metrics.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -716,8 +721,20 @@ impl InventorySyncPipeline {
             impersonation: None,
             credentials: None,
             clusters: None,
+            metrics: None,
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Wires the Prometheus recorder (`T15.1`).
+    ///
+    /// Without one the pipeline behaves exactly as before: no allocation, no lock, no metric. The
+    /// recorder observes the Git fetch duration ([`Self::fetch_desired`]) and bridges the render
+    /// cache's existing counters — the pipeline does not keep its own copy of any of them.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: crate::metrics::Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Number of mutating Server-Side Apply calls this pipeline has issued so far.
@@ -1993,11 +2010,24 @@ impl InventorySyncPipeline {
         // control-plane namespace. No match is `Anonymous` (public repositories keep working);
         // an unusable Secret is a terminal error instead of a silent anonymous clone.
         let credentials = self.credentials_for(&source.repo_url).await?;
-        let resolved = self.repos.resolve_revision(&source, &credentials).await?;
-        let checkout = self
-            .repos
-            .checkout(&source, &resolved.commit_sha, &credentials)
-            .await?;
+        // `T15.1`: resolve + checkout is the Git work of one pass (both go through the `RepoCache`,
+        // which carries the mirror/worktree state), so they are timed together. The observation is
+        // recorded for a failed fetch too — the latency of a timeout is exactly what an operator
+        // needs — and the histogram has no label, so neither the URL nor the error can widen it.
+        let fetch_started = std::time::Instant::now();
+        let fetched: Result<_, ReconcileError> = async {
+            let resolved = self.repos.resolve_revision(&source, &credentials).await?;
+            let checkout = self
+                .repos
+                .checkout(&source, &resolved.commit_sha, &credentials)
+                .await?;
+            Ok((resolved, checkout))
+        }
+        .await;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_git_fetch(fetch_started.elapsed());
+        }
+        let (resolved, checkout) = fetched?;
 
         // Helm's `.Capabilities.KubeVersion` must match the destination cluster, so the discovery
         // snapshot has to be populated *before* the render. This is TTL-gated: an already-fresh
@@ -2016,7 +2046,14 @@ impl InventorySyncPipeline {
 
         // File I/O, YAML parsing, and the renderer subprocess all run off the Tokio worker pool
         // inside the pipeline.
-        let rendered = self.render.render(&context).await?;
+        let rendered = self.render.render(&context).await;
+        // `T15.1`: the render cache owns the `hits`/`misses` counters; the recorder turns the
+        // increase into `ferriscd_render_cache_total{outcome="hit|miss"}`. Sampled on a failed
+        // render too, because a miss is counted before the renderer runs.
+        if let Some(metrics) = &self.metrics {
+            metrics.record_render_cache(self.render.cache().stats());
+        }
+        let rendered = rendered?;
         // The pipeline hands back a shared, already-normalized bundle; stamping ownership below
         // mutates the resources, so this pass needs its own copy.
         Ok((resolved.commit_sha, rendered.as_ref().clone()))
@@ -4375,6 +4412,25 @@ spec:
             pipeline,
             repo_url,
             _temp: temp,
+        }
+    }
+
+    /// Returns `fixture` with the `T15.1` recorder wired into its pipeline.
+    ///
+    /// `InventorySyncPipeline::with_metrics` consumes the pipeline (it owns the render cache and the
+    /// applier, so it is deliberately not `Clone`), so the fixture is taken apart and put back
+    /// together instead of being mutated in place.
+    fn with_metrics(fixture: Fixture, metrics: &crate::metrics::Metrics) -> Fixture {
+        Fixture {
+            pipeline: fixture.pipeline.with_metrics(metrics.clone()),
+            git: fixture.git,
+            cluster: fixture.cluster,
+            discovery: fixture.discovery,
+            dry_run: fixture.dry_run,
+            projects: fixture.projects,
+            impersonation: fixture.impersonation,
+            repo_url: fixture.repo_url,
+            _temp: fixture._temp,
         }
     }
 
@@ -8953,6 +9009,89 @@ spec:
         let stats = fixture.pipeline.render_cache_stats();
         assert_eq!(stats.misses, 1, "{stats:?}");
         assert!(stats.hits >= 1, "{stats:?}");
+    }
+
+    /// **`T15.1` verification:** a real pass records the Git fetch duration and bridges the render
+    /// cache's own `hits`/`misses` into `ferriscd_render_cache_total{outcome=...}` — the metric is
+    /// the engine's counter, not a second bookkeeping copy.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pass_records_git_fetch_and_render_cache_metrics() {
+        let fake = FakeRenderer::new(
+            "kustomize",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  key: rendered\n",
+        );
+        let metrics = crate::metrics::Metrics::with_fixed_series();
+        // The fixture owns the pipeline, and `with_metrics` consumes it: rebuild the fixture with
+        // the recorder attached rather than mutating a shared pipeline.
+        let fixture = with_metrics(
+            fixture_with_renderers(
+                FakeCluster::default().with_namespace("payments"),
+                RendererBinaries {
+                    kustomize: Some(fake.path().to_path_buf()),
+                    ..RendererBinaries::default()
+                },
+            ),
+            &metrics,
+        );
+        fixture.commit(&[
+            (
+                "kustomization.yaml",
+                "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - configmap.yaml\n",
+            ),
+            ("configmap.yaml", CONFIGMAP),
+        ]);
+        let mut app = fixture.app(".");
+        app.spec.source.renderer = RendererSpec::Kustomize(ferriscd_crd::KustomizeRenderer {
+            kustomization_path: None,
+            images: Vec::new(),
+        });
+
+        // Two passes at the same commit: one render (a miss) and one cache hit.
+        fixture.pipeline.apply(&app).await.expect("first pass");
+        fixture.pipeline.apply(&app).await.expect("second pass");
+        assert_eq!(
+            fake.invocations(),
+            1,
+            "the second pass must be served from the render cache"
+        );
+
+        let body = metrics.encode().expect("the registry encodes");
+        let samples = crate::metrics::exposition::parse(&body);
+        for (outcome, expected) in [("miss", "1"), ("hit", "1")] {
+            assert_eq!(
+                crate::metrics::exposition::value_of(
+                    &samples,
+                    crate::metrics::RENDER_CACHE_TOTAL,
+                    &[("outcome", outcome)],
+                    &body
+                ),
+                expected,
+                "the bridge must report the engine's own cache counters:\n{body}"
+            );
+        }
+        assert_eq!(
+            crate::metrics::exposition::value_of(
+                &samples,
+                &format!("{}_count", crate::metrics::GIT_FETCH_DURATION_SECONDS),
+                &[],
+                &body
+            ),
+            "2",
+            "one Git resolve/checkout per pass:\n{body}"
+        );
+        // The histogram carries no label at all, so neither the repository URL nor an error can
+        // widen it.
+        for sample in crate::metrics::exposition::samples_of(
+            &samples,
+            crate::metrics::GIT_FETCH_DURATION_SECONDS,
+        ) {
+            let labels: Vec<&str> = sample.labels.keys().map(String::as_str).collect();
+            assert!(
+                labels.is_empty() || labels == vec!["le"],
+                "the Git fetch histogram must stay label-free: {labels:?}\n{body}"
+            );
+        }
     }
 
     /// The Helm path renders offline with the **discovered** cluster version, so

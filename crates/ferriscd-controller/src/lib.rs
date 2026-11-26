@@ -17,6 +17,7 @@ pub mod hooks;
 pub mod impersonation;
 pub mod leader_election;
 pub mod live_state;
+pub mod metrics;
 pub mod predicate;
 pub mod project;
 pub mod prune;
@@ -73,6 +74,12 @@ pub use leader_election::{
 pub use live_state::{
     ClusterStateReader, DynamicApiSource, FetchRequest, LiveObjectSource, LiveState,
     LiveStateError, TrackingOwner,
+};
+pub use metrics::{
+    ACTIVE_RECONCILES, APP_HEALTH_STATUS, APP_SYNC_STATUS, CACHE_OUTCOMES, DEFAULT_METRICS_ADDR,
+    GIT_FETCH_DURATION_SECONDS, METRICS_ADDR_ENV, METRICS_PATH, Metrics, MetricsEncodeError,
+    MetricsServeError, MetricsStatusWriter, RECONCILE_DURATION_SECONDS, RECONCILE_RESULTS,
+    RECONCILE_TOTAL, RENDER_CACHE_TOTAL, ReconcileGuard, ReconcileResult, SYNC_STATUS_VALUES,
 };
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
 pub use project::{ApiProjectSource, ProjectSource};
@@ -164,6 +171,18 @@ pub struct RunOptions {
     /// replica reconciles only its shard, and it **must** also enable leader election — see
     /// [`RunOptions::shard_config`].
     pub shard: ShardOptions,
+
+    /// Address the dedicated internal `/metrics` listener binds to (`T15.1`).
+    ///
+    /// `None` (the library default, and what the hermetic and live tests use) opens **no socket**,
+    /// so nothing can be scraped. The registry itself is still built and still records (the
+    /// reconcile counter/histogram, the in-flight gauge and the per-`Application` status gauges):
+    /// the recorder is wired into the reconcile context and the pipeline regardless, because the
+    /// metrics-free case is a *library/test* default, not a mode the shipped binaries use.
+    /// `ferriscd controller` and `ferriscd server` always set it from `--metrics-addr` /
+    /// [`metrics::METRICS_ADDR_ENV`], defaulting to [`metrics::DEFAULT_METRICS_ADDR`]. The listener
+    /// is never the API/webhook port.
+    pub metrics_addr: Option<String>,
 }
 
 /// The `T13.2` knobs [`RunOptions::leader_election`] carries.
@@ -348,6 +367,15 @@ pub struct ControlPlane {
     pipeline: Arc<dyn SyncPipeline>,
     clusters: Arc<ClusterManager>,
     leader_election: Option<LeaderElectionConfig>,
+    /// `T15.1`: the process's metric registry (shared with the pipeline and the `/status` writer).
+    metrics: metrics::Metrics,
+    /// The already-bound metrics listener (`None` when `RunOptions::metrics_addr` is unset).
+    ///
+    /// Bound in [`prepare`] so an unusable `--metrics-addr` is a startup failure rather than a
+    /// controller that reconciles while nothing can be scraped.
+    metrics_listener: Option<tokio::net::TcpListener>,
+    /// The address the metrics listener actually bound (`:0` resolves to the real port).
+    metrics_addr: Option<std::net::SocketAddr>,
     cluster_stop: tokio_util::sync::CancellationToken,
     cluster_watch: tokio::task::JoinHandle<()>,
 }
@@ -362,6 +390,7 @@ impl std::fmt::Debug for ControlPlane {
             )
             .field("clusters", &self.clusters.names())
             .field("leader_election", &self.leader_election.is_some())
+            .field("metrics_addr", &self.metrics_addr)
             .finish_non_exhaustive()
     }
 }
@@ -403,6 +432,21 @@ impl ControlPlane {
         self.clusters.clone()
     }
 
+    /// The Prometheus registry (`T15.1`).
+    ///
+    /// Exposed so a caller can encode it directly (a test, or a diagnostics command); the shipped
+    /// listener is already wired into [`Self::run_until`].
+    #[must_use]
+    pub fn metrics(&self) -> &metrics::Metrics {
+        &self.metrics
+    }
+
+    /// The address the internal `/metrics` listener bound, or `None` when it is disabled.
+    #[must_use]
+    pub fn metrics_addr(&self) -> Option<std::net::SocketAddr> {
+        self.metrics_addr
+    }
+
     /// Runs the controller loop until `SIGINT`/`SIGTERM`, then stops the cluster registry watch.
     ///
     /// # Errors
@@ -436,7 +480,16 @@ impl ControlPlane {
     /// # Errors
     ///
     /// See [`run_with`].
-    pub async fn run_until(self, stop: tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
+    pub async fn run_until(
+        mut self,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        // `T15.1`: the dedicated metrics listener joins the process's ONE shutdown decision. It is
+        // an independent task on its own port, so a slow or hung scrape can never delay a reconcile
+        // (and a reconcile can never delay a scrape).
+        let metrics_task = self.spawn_metrics_listener(stop.clone());
         let result: anyhow::Result<()> = match self.leader_election.clone() {
             // The non-leader path reuses the public per-term driver: it treats the token as its only
             // shutdown input, which is precisely the contract this method promises.
@@ -455,7 +508,7 @@ impl ControlPlane {
                     self.ctx.clone(),
                     leader,
                     self.cluster_stop.clone(),
-                    stop,
+                    stop.clone(),
                 )
                 .await
             }
@@ -463,7 +516,40 @@ impl ControlPlane {
         // The registry is a background watcher: stopping it is enough, nothing is buffered.
         self.cluster_stop.cancel();
         drop(self.cluster_watch);
-        result
+        // The controller has drained: stop the listener too (idempotent — a `SIGTERM` already
+        // cancelled the token) and report its outcome, so a dead `/metrics` endpoint can never be
+        // mistaken for a healthy process.
+        stop.cancel();
+        let served = match metrics_task {
+            None => Ok(()),
+            Some(task) => task.await.context("the metrics listener task panicked")?,
+        };
+        result?;
+        served.map_err(anyhow::Error::from)
+    }
+
+    /// Spawns the internal `/metrics` listener, if one was bound at startup.
+    ///
+    /// The task cancels the shared token if serving fails: a metrics endpoint that died must stop
+    /// the process, not leave a reconciling controller that nobody can observe.
+    fn spawn_metrics_listener(
+        &mut self,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> Option<tokio::task::JoinHandle<Result<(), metrics::MetricsServeError>>> {
+        let listener = self.metrics_listener.take()?;
+        let metrics = self.metrics.clone();
+        Some(tokio::spawn(async move {
+            let cancel = stop.clone();
+            let outcome = metrics::serve_listener(listener, metrics, stop.cancelled_owned()).await;
+            if let Err(err) = &outcome {
+                tracing::error!(
+                    error = %err,
+                    "the internal metrics listener failed; stopping the controller"
+                );
+                cancel.cancel();
+            }
+            outcome
+        }))
     }
 }
 
@@ -481,12 +567,33 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     impersonation::ensure_crypto_provider();
 
     let log_format = init_logging()?;
+    // `T15.1`: the metrics registry is built (and its listener bound) before any client, so an
+    // unusable `--metrics-addr` fails the startup instead of leaving a reconciling process that
+    // cannot be scraped. `None` keeps the process metrics-free (hermetic/live tests, library use).
+    let metrics = metrics::Metrics::with_fixed_series();
+    let (metrics_listener, metrics_addr) = match options.metrics_addr.as_deref() {
+        None => (None, None),
+        Some(addr) => {
+            let requested: std::net::SocketAddr = addr.parse().with_context(|| {
+                format!(
+                    "--metrics-addr {addr:?} is not a socket address (expected e.g. {})",
+                    metrics::DEFAULT_METRICS_ADDR
+                )
+            })?;
+            let listener = metrics::bind(requested).await?;
+            let bound = listener
+                .local_addr()
+                .context("the metrics listener has no local address")?;
+            (Some(listener), Some(bound))
+        }
+    };
     tracing::info!(
         controller = controller_name(),
         api_group = ferriscd_crd::api_group(),
         log_format = log_format.as_str(),
         allow_local_repos = options.allow_local_repos,
         leader_election = options.leader_election.is_some(),
+        metrics_addr = ?metrics_addr.map(|addr| addr.to_string()),
         "ferriscd-controller starting"
     );
     if options.leader_election.is_none() {
@@ -698,10 +805,17 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         )))
         // `T13.1`: `spec.destination.cluster` is resolved through the registry. Without this every
         // non-`in-cluster` destination is a terminal error, which is the pre-Phase-13 behaviour.
-        .with_cluster_source(clusters.clone()),
+        .with_cluster_source(clusters.clone())
+        // `T15.1`: Git fetch latency and the render-cache hit/miss bridge (`with_metrics` consumes
+        // the pipeline, so it is the last builder call).
+        .with_metrics(metrics.clone()),
     );
     let ctx = Arc::new(
-        ReconcileContext::new(apps_api, pipeline.clone(), status).with_client(client.clone()),
+        ReconcileContext::new(apps_api, pipeline.clone(), status)
+            .with_client(client.clone())
+            // `T15.1`: reconcile start/end/result plus the per-`Application` sync/health gauges,
+            // recorded from the `/status` the pass actually persisted.
+            .with_metrics(metrics.clone()),
     );
 
     Ok(ControlPlane {
@@ -711,6 +825,9 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         pipeline,
         clusters,
         leader_election,
+        metrics,
+        metrics_listener,
+        metrics_addr,
         cluster_stop,
         cluster_watch,
     })

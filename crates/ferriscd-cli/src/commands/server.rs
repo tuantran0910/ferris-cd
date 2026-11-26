@@ -121,6 +121,7 @@ impl std::fmt::Debug for ServerArgs {
         f.debug_struct("ServerArgs")
             .field("controller", &self.controller)
             .field("api_addr", &self.api_addr)
+            .field("metrics_addr", &self.controller.metrics_addr)
             .field("auth_policy", &self.auth_policy)
             .field(
                 "github_webhook_secret",
@@ -239,12 +240,38 @@ fn webhook_config(args: &ServerArgs) -> Result<ferriscd_server::WebhookConfig> {
     })
 }
 
+/// Refuses a `--metrics-addr` that resolves to the API port (`T15.1`).
+///
+/// The comparison is on the **port** only: two listeners can never share a port even when their
+/// addresses differ (`127.0.0.1:8080` and `0.0.0.0:8080` overlap on loopback, and a `0.0.0.0` bind
+/// takes the port on every interface), so an address comparison would let that collision through to
+/// a confusing "address already in use".
+///
+/// An unparsable value is left to the controller's own startup validation (which reports it with the
+/// expected format), so this check only covers the collision it can recognise.
+fn ensure_metrics_addr_differs(api: SocketAddr, metrics_addr: &str) -> Result<()> {
+    if let Ok(metrics) = metrics_addr.parse::<SocketAddr>() {
+        anyhow::ensure!(
+            metrics.port() != api.port(),
+            "--metrics-addr ({metrics}) must not use the --api-addr port ({}): the metrics \
+             listener is never served on the API/webhook port, whatever address it binds",
+            api.port()
+        );
+    }
+    Ok(())
+}
+
 /// Builds the shared control plane and runs the controller and the API server together.
 async fn serve(args: ServerArgs) -> Result<()> {
     let address: SocketAddr = args
         .api_addr
         .parse()
         .with_context(|| format!("--api-addr {:?} is not a socket address", args.api_addr))?;
+    // `T15.1`: `/metrics` gets its **own** listener. Sharing the API port would put the scrape
+    // endpoint behind the same socket as the bearer-protected `/api/v1/*` surface (and the webhook
+    // POSTs), which is exactly what `T14.3` split apart — so the collision is refused up front
+    // instead of surfacing as a confusing "address already in use" from whichever bind ran second.
+    ensure_metrics_addr_differs(address, &args.controller.metrics_addr)?;
     let webhooks = webhook_config(&args)?;
 
     // The ONE control plane: the same caches, registry, pipeline and discovery every handler and
@@ -257,6 +284,16 @@ async fn serve(args: ServerArgs) -> Result<()> {
     let state = ferriscd_server::kube::app_state(&plane, webhooks)
         .with_auth(args.auth_policy)
         .with_rbac(std::sync::Arc::new(rbac));
+    if let Some(metrics_addr) = plane.metrics_addr() {
+        // `T15.1`: said out loud where the API address is decided, so a scrape that fails is not
+        // diagnosed as a missing endpoint.
+        tracing::info!(
+            metrics_addr = %metrics_addr,
+            api_addr = %address,
+            "internal Prometheus metrics listener bound (GET /metrics); it is a separate port, \
+             never the API/webhook one"
+        );
+    }
     if ferriscd_server::auth::exposes_unauthenticated_api(address, args.auth_policy) {
         // Before the listener exists, so the operator sees it even if the bind then fails. The
         // listener logs it again with the address it really bound (`serve_listener`).
@@ -376,6 +413,55 @@ mod tests {
             !ferriscd_server::auth::exposes_unauthenticated_api(address, args.auth_policy),
             "the shipped default must not be the unauthenticated-bind combination: {address}"
         );
+        // **`T15.1`:** the metrics listener is inherited from `ferriscd controller`, and its default
+        // is a *different* port from the API — the scrape endpoint is never the API/webhook port.
+        assert_eq!(
+            args.controller.metrics_addr,
+            ferriscd_controller::DEFAULT_METRICS_ADDR
+        );
+        let metrics: SocketAddr = args
+            .controller
+            .metrics_addr
+            .parse()
+            .expect("a socket address");
+        assert_eq!(metrics.port(), 9090);
+        assert_ne!(metrics, address);
+        ensure_metrics_addr_differs(address, &args.controller.metrics_addr)
+            .expect("the shipped default pair must not collide");
+    }
+
+    /// **`T15.1`:** a `--metrics-addr` that lands on the API port is refused before any listener is
+    /// bound, instead of surfacing as a confusing "address already in use" from the second bind.
+    ///
+    /// The check is by port, so a *different* address on the same port is refused too: two
+    /// listeners cannot share a port, and `0.0.0.0:8080` overlaps `127.0.0.1:8080` on loopback.
+    #[test]
+    fn a_metrics_address_that_is_the_api_address_is_refused() {
+        let api: SocketAddr = "127.0.0.1:8080".parse().expect("a socket address");
+        for metrics_addr in [
+            "127.0.0.1:8080",
+            "0.0.0.0:8080",
+            "[::1]:8080",
+            "10.0.0.1:8080",
+        ] {
+            let error = ensure_metrics_addr_differs(api, metrics_addr)
+                .expect_err("sharing the API port must be refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not use the --api-addr port"),
+                "{error}"
+            );
+        }
+        // The reverse direction collides as well (the API bound to all interfaces).
+        let wildcard: SocketAddr = "0.0.0.0:8080".parse().expect("a socket address");
+        ensure_metrics_addr_differs(wildcard, "127.0.0.1:8080")
+            .expect_err("the same port collides whatever the address is");
+        ensure_metrics_addr_differs(api, "0.0.0.0:9090").expect("a distinct address is accepted");
+        ensure_metrics_addr_differs(api, "127.0.0.1:9091").expect("a distinct port is accepted");
+        // Only a parsed socket address can collide; an unparsable value is the controller's own
+        // startup error (with the expected format), not a silent default.
+        ensure_metrics_addr_differs(api, "9090").expect("the controller validates the format");
     }
 
     /// **Finding `P14-H1`:** the policy is selectable, the flag takes both documented values, a typo
@@ -590,6 +676,11 @@ mod tests {
             "--webhook-debounce-seconds",
             "--webhook-max-jitter-millis",
             "openapi",
+            // `T15.1`: `ferriscd server` inherits the controller's metrics flag, and the help must
+            // say it is a separate port.
+            "--metrics-addr",
+            "FERRISCD_METRICS_ADDR",
+            "ferriscd_reconcile_total",
         ] {
             assert!(
                 help.contains(expected),

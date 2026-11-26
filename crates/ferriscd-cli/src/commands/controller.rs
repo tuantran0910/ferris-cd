@@ -157,6 +157,31 @@ pub struct ControllerArgs {
         conflicts_with = "leader_election_lease_name"
     )]
     pub total_shards: Option<u32>,
+
+    /// Address of the **dedicated internal Prometheus metrics listener** (`T15.1`).
+    ///
+    /// `GET /metrics` is served here and nowhere else: the REST API port (`--api-addr`) carries the
+    /// bearer-protected `/api/v1/*` routes and the unauthenticated `/healthz`/`/readyz` probes, and
+    /// the webhook endpoints, so a scraper never needs (and never gets) a credential and the API is
+    /// never reachable through the metrics port. Defaults to `0.0.0.0:9090` — all interfaces on
+    /// purpose, because Prometheus scrapes the pod IP; use `127.0.0.1:9090` or a `NetworkPolicy`
+    /// to restrict it. `:0` binds an ephemeral port, which is logged.
+    ///
+    /// The exposition is strictly low-cardinality and carries no secret material: no `commit_sha`,
+    /// no error message, no repository URL and no resource name is ever a label — only
+    /// `result` (`success|retryable|terminal`), `outcome` (`hit|miss`), the
+    /// `app_namespace`/`app_name` identity, and the fixed sync/health status sets. Families:
+    /// `ferriscd_reconcile_duration_seconds`, `ferriscd_reconcile_total`,
+    /// `ferriscd_app_sync_status`, `ferriscd_app_health_status`,
+    /// `ferriscd_git_fetch_duration_seconds`, `ferriscd_render_cache_total`, and
+    /// `ferriscd_active_reconciles`. Falls back to `FERRISCD_METRICS_ADDR`.
+    #[arg(
+        long = "metrics-addr",
+        value_name = "ADDR",
+        env = ferriscd_controller::METRICS_ADDR_ENV,
+        default_value = ferriscd_controller::DEFAULT_METRICS_ADDR
+    )]
+    pub metrics_addr: String,
 }
 
 /// Executes `ferriscd controller`, blocking until `SIGINT`/`SIGTERM`.
@@ -200,6 +225,9 @@ pub(crate) fn run_options(args: ControllerArgs) -> ferriscd_controller::RunOptio
         // `--leader-election` (or with a lease name other than the per-shard one). Both unset — the
         // default — leaves the single-replica behaviour untouched.
         shard: ferriscd_controller::ShardOptions::new(args.shard_id, args.total_shards),
+        // `T15.1`: the CLI always serves `/metrics`; the library default (`None`) keeps tests and
+        // other embedders off a socket. The controller parses and binds this before any client.
+        metrics_addr: Some(args.metrics_addr),
     }
 }
 
@@ -273,6 +301,19 @@ mod tests {
                 .leader_election_config("ferriscd-system")
                 .expect("the defaults must be valid")
                 .is_some()
+        );
+        // `T15.1`: the CLI always serves `/metrics`, on the dedicated metrics port only.
+        assert_eq!(args.metrics_addr, ferriscd_controller::DEFAULT_METRICS_ADDR);
+        let options = run_options(parse(&["ferriscd", "controller"]));
+        assert_eq!(
+            options.metrics_addr.as_deref(),
+            Some(ferriscd_controller::DEFAULT_METRICS_ADDR),
+            "the shipped command must serve the metrics endpoint: the library default (`None`) is \
+             only for tests and other embedders"
+        );
+        assert!(
+            ferriscd_controller::DEFAULT_METRICS_ADDR.ends_with(":9090"),
+            "the metrics listener has its own documented port"
         );
         // `T13.3`: no shard flags means no sharding, i.e. the pre-Phase-13 work partition.
         assert_eq!(args.shard_id, None);
@@ -505,6 +546,52 @@ mod tests {
         assert_eq!(malformed.application_namespaces.as_deref(), Some("Team-A"));
     }
 
+    /// **`T15.1`:** the metrics flag parses, reaches the controller's `RunOptions`, and declares its
+    /// environment fallback. The listener is on its own port, so `--metrics-addr` is independent of
+    /// `--api-addr` (`ferriscd server` refuses a value that collides with it).
+    #[test]
+    fn controller_parses_the_metrics_flag_and_its_env_fallback() {
+        let args = parse(&[
+            "ferriscd",
+            "controller",
+            "--metrics-addr",
+            "127.0.0.1:19090",
+        ]);
+        assert_eq!(args.metrics_addr, "127.0.0.1:19090");
+        assert_eq!(
+            run_options(args).metrics_addr.as_deref(),
+            Some("127.0.0.1:19090")
+        );
+
+        // The env fallback is *declared* on the flag (clap reads `FERRISCD_METRICS_ADDR` when the
+        // flag is absent); asserting the declaration avoids mutating the process environment.
+        let mut command = Harness::command();
+        let controller = command
+            .find_subcommand_mut("controller")
+            .expect("the controller subcommand exists");
+        let arg = controller
+            .get_arguments()
+            .find(|arg| arg.get_id() == "metrics_addr")
+            .expect("the --metrics-addr argument exists");
+        assert_eq!(
+            arg.get_env().and_then(|env| env.to_str()),
+            Some("FERRISCD_METRICS_ADDR")
+        );
+        assert_eq!(
+            arg.get_default_values()
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![ferriscd_controller::DEFAULT_METRICS_ADDR.to_owned()],
+            "the default is the documented dedicated metrics port"
+        );
+
+        // The value is passed through untouched; the controller parses it at startup and rejects an
+        // unusable one with the expected format in the message (never a silent default).
+        let unusable = run_options(parse(&["ferriscd", "controller", "--metrics-addr", "9090"]));
+        assert_eq!(unusable.metrics_addr.as_deref(), Some("9090"));
+    }
+
     /// **Finding M1:** the RBAC an operator has to grant for multi-tenancy is in the flag help, not
     /// only in a doc file nobody reads before turning the flag on.
     #[test]
@@ -546,6 +633,20 @@ mod tests {
             "ferriscd-leader-shard-",
             "FERRISCD_SHARD_ID",
             "FERRISCD_TOTAL_SHARDS",
+            // `T15.1`: the metrics listener is on its own port, with an env fallback, and the help
+            // states the cardinality contract so nobody adds a `commit_sha` label.
+            "--metrics-addr",
+            "FERRISCD_METRICS_ADDR",
+            "9090",
+            "/metrics",
+            "ferriscd_reconcile_total",
+            "ferriscd_reconcile_duration_seconds",
+            "ferriscd_app_sync_status",
+            "ferriscd_app_health_status",
+            "ferriscd_git_fetch_duration_seconds",
+            "ferriscd_render_cache_total",
+            "ferriscd_active_reconciles",
+            "commit_sha",
         ] {
             assert!(
                 help.contains(expected),
