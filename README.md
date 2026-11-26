@@ -1,5 +1,9 @@
 # FerrisCD
 
+<p align="center">
+  <img src="docs/brand/ferriscd-logo.svg" alt="FerrisCD" width="260">
+</p>
+
 [![CI](https://github.com/tuantran0910/ferris-cd/actions/workflows/ci.yml/badge.svg)](https://github.com/tuantran0910/ferris-cd/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.100%20(Edition%202024)-orange.svg)](rust-toolchain.toml)
