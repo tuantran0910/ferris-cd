@@ -17,6 +17,7 @@ export interface ResourceFlowNodeData extends Record<string, unknown> {
   healthStatus: string;
   healthMessage?: string | null;
   present: boolean;
+  hasChildren: boolean;
   ownership?: string | null;
   parent?: string | null;
   resource?: ResourceNodeView;
@@ -64,6 +65,7 @@ export function buildResourceGraphElements(
         syncStatus: graph.syncStatus,
         healthStatus: graph.healthStatus,
         present: true,
+        hasChildren: false,
       },
     },
   ];
@@ -89,6 +91,7 @@ export function buildResourceGraphElements(
         healthStatus: derivedHealth,
         healthMessage: resource.healthMessage ?? null,
         present: resource.present,
+        hasChildren: false,
         ownership: resource.ownership ?? null,
         parent: resource.parent ?? null,
         resource,
@@ -121,6 +124,13 @@ export function buildResourceGraphElements(
   }
   for (const e of edges) {
     g.setEdge(e.source, e.target);
+  }
+
+  // Only nodes that actually have an outgoing edge render a source handle, so leaf
+  // resources do not show a dangling connector dot on their right edge.
+  const parentIds = new Set(edges.map((e) => e.source));
+  for (const n of rawNodes) {
+    n.data.hasChildren = parentIds.has(n.id);
   }
 
   dagre.layout(g);

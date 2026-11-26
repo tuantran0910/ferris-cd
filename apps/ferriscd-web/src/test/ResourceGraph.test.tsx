@@ -39,6 +39,15 @@ describe("ResourceGraph & dagre layout (T16.3 & Trap Guard T16.3)", () => {
       }),
     );
 
+    // Only nodes with outgoing edges expose a source handle (no dangling dot on leaves).
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    expect(
+      byId.get("apps/ReplicaSet/payments/payments-api-7f8d9")?.data.hasChildren,
+    ).toBe(true);
+    expect(byId.get("/Pod/payments/payments-api-7f8d9-aaa")?.data.hasChildren).toBe(
+      false,
+    );
+
     // Pairwise axis-aligned bounding-box overlap check
     for (let i = 0; i < nodes.length; i++) {
       for (let j = i + 1; j < nodes.length; j++) {
