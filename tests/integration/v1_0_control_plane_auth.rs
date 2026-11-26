@@ -131,7 +131,11 @@ fn token_review_rbac_and_the_cli_work_end_to_end() {
     );
 
     // --- a read-only identity is refused on sync (403) ------------------------------------------
-    let sync = run_cli(&["app", "sync", APPLICATION], &config, None);
+    let sync = run_cli(
+        &["app", "sync", "-n", NAMESPACE, APPLICATION],
+        &config,
+        None,
+    );
     assert!(
         !sync.status.success(),
         "a read-only identity must not be able to sync"
@@ -160,7 +164,7 @@ fn token_review_rbac_and_the_cli_work_end_to_end() {
 
     // --- an invisible application is 404, exactly like a missing one ----------------------------
     for name in ["tenant-b-api", "does-not-exist"] {
-        let get = run_cli(&["app", "get", name], &config, None);
+        let get = run_cli(&["app", "get", "-n", NAMESPACE, name], &config, None);
         assert!(!get.status.success(), "{name} must not be readable");
         assert!(
             String::from_utf8_lossy(&get.stderr).contains("not found"),
@@ -189,6 +193,8 @@ impl ServerProcess {
                 "server",
                 "--api-addr",
                 &address.to_string(),
+                "--metrics-addr",
+                "127.0.0.1:0",
                 "--namespace",
                 NAMESPACE,
                 "--auth-policy",
@@ -309,6 +315,21 @@ struct ClusterCleanup;
 
 impl Drop for ClusterCleanup {
     fn drop(&mut self) {
+        // Strip any finalizer attached by the test server before deleting the namespace, since
+        // `ServerProcess` is dropped before `ClusterCleanup` and no controller remains to release
+        // `ferriscd.io/finalizer`.
+        for app in [APPLICATION, "tenant-b-api"] {
+            let _ = kubectl(&[
+                "-n",
+                NAMESPACE,
+                "patch",
+                "application",
+                app,
+                "--type=merge",
+                "-p",
+                r#"{"metadata":{"finalizers":null}}"#,
+            ]);
+        }
         let _ = kubectl(&[
             "delete",
             "namespace",

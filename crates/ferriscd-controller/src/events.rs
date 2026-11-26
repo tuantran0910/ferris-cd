@@ -1065,6 +1065,7 @@ mod tests {
             "ABORT: refusing to run live test against non-kind context {ctx:?}"
         );
 
+        crate::impersonation::ensure_crypto_provider();
         let client = Client::try_default()
             .await
             .expect("kind kubeconfig must connect");

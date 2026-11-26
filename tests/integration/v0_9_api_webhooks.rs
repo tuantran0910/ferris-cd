@@ -104,6 +104,7 @@ fn a_signed_github_push_syncs_the_pushed_commit() {
     );
     install_crds();
     ensure_namespace(CONTROL_NAMESPACE);
+    ensure_namespace(TARGET_NAMESPACE);
     ensure_default_project();
     let _cluster_cleanup = ClusterCleanup;
 
@@ -283,6 +284,17 @@ impl Drop for ClusterCleanup {
             "-n",
             CONTROL_NAMESPACE,
             "--ignore-not-found=true",
+            "--wait=false",
+        ]);
+        let _ = kubectl(&[
+            "patch",
+            "application",
+            APPLICATION_NAME,
+            "-n",
+            CONTROL_NAMESPACE,
+            "--type=merge",
+            "-p",
+            r#"{"metadata":{"finalizers":null}}"#,
         ]);
         let _ = kubectl(&[
             "delete",

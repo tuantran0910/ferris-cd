@@ -99,8 +99,8 @@ async fn an_application_lands_on_a_secret_registered_remote_cluster_and_is_prune
     install_crds();
     ensure_namespace(CONTROL_NAMESPACE);
     ensure_namespace_on(REMOTE_CONTEXT, DESTINATION_NAMESPACE);
-    apply_manifest(&project_manifest());
     let _cleanup = ClusterCleanup::new();
+    apply_manifest(&project_manifest());
 
     // The registry: a real in-cluster handle plus a registration built from the workload
     // cluster's own kubeconfig (server, CA and credentials), exactly as an operator would.
@@ -482,6 +482,8 @@ impl Fixture {
                 "user.name=FerrisCD Test",
                 "-c",
                 "user.email=ferriscd@example.com",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",
@@ -492,20 +494,19 @@ impl Fixture {
 
     fn apply_application(&self, automation: &str) {
         let manifest = application_manifest(&self.repo.display().to_string(), automation);
-        let _ = kubectl(&[
-            "-n",
-            CONTROL_NAMESPACE,
-            "delete",
-            "application",
-            APPLICATION_NAME,
-            "--ignore-not-found=true",
-            "--timeout=120s",
-        ]);
+        delete_application_force(CONTROL_NAMESPACE, APPLICATION_NAME);
         apply_manifest(&manifest);
     }
 
     async fn reconcile(&self) -> Result<(), ferriscd_controller::reconcile::ControllerError> {
-        let app = self.read_application().await;
+        let mut app = self.read_application().await;
+        if !has_finalizer(&app) {
+            // `kube::runtime::finalizer` returns after attaching the finalizer on the first pass;
+            // re-read the updated object so the `Apply` branch executes on this call.
+            ferriscd_controller::reconcile::reconcile_instance(Arc::new(app), self.ctx.clone())
+                .await?;
+            app = self.read_application().await;
+        }
         ferriscd_controller::reconcile::reconcile_instance(Arc::new(app), self.ctx.clone())
             .await
             .map(|_action| ())
@@ -672,15 +673,7 @@ impl ClusterCleanup {
     }
 
     fn delete_all() {
-        let _ = kubectl(&[
-            "-n",
-            CONTROL_NAMESPACE,
-            "delete",
-            "application",
-            APPLICATION_NAME,
-            "--ignore-not-found=true",
-            "--timeout=120s",
-        ]);
+        delete_application_force(CONTROL_NAMESPACE, APPLICATION_NAME);
         let _ = kubectl(&[
             "-n",
             CONTROL_NAMESPACE,
@@ -714,6 +707,29 @@ impl Drop for ClusterCleanup {
     fn drop(&mut self) {
         Self::delete_all();
     }
+}
+
+/// Deletes an `Application` even when no controller is running to release `ferriscd.io/finalizer`.
+fn delete_application_force(namespace: &str, name: &str) {
+    let _ = kubectl(&[
+        "-n",
+        namespace,
+        "delete",
+        "application",
+        name,
+        "--ignore-not-found=true",
+        "--wait=false",
+    ]);
+    let _ = kubectl(&[
+        "-n",
+        namespace,
+        "patch",
+        "application",
+        name,
+        "--type=merge",
+        "-p",
+        r#"{"metadata":{"finalizers":null}}"#,
+    ]);
 }
 
 /// Removes the leader-election `Lease` between runs.

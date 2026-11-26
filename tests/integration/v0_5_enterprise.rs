@@ -145,13 +145,13 @@ const CONFIGMAP_NAME: &str = "enterprise-settings";
 async fn an_application_outside_the_projects_namespaces_and_kinds_is_denied() {
     require_kind_context();
     install_crds();
+    let _cleanup = ClusterCleanup::new();
     ensure_namespace(CONTROL_NAMESPACE);
     ensure_namespace(TENANT_NAMESPACE);
     ensure_namespace(DESTINATION_NAMESPACE);
     ensure_namespace(DENIED_NAMESPACE);
     apply_manifest(&project_manifest());
     apply_manifest(&tenant_rbac_manifest());
-    let _cleanup = ClusterCleanup::new();
 
     let fixture = Fixture::new().await;
 
@@ -254,12 +254,12 @@ async fn an_application_outside_the_projects_namespaces_and_kinds_is_denied() {
 async fn a_tenant_deploy_is_impersonated_and_bounded_by_the_api_server() {
     require_kind_context();
     install_crds();
+    let _cleanup = ClusterCleanup::new();
     ensure_namespace(CONTROL_NAMESPACE);
     ensure_namespace(TENANT_NAMESPACE);
     ensure_namespace(DESTINATION_NAMESPACE);
     apply_manifest(&project_manifest());
     apply_manifest(&tenant_rbac_manifest());
-    let _cleanup = ClusterCleanup::new();
 
     let fixture = Fixture::new().await;
 
@@ -281,9 +281,11 @@ async fn a_tenant_deploy_is_impersonated_and_bounded_by_the_api_server() {
         "the finalizer stays on the Application, in {TENANT_NAMESPACE}"
     );
 
-    // (b) Refused by the API server, not by the project.
+    // (b) Refused by the API server, not by the project: keep destination.namespace on the
+    // tenant's namespace (so FerrisCD impersonates `enterprise-app/deployer`), while the manifest
+    // targets `kube-system` (permitted by `AppProject.destinations`, denied by Kubernetes RBAC).
     fixture.commit(&[("configmap.yaml", configmap_manifest(FORBIDDEN_NAMESPACE))]);
-    fixture.apply_application(FORBIDDEN_NAMESPACE);
+    fixture.apply_application(DESTINATION_NAMESPACE);
     let err = fixture
         .reconcile()
         .await
@@ -322,10 +324,10 @@ async fn an_application_deploys_to_and_is_pruned_from_a_remote_kind_cluster() {
         "this test needs the workload cluster; create it with: kind create cluster --name ferriscd-workload"
     );
     install_crds();
+    let _cleanup = ClusterCleanup::new();
     ensure_namespace(CONTROL_NAMESPACE);
     ensure_namespace_on(REMOTE_CONTEXT, REMOTE_NAMESPACE);
     apply_manifest(&project_manifest());
-    let _cleanup = ClusterCleanup::new();
 
     let fixture = Fixture::new().await;
     fixture.register_remote_cluster().await;
@@ -665,6 +667,8 @@ impl Fixture {
                 "user.name=FerrisCD Test",
                 "-c",
                 "user.email=ferriscd@example.com",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",
@@ -703,22 +707,26 @@ impl Fixture {
         // Re-creating the object keeps the test independent of whatever a previous run left behind
         // (a finalizer would otherwise keep it `Terminating`).
         for namespace in [TENANT_NAMESPACE, CONTROL_NAMESPACE] {
-            let _ = kubectl(&[
-                "-n",
-                namespace,
-                "delete",
-                "application",
-                APPLICATION_NAME,
-                "--ignore-not-found=true",
-                "--timeout=120s",
-            ]);
+            delete_application_force(namespace, APPLICATION_NAME);
         }
         apply_manifest(manifest);
     }
 
     /// Runs one reconcile exactly as the controller's finalizer gate would.
     async fn reconcile(&self) -> Result<(), ferriscd_controller::reconcile::ControllerError> {
-        let app = self.read_application().await;
+        let mut app = self.read_application().await;
+        let has_finalizer = app
+            .metadata
+            .finalizers
+            .as_deref()
+            .is_some_and(|list| list.iter().any(|f| f == ferriscd_controller::FINALIZER));
+        if !has_finalizer {
+            // `kube::runtime::finalizer` returns after attaching the finalizer on the first pass;
+            // re-read the updated object so the `Apply` branch executes on this call.
+            ferriscd_controller::reconcile::reconcile_instance(Arc::new(app), self.ctx.clone())
+                .await?;
+            app = self.read_application().await;
+        }
         ferriscd_controller::reconcile::reconcile_instance(Arc::new(app), self.ctx.clone())
             .await
             .map(|_action| ())
@@ -975,15 +983,7 @@ impl ClusterCleanup {
 
     fn delete_all() {
         for namespace in [TENANT_NAMESPACE, CONTROL_NAMESPACE] {
-            let _ = kubectl(&[
-                "-n",
-                namespace,
-                "delete",
-                "application",
-                APPLICATION_NAME,
-                "--ignore-not-found=true",
-                "--timeout=120s",
-            ]);
+            delete_application_force(namespace, APPLICATION_NAME);
         }
         for namespace in [DESTINATION_NAMESPACE, DENIED_NAMESPACE] {
             let _ = kubectl(&[
@@ -1036,6 +1036,29 @@ impl Drop for ClusterCleanup {
     fn drop(&mut self) {
         Self::delete_all();
     }
+}
+
+/// Deletes an `Application` even when no controller is running to release `ferriscd.io/finalizer`.
+fn delete_application_force(namespace: &str, name: &str) {
+    let _ = kubectl(&[
+        "-n",
+        namespace,
+        "delete",
+        "application",
+        name,
+        "--ignore-not-found=true",
+        "--wait=false",
+    ]);
+    let _ = kubectl(&[
+        "-n",
+        namespace,
+        "patch",
+        "application",
+        name,
+        "--type=merge",
+        "-p",
+        r#"{"metadata":{"finalizers":null}}"#,
+    ]);
 }
 
 /// Removes one leader-election `Lease` between runs.
