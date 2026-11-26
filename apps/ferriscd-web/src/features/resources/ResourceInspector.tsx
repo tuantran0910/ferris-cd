@@ -1,5 +1,6 @@
 import { Copy, Check, FileDiff, Layers, Shield, X } from "lucide-react";
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import type { ResourceNodeView } from "../../api/types";
 import { Button } from "../../ui/Button";
 import { HealthStatusBadge, SyncStatusBadge } from "../../ui/StatusBadges";
@@ -56,7 +57,7 @@ export function ResourceInspector({
     }
   };
 
-  return (
+  return createPortal(
     <>
       <div
         data-testid="resource-inspector-backdrop"
@@ -221,6 +222,7 @@ export function ResourceInspector({
         </div>
       )}
     </aside>
-    </>
+    </>,
+    document.body,
   );
 }

@@ -1,5 +1,6 @@
 import { X } from "lucide-react";
 import type { ReactNode, RefObject } from "react";
+import { createPortal } from "react-dom";
 import { cx } from "../utils/cx";
 
 export interface ModalProps {
@@ -43,7 +44,7 @@ export function Modal({
     return null;
   }
 
-  return (
+  return createPortal(
     <div
       role="dialog"
       aria-modal="true"
@@ -67,7 +68,8 @@ export function Modal({
           {children}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

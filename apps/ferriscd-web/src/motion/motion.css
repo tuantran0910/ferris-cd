@@ -45,7 +45,14 @@
 }
 
 /* 2px only: enough to communicate "new screen", small enough to never read as
- * a slide, and it cannot shift the surrounding layout. */
+ * a slide, and it cannot shift the surrounding layout.
+ *
+ * `fill-mode: backwards` (not `both`): an entrance should leave no animated
+ * value behind. With `forwards`/`both`, browsers keep the final interpolated
+ * `transform` (an identity matrix, not `none`) on the element, which would turn
+ * it into the containing block for `position: fixed` descendants — that is what
+ * shifted the resource inspector. Fixed overlays are additionally portalled to
+ * `document.body` so no transformed ancestor can ever capture them. */
 @keyframes motion-slide-up {
   from {
     opacity: 0;
@@ -100,22 +107,22 @@
 
 .motion-fade-in {
   animation: motion-fade-in var(--motion-base) var(--motion-ease-decelerate)
-    both;
+    backwards;
 }
 
 .motion-slide-up {
   animation: motion-slide-up var(--motion-base) var(--motion-ease-decelerate)
-    both;
+    backwards;
 }
 
 .motion-scale-in {
   animation: motion-scale-in var(--motion-fast) var(--motion-ease-decelerate)
-    both;
+    backwards;
 }
 
 .motion-slide-in-right {
   animation: motion-slide-in-right var(--motion-base)
-    var(--motion-ease-decelerate) both;
+    var(--motion-ease-decelerate) backwards;
 }
 
 .motion-shimmer {

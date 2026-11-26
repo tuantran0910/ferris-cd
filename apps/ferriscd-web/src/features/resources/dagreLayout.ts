@@ -186,6 +186,9 @@ export function buildResourceGraphElements(
       // guaranteed to reach it. The card is fixed-size, so declare it.
       width: GRAPH_NODE_WIDTH,
       height: GRAPH_NODE_HEIGHT,
+      // The synthetic Application root has no `resource` to inspect, so it must
+      // not look/behave like a selectable node.
+      ...(n.data.isRootApplication ? { selectable: false } : {}),
       sourcePosition: isHorizontal ? Position.Right : Position.Bottom,
       targetPosition: isHorizontal ? Position.Left : Position.Top,
       data: n.data,

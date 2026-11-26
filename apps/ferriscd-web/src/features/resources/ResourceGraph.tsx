@@ -56,8 +56,8 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
         data.isRootApplication ? "graph-root-node" : `graph-node-${data.key}`
       }
       className={`w-[264px] rounded-xl border-2 px-3 py-2.5 shadow-lg transition-colors ${borderClass} ${
-        selected ? "ring-2 ring-indigo-400" : ""
-      }`}
+        data.isRootApplication ? "cursor-default" : "cursor-pointer"
+      } ${selected ? "ring-2 ring-indigo-400" : ""}`}
     >
       {data.isRootApplication ? null : (
         <Handle
