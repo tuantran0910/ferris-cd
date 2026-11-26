@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferriscd
+  namespace: ferriscd-system
+  labels:
+    app.kubernetes.io/name: ferriscd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: ferriscd
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferriscd
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferriscd
+        app.kubernetes.io/component: server
+        app.kubernetes.io/part-of: ferriscd
+    spec:
+      serviceAccountName: ferriscd
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ferriscd
+          image: ghcr.io/ferriscd/ferriscd:1.0.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - server
+            - --namespace
+            - ferriscd-system
+            - --api-addr
+            - 0.0.0.0:8080
+            - --metrics-addr
+            - 0.0.0.0:9090
+            - --auth-policy
+            - token-review
+            - --work-root
+            - /tmp/ferriscd-repos
+          env:
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: api
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: api
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

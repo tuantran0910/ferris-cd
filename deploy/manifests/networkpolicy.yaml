@@ -1,0 +1,71 @@
+# Default-deny NetworkPolicy for `ferriscd server` (Ingress + Egress) with explicit allow rules.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ferriscd
+  namespace: ferriscd-system
+  labels:
+    app.kubernetes.io/name: ferriscd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: ferriscd
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ferriscd
+      app.kubernetes.io/component: server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow pods in `ferriscd-system` to reach the REST API port.
+    # Add an explicit namespaceSelector patch for your Ingress controller or Prometheus scraper.
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS resolution (UDP/TCP 53).
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+    # Kubernetes API server access (patch with your API server CIDR in production;
+    # pinning Git HTTPS CIDRs also requires pinning API server CIDRs or restricting
+    # this rule to port 6443 on post-DNAT CNIs).
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+    # Git HTTPS remotes (blocks cloud metadata IMDS 169.254.169.254/32).
+    - ports:
+        - protocol: TCP
+          port: 443
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+    # Git SSH remotes (blocks cloud metadata IMDS 169.254.169.254/32).
+    - ports:
+        - protocol: TCP
+          port: 22
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32

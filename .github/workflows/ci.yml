@@ -29,12 +29,221 @@ jobs:
             files = Dir.glob("{.github,deploy,examples}/**/*.{yml,yaml}")
             # Helm chart templates are Go templates, not data YAML; `helm template` (and the
             # ignored v0_4_renderers tests) validate them. Chart.yaml/values*/crds/ stay checked.
-            files.reject! { |f| f.start_with?("examples/helm/templates/") }
+            files.reject! do |f|
+              f.start_with?("examples/helm/templates/") ||
+                f.start_with?("deploy/helm/ferriscd/templates/")
+            end
             abort("No YAML files found") if files.empty?
             files.sort.each do |f|
               YAML.load_stream(File.read(f))
               puts "OK: #{f}"
             end
+          '
+
+      - name: Check CRD sync (deploy/crds vs Helm & Kustomize)
+        run: |
+          for crd in applications.ferriscd.io.yaml appprojects.ferriscd.io.yaml; do
+            diff -u "deploy/crds/${crd}" "deploy/helm/ferriscd/crds/${crd}"
+            diff -u "deploy/crds/${crd}" "deploy/manifests/crds/${crd}"
+          done
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint and validate Helm chart & Kustomize overlay
+        run: |
+          helm lint deploy/helm/ferriscd
+          helm lint deploy/helm/ferriscd -f deploy/helm/ferriscd/values-ha.yaml
+
+          helm template ferriscd deploy/helm/ferriscd -n ferriscd-system | ruby -ryaml -e '
+            docs = YAML.load_stream($stdin.read).compact
+            abort("No rendered Helm docs") if docs.empty?
+            cluster_roles = docs.select { |d| d["kind"] == "ClusterRole" }
+            deployments = docs.select { |d| d["kind"] == "Deployment" }
+            netpols = docs.select { |d| d["kind"] == "NetworkPolicy" }
+            abort("Missing ClusterRole in Helm default manifests") if cluster_roles.empty?
+            abort("Missing Deployment in Helm default manifests") if deployments.empty?
+            abort("Missing NetworkPolicy in Helm default manifests") if netpols.empty?
+
+            cluster_roles.each do |d|
+              (d["rules"] || []).each do |r|
+                groups = r["apiGroups"] || []
+                res = r["resources"] || []
+                verbs = r["verbs"] || []
+                abort("Default ClusterRole must not grant */* wildcard") if groups.include?("*") && res.include?("*")
+                abort("Default ClusterRole must not grant secrets") if res.include?("secrets")
+                abort("Default ClusterRole must not grant impersonate") if verbs.include?("impersonate")
+                abort("Default ClusterRole must not grant rbac.authorization.k8s.io") if groups.include?("rbac.authorization.k8s.io")
+                if res.include?("customresourcedefinitions")
+                  extra = verbs - %w[get list watch]
+                  abort("Default ClusterRole must grant read-only CRDs, got verbs: #{verbs}") unless extra.empty?
+                end
+              end
+            end
+
+            deployments.each do |d|
+              name = d.dig("metadata", "name")
+              pod = d.dig("spec", "template", "spec") || {}
+              psc = pod["securityContext"] || {}
+              abort("#{name} must set runAsNonRoot: true") unless psc["runAsNonRoot"] == true
+              abort("#{name} must set runAsUser: 65532") unless psc["runAsUser"] == 65532
+              abort("#{name} must set RuntimeDefault seccomp") unless psc.dig("seccompProfile", "type") == "RuntimeDefault"
+              (pod["containers"] || []).each do |c|
+                sc = c["securityContext"] || {}
+                abort("#{c["name"]} must set readOnlyRootFilesystem: true") unless sc["readOnlyRootFilesystem"] == true
+                abort("#{c["name"]} must set allowPrivilegeEscalation: false") unless sc["allowPrivilegeEscalation"] == false
+                abort("#{c["name"]} must drop ALL capabilities") unless (sc.dig("capabilities", "drop") || []).include?("ALL")
+              end
+            end
+
+            netpols.each do |d|
+              name = d.dig("metadata", "name")
+              pt = d.dig("spec", "policyTypes") || []
+              abort("NetworkPolicy #{name} must set policyTypes [Ingress, Egress], got #{pt}") unless pt == %w[Ingress Egress]
+              (d.dig("spec", "egress") || []).each_with_index do |rule, idx|
+                to = rule["to"]
+                abort("NetworkPolicy #{name} egress[#{idx}] must not omit to:") unless to.is_a?(Array) && !to.empty?
+                to.each do |peer|
+                  ipb = peer["ipBlock"]
+                  next unless ipb && ipb["cidr"] == "0.0.0.0/0"
+                  except = ipb["except"] || []
+                  abort("NetworkPolicy #{name} egress[#{idx}] 0.0.0.0/0 must exclude 169.254.169.254/32") unless except.include?("169.254.169.254/32")
+                end
+              end
+            end
+            puts "OK: Helm default template (#{docs.size} manifests)"
+          '
+
+          helm template ferriscd deploy/helm/ferriscd -n custom-ns | ruby -ryaml -e '
+            docs = YAML.load_stream($stdin.read).compact
+            proj = docs.find { |d| d["kind"] == "AppProject" && d.dig("metadata", "name") == "default" }
+            abort("Missing default AppProject in custom-ns render") unless proj
+            sns = proj.dig("spec", "sourceNamespaces")
+            abort("Expected default AppProject spec.sourceNamespaces == [\"custom-ns\"], got #{sns.inspect}") unless sns == ["custom-ns"]
+            puts "OK: Helm custom-ns AppProject sourceNamespaces=#{sns.inspect}"
+          '
+
+          if helm template ferriscd deploy/helm/ferriscd -n ferriscd-system \
+            --set sharding.enabled=true \
+            --set sharding.shardId=0 \
+            --set sharding.totalShards=2 \
+            --set leaderElection.leaseName=custom-lease >/dev/null 2>&1; then
+            echo "ERROR: expected sharding + leaderElection.leaseName to fail helm template" >&2
+            exit 1
+          fi
+          echo "OK: Helm rejects sharding + leaderElection.leaseName"
+
+          helm template ferriscd deploy/helm/ferriscd -n ferriscd-system \
+            --set 'rbacPolicy.rules[0].subject.kind=group' \
+            --set 'rbacPolicy.rules[0].subject.name=platform-admins' \
+            --set 'rbacPolicy.rules[0].project=*' \
+            --set 'rbacPolicy.rules[0].actions[0]=admin' | ruby -ryaml -e '
+            docs = YAML.load_stream($stdin.read).compact
+            cm = docs.find { |d| d["kind"] == "ConfigMap" && d.dig("metadata", "name") == "ferriscd-rbac-cm" }
+            abort("Missing ferriscd-rbac-cm ConfigMap") unless cm
+            policy_raw = cm.dig("data", "policy.yaml")
+            abort("Missing policy.yaml in ferriscd-rbac-cm") unless policy_raw.is_a?(String) && !policy_raw.empty?
+            policy = YAML.safe_load(policy_raw)
+            rules = policy.is_a?(Hash) ? policy["rules"] : nil
+            abort("Expected 1 rule in policy.yaml, got #{policy.inspect}") unless rules.is_a?(Array) && rules.size == 1
+            r = rules.first
+            unless r.dig("subject", "kind") == "group" && r.dig("subject", "name") == "platform-admins" && r["project"] == "*" && r["actions"] == ["admin"]
+              abort("Unexpected RBAC policy rule: #{r.inspect}")
+            end
+            puts "OK: Helm non-empty rbacPolicy.rules renders valid policy.yaml"
+          '
+
+          helm template ferriscd deploy/helm/ferriscd -n ferriscd-system \
+            -f deploy/helm/ferriscd/values-ha.yaml \
+            --set metrics.serviceMonitor.enabled=true \
+            --set rbac.impersonation.enabled=true \
+            --set networkPolicy.enabled=true \
+            --set telemetry.otlpEndpoint=http://otel-collector.monitoring:4318 \
+            --set 'multiTenant.applicationNamespaces[0]=team-a' \
+            --set webhooks.existingSecret=ferriscd-webhooks \
+            --set podDisruptionBudget.maxUnavailable=1 | ruby -ryaml -e '
+            docs = YAML.load_stream($stdin.read).compact
+            kinds = docs.map { |d| d["kind"] }
+            %w[Deployment PodDisruptionBudget ServiceMonitor NetworkPolicy ClusterRole Role].each do |k|
+              abort("Missing #{k} in HA rendered manifests") unless kinds.include?(k)
+            end
+            pdb = docs.find { |d| d["kind"] == "PodDisruptionBudget" }
+            pdb_spec = pdb["spec"] || {}
+            abort("PDB with maxUnavailable must not also set minAvailable: #{pdb_spec}") unless pdb_spec["maxUnavailable"] == 1 && !pdb_spec.key?("minAvailable")
+            docs.select { |d| d["kind"] == "NetworkPolicy" }.each do |d|
+              name = d.dig("metadata", "name")
+              (d.dig("spec", "egress") || []).each_with_index do |rule, idx|
+                to = rule["to"]
+                abort("HA NetworkPolicy #{name} egress[#{idx}] must not omit to:") unless to.is_a?(Array) && !to.empty?
+                to.each do |peer|
+                  ipb = peer["ipBlock"]
+                  next unless ipb && ipb["cidr"] == "0.0.0.0/0"
+                  except = ipb["except"] || []
+                  abort("HA NetworkPolicy #{name} egress[#{idx}] 0.0.0.0/0 must exclude 169.254.169.254/32") unless except.include?("169.254.169.254/32")
+                end
+              end
+            end
+            puts "OK: Helm HA+features template (#{docs.size} manifests)"
+          '
+
+          KUSTOMIZE_OUT=$(if command -v kustomize >/dev/null 2>&1; then kustomize build deploy/manifests; else kubectl kustomize deploy/manifests; fi)
+          printf "%s\n" "$KUSTOMIZE_OUT" | ruby -ryaml -e '
+            docs = YAML.load_stream($stdin.read).compact
+            abort("No rendered Kustomize docs") if docs.empty?
+            cluster_roles = docs.select { |d| d["kind"] == "ClusterRole" }
+            deployments = docs.select { |d| d["kind"] == "Deployment" }
+            netpols = docs.select { |d| d["kind"] == "NetworkPolicy" }
+            abort("Missing ClusterRole in Kustomize manifests") if cluster_roles.empty?
+            abort("Missing Deployment in Kustomize manifests") if deployments.empty?
+            abort("Missing NetworkPolicy in Kustomize manifests") if netpols.empty?
+
+            cluster_roles.each do |d|
+              (d["rules"] || []).each do |r|
+                groups = r["apiGroups"] || []
+                res = r["resources"] || []
+                verbs = r["verbs"] || []
+                abort("Kustomize ClusterRole must not grant */* wildcard") if groups.include?("*") && res.include?("*")
+                abort("Kustomize ClusterRole must not grant secrets") if res.include?("secrets")
+                abort("Kustomize ClusterRole must not grant impersonate") if verbs.include?("impersonate")
+                abort("Kustomize ClusterRole must not grant rbac.authorization.k8s.io") if groups.include?("rbac.authorization.k8s.io")
+                if res.include?("customresourcedefinitions")
+                  extra = verbs - %w[get list watch]
+                  abort("Kustomize ClusterRole must grant read-only CRDs, got verbs: #{verbs}") unless extra.empty?
+                end
+              end
+            end
+
+            deployments.each do |d|
+              name = d.dig("metadata", "name")
+              pod = d.dig("spec", "template", "spec") || {}
+              psc = pod["securityContext"] || {}
+              abort("Kustomize #{name} must set runAsNonRoot: true") unless psc["runAsNonRoot"] == true
+              abort("Kustomize #{name} must set runAsUser: 65532") unless psc["runAsUser"] == 65532
+              abort("Kustomize #{name} must set RuntimeDefault seccomp") unless psc.dig("seccompProfile", "type") == "RuntimeDefault"
+              (pod["containers"] || []).each do |c|
+                sc = c["securityContext"] || {}
+                abort("Kustomize #{c["name"]} must set readOnlyRootFilesystem: true") unless sc["readOnlyRootFilesystem"] == true
+                abort("Kustomize #{c["name"]} must set allowPrivilegeEscalation: false") unless sc["allowPrivilegeEscalation"] == false
+                abort("Kustomize #{c["name"]} must drop ALL capabilities") unless (sc.dig("capabilities", "drop") || []).include?("ALL")
+              end
+            end
+
+            netpols.each do |d|
+              name = d.dig("metadata", "name")
+              pt = d.dig("spec", "policyTypes") || []
+              abort("Kustomize NetworkPolicy #{name} must set policyTypes [Ingress, Egress], got #{pt}") unless pt == %w[Ingress Egress]
+              (d.dig("spec", "egress") || []).each_with_index do |rule, idx|
+                to = rule["to"]
+                abort("Kustomize NetworkPolicy #{name} egress[#{idx}] must not omit to:") unless to.is_a?(Array) && !to.empty?
+                to.each do |peer|
+                  ipb = peer["ipBlock"]
+                  next unless ipb && ipb["cidr"] == "0.0.0.0/0"
+                  except = ipb["except"] || []
+                  abort("Kustomize NetworkPolicy #{name} egress[#{idx}] 0.0.0.0/0 must exclude 169.254.169.254/32") unless except.include?("169.254.169.254/32")
+                end
+              end
+            end
+            puts "OK: Kustomize overlay (#{docs.size} manifests)"
           '
 
   ci:
