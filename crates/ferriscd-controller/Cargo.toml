@@ -48,6 +48,12 @@ kube = { workspace = true, features = ["unstable-runtime"] }
 serde_json.workspace = true
 # `T15.1`: the metric families, their typed label sets, and the text (0.0.4) exposition.
 prometheus-client.workspace = true
+# `T15.2`: optional OpenTelemetry OTLP tracing layer (no-op unless `OTEL_EXPORTER_OTLP_ENDPOINT`
+# is set).
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

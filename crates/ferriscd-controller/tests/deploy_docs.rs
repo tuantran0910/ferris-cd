@@ -268,3 +268,37 @@ fn the_metrics_listener_and_its_cardinality_contract_are_documented() {
         "the README must state that `/metrics` is not served on the API port"
     );
 }
+
+/// **`T15.2`:** OpenTelemetry OTLP configuration, Kubernetes `events.k8s.io/v1` RBAC, and the
+/// 5-minute consecutive `Warning` deduplication contract are documented in `deploy/README.md`.
+#[test]
+fn otlp_tracing_and_kubernetes_events_rbac_are_documented() {
+    for expected in [
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_SERVICE_NAME",
+        "events.k8s.io",
+        "SyncSucceeded",
+        "ResourcePruned",
+        "SyncFailed",
+        "5-minute",
+    ] {
+        assert!(
+            README.contains(expected),
+            "deploy/README.md must document {expected:?}"
+        );
+    }
+    let documents = rbac_documents();
+    let has_events_rule = documents.iter().any(|(kind, _, rules)| {
+        kind == "ClusterRole"
+            && rules.iter().any(|rule| {
+                contains(rule, "apiGroups", "events.k8s.io")
+                    && contains(rule, "resources", "events")
+                    && contains(rule, "verbs", "create")
+                    && contains(rule, "verbs", "patch")
+            })
+    });
+    assert!(
+        has_events_rule,
+        "the ClusterRole sample must grant create/patch on events.k8s.io/v1 events"
+    );
+}
