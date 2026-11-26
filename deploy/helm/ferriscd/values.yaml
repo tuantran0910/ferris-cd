@@ -1,0 +1,453 @@
+# Default values for FerrisCD.
+#
+# This chart deploys the FerrisCD modular-monolith control plane (`ferriscd server` =
+# controller + in-process REST API + dedicated Prometheus metrics listener) plus the
+# optional FerrisCD Web Dashboard (`ferriscd-web`).
+#
+# Security defaults:
+# - Kubernetes `restricted` PodSecurityStandard (`runAsNonRoot`, UID/GID 65532,
+#   `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `drop: ["ALL"]`,
+#   `seccompProfile: RuntimeDefault`) with a bounded `emptyDir` mounted at `/tmp`.
+# - Least-privilege RBAC: `secrets` is granted ONLY in the control-plane namespace Role
+#   (for `ferriscd.io/secret-type=repository` and `cluster`), NEVER cluster-wide, and NO
+#   `apiGroups: ["*"] / resources: ["*"]` wildcard exists by default.
+# - `TokenReview` API authentication (`--auth-policy token-review`) + default-deny
+#   `ferriscd-rbac-cm` ConfigMap until explicit rules are added under `rbacPolicy.rules`.
+# - Default-deny `NetworkPolicy` (ingress & egress) with explicit allow rules for DNS,
+#   Kubernetes API server, and Git HTTPS/SSH (blocking cloud metadata IMDS `169.254.169.254/32`).
+#
+# High Availability:
+# For HA active/standby deployments, see `values-ha.yaml` (sets `replicaCount: 2`,
+# `leaderElection.enabled: true`, and `podDisruptionBudget.enabled: true`).
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Number of `ferriscd server` replicas.
+# When replicaCount > 1, `--leader-election`, anti-affinity, topology spread constraints,
+# and PodDisruptionBudget are enabled automatically to prevent split-brain double applies.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/ferriscd/ferriscd
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion ("1.0.0").
+  tag: ""
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  # The controller/server requires its ServiceAccount token to talk to the Kubernetes API.
+  automount: true
+  annotations: {}
+  # If empty and `create: true`, a name is generated from the chart fullname.
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# Kubernetes `restricted` PodSecurityStandard (UID/GID 65532 matches the hardened image).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Control-plane server (`ferriscd server`) runtime configuration.
+server:
+  # REST API & health probe port (`/api/v1/*`, `/healthz`, `/readyz`, `/api/v1/webhooks/*`).
+  apiPort: 8080
+  # Dedicated internal Prometheus metrics port (`/metrics`). Must differ from `apiPort`.
+  metricsPort: 9090
+  # Authentication policy for `/api/v1/*`: `token-review` (default), `deny-all`, or
+  # `pass-through` (local development escape hatch only — never expose off loopback).
+  authPolicy: token-review
+  # Directory inside the writable `/tmp` emptyDir for Git mirror cache & worktrees.
+  workRoot: /tmp/ferriscd-repos
+  # RUST_LOG filter for structured tracing output.
+  logLevel: info
+  # Opt-in development flags (keep `false` in production!).
+  allowLocalRepos: false
+  allowInsecureClusterTls: false
+  # Additional CLI flags passed verbatim to `ferriscd server`.
+  extraArgs: []
+  # Additional environment variables appended to the server container.
+  extraEnv: []
+
+# Active/standby HA leader election (`coordination.k8s.io/v1` Lease in release namespace).
+# Automatically enabled whenever `replicaCount > 1` or `sharding.enabled: true`.
+leaderElection:
+  enabled: false
+  # Optional Lease name override (controller default: `ferriscd-controller-leader`).
+  # MUST remain empty when `sharding.enabled: true` (each shard owns `ferriscd-leader-shard-<id>`).
+  leaseName: ""
+  # Lease duration in seconds (must be strictly greater than 3 * renewIntervalSeconds).
+  leaseDurationSeconds: 15
+  # Lease renewal interval in seconds (must be strictly less than leaseDurationSeconds / 3).
+  renewIntervalSeconds: 4
+
+# Optional deterministic Application sharding (`T13.3`).
+# When enabled, `--leader-election` is automatically added and `leaderElection.leaseName`
+# must remain empty. Both `shardId` and `totalShards` must be set (`0 <= shardId < totalShards`).
+sharding:
+  enabled: false
+  shardId: null
+  totalShards: null
+
+# Hardened GitHub/GitLab webhook listener configuration (`T14.2`).
+webhooks:
+  debounceSeconds: 2
+  maxJitterMillis: 500
+  # Name of an existing Secret in the release namespace containing webhook credentials.
+  # Keys are mounted as `FERRISCD_GITHUB_WEBHOOK_SECRET` and `FERRISCD_GITLAB_WEBHOOK_TOKEN`
+  # (never passed as CLI arguments so they never appear in `ps`).
+  existingSecret: ""
+  githubSecretKey: github-webhook-secret
+  gitlabTokenKey: gitlab-webhook-token
+
+# Optional OpenTelemetry OTLP trace exporter (`T15.2`).
+# When `otlpEndpoint` is empty, zero OTLP exporter or background thread is created.
+telemetry:
+  otlpEndpoint: ""
+  serviceName: ferriscd-controller
+
+# Multi-tenancy (`T12.2`): namespaces allowed to host `Application` CRs.
+# Empty list (default) restricts watching to the release control-plane namespace only.
+# Provide explicit namespace names (e.g. `["team-a", "team-b"]`) to create least-privilege
+# per-namespace Roles, or `["*"]` for cluster-wide Apps-in-any-namespace.
+multiTenant:
+  applicationNamespaces: []
+
+# Least-privilege RBAC configuration (Trap Guard T16.6).
+rbac:
+  create: true
+
+  # Opt-in ServiceAccount impersonation (`T12.3`) for multi-tenant deployments.
+  # Grants `impersonate` on `users`, `groups`, and `serviceaccounts` in the ClusterRole.
+  # Never impersonates `system:masters` (enforced in controller code).
+  impersonation:
+    enabled: false
+
+  # Opt-in write access (`create`, `patch`, `update`, `delete`) on
+  # `apiextensions.k8s.io/customresourcedefinitions`. Read-only (`get`, `list`, `watch`)
+  # is always granted for API discovery.
+  manageCrds: false
+
+  # Opt-in write access on `rbac.authorization.k8s.io` (`roles`, `rolebindings`,
+  # `clusterroles`, `clusterrolebindings`). Disabled by default to prevent RBAC escalation;
+  # prefer impersonated tenant ServiceAccounts for managing RBAC objects.
+  manageRbacResources: false
+
+  # Enumerated workload rules granted to the controller's ClusterRole.
+  # NEVER add `apiGroups: ["*"] / resources: ["*"]` or `secrets` here: repository and
+  # remote-cluster Secrets are strictly scoped to the control-plane namespace Role.
+  # If Applications manage workload Secrets, bind a narrow Role in each destination
+  # namespace (or use per-tenant impersonated ServiceAccounts).
+  workloadRules:
+    - apiGroups: [""]
+      resources:
+        - configmaps
+        - services
+        - serviceaccounts
+        - persistentvolumeclaims
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    # Read-only Pod access for `GET /api/v1/applications/:ns/:name/resources` DAG traversal.
+    - apiGroups: [""]
+      resources:
+        - pods
+      verbs: ["get", "list", "watch"]
+    # Namespace reconciliation without automatic `delete` (namespace pruning is opt-in).
+    - apiGroups: [""]
+      resources:
+        - namespaces
+      verbs: ["get", "list", "watch", "create", "patch", "update"]
+    - apiGroups: ["apps"]
+      resources:
+        - deployments
+        - statefulsets
+        - daemonsets
+        - replicasets
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    - apiGroups: ["batch"]
+      resources:
+        - jobs
+        - cronjobs
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    - apiGroups: ["networking.k8s.io"]
+      resources:
+        - ingresses
+        - networkpolicies
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    - apiGroups: ["autoscaling"]
+      resources:
+        - horizontalpodautoscalers
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    - apiGroups: ["policy"]
+      resources:
+        - poddisruptionbudgets
+      verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+
+  # Additional ClusterRole rules (e.g. for custom CRDs your Applications reconcile).
+  # Explicitly opt-in and empty by default. Do NOT grant cluster-wide `secrets` here.
+  extraClusterRules: []
+
+# Project-scoped REST API RBAC ConfigMap (`ferriscd-rbac-cm`, key `policy.yaml`, `T14.4`).
+# Default-deny: an empty `rules: []` refuses every authenticated caller until explicit
+# grants are configured.
+rbacPolicy:
+  create: true
+  # Example:
+  # rules:
+  #   - subject:
+  #       kind: group
+  #       name: platform-admins
+  #     project: "*"
+  #     actions: [admin]
+  #   - subject:
+  #       kind: user
+  #       name: system:serviceaccount:ferriscd-system:ci
+  #     project: default
+  #     actions: [get, diff, sync]
+  rules: []
+
+# Optional `default` AppProject (`deploy/manifests/default-project.yaml`).
+# Permissive single-tenant default; narrow before enabling multi-tenancy!
+defaultProject:
+  create: true
+  description: >-
+    Default FerrisCD project used when an Application does not name a project.
+    Permits every source repository, destination, GroupKind, and ServiceAccount;
+    it is only appropriate for single-tenant clusters.
+  # Namespaces allowed to host Applications referencing this project.
+  # When empty, defaults to `[{{ .Release.Namespace }}]`.
+  sourceNamespaces: []
+  sourceRepos:
+    - "*"
+  destinations:
+    - cluster: in-cluster
+      namespace: "*"
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  namespaceResourceBlacklist: []
+  allowedServiceAccounts:
+    - "*"
+
+# Writable ephemeral storage mounted at `/tmp` for Git mirrors, ephemeral `0600` SSH keys,
+# and renderer scratch directories (required because `readOnlyRootFilesystem: true`).
+persistence:
+  tmpSizeLimit: 1Gi
+
+service:
+  type: ClusterIP
+  annotations: {}
+  apiPort: 8080
+  metricsPort: 9090
+
+# Prometheus ServiceMonitor (Prometheus Operator CRD `monitoring.coreos.com/v1`).
+metrics:
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels: {}
+    relabelings: []
+    metricRelabelings: []
+
+# PodDisruptionBudget for `ferriscd server`.
+# `enabled: null` automatically enables the PDB when `replicaCount > 1`.
+# Set `enabled: true` or `enabled: false` to override explicitly.
+# If `maxUnavailable` is explicitly set (non-null), it takes precedence over `minAvailable`.
+podDisruptionBudget:
+  enabled: null
+  minAvailable: 1
+  maxUnavailable: null
+
+# Default-deny NetworkPolicy (ingress + egress) with explicit allowlists (Trap Guard T16.6).
+networkPolicy:
+  enabled: true
+
+  ingress:
+    # Allow pods in the release namespace (e.g. `ferriscd-web`) to reach the API port.
+    allowSameNamespaceApi: true
+    # Additional NetworkPolicyPeer entries allowed to reach `server.apiPort` (e.g. Ingress controller).
+    # Example:
+    # apiFrom:
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: ingress-nginx
+    apiFrom: []
+    # NetworkPolicyPeer entries allowed to scrape `server.metricsPort` (`/metrics`).
+    # Empty by default so metrics are not exposed cluster-wide without an explicit scraper selector.
+    # Example:
+    # metricsFrom:
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: monitoring
+    metricsFrom: []
+
+  egress:
+    dns:
+      enabled: true
+      peers:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+
+    kubeApi:
+      enabled: true
+      ports:
+        - 443
+        - 6443
+      # Optional CIDR allowlist for the Kubernetes API server endpoint(s).
+      # When empty, allows `0.0.0.0/0` excluding `except` (which blocks cloud metadata
+      # IMDS `169.254.169.254/32` by default) for portability across kind/EKS/GKE/AKS.
+      # Pin to your cluster's API server CIDR(s) in hardened production clusters.
+      # Note: because port 443 is included by default, pinning `gitHttps.cidrs` also
+      # requires pinning `kubeApi.cidrs` (or restricting `kubeApi.ports` to `[6443]`
+      # on post-DNAT CNIs) so port 443 egress is not widened by this rule.
+      cidrs: []
+      except:
+        - 169.254.169.254/32
+
+    gitHttps:
+      enabled: true
+      ports:
+        - 443
+      # Optional CIDR allowlist for HTTPS Git servers. When empty, allows `0.0.0.0/0`
+      # excluding `except` (which blocks cloud metadata IMDS SSRF by default).
+      cidrs: []
+      except:
+        - 169.254.169.254/32
+
+    gitSsh:
+      enabled: true
+      ports:
+        - 22
+      # Optional CIDR allowlist for SSH Git servers. When empty, allows `0.0.0.0/0`
+      # excluding `except`.
+      cidrs: []
+      except:
+        - 169.254.169.254/32
+
+    # OpenTelemetry OTLP egress. Enabled automatically when `telemetry.otlpEndpoint` is set.
+    otlp:
+      enabled: false
+      ports:
+        - 4318
+      peers: []
+
+    # Additional custom egress rules (e.g. remote clusters or private Helm chart repos on custom ports).
+    extraRules: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+probes:
+  liveness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+nodeSelector: {}
+tolerations: []
+# When empty and `replicaCount > 1`, a preferred podAntiAffinity across hostnames is added.
+affinity: {}
+# When empty and `replicaCount > 1`, a default hostname topologySpreadConstraint is added.
+topologySpreadConstraints: []
+priorityClassName: ""
+terminationGracePeriodSeconds: 30
+
+# Optional FerrisCD Modern Web Dashboard (`apps/ferriscd-web`).
+# Runs under the same `restricted` PodSecurityStandard (`readOnlyRootFilesystem: true`,
+# UID/GID 65532, `/tmp` emptyDir) with `automountServiceAccountToken: false`.
+web:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/ferriscd/ferriscd-web
+    pullPolicy: IfNotPresent
+    # Overrides the image tag whose default is the chart appVersion ("1.0.0").
+    tag: ""
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8080
+    annotations: {}
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  tmpSizeLimit: 128Mi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
+  probes:
+    liveness:
+      path: /healthz
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readiness:
+      path: /healthz
+      initialDelaySeconds: 3
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+  networkPolicy:
+    allowSameNamespace: true
+    ingressFrom: []
+    # Disabled by default: the stock `ferriscd-web` image serves static assets only;
+    # `/api` traffic is routed to `ferriscd server` by an Ingress or reverse proxy.
+    # Enable only if you mount a custom Nginx reverse-proxy config inside `ferriscd-web`.
+    allowApiProxyEgress: false
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []

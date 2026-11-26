@@ -1,0 +1,15 @@
+# Project-scoped REST API RBAC ConfigMap (`T14.4`).
+# Default-deny: an empty `rules: []` refuses every authenticated caller until explicit
+# subject/project/action grants are added.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ferriscd-rbac-cm
+  namespace: ferriscd-system
+  labels:
+    app.kubernetes.io/name: ferriscd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: ferriscd
+data:
+  policy.yaml: |
+    rules: []

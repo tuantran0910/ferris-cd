@@ -1,0 +1,36 @@
+{{- if .Values.defaultProject.create }}
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: {{ .Release.Namespace }}
+  labels:
+    helm.sh/chart: {{ include "ferriscd.chart" . }}
+    app.kubernetes.io/name: {{ include "ferriscd.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: appproject
+    {{- if .Chart.AppVersion }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    {{- end }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  description: {{ .Values.defaultProject.description | quote }}
+  sourceNamespaces:
+    {{- if .Values.defaultProject.sourceNamespaces }}
+    {{- toYaml .Values.defaultProject.sourceNamespaces | nindent 4 }}
+    {{- else }}
+    - {{ .Release.Namespace | quote }}
+    {{- end }}
+  sourceRepos:
+    {{- toYaml .Values.defaultProject.sourceRepos | nindent 4 }}
+  destinations:
+    {{- toYaml .Values.defaultProject.destinations | nindent 4 }}
+  clusterResourceWhitelist:
+    {{- toYaml .Values.defaultProject.clusterResourceWhitelist | nindent 4 }}
+  namespaceResourceWhitelist:
+    {{- toYaml .Values.defaultProject.namespaceResourceWhitelist | nindent 4 }}
+  namespaceResourceBlacklist:
+    {{- toYaml .Values.defaultProject.namespaceResourceBlacklist | nindent 4 }}
+  allowedServiceAccounts:
+    {{- toYaml .Values.defaultProject.allowedServiceAccounts | nindent 4 }}
+{{- end }}

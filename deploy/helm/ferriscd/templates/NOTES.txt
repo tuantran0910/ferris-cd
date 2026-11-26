@@ -1,0 +1,40 @@
+FerrisCD {{ .Chart.AppVersion }} has been deployed to namespace {{ .Release.Namespace }}.
+
+1. Verify the control plane is ready:
+   kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "ferriscd.fullname" . }}
+{{- if .Values.web.enabled }}
+   kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "ferriscd.fullname" . }}-web
+{{- end }}
+
+2. Configure project-scoped API RBAC (default-deny until rules are added):
+{{- if and .Values.rbacPolicy.create (empty .Values.rbacPolicy.rules) }}
+   WARNING: `ferriscd-rbac-cm` currently has `rules: []` (default-deny).
+   Add subject/project/action grants under `rbacPolicy.rules` in your values file and upgrade:
+     helm upgrade {{ .Release.Name }} deploy/helm/ferriscd -n {{ .Release.Namespace }} -f values-rbac.yaml
+{{- else }}
+   Policy ConfigMap: {{ .Release.Namespace }}/ferriscd-rbac-cm (key: policy.yaml)
+{{- end }}
+
+3. Access the API locally via port-forward:
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ferriscd.fullname" . }} 8080:{{ .Values.service.apiPort }}
+   curl http://127.0.0.1:8080/healthz
+{{- if .Values.web.enabled }}
+
+4. Access the Web Dashboard locally via port-forward:
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ferriscd.fullname" . }}-web 5173:{{ .Values.web.service.port }}
+   Open http://127.0.0.1:5173
+   Note: `ferriscd-web` serves the static SPA only; in production route `/api` to
+   `svc/{{ include "ferriscd.fullname" . }}:{{ .Values.service.apiPort }}` via an Ingress or reverse proxy.
+{{- end }}
+
+5. Security reminders:
+   - Repository (`ferriscd.io/secret-type=repository`) and remote-cluster (`ferriscd.io/secret-type=cluster`)
+     Secrets are read ONLY from namespace `{{ .Release.Namespace }}`.
+{{- if .Values.defaultProject.create }}
+   - The `default` AppProject is permissive for single-tenant use. Narrow its allowlists before
+     enabling multi-tenancy (`multiTenant.applicationNamespaces` + `rbac.impersonation.enabled`).
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+   - NetworkPolicy is enabled (default-deny). Configure `networkPolicy.ingress.apiFrom`,
+     `networkPolicy.ingress.metricsFrom`, and `networkPolicy.egress.kubeApi.cidrs` for your cluster.
+{{- end }}

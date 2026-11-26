@@ -1,0 +1,20 @@
+{{- if .Values.rbacPolicy.create }}
+# Project-scoped REST API RBAC ConfigMap (`T14.4`).
+# The ConfigMap name (`ferriscd-rbac-cm`) and key (`policy.yaml`) are read at startup by
+# `ferriscd server`. Default-deny: an empty `rules: []` refuses every authenticated caller.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ferriscd-rbac-cm
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferriscd.labels" . | nindent 4 }}
+data:
+  policy.yaml: |
+    {{- if .Values.rbacPolicy.rules }}
+    rules:
+      {{- toYaml .Values.rbacPolicy.rules | nindent 6 }}
+    {{- else }}
+    rules: []
+    {{- end }}
+{{- end }}

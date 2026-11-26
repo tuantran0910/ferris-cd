@@ -1,0 +1,18 @@
+{{- if include "ferriscd.pdbEnabled" . }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ferriscd.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferriscd.labels" . | nindent 4 }}
+spec:
+  {{- if not (kindIs "invalid" .Values.podDisruptionBudget.maxUnavailable) }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- else if not (kindIs "invalid" .Values.podDisruptionBudget.minAvailable) }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ferriscd.selectorLabels" . | nindent 6 }}
+{{- end }}

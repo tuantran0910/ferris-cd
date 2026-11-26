@@ -1,0 +1,182 @@
+{{- if .Values.rbac.create }}
+{{- $saName := include "ferriscd.serviceAccountName" . }}
+{{- $fullname := include "ferriscd.fullname" . }}
+{{- $watchAllNamespaces := has "*" .Values.multiTenant.applicationNamespaces }}
+# Control-plane namespace Role:
+# Strictly scopes `secrets` (repository credentials and remote-cluster registrations),
+# `configmaps` (`ferriscd-rbac-cm`), leader-election `leases`, control-plane `AppProject`s,
+# `Application`s, and `events` to the control-plane namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferriscd.labels" . | nindent 4 }}
+rules:
+  # Leader-election Lease (`T13.2`) and per-shard Leases (`T13.3`).
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  # Repository credentials (`ferriscd.io/secret-type=repository`, `T12.4`) and
+  # remote-cluster registrations (`ferriscd.io/secret-type=cluster`, `T13.1`).
+  # NEVER granted in the ClusterRole.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  # Project-scoped REST API RBAC ConfigMap (`ferriscd-rbac-cm`, `T14.4`).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  # Rate-limited Kubernetes Events attached to Applications (`T15.2`).
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Application and AppProject lifecycle in the control-plane namespace.
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["appprojects"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferriscd.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ .Release.Namespace }}
+{{- if and (not $watchAllNamespaces) .Values.multiTenant.applicationNamespaces }}
+{{- range $ns := .Values.multiTenant.applicationNamespaces }}
+{{- if ne $ns $.Release.Namespace }}
+---
+# Least-privilege tenant-namespace Role (`T12.2`): grants Application lifecycle and
+# event emission in an explicitly allowlisted tenant namespace without cluster-wide scope.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-tenant
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ferriscd.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-tenant
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ferriscd.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-tenant
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- end }}
+---
+# Least-privilege ClusterRole:
+# Deliberately excludes `secrets` and `*/*` wildcards by default.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "ferriscd.labels" . | nindent 4 }}
+rules:
+  # Kubernetes TokenReview AuthN for `/api/v1/*` (`T14.3`).
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # CRD discovery (write verbs require explicit `rbac.manageCrds: true`).
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    {{- if .Values.rbac.manageCrds }}
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+    {{- else }}
+    verbs: ["get", "list", "watch"]
+    {{- end }}
+  {{- if $watchAllNamespaces }}
+  # Cluster-wide Application watching enabled via `multiTenant.applicationNamespaces: ["*"]`.
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  {{- end }}
+  {{- if .Values.rbac.impersonation.enabled }}
+  # Opt-in ServiceAccount impersonation (`T12.3`). Controller refuses `system:masters`.
+  - apiGroups: [""]
+    resources: ["users", "groups"]
+    verbs: ["impersonate"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["impersonate"]
+  {{- end }}
+  {{- if .Values.rbac.manageRbacResources }}
+  # Opt-in RBAC resource reconciliation.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  {{- end }}
+  {{- with .Values.rbac.workloadRules }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+  {{- with .Values.rbac.extraClusterRules }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "ferriscd.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

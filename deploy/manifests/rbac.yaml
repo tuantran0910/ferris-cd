@@ -1,0 +1,134 @@
+# Least-privilege RBAC for FerrisCD.
+#
+# Control-plane namespace Role:
+# Strictly scopes `secrets` (`ferriscd.io/secret-type=repository` and `cluster`),
+# `configmaps` (`ferriscd-rbac-cm`), leader-election `leases`, `events`, and
+# control-plane `Application`/`AppProject` access to `ferriscd-system` only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferriscd
+  namespace: ferriscd-system
+  labels:
+    app.kubernetes.io/name: ferriscd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: ferriscd
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["appprojects"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferriscd
+  namespace: ferriscd-system
+  labels:
+    app.kubernetes.io/name: ferriscd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: ferriscd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferriscd
+subjects:
+  - kind: ServiceAccount
+    name: ferriscd
+    namespace: ferriscd-system
+---
+# Least-privilege ClusterRole:
+# Deliberately excludes `secrets` and `*/*` wildcards. Extend via Kustomize patch if your
+# Applications reconcile additional CRDs or require opt-in ServiceAccount impersonation.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferriscd
+  labels:
+    app.kubernetes.io/name: ferriscd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: ferriscd
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - services
+      - serviceaccounts
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources:
+      - pods
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources:
+      - namespaces
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - networkpolicies
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources:
+      - horizontalpodautoscalers
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["policy"]
+    resources:
+      - poddisruptionbudgets
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferriscd
+  labels:
+    app.kubernetes.io/name: ferriscd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: ferriscd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferriscd
+subjects:
+  - kind: ServiceAccount
+    name: ferriscd
+    namespace: ferriscd-system

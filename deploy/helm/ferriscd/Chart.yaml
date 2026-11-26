@@ -1,0 +1,18 @@
+apiVersion: v2
+name: ferriscd
+description: Kubernetes-native GitOps Continuous Delivery platform written in Rust
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">= 1.29.0-0"
+keywords:
+  - gitops
+  - kubernetes
+  - continuous-delivery
+  - rust
+  - ferriscd
+home: https://github.com/tuantran0910/ferris-cd
+sources:
+  - https://github.com/tuantran0910/ferris-cd
+maintainers:
+  - name: FerrisCD Maintainers

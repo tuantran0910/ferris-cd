@@ -1,0 +1,40 @@
+# Production High-Availability overlay for FerrisCD.
+#
+# Usage:
+#   helm install ferriscd deploy/helm/ferriscd \
+#     -n ferriscd-system --create-namespace \
+#     -f deploy/helm/ferriscd/values-ha.yaml
+#
+# Runs 2 active/standby `ferriscd server` replicas coordinated by a namespaced
+# `coordination.k8s.io/v1` Lease (`ferriscd-controller-leader`), protected by a
+# PodDisruptionBudget, pod anti-affinity, and hostname topology spread constraints.
+
+replicaCount: 2
+
+leaderElection:
+  enabled: true
+  leaseDurationSeconds: 15
+  renewIntervalSeconds: 4
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+web:
+  enabled: true
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi

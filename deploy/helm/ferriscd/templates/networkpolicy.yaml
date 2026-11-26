@@ -1,0 +1,212 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $fullname := include "ferriscd.fullname" . }}
+{{- $otlpEnabled := or .Values.networkPolicy.egress.otlp.enabled (ne .Values.telemetry.otlpEndpoint "") }}
+# Default-deny NetworkPolicy for `ferriscd server` (Ingress + Egress) with explicit allow rules.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferriscd.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ferriscd.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  {{- $hasApiIngress := or .Values.networkPolicy.ingress.allowSameNamespaceApi (gt (len .Values.networkPolicy.ingress.apiFrom) 0) }}
+  {{- $hasMetricsIngress := gt (len .Values.networkPolicy.ingress.metricsFrom) 0 }}
+  {{- if or $hasApiIngress $hasMetricsIngress }}
+  ingress:
+    {{- if $hasApiIngress }}
+    - from:
+        {{- if .Values.networkPolicy.ingress.allowSameNamespaceApi }}
+        - podSelector: {}
+        {{- end }}
+        {{- with .Values.networkPolicy.ingress.apiFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.server.apiPort }}
+    {{- end }}
+    {{- if $hasMetricsIngress }}
+    - from:
+        {{- toYaml .Values.networkPolicy.ingress.metricsFrom | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.server.metricsPort }}
+    {{- end }}
+  {{- else }}
+  ingress: []
+  {{- end }}
+  {{- $hasEgress := or .Values.networkPolicy.egress.dns.enabled .Values.networkPolicy.egress.kubeApi.enabled .Values.networkPolicy.egress.gitHttps.enabled .Values.networkPolicy.egress.gitSsh.enabled $otlpEnabled (gt (len .Values.networkPolicy.egress.extraRules) 0) }}
+  {{- if $hasEgress }}
+  egress:
+    {{- if .Values.networkPolicy.egress.dns.enabled }}
+    # DNS resolution (UDP/TCP 53).
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      {{- with .Values.networkPolicy.egress.dns.peers }}
+      to:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.kubeApi.enabled }}
+    # Kubernetes API server access. Pin `networkPolicy.egress.kubeApi.cidrs` in production
+    # (note: pinning `gitHttps.cidrs` also requires pinning `kubeApi.cidrs` or restricting
+    # `kubeApi.ports` to `[6443]` on post-DNAT CNIs).
+    - ports:
+        {{- range .Values.networkPolicy.egress.kubeApi.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+      to:
+        {{- if .Values.networkPolicy.egress.kubeApi.cidrs }}
+        {{- range .Values.networkPolicy.egress.kubeApi.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- else }}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            {{- with .Values.networkPolicy.egress.kubeApi.except }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+        {{- end }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.gitHttps.enabled }}
+    # Git HTTPS remotes (blocks cloud metadata IMDS `169.254.169.254/32` by default).
+    - ports:
+        {{- range .Values.networkPolicy.egress.gitHttps.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+      to:
+        {{- if .Values.networkPolicy.egress.gitHttps.cidrs }}
+        {{- range .Values.networkPolicy.egress.gitHttps.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- else }}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            {{- with .Values.networkPolicy.egress.gitHttps.except }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+        {{- end }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.gitSsh.enabled }}
+    # Git SSH remotes (blocks cloud metadata IMDS `169.254.169.254/32` by default).
+    - ports:
+        {{- range .Values.networkPolicy.egress.gitSsh.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+      to:
+        {{- if .Values.networkPolicy.egress.gitSsh.cidrs }}
+        {{- range .Values.networkPolicy.egress.gitSsh.cidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- else }}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            {{- with .Values.networkPolicy.egress.gitSsh.except }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+        {{- end }}
+    {{- end }}
+    {{- if $otlpEnabled }}
+    # Optional OpenTelemetry OTLP trace exporter egress.
+    - ports:
+        {{- range .Values.networkPolicy.egress.otlp.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+      to:
+        {{- if .Values.networkPolicy.egress.otlp.peers }}
+        {{- toYaml .Values.networkPolicy.egress.otlp.peers | nindent 8 }}
+        {{- else }}
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+        {{- end }}
+    {{- end }}
+    {{- with .Values.networkPolicy.egress.extraRules }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- else }}
+  egress: []
+  {{- end }}
+{{- if .Values.web.enabled }}
+---
+# Default-deny NetworkPolicy for `ferriscd-web` (Ingress + Egress).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-web
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferriscd.webLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ferriscd.webSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  {{- $hasWebIngress := or .Values.web.networkPolicy.allowSameNamespace (gt (len .Values.web.networkPolicy.ingressFrom) 0) }}
+  {{- if $hasWebIngress }}
+  ingress:
+    - from:
+        {{- if .Values.web.networkPolicy.allowSameNamespace }}
+        - podSelector: {}
+        {{- end }}
+        {{- with .Values.web.networkPolicy.ingressFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.web.service.targetPort }}
+  {{- else }}
+  ingress: []
+  {{- end }}
+  {{- $hasWebEgress := or .Values.networkPolicy.egress.dns.enabled .Values.web.networkPolicy.allowApiProxyEgress }}
+  {{- if $hasWebEgress }}
+  egress:
+    {{- if .Values.networkPolicy.egress.dns.enabled }}
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+      {{- with .Values.networkPolicy.egress.dns.peers }}
+      to:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.web.networkPolicy.allowApiProxyEgress }}
+    # Opt-in egress for custom Nginx reverse-proxy overrides routing `/api` to `ferriscd server`.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.server.apiPort }}
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "ferriscd.selectorLabels" . | nindent 14 }}
+    {{- end }}
+  {{- else }}
+  egress: []
+  {{- end }}
+{{- end }}
+{{- end }}

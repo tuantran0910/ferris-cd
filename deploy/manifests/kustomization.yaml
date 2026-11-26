@@ -1,0 +1,28 @@
+# Kustomize install overlay for FerrisCD (`kubectl apply -k deploy/manifests`).
+#
+# Note: On a brand-new cluster, apply CRDs first so the `AppProject` CRD establishes
+# before `default-project.yaml` is submitted (or run two-pass apply):
+#   kubectl apply -f deploy/crds/ && kubectl apply -k deploy/manifests
+#
+# Installs:
+# - CRDs (`Application`, `AppProject`) — byte-for-byte synced with `deploy/crds/` (enforced in CI)
+# - `ferriscd-system` Namespace with Kubernetes `restricted` PodSecurity Admission labels
+# - Least-privilege RBAC (namespaced `Role`/`RoleBinding` + scoped `ClusterRole`/`ClusterRoleBinding`)
+# - Default-deny `ferriscd-rbac-cm` ConfigMap and single-tenant `default` AppProject
+# - Hardened `ferriscd server` Deployment (`readOnlyRootFilesystem`, UID 65532, `/tmp` emptyDir)
+# - ClusterIP Service (API `:8080` + dedicated Prometheus metrics `:9090`)
+# - Default-deny `NetworkPolicy` (DNS + Kubernetes API + Git HTTPS/SSH egress)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - crds/applications.ferriscd.io.yaml
+  - crds/appprojects.ferriscd.io.yaml
+  - namespace.yaml
+  - serviceaccount.yaml
+  - rbac.yaml
+  - rbac-configmap.yaml
+  - default-project.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml

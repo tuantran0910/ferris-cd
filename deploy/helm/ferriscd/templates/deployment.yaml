@@ -1,0 +1,189 @@
+{{- include "ferriscd.validateValues" . -}}
+{{- $leaderElection := include "ferriscd.leaderElectionEnabled" . -}}
+{{- $replicas := int .Values.replicaCount -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ferriscd.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ferriscd.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "ferriscd.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- if or .Values.rbacPolicy.create .Values.podAnnotations }}
+      annotations:
+        {{- if .Values.rbacPolicy.create }}
+        checksum/rbac-policy: {{ include (print $.Template.BasePath "/rbac-configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      labels:
+        {{- include "ferriscd.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ferriscd.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName | quote }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: ferriscd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - server
+            - --namespace
+            - {{ .Release.Namespace | quote }}
+            - --api-addr
+            - {{ printf "0.0.0.0:%d" (int .Values.server.apiPort) | quote }}
+            - --metrics-addr
+            - {{ printf "0.0.0.0:%d" (int .Values.server.metricsPort) | quote }}
+            - --auth-policy
+            - {{ .Values.server.authPolicy | quote }}
+            - --work-root
+            - {{ .Values.server.workRoot | quote }}
+            - --webhook-debounce-seconds
+            - {{ .Values.webhooks.debounceSeconds | int | quote }}
+            - --webhook-max-jitter-millis
+            - {{ .Values.webhooks.maxJitterMillis | int | quote }}
+            {{- if .Values.server.allowLocalRepos }}
+            - --allow-local-repos
+            {{- end }}
+            {{- if .Values.server.allowInsecureClusterTls }}
+            - --allow-insecure-cluster-tls
+            {{- end }}
+            {{- if $leaderElection }}
+            - --leader-election
+            - --leader-election-lease-duration-seconds
+            - {{ .Values.leaderElection.leaseDurationSeconds | int | quote }}
+            - --leader-election-renew-interval-seconds
+            - {{ .Values.leaderElection.renewIntervalSeconds | int | quote }}
+            {{- if and (not .Values.sharding.enabled) .Values.leaderElection.leaseName }}
+            - --leader-election-lease-name
+            - {{ .Values.leaderElection.leaseName | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.sharding.enabled }}
+            - --shard-id
+            - {{ .Values.sharding.shardId | int | quote }}
+            - --total-shards
+            - {{ .Values.sharding.totalShards | int | quote }}
+            {{- end }}
+            {{- if .Values.multiTenant.applicationNamespaces }}
+            - --application-namespaces
+            - {{ join "," .Values.multiTenant.applicationNamespaces | quote }}
+            {{- end }}
+            {{- range .Values.server.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.server.logLevel | quote }}
+            {{- if .Values.webhooks.existingSecret }}
+            - name: FERRISCD_GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.webhooks.existingSecret | quote }}
+                  key: {{ .Values.webhooks.githubSecretKey | quote }}
+                  optional: true
+            - name: FERRISCD_GITLAB_WEBHOOK_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.webhooks.existingSecret | quote }}
+                  key: {{ .Values.webhooks.gitlabTokenKey | quote }}
+                  optional: true
+            {{- end }}
+            {{- if .Values.telemetry.otlpEndpoint }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.telemetry.otlpEndpoint | quote }}
+            - name: OTEL_SERVICE_NAME
+              value: {{ .Values.telemetry.serviceName | quote }}
+            {{- end }}
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: api
+              containerPort: {{ .Values.server.apiPort }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.server.metricsPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: api
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: api
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.persistence.tmpSizeLimit }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if gt $replicas 1 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "ferriscd.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+      {{- else if gt $replicas 1 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "ferriscd.selectorLabels" . | nindent 14 }}
+      {{- end }}
