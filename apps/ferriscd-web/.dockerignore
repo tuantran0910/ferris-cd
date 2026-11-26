@@ -1,0 +1,13 @@
+# Local dependencies and build outputs (rebuilt cleanly inside the builder stage)
+node_modules/
+dist/
+coverage/
+
+# Local secrets, logs, scratch, and OS files (never send into Docker build context)
+**/*.env*
+**/*.log
+**/*.tmp
+**/*.pem
+**/*.key
+**/.DS_Store
+**/Thumbs.db

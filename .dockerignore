@@ -1,0 +1,49 @@
+# Version control & local tooling
+.git
+.gitignore
+.githooks
+.github
+.agents
+.commandcode
+.worktrees
+**/.DS_Store
+**/Thumbs.db
+
+# Rust build artifacts (rebuilt cleanly inside the builder stage)
+target
+**/*.rs.bk
+
+# Frontend dependencies and build outputs (rebuilt cleanly inside web builder stage)
+apps/ferriscd-web/node_modules
+apps/ferriscd-web/dist
+apps/ferriscd-web/coverage
+
+# Benchmarks, live test suites, examples, deployment manifests, and narrative docs
+benchmarks
+deploy
+examples
+tests
+docs/adr
+docs/benchmarks
+docs/lessons
+docs/operations
+docs/roadmap
+docs/MASTER_PLAN.md
+docs/ROADMAP.md
+docs/REVIEW_LOG.md
+README.md
+CONTRIBUTING.md
+SECURITY.md
+CODE_OF_CONDUCT.md
+AGENTS.md
+Makefile
+
+# Local secrets, logs, and scratch files (never send into Docker build context)
+**/*.log
+**/*.tmp
+**/*.pem
+**/*.key
+**/.env
+**/.env.*
+**/kubeconfig
+**/kubeconfig.*
