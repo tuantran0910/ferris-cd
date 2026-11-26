@@ -135,6 +135,11 @@ export function buildResourceGraphElements(
         x: Math.round(pos.x - GRAPH_NODE_WIDTH / 2),
         y: Math.round(pos.y - GRAPH_NODE_HEIGHT / 2),
       },
+      // React Flow's MiniMap only draws nodes that carry explicit dimensions
+      // (`measured ?? width ?? initialWidth`); DOM measurement alone is not
+      // guaranteed to reach it. The card is fixed-size, so declare it.
+      width: GRAPH_NODE_WIDTH,
+      height: GRAPH_NODE_HEIGHT,
       sourcePosition: isHorizontal ? Position.Right : Position.Bottom,
       targetPosition: isHorizontal ? Position.Left : Position.Top,
       data: n.data,
