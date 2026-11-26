@@ -17,6 +17,7 @@ export interface ResourceFlowNodeData extends Record<string, unknown> {
   healthStatus: string;
   healthMessage?: string | null;
   present: boolean;
+  hasChildren: boolean;
   ownership?: string | null;
   parent?: string | null;
   resource?: ResourceNodeView;
@@ -64,6 +65,7 @@ export function buildResourceGraphElements(
         syncStatus: graph.syncStatus,
         healthStatus: graph.healthStatus,
         present: true,
+        hasChildren: false,
       },
     },
   ];
@@ -89,6 +91,7 @@ export function buildResourceGraphElements(
         healthStatus: derivedHealth,
         healthMessage: resource.healthMessage ?? null,
         present: resource.present,
+        hasChildren: false,
         ownership: resource.ownership ?? null,
         parent: resource.parent ?? null,
         resource,
@@ -123,6 +126,13 @@ export function buildResourceGraphElements(
     g.setEdge(e.source, e.target);
   }
 
+  // Only nodes that actually have an outgoing edge render a source handle, so leaf
+  // resources do not show a dangling connector dot on their right edge.
+  const parentIds = new Set(edges.map((e) => e.source));
+  for (const n of rawNodes) {
+    n.data.hasChildren = parentIds.has(n.id);
+  }
+
   dagre.layout(g);
 
   const isHorizontal = direction === "LR";
@@ -135,6 +145,11 @@ export function buildResourceGraphElements(
         x: Math.round(pos.x - GRAPH_NODE_WIDTH / 2),
         y: Math.round(pos.y - GRAPH_NODE_HEIGHT / 2),
       },
+      // React Flow's MiniMap only draws nodes that carry explicit dimensions
+      // (`measured ?? width ?? initialWidth`); DOM measurement alone is not
+      // guaranteed to reach it. The card is fixed-size, so declare it.
+      width: GRAPH_NODE_WIDTH,
+      height: GRAPH_NODE_HEIGHT,
       sourcePosition: isHorizontal ? Position.Right : Position.Bottom,
       targetPosition: isHorizontal ? Position.Left : Position.Top,
       data: n.data,

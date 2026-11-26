@@ -57,7 +57,7 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
         selected ? "ring-2 ring-indigo-400" : ""
       }`}
     >
-      {!data.isRootApplication && (
+      {data.isRootApplication ? null : (
         <Handle
           type="target"
           position={Position.Left}
@@ -84,11 +84,13 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
         <SyncStatusBadge status={data.syncStatus} compact />
         <HealthStatusBadge status={data.healthStatus} compact />
       </div>
-      <Handle
-        type="source"
-        position={Position.Right}
-        className="!h-2.5 !w-2.5 !border-slate-900 !bg-indigo-400"
-      />
+      {data.hasChildren && (
+        <Handle
+          type="source"
+          position={Position.Right}
+          className="!h-2.5 !w-2.5 !border-slate-900 !bg-indigo-400"
+        />
+      )}
     </div>
   );
 });
@@ -274,6 +276,7 @@ export function ResourceGraph({
             nodes={layout.nodes}
             edges={layout.edges}
             nodeTypes={nodeTypes}
+            nodesConnectable={false}
             fitView
             fitViewOptions={{ padding: 0.2 }}
             minZoom={0.2}
