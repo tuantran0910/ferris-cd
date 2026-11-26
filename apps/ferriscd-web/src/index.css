@@ -1,5 +1,8 @@
 @import "tailwindcss";
 @import "@xyflow/react/dist/style.css";
+/* Motion tokens + utility classes. Imported after Tailwind so the utility
+ * classes win over Preflight and can be used from any component. */
+@import "./motion/motion.css";
 
 @layer base {
   body {
@@ -24,6 +27,19 @@
     [role="button"]:not([aria-disabled="true"])
   ) {
     cursor: pointer;
+  }
+
+  button:not(:disabled) {
+    transition:
+      transform var(--motion-fast) var(--motion-ease-standard),
+      background-color var(--motion-base) var(--motion-ease-standard),
+      border-color var(--motion-base) var(--motion-ease-standard),
+      color var(--motion-base) var(--motion-ease-standard),
+      box-shadow var(--motion-base) var(--motion-ease-standard);
+  }
+
+  button:not(:disabled):active {
+    transform: scale(0.98);
   }
 
   /*

@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { App } from "../App";
+import { App } from "../app/App";
 import {
   clearStoredToken,
   getStoredToken,
@@ -9,7 +9,7 @@ import {
   resetTokenMemoryCache,
   setStoredToken,
 } from "../auth/tokenStorage";
-import { ApiErrorBoundary } from "../components/ApiErrorBoundary";
+import { ApiErrorBoundary } from "../ui/ApiErrorBoundary";
 import { createMockApiClient } from "./fixtures";
 
 describe("Token storage & auth security (Trap Guard T16.1)", () => {

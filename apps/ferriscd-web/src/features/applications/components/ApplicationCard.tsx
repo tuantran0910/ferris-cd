@@ -1,0 +1,102 @@
+import { Box, FolderGit2, GitBranch, Server } from "lucide-react";
+import { Link } from "react-router-dom";
+import type { ApplicationSummary } from "../../../api/types";
+import { shortRevision } from "../../../utils/format";
+import { CARD_INTERACTIVE_CLASS, CARD_SURFACE_CLASS } from "../../../ui/Card";
+import { HealthStatusBadge, SyncStatusBadge } from "../../../ui/StatusBadges";
+
+/** Stagger cap: the last card in a row starts 120ms after the first, which is
+ *  the most a grid can spend on entrance motion before it reads as slow. */
+const STAGGER_STEP_MS = 30;
+const STAGGER_MAX_MS = 120;
+
+function staggerDelay(index: number): string {
+  return `${Math.min(index * STAGGER_STEP_MS, STAGGER_MAX_MS)}ms`;
+}
+
+export interface ApplicationCardProps {
+  app: ApplicationSummary;
+  /** Router state carried from the list so "Back to Applications" restores
+   *  the operator's exact filtered view. */
+  listState: { listSearch: string };
+  /** Position in the grid, used only for the entrance stagger. */
+  index?: number;
+}
+
+export function ApplicationCard({ app, listState, index = 0 }: ApplicationCardProps) {
+  return (
+    <Link
+      to={`/applications/${encodeURIComponent(app.namespace)}/${encodeURIComponent(app.name)}`}
+      state={listState}
+      data-testid={`app-card-${app.namespace}-${app.name}`}
+      style={{ animationDelay: staggerDelay(index) }}
+      className={`group flex flex-col justify-between p-4 motion-slide-up ${CARD_SURFACE_CLASS} ${CARD_INTERACTIVE_CLASS}`}
+    >
+      <div>
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <p
+              className="truncate font-mono text-[11px] text-slate-400"
+              title={app.namespace}
+            >
+              {app.namespace}
+            </p>
+            <h2
+              className="truncate text-base font-semibold text-slate-100 group-hover:text-indigo-300"
+              title={app.name}
+            >
+              {app.name}
+            </h2>
+          </div>
+          <span
+            className="max-w-[45%] shrink-0 truncate rounded-md border border-slate-700 bg-slate-950 px-2 py-0.5 font-mono text-[11px] text-slate-300"
+            title={app.project}
+          >
+            {app.project}
+          </span>
+        </div>
+
+        {/* Trap Guard T16.2: Always render separate Sync & Health badges */}
+        <div className="mt-3 flex flex-wrap gap-2">
+          <SyncStatusBadge status={app.sync?.status} />
+          <HealthStatusBadge status={app.health?.status} />
+        </div>
+
+        <dl className="mt-4 space-y-1.5 text-xs text-slate-400">
+          <div className="flex items-center gap-2">
+            <FolderGit2 className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+            <span
+              className="min-w-0 truncate font-mono text-slate-300"
+              title={app.source.repoUrl}
+            >
+              {app.source.repoUrl}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <GitBranch className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+            <span
+              className="min-w-0 truncate font-mono"
+              title={`${app.source.targetRevision} @ ${app.sync?.revision ?? "unknown revision"}`}
+            >
+              {app.source.targetRevision} ({shortRevision(app.sync?.revision)})
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <Server className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+            <span className="min-w-0 truncate font-mono">
+              {app.destination.cluster} / {app.destination.namespace}
+            </span>
+          </div>
+        </dl>
+      </div>
+
+      <div className="mt-4 flex items-center justify-between border-t border-slate-800/80 pt-3 text-[11px] text-slate-400">
+        <span className="inline-flex items-center gap-1">
+          <Box className="h-3.5 w-3.5 text-slate-500" />
+          {app.resourceCount} resources
+        </span>
+        <span className="font-mono text-slate-500">{app.source.renderer}</span>
+      </div>
+    </Link>
+  );
+}

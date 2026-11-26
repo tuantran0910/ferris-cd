@@ -1,12 +1,12 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { ResourceGraph } from "../components/ResourceGraph";
+import { ResourceGraph } from "../features/resources/ResourceGraph";
 import {
   buildResourceGraphElements,
   GRAPH_NODE_HEIGHT,
   GRAPH_NODE_WIDTH,
-} from "../utils/dagreLayout";
+} from "../features/resources/dagreLayout";
 import { make15NodeResourceGraph, makeLargeResourceGraph } from "./fixtures";
 
 describe("ResourceGraph & dagre layout (T16.3 & Trap Guard T16.3)", () => {
@@ -302,10 +302,10 @@ describe("ResourceGraph & dagre layout (T16.3 & Trap Guard T16.3)", () => {
     await user.click(
       screen.getByRole("button", { name: /Resource Table View/i }),
     );
-    const kindSelect = screen.getByLabelText(
-      /Filter by resource kind/i,
-    ) as HTMLSelectElement;
-    await user.selectOptions(kindSelect, "Pod");
+    await user.click(
+      screen.getByRole("combobox", { name: /Filter by resource kind/i }),
+    );
+    await user.click(screen.getByRole("option", { name: "Pod" }));
     expect(screen.getByText("Showing 5 of 15")).toBeInTheDocument();
 
     // The Pods disappear from the inventory on the next poll.
@@ -321,7 +321,9 @@ describe("ResourceGraph & dagre layout (T16.3 & Trap Guard T16.3)", () => {
       />,
     );
 
-    expect(kindSelect.value).toBe("ALL");
+    expect(
+      screen.getByRole("combobox", { name: /Filter by resource kind/i }),
+    ).toHaveTextContent("All Kinds (10)");
     expect(screen.getByText("Showing 10 of 10")).toBeInTheDocument();
     expect(
       screen.queryByText("No resources match your search filter."),

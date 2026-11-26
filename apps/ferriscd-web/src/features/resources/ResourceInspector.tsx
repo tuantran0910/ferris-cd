@@ -1,7 +1,8 @@
 import { Copy, Check, FileDiff, Layers, Shield, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { ResourceNodeView } from "../api/types";
-import { HealthStatusBadge, SyncStatusBadge } from "./StatusBadges";
+import type { ResourceNodeView } from "../../api/types";
+import { Button } from "../../ui/Button";
+import { HealthStatusBadge, SyncStatusBadge } from "../../ui/StatusBadges";
 
 export interface ResourceInspectorProps {
   resource: ResourceNodeView | null;
@@ -61,12 +62,12 @@ export function ResourceInspector({
         data-testid="resource-inspector-backdrop"
         aria-hidden="true"
         onClick={onClose}
-        className="fixed inset-0 z-30 bg-slate-950/50 backdrop-blur-[1px]"
+        className="motion-fade-in fixed inset-0 z-30 bg-slate-950/50 backdrop-blur-[1px]"
       />
       <aside
         aria-label="Resource Inspector"
         data-testid="resource-inspector"
-        className="fixed inset-y-0 right-0 z-40 flex w-full max-w-md flex-col border-l border-slate-800 bg-slate-900 shadow-2xl"
+        className="motion-slide-in-right fixed inset-y-0 right-0 z-40 flex w-full max-w-md flex-col border-l border-slate-800 bg-slate-900 shadow-2xl"
       >
       <div className="flex items-start justify-between gap-3 border-b border-slate-800 px-5 py-4">
         <div className="min-w-0">
@@ -81,7 +82,7 @@ export function ResourceInspector({
           type="button"
           onClick={onClose}
           aria-label="Close resource inspector"
-          className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+          className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-100"
         >
           <X className="h-4 w-4" />
         </button>
@@ -108,7 +109,7 @@ export function ResourceInspector({
               type="button"
               onClick={handleCopyKey}
               aria-label="Copy GKNN key"
-              className="shrink-0 rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+              className="shrink-0 rounded p-1 text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-100"
             >
               {copied ? (
                 <Check className="h-3.5 w-3.5 text-emerald-400" />
@@ -208,14 +209,15 @@ export function ResourceInspector({
 
       {onInspectDiff && (
         <div className="border-t border-slate-800 px-5 py-3">
-          <button
-            type="button"
+          <Button
+            variant="secondary"
+            size="md"
             onClick={() => onInspectDiff(resource.key)}
-            className="flex w-full items-center justify-center gap-2 rounded-lg border border-indigo-500/40 bg-indigo-500/15 px-4 py-2 text-xs font-semibold text-indigo-200 hover:bg-indigo-500/25"
+            icon={<FileDiff className="h-4 w-4" aria-hidden="true" />}
+            className="w-full border-indigo-500/40 bg-indigo-500/15 text-indigo-200 hover:bg-indigo-500/25"
           >
-            <FileDiff className="h-4 w-4" />
             View Resource in Diff
-          </button>
+          </Button>
         </div>
       )}
     </aside>

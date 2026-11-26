@@ -4,8 +4,8 @@ import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { ApiClientError } from "../api/client";
 import type { OperationResponse } from "../api/types";
-import { RollbackModal } from "../components/RollbackModal";
-import { SyncModal } from "../components/SyncModal";
+import { RollbackModal } from "../features/sync/RollbackModal";
+import { SyncModal } from "../features/sync/SyncModal";
 import { sampleAppDetail } from "./fixtures";
 
 describe("SyncModal & RollbackModal (T16.4 & Trap Guard T16.4)", () => {

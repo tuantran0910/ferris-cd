@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { ApiClientError } from "../api/client";
 import { AuthProvider } from "../auth/AuthContext";
 import { resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
-import { ApplicationsPage } from "../pages/ApplicationsPage";
+import { ApplicationsPage } from "../features/applications/ApplicationsPage";
 import { createMockApiClient, sampleApps } from "./fixtures";
 
 function LocationProbe() {
@@ -74,40 +74,30 @@ describe("ApplicationsPage (T16.2 & Trap Guard T16.2)", () => {
     expect(screen.getByText("checkout-web")).toBeInTheDocument();
     expect(screen.getByText("observability-stack")).toBeInTheDocument();
 
+    const pick = async (label: RegExp, optionName: string) => {
+      await user.click(screen.getByRole("combobox", { name: label }));
+      await user.click(screen.getByRole("option", { name: optionName }));
+    };
+
     // Filter by project
-    await user.selectOptions(
-      screen.getByLabelText(/Filter by project/i),
-      "payments",
-    );
+    await pick(/Filter by project/i, "payments");
     expect(screen.getByText("payments-api")).toBeInTheDocument();
     expect(screen.queryByText("checkout-web")).not.toBeInTheDocument();
 
     // Reset project and filter by health status
-    await user.selectOptions(screen.getByLabelText(/Filter by project/i), "ALL");
-    await user.selectOptions(
-      screen.getByLabelText(/Filter by health status/i),
-      "Degraded",
-    );
+    await pick(/Filter by project/i, "All Projects");
+    await pick(/Filter by health status/i, "Degraded");
     expect(screen.getByText("checkout-web")).toBeInTheDocument();
     expect(screen.queryByText("payments-api")).not.toBeInTheDocument();
 
     // Reset health and filter by sync status
-    await user.selectOptions(
-      screen.getByLabelText(/Filter by health status/i),
-      "ALL",
-    );
-    await user.selectOptions(
-      screen.getByLabelText(/Filter by sync status/i),
-      "OutOfSync",
-    );
+    await pick(/Filter by health status/i, "All Health Statuses");
+    await pick(/Filter by sync status/i, "OutOfSync");
     expect(screen.getByText("payments-api")).toBeInTheDocument();
     expect(screen.queryByText("observability-stack")).not.toBeInTheDocument();
 
     // Reset sync and filter by search text
-    await user.selectOptions(
-      screen.getByLabelText(/Filter by sync status/i),
-      "ALL",
-    );
+    await pick(/Filter by sync status/i, "All Sync Statuses");
     await user.type(screen.getByLabelText(/Search applications/i), "monitoring");
     expect(screen.getByText("observability-stack")).toBeInTheDocument();
     expect(screen.queryByText("payments-api")).not.toBeInTheDocument();
@@ -119,10 +109,10 @@ describe("ApplicationsPage (T16.2 & Trap Guard T16.2)", () => {
 
     expect(await screen.findByTestId("applications-grid")).toBeInTheDocument();
 
-    await user.selectOptions(
-      screen.getByLabelText(/Filter by project/i),
-      "payments",
+    await user.click(
+      screen.getByRole("combobox", { name: /Filter by project/i }),
     );
+    await user.click(screen.getByRole("option", { name: "payments" }));
     await user.click(screen.getByRole("button", { name: /Table view/i }));
     await user.type(screen.getByLabelText(/Search applications/i), "payments");
 
@@ -204,26 +194,27 @@ describe("ApplicationsPage (T16.2 & Trap Guard T16.2)", () => {
     expect(await screen.findByText("checkout-web")).toBeInTheDocument();
 
     // Canonical statuses are always available even if no current app has them
-    const healthSelect = screen.getByLabelText(
-      /Filter by health status/i,
-    ) as HTMLSelectElement;
+    const healthSelect = screen.getByRole("combobox", {
+      name: /Filter by health status/i,
+    });
+    await user.click(healthSelect);
     expect(
-      within(healthSelect).getByRole("option", { name: "Suspended" }),
+      screen.getByRole("option", { name: "Suspended" }),
     ).toBeInTheDocument();
     expect(
-      within(healthSelect).getByRole("option", { name: "Progressing" }),
+      screen.getByRole("option", { name: "Progressing" }),
     ).toBeInTheDocument();
 
     // Select Degraded, then refresh when all apps become Healthy
-    await user.selectOptions(healthSelect, "Degraded");
-    expect(healthSelect.value).toBe("Degraded");
+    await user.click(screen.getByRole("option", { name: "Degraded" }));
+    expect(healthSelect).toHaveTextContent("Degraded");
     expect(screen.getByText("checkout-web")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /Refresh/i }));
     expect(
       await screen.findByText("No Applications match the current filters."),
     ).toBeInTheDocument();
-    expect(healthSelect.value).toBe("Degraded");
+    expect(healthSelect).toHaveTextContent("Degraded");
 
     // ...and the operator can recover with one click.
     await user.click(screen.getByRole("button", { name: /Clear filters/i }));

@@ -8,16 +8,18 @@ import {
   type NodeProps,
   type NodeTypes,
 } from "@xyflow/react";
-import { AlertTriangle, GitFork, Search, Table2 } from "lucide-react";
+import { AlertTriangle, GitFork, Table2 } from "lucide-react";
 import { memo, useEffect, useMemo, useState } from "react";
-import type { ResourceGraphView } from "../api/types";
+import type { ResourceGraphView } from "../../api/types";
+import { EmptyState } from "../../ui/EmptyState";
+import { HealthStatusBadge, SyncStatusBadge } from "../../ui/StatusBadges";
 import {
   buildResourceGraphElements,
   LARGE_GRAPH_THRESHOLD,
   type ResourceFlowNode,
-} from "../utils/dagreLayout";
+} from "./dagreLayout";
 import { ResourceInspector } from "./ResourceInspector";
-import { HealthStatusBadge, SyncStatusBadge } from "./StatusBadges";
+import { ResourceTable } from "./ResourceTable";
 
 function getNodeBorderClass(health: string, sync: string, isRoot: boolean): string {
   if (isRoot) {
@@ -53,7 +55,7 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
       data-testid={
         data.isRootApplication ? "graph-root-node" : `graph-node-${data.key}`
       }
-      className={`w-[264px] rounded-xl border-2 px-3 py-2.5 shadow-lg transition ${borderClass} ${
+      className={`w-[264px] rounded-xl border-2 px-3 py-2.5 shadow-lg transition-colors ${borderClass} ${
         selected ? "ring-2 ring-indigo-400" : ""
       }`}
     >
@@ -117,8 +119,6 @@ export function ResourceGraph({
     isLargeGraph ? "table" : "graph",
   );
   const [userPickedMode, setUserPickedMode] = useState(false);
-  const [tableSearch, setTableSearch] = useState("");
-  const [kindFilter, setKindFilter] = useState<string>("ALL");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
   const selectedResource = useMemo(
@@ -162,36 +162,6 @@ export function ResourceGraph({
     [appNamespace, appName, graph, viewMode],
   );
 
-  const uniqueKinds = useMemo(() => {
-    const kinds = new Set(graph.nodes.map((n) => n.kind));
-    return Array.from(kinds).sort();
-  }, [graph.nodes]);
-
-  // A poll can remove every node of the filtered kind. Without this guard the
-  // <select> would silently fall back to its first option while the state stayed
-  // on the vanished kind, leaving a permanently empty table.
-  const effectiveKindFilter =
-    kindFilter === "ALL" || uniqueKinds.includes(kindFilter) ? kindFilter : "ALL";
-
-  const filteredTableNodes = useMemo(() => {
-    const q = tableSearch.trim().toLowerCase();
-    return graph.nodes.filter((n) => {
-      if (effectiveKindFilter !== "ALL" && n.kind !== effectiveKindFilter) {
-        return false;
-      }
-      if (!q) {
-        return true;
-      }
-      return (
-        n.name.toLowerCase().includes(q) ||
-        n.kind.toLowerCase().includes(q) ||
-        n.key.toLowerCase().includes(q) ||
-        (n.namespace ?? "").toLowerCase().includes(q) ||
-        (n.health ?? "").toLowerCase().includes(q)
-      );
-    });
-  }, [graph.nodes, effectiveKindFilter, tableSearch]);
-
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -220,7 +190,7 @@ export function ResourceGraph({
             type="button"
             onClick={() => handleSelectViewMode("graph")}
             aria-pressed={viewMode === "graph"}
-            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition ${
+            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
               viewMode === "graph"
                 ? "bg-indigo-600 text-white"
                 : "text-slate-300 hover:text-white"
@@ -233,7 +203,7 @@ export function ResourceGraph({
             type="button"
             onClick={() => handleSelectViewMode("table")}
             aria-pressed={viewMode === "table"}
-            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition ${
+            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
               viewMode === "table"
                 ? "bg-indigo-600 text-white"
                 : "text-slate-300 hover:text-white"
@@ -249,7 +219,7 @@ export function ResourceGraph({
         <div
           role="status"
           data-testid="large-graph-banner"
-          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200 motion-fade-in"
         >
           <div className="flex items-center gap-2">
             <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" />
@@ -263,7 +233,7 @@ export function ResourceGraph({
             <button
               type="button"
               onClick={() => handleSelectViewMode("graph")}
-              className="rounded border border-amber-500/50 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-100 hover:bg-amber-500/25"
+              className="rounded border border-amber-500/50 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-100 transition-colors hover:bg-amber-500/25"
             >
               Switch to Graph View anyway
             </button>
@@ -274,7 +244,7 @@ export function ResourceGraph({
       {graph.truncated && (
         <div
           role="status"
-          className="flex items-center gap-2 rounded-lg border border-sky-500/40 bg-sky-500/10 px-4 py-2 text-xs text-sky-200"
+          className="flex items-center gap-2 rounded-lg border border-sky-500/40 bg-sky-500/10 px-4 py-2 text-xs text-sky-200 motion-fade-in"
         >
           <AlertTriangle className="h-4 w-4 shrink-0 text-sky-400" />
           <span>
@@ -285,10 +255,10 @@ export function ResourceGraph({
       )}
 
       {graph.nodes.length === 0 ? (
-        <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-10 text-center text-sm text-slate-400">
+        <EmptyState size="md">
           No tracked resources in inventory yet. Trigger a sync to reconcile
           this application.
-        </div>
+        </EmptyState>
       ) : viewMode === "graph" ? (
         <div
           data-testid="resource-graph-canvas"
@@ -330,113 +300,11 @@ export function ResourceGraph({
           </ReactFlow>
         </div>
       ) : (
-        <div data-testid="resource-table-view" className="space-y-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="relative min-w-[240px] flex-1">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
-              <input
-                type="search"
-                aria-label="Search resources"
-                value={tableSearch}
-                onChange={(e) => setTableSearch(e.target.value)}
-                placeholder="Search resources by name, kind, namespace, or GKNN..."
-                className="w-full rounded-lg border border-slate-700 bg-slate-900 py-2 pl-9 pr-3 text-xs text-slate-100 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
-              />
-            </div>
-            <select
-              aria-label="Filter by resource kind"
-              value={effectiveKindFilter}
-              onChange={(e) => setKindFilter(e.target.value)}
-              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
-            >
-              <option value="ALL">All Kinds ({graph.nodes.length})</option>
-              {uniqueKinds.map((kind) => (
-                <option key={kind} value={kind}>
-                  {kind}
-                </option>
-              ))}
-            </select>
-            <span className="text-xs text-slate-400">
-              Showing {filteredTableNodes.length} of {graph.nodes.length}
-            </span>
-          </div>
-
-          <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-900/60">
-            <table className="w-full text-left text-xs">
-              <thead className="border-b border-slate-800 bg-slate-900 text-[11px] uppercase tracking-wider text-slate-400">
-                <tr>
-                  <th className="px-4 py-2.5">Kind</th>
-                  <th className="px-4 py-2.5">Name</th>
-                  <th className="px-4 py-2.5">Namespace</th>
-                  <th className="px-4 py-2.5">Sync</th>
-                  <th className="px-4 py-2.5">Health</th>
-                  <th className="px-4 py-2.5">Message</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/70">
-                {filteredTableNodes.map((node) => {
-                  const syncStatus = node.present ? graph.syncStatus : "OutOfSync";
-                  const healthStatus = !node.present
-                    ? "Missing"
-                    : node.health ?? "Unknown";
-                  return (
-                    <tr
-                      key={node.key}
-                      tabIndex={0}
-                      aria-label={`Inspect ${node.kind} ${node.name}`}
-                      onClick={() => setSelectedKey(node.key)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault();
-                          setSelectedKey(node.key);
-                        }
-                      }}
-                      className="cursor-pointer transition hover:bg-slate-800/60 focus-visible:bg-slate-800/60"
-                    >
-                      <td className="whitespace-nowrap px-4 py-2.5 font-medium text-indigo-300">
-                        {node.kind}
-                      </td>
-                      <td
-                        className="max-w-[220px] truncate px-4 py-2.5 font-mono text-slate-100"
-                        title={node.name}
-                      >
-                        {node.name}
-                      </td>
-                      <td
-                        className="max-w-[160px] truncate px-4 py-2.5 font-mono text-slate-400"
-                        title={node.namespace ?? undefined}
-                      >
-                        {node.namespace ?? "—"}
-                      </td>
-                      <td className="whitespace-nowrap px-4 py-2.5">
-                        <SyncStatusBadge status={syncStatus} compact />
-                      </td>
-                      <td className="whitespace-nowrap px-4 py-2.5">
-                        <HealthStatusBadge status={healthStatus} compact />
-                      </td>
-                      <td
-                        className="max-w-xs truncate px-4 py-2.5 text-slate-400"
-                        title={node.healthMessage ?? undefined}
-                      >
-                        {node.healthMessage ?? "—"}
-                      </td>
-                    </tr>
-                  );
-                })}
-                {filteredTableNodes.length === 0 && (
-                  <tr>
-                    <td
-                      colSpan={6}
-                      className="px-4 py-8 text-center text-slate-400"
-                    >
-                      No resources match your search filter.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <ResourceTable
+          nodes={graph.nodes}
+          graph={graph}
+          onSelect={(key) => setSelectedKey(key)}
+        />
       )}
 
       <ResourceInspector

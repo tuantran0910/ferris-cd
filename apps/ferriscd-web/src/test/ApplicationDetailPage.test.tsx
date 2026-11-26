@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, type FerrisApiClient } from "../api/client";
 import { AuthProvider } from "../auth/AuthContext";
 import { resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
-import { ApplicationDetailPage } from "../pages/ApplicationDetailPage";
+import { ApplicationDetailPage } from "../features/applications/ApplicationDetailPage";
 import { createMockApiClient, sampleAppDetail, sampleApps } from "./fixtures";
 
 function renderDetailPage(overrides: Partial<FerrisApiClient> = {}) {

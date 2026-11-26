@@ -1,28 +1,24 @@
-import { useQuery } from "@tanstack/react-query";
-import {
-  Box,
-  FolderGit2,
-  GitBranch,
-  LayoutGrid,
-  List,
-  RefreshCw,
-  Search,
-  Server,
-} from "lucide-react";
+import { LayoutGrid, List, RefreshCw, Search } from "lucide-react";
 import { useCallback, useMemo } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
-import type { ApplicationSummary } from "../api/types";
-import { useAuth } from "../auth/AuthContext";
-import { ApiErrorAlert } from "../components/ApiErrorBoundary";
+import type { ApplicationSummary } from "../../api/types";
+import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
+import { Button } from "../../ui/Button";
+import { EmptyState } from "../../ui/EmptyState";
+import { Skeleton } from "../../ui/Skeleton";
 import {
   HealthStatusBadge,
   normalizeHealthStatus,
   normalizeSyncStatus,
   SyncStatusBadge,
-} from "../components/StatusBadges";
-import { shortRevision } from "../utils/format";
-
-export const APPLICATIONS_POLL_INTERVAL_MS = 10_000;
+} from "../../ui/StatusBadges";
+import { shortRevision } from "../../utils/format";
+import { ApplicationCard } from "./components/ApplicationCard";
+import {
+  APPLICATIONS_POLL_INTERVAL_MS,
+  useApplications,
+} from "./hooks";
+import { Select } from "../../ui/Select";
 
 const CANONICAL_SYNC_STATUSES = ["Synced", "OutOfSync", "Unknown"] as const;
 const CANONICAL_HEALTH_STATUSES = [
@@ -50,7 +46,6 @@ const FILTER_PARAMS = {
 } as const;
 
 export function ApplicationsPage() {
-  const { apiClient } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
   // Carried into the detail route so "Back to Applications" returns to the
@@ -60,7 +55,8 @@ export function ApplicationsPage() {
     [location.search],
   );
 
-  const viewMode = searchParams.get(FILTER_PARAMS.view) === "table" ? "table" : "grid";
+  const viewMode =
+    searchParams.get(FILTER_PARAMS.view) === "table" ? "table" : "grid";
   const search = searchParams.get(FILTER_PARAMS.search) ?? "";
   const projectFilter = searchParams.get(FILTER_PARAMS.project) ?? ALL;
   const syncFilter = searchParams.get(FILTER_PARAMS.sync) ?? ALL;
@@ -97,11 +93,7 @@ export function ApplicationsPage() {
     );
   }, [setSearchParams]);
 
-  const { data, isLoading, isFetching, error, refetch } = useQuery({
-    queryKey: ["applications"],
-    queryFn: () => apiClient.listApplications(),
-    refetchInterval: APPLICATIONS_POLL_INTERVAL_MS,
-  });
+  const { data, isLoading, isFetching, error, refetch } = useApplications();
 
   const apps: ApplicationSummary[] = useMemo(() => data?.items ?? [], [data]);
 
@@ -187,17 +179,20 @@ export function ApplicationsPage() {
         </div>
 
         <div className="flex items-center gap-2">
-          <button
-            type="button"
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => void refetch()}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800"
+            icon={
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${isFetching ? "animate-spin text-indigo-400" : ""}`}
+                aria-hidden="true"
+              />
+            }
+            className="px-3 py-1.5"
           >
-            <RefreshCw
-              className={`h-3.5 w-3.5 ${isFetching ? "animate-spin text-indigo-400" : ""}`}
-              aria-hidden="true"
-            />
             Refresh
-          </button>
+          </Button>
 
           <div
             role="group"
@@ -209,7 +204,7 @@ export function ApplicationsPage() {
               aria-label="Grid view"
               aria-pressed={viewMode === "grid"}
               onClick={() => setParam(FILTER_PARAMS.view, "grid", "grid")}
-              className={`rounded-md p-1.5 ${
+              className={`rounded-md p-1.5 transition-colors ${
                 viewMode === "grid"
                   ? "bg-indigo-600 text-white"
                   : "text-slate-400 hover:text-slate-100"
@@ -222,7 +217,7 @@ export function ApplicationsPage() {
               aria-label="Table view"
               aria-pressed={viewMode === "table"}
               onClick={() => setParam(FILTER_PARAMS.view, "table", "grid")}
-              className={`rounded-md p-1.5 ${
+              className={`rounded-md p-1.5 transition-colors ${
                 viewMode === "table"
                   ? "bg-indigo-600 text-white"
                   : "text-slate-400 hover:text-slate-100"
@@ -246,62 +241,49 @@ export function ApplicationsPage() {
             value={search}
             onChange={(e) => setParam(FILTER_PARAMS.search, e.target.value)}
             placeholder="Search by name, namespace, repo, or cluster..."
-            className="w-full rounded-lg border border-slate-700 bg-slate-950 py-2 pl-9 pr-3 text-xs text-slate-100 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
+            className="w-full rounded-lg border border-slate-700 bg-slate-950 py-2 pl-9 pr-3 text-xs text-slate-100 transition-colors placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
           />
         </div>
 
-        <select
+        <Select
           aria-label="Filter by project"
           value={projectFilter}
-          onChange={(e) => setParam(FILTER_PARAMS.project, e.target.value, ALL)}
-          className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
-        >
-          <option value="ALL">All Projects</option>
-          {projects.map((p) => (
-            <option key={p} value={p}>
-              {p}
-            </option>
-          ))}
-        </select>
+          onChange={(value) => setParam(FILTER_PARAMS.project, value, ALL)}
+          options={[
+            { value: ALL, label: "All Projects" },
+            ...projects.map((p) => ({ value: p, label: p })),
+          ]}
+        />
 
-        <select
+        <Select
           aria-label="Filter by sync status"
           value={syncFilter}
-          onChange={(e) => setParam(FILTER_PARAMS.sync, e.target.value, ALL)}
-          className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
-        >
-          <option value="ALL">All Sync Statuses</option>
-          {syncStatuses.map((s) => (
-            <option key={s} value={s}>
-              {s}
-            </option>
-          ))}
-        </select>
+          onChange={(value) => setParam(FILTER_PARAMS.sync, value, ALL)}
+          options={[
+            { value: ALL, label: "All Sync Statuses" },
+            ...syncStatuses.map((s) => ({ value: s, label: s })),
+          ]}
+        />
 
-        <select
+        <Select
           aria-label="Filter by health status"
           value={healthFilter}
-          onChange={(e) => setParam(FILTER_PARAMS.health, e.target.value, ALL)}
-          className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
-        >
-          <option value="ALL">All Health Statuses</option>
-          {healthStatuses.map((h) => (
-            <option key={h} value={h}>
-              {h}
-            </option>
-          ))}
-        </select>
+          onChange={(value) => setParam(FILTER_PARAMS.health, value, ALL)}
+          options={[
+            { value: ALL, label: "All Health Statuses" },
+            ...healthStatuses.map((h) => ({ value: h, label: h })),
+          ]}
+        />
       </section>
 
-      {error && <ApiErrorAlert error={error} onRetry={() => void refetch()} />}
+      {error && (
+        <ApiErrorAlert error={error} onRetry={() => void refetch()} />
+      )}
 
       {isLoading ? (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
           {Array.from({ length: 3 }).map((_, i) => (
-            <div
-              key={i}
-              className="h-44 animate-pulse rounded-xl border border-slate-800 bg-slate-900/50"
-            />
+            <Skeleton key={i} className="h-44" />
           ))}
         </div>
       ) : !data ? (
@@ -310,104 +292,39 @@ export function ApplicationsPage() {
         // an API/network failure.
         null
       ) : filteredApps.length === 0 ? (
-        <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-12 text-center text-sm text-slate-400">
+        <EmptyState
+          size="lg"
+          action={
+            apps.length > 0 && filtersActive ? (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={clearFilters}
+                className="mt-3 px-3 py-1.5"
+              >
+                Clear filters
+              </Button>
+            ) : undefined
+          }
+        >
           <p>
             {apps.length === 0
               ? "No Applications visible to your identity."
               : "No Applications match the current filters."}
           </p>
-          {apps.length > 0 && filtersActive && (
-            <button
-              type="button"
-              onClick={clearFilters}
-              className="mt-3 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800"
-            >
-              Clear filters
-            </button>
-          )}
-        </div>
+        </EmptyState>
       ) : viewMode === "grid" ? (
         <div
           data-testid="applications-grid"
           className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3"
         >
-          {filteredApps.map((app) => (
-            <Link
+          {filteredApps.map((app, index) => (
+            <ApplicationCard
               key={`${app.namespace}/${app.name}`}
-              to={`/applications/${encodeURIComponent(app.namespace)}/${encodeURIComponent(app.name)}`}
-              state={listState}
-              data-testid={`app-card-${app.namespace}-${app.name}`}
-              className="group flex flex-col justify-between rounded-xl border border-slate-800 bg-slate-900/70 p-4 transition hover:border-indigo-500/60 hover:bg-slate-900"
-            >
-              <div>
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <p
-                      className="truncate font-mono text-[11px] text-slate-400"
-                      title={app.namespace}
-                    >
-                      {app.namespace}
-                    </p>
-                    <h2
-                      className="truncate text-base font-semibold text-slate-100 group-hover:text-indigo-300"
-                      title={app.name}
-                    >
-                      {app.name}
-                    </h2>
-                  </div>
-                  <span
-                    className="max-w-[45%] shrink-0 truncate rounded-md border border-slate-700 bg-slate-950 px-2 py-0.5 font-mono text-[11px] text-slate-300"
-                    title={app.project}
-                  >
-                    {app.project}
-                  </span>
-                </div>
-
-                {/* Trap Guard T16.2: Always render separate Sync & Health badges */}
-                <div className="mt-3 flex flex-wrap gap-2">
-                  <SyncStatusBadge status={app.sync?.status} />
-                  <HealthStatusBadge status={app.health?.status} />
-                </div>
-
-                <dl className="mt-4 space-y-1.5 text-xs text-slate-400">
-                  <div className="flex items-center gap-2">
-                    <FolderGit2 className="h-3.5 w-3.5 shrink-0 text-slate-500" />
-                    <span
-                      className="min-w-0 truncate font-mono text-slate-300"
-                      title={app.source.repoUrl}
-                    >
-                      {app.source.repoUrl}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <GitBranch className="h-3.5 w-3.5 shrink-0 text-slate-500" />
-                    <span
-                      className="min-w-0 truncate font-mono"
-                      title={`${app.source.targetRevision} @ ${app.sync?.revision ?? "unknown revision"}`}
-                    >
-                      {app.source.targetRevision} (
-                      {shortRevision(app.sync?.revision)})
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Server className="h-3.5 w-3.5 shrink-0 text-slate-500" />
-                    <span className="min-w-0 truncate font-mono">
-                      {app.destination.cluster} / {app.destination.namespace}
-                    </span>
-                  </div>
-                </dl>
-              </div>
-
-              <div className="mt-4 flex items-center justify-between border-t border-slate-800/80 pt-3 text-[11px] text-slate-400">
-                <span className="inline-flex items-center gap-1">
-                  <Box className="h-3.5 w-3.5 text-slate-500" />
-                  {app.resourceCount} resources
-                </span>
-                <span className="font-mono text-slate-500">
-                  {app.source.renderer}
-                </span>
-              </div>
-            </Link>
+              app={app}
+              listState={listState}
+              index={index}
+            />
           ))}
         </div>
       ) : (
@@ -431,7 +348,7 @@ export function ApplicationsPage() {
               {filteredApps.map((app) => (
                 <tr
                   key={`${app.namespace}/${app.name}`}
-                  className="hover:bg-slate-800/50"
+                  className="transition-colors hover:bg-slate-800/50"
                 >
                   <td className="max-w-[280px] px-4 py-3">
                     <Link

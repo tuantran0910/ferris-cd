@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import { DiffViewer } from "../components/DiffViewer";
+import { DiffViewer } from "../features/diff/DiffViewer";
 import { sampleDiffPayload } from "./fixtures";
 
 describe("DiffViewer (T16.4)", () => {
@@ -56,10 +56,10 @@ describe("DiffViewer (T16.4)", () => {
     expect(screen.queryByTestId("diff-side-by-side")).not.toBeInTheDocument();
 
     // Filter to FieldConflict only
-    await user.selectOptions(
-      screen.getByLabelText(/Filter diff status/i),
-      "FieldConflict",
+    await user.click(
+      screen.getByRole("combobox", { name: /Filter diff status/i }),
     );
+    await user.click(screen.getByRole("option", { name: "FieldConflict" }));
     expect(
       screen.getByTestId("diff-resource-apps/Deployment/payments/payments-api"),
     ).toBeInTheDocument();

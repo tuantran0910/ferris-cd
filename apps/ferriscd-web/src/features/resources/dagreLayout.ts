@@ -1,6 +1,6 @@
 import dagre from "dagre";
 import { Position, type Edge, type Node } from "@xyflow/react";
-import type { ResourceGraphView, ResourceNodeView } from "../api/types";
+import type { ResourceGraphView, ResourceNodeView } from "../../api/types";
 
 export const GRAPH_NODE_WIDTH = 264;
 export const GRAPH_NODE_HEIGHT = 104;

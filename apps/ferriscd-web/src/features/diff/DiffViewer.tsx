@@ -10,13 +10,15 @@ import {
   ShieldAlert,
 } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { DiffChange, DiffPayload, DiffResource } from "../api/types";
+import type { DiffChange, DiffPayload, DiffResource } from "../../api/types";
+import { EmptyState } from "../../ui/EmptyState";
 import {
   containsRedactedMarker,
   formatDiffValue,
   isRedactedToken,
   isSecretResourceKey,
-} from "../utils/diffFormat";
+} from "./diffFormat";
+import { Select } from "../../ui/Select";
 
 type DiffStatusFilter =
   | "ALL"
@@ -206,7 +208,7 @@ function ResourceDiffCard({
   return (
     <article
       data-testid={`diff-resource-${resource.key}`}
-      className="rounded-xl border border-slate-800 bg-slate-900/70 p-4"
+      className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 motion-fade-in"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -401,7 +403,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             type="button"
             onClick={() => setViewMode("side-by-side")}
             aria-pressed={viewMode === "side-by-side"}
-            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium ${
+            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
               viewMode === "side-by-side"
                 ? "bg-indigo-600 text-white"
                 : "text-slate-300 hover:text-white"
@@ -414,7 +416,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             type="button"
             onClick={() => setViewMode("unified")}
             aria-pressed={viewMode === "unified"}
-            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium ${
+            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
               viewMode === "unified"
                 ? "bg-indigo-600 text-white"
                 : "text-slate-300 hover:text-white"
@@ -435,35 +437,32 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Filter resources by GKNN key..."
-            className="w-full rounded-lg border border-slate-700 bg-slate-900 py-2 pl-9 pr-3 text-xs text-slate-100 placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
+            className="w-full rounded-lg border border-slate-700 bg-slate-900 py-2 pl-9 pr-3 text-xs text-slate-100 transition-colors placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
           />
         </div>
-        <select
+        <Select
           aria-label="Filter diff status"
           value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value as DiffStatusFilter)}
-          className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 focus:border-indigo-500 focus:outline-none"
-        >
-          <option value="ALL">All Statuses ({resources.length})</option>
-          <option value="DRIFTED">Drifted &amp; Conflicts Only</option>
-          <option value="OutOfSync">OutOfSync</option>
-          <option value="Missing">Missing</option>
-          <option value="Orphaned">Orphaned</option>
-          <option value="FieldConflict">FieldConflict</option>
-          <option value="OwnershipConflict">OwnershipConflict</option>
-          <option value="Synced">Synced</option>
-        </select>
+          onChange={(value) => setStatusFilter(value as DiffStatusFilter)}
+          options={[
+            { value: "ALL", label: `All Statuses (${resources.length})` },
+            { value: "DRIFTED", label: "Drifted & Conflicts Only" },
+            { value: "OutOfSync", label: "OutOfSync" },
+            { value: "Missing", label: "Missing" },
+            { value: "Orphaned", label: "Orphaned" },
+            { value: "FieldConflict", label: "FieldConflict" },
+            { value: "OwnershipConflict", label: "OwnershipConflict" },
+            { value: "Synced", label: "Synced" },
+          ]}
+        />
       </div>
 
       {filteredResources.length === 0 ? (
-        <div
-          data-testid="diff-empty-state"
-          className="rounded-xl border border-slate-800 bg-slate-900/50 p-8 text-center text-sm text-slate-400"
-        >
+        <EmptyState data-testid="diff-empty-state">
           {resources.length === 0
             ? "No resources were diffed: the rendered bundle and the tracked inventory are both empty."
             : "No diff entries match the selected filter."}
-        </div>
+        </EmptyState>
       ) : (
         <div className="space-y-3">
           {filteredResources.map((res) => (
