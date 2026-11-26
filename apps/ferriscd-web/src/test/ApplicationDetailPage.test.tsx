@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, type FerrisApiClient } from "../api/client";
 import { AuthProvider } from "../auth/AuthContext";
 import { resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
-import { ApplicationDetailPage } from "../pages/ApplicationDetailPage";
+import { ApplicationDetailPage } from "../features/applications/ApplicationDetailPage";
 import { createMockApiClient, sampleAppDetail, sampleApps } from "./fixtures";
 
 function renderDetailPage(overrides: Partial<FerrisApiClient> = {}) {
@@ -236,6 +236,41 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
     // Clicking the Live Diff tab directly must clear diffFilterKey
     await user.click(screen.getByRole("tab", { name: /Live Diff/i }));
     expect(screen.getByLabelText(/Filter diff resources/i)).toHaveValue("");
+  });
+
+  it("returns to the filtered list view via the back link carried in router state (H6)", async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider clientOverride={createMockApiClient()}>
+          <MemoryRouter
+            initialEntries={[
+              {
+                pathname: "/applications/ferriscd-system/payments-api",
+                state: { listSearch: "?project=payments&view=table" },
+              },
+            ]}
+          >
+            <Routes>
+              <Route
+                path="/applications/:namespace/:name"
+                element={<ApplicationDetailPage />}
+              />
+            </Routes>
+          </MemoryRouter>
+        </AuthProvider>
+      </QueryClientProvider>,
+    );
+
+    const backLinks = await screen.findAllByRole("link", {
+      name: /Applications/i,
+    });
+    expect(backLinks[0]).toHaveAttribute(
+      "href",
+      "/?project=payments&view=table",
+    );
   });
 
   it("stops detail polling when the server returns 403 or 404 (M8)", async () => {

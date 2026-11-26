@@ -1,7 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import { DiffViewer } from "../components/DiffViewer";
+import { DiffViewer } from "../features/diff/DiffViewer";
 import { sampleDiffPayload } from "./fixtures";
 
 describe("DiffViewer (T16.4)", () => {
@@ -56,15 +56,44 @@ describe("DiffViewer (T16.4)", () => {
     expect(screen.queryByTestId("diff-side-by-side")).not.toBeInTheDocument();
 
     // Filter to FieldConflict only
-    await user.selectOptions(
-      screen.getByLabelText(/Filter diff status/i),
-      "FieldConflict",
+    await user.click(
+      screen.getByRole("combobox", { name: /Filter diff status/i }),
     );
+    await user.click(screen.getByRole("option", { name: "FieldConflict" }));
     expect(
       screen.getByTestId("diff-resource-apps/Deployment/payments/payments-api"),
     ).toBeInTheDocument();
     expect(
       screen.queryByTestId("diff-resource-/Service/payments/payments-svc"),
     ).not.toBeInTheDocument();
+  });
+
+  it("distinguishes an empty diff from an over-narrow filter and tolerates a missing resources array (M9)", () => {
+    const emptyDiff = {
+      revision: "deadbeef",
+      desired: 0,
+      wouldSync: false,
+      summary: {
+        total: 0,
+        synced: 0,
+        outOfSync: 0,
+        missing: 0,
+        orphaned: 0,
+        ownershipConflicts: 0,
+        fieldConflicts: 0,
+      },
+      resources: [],
+    };
+    const { unmount } = render(<DiffViewer diff={emptyDiff} />);
+    expect(screen.getByTestId("diff-empty-state")).toHaveTextContent(
+      /both empty/i,
+    );
+    unmount();
+
+    // `resources` is optional in the OpenAPI schema: an absent array must not
+    // crash the page.
+    const { resources: _omit, ...withoutResources } = emptyDiff;
+    render(<DiffViewer diff={withoutResources} />);
+    expect(screen.getByTestId("diff-empty-state")).toBeInTheDocument();
   });
 });

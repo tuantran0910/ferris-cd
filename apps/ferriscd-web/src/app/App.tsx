@@ -1,19 +1,26 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
-import type { FerrisApiClient } from "./api/client";
-import { AuthProvider, useAuth } from "./auth/AuthContext";
-import { ApiErrorBoundary } from "./components/ApiErrorBoundary";
-import { Layout } from "./components/Layout";
-import { LoginScreen } from "./components/LoginScreen";
-import { ApplicationDetailPage } from "./pages/ApplicationDetailPage";
-import { ApplicationsPage } from "./pages/ApplicationsPage";
+import type { FerrisApiClient } from "../api/client";
+import { AuthProvider, useAuth } from "../auth/AuthContext";
+import { ApplicationDetailPage } from "../features/applications/ApplicationDetailPage";
+import { ApplicationsPage } from "../features/applications/ApplicationsPage";
+import { ApiErrorBoundary } from "../ui/ApiErrorBoundary";
+import { Layout } from "./Layout";
+import { LoginScreen } from "./LoginScreen";
 
 function AuthenticatedRoutes() {
   const { isAuthenticated, logout } = useAuth();
 
   if (!isAuthenticated) {
-    return <LoginScreen />;
+    // The sign-in screen gets the same error boundary as the authenticated
+    // tree: a render crash there would otherwise leave a blank page with no
+    // way back.
+    return (
+      <ApiErrorBoundary>
+        <LoginScreen />
+      </ApiErrorBoundary>
+    );
   }
 
   return (

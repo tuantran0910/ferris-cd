@@ -1,0 +1,210 @@
+/*
+ * Motion system
+ * =============
+ *
+ * One place for every animation the web UI is allowed to use. Rules the rest of
+ * the app is expected to follow:
+ *
+ * 1. Animate only compositor-friendly properties: `transform`, `opacity`,
+ *    `filter`. Never animate layout properties (`width`, `height`, `top`,
+ *    `left`, `margin`, ...) — they force a re-layout every frame and are the
+ *    usual cause of janky GitOps dashboards on a laptop during an incident.
+ * 2. Keep interactions inside the 120–240ms band below. Anything longer reads
+ *    as lag, not polish.
+ * 3. No looping/attention-seeking animation except the loading shimmer and
+ *    React Flow's own "Progressing" edge animation.
+ * 4. `prefers-reduced-motion: reduce` turns all of it off — motion is a
+ *    preference, never load-bearing. Colour/state changes stay (just instant),
+ *    because those carry meaning (hover affordance, selected tab, badge tone).
+ */
+
+:root {
+  /* Durations */
+  --motion-fast: 120ms;
+  --motion-base: 180ms;
+  --motion-slow: 240ms;
+
+  /* Easings: a fast start / soft landing reads as "responsive". `accelerate`
+   * is the exit counterpart — reserved for elements leaving the screen (there
+   * are none today: nothing is worth animating *out* in an operations UI, where
+   * content disappearing is itself the signal). */
+  --motion-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --motion-ease-decelerate: cubic-bezier(0, 0, 0.2, 1);
+  --motion-ease-accelerate: cubic-bezier(0.4, 0, 1, 1);
+}
+
+/* ---------------------------------------------------------------- keyframes */
+
+@keyframes motion-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* 2px only: enough to communicate "new screen", small enough to never read as
+ * a slide, and it cannot shift the surrounding layout.
+ *
+ * `fill-mode: backwards` (not `both`): an entrance should leave no animated
+ * value behind. With `forwards`/`both`, browsers keep the final interpolated
+ * `transform` (an identity matrix, not `none`) on the element, which would turn
+ * it into the containing block for `position: fixed` descendants — that is what
+ * shifted the resource inspector. Fixed overlays are additionally portalled to
+ * `document.body` so no transformed ancestor can ever capture them. */
+@keyframes motion-slide-up {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 2px, 0);
+  }
+  to {
+    opacity: 1;
+    /* `none`, not `translate3d(0,0,0)`: with `animation-fill-mode: both` the
+     * final frame sticks, and any non-none transform would turn this element
+     * into the containing block for `position: fixed` descendants (the modals
+     * and the resource inspector) for the rest of its life. */
+    transform: none;
+  }
+}
+
+@keyframes motion-scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes motion-slide-in-right {
+  from {
+    opacity: 0;
+    transform: translate3d(16px, 0, 0);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Shimmer is the only looping animation: skeleton placeholders are decorative,
+ * and a still grey block reads as broken content. The sweep lives on a
+ * pseudo-element translated on the X axis so the placeholder box itself never
+ * re-lays-out. */
+@keyframes motion-shimmer {
+  from {
+    transform: translate3d(-100%, 0, 0);
+  }
+  to {
+    transform: translate3d(100%, 0, 0);
+  }
+}
+
+/* --------------------------------------------------------------- utilities */
+
+.motion-fade-in {
+  animation: motion-fade-in var(--motion-base) var(--motion-ease-decelerate)
+    backwards;
+}
+
+.motion-slide-up {
+  animation: motion-slide-up var(--motion-base) var(--motion-ease-decelerate)
+    backwards;
+}
+
+.motion-scale-in {
+  animation: motion-scale-in var(--motion-fast) var(--motion-ease-decelerate)
+    backwards;
+}
+
+.motion-slide-in-right {
+  animation: motion-slide-in-right var(--motion-base)
+    var(--motion-ease-decelerate) backwards;
+}
+
+.motion-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+
+.motion-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translate3d(-100%, 0, 0);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgb(148 163 184 / 0.14) 50%,
+    transparent 100%
+  );
+  animation: motion-shimmer 1.6s var(--motion-ease-standard) infinite;
+}
+
+/* Shared transition for interactive surfaces (cards, rows, tiles): colour and
+ * a 2px lift only. */
+.motion-interactive {
+  transition:
+    transform var(--motion-base) var(--motion-ease-standard),
+    border-color var(--motion-base) var(--motion-ease-standard),
+    background-color var(--motion-base) var(--motion-ease-standard),
+    color var(--motion-base) var(--motion-ease-standard),
+    box-shadow var(--motion-base) var(--motion-ease-standard);
+}
+
+/* ------------------------------------------------------------ reduced motion */
+
+@media (prefers-reduced-motion: reduce) {
+  /* Zeroed at the token level so any component that reaches for the tokens
+   * (rather than the utility classes) is covered too. */
+  :root {
+    --motion-fast: 0ms;
+    --motion-base: 0ms;
+    --motion-slow: 0ms;
+  }
+
+  .motion-fade-in,
+  .motion-slide-up,
+  .motion-scale-in,
+  .motion-slide-in-right {
+    animation: none !important;
+  }
+
+  .motion-shimmer::after {
+    /* Keep the placeholder's own background; just drop the sweep. */
+    content: none;
+    animation: none !important;
+  }
+
+  .motion-interactive {
+    transition-duration: 0ms;
+  }
+
+  /* Neutralise movement, keep colour changes (they are the affordance). */
+  .motion-lift:hover,
+  .motion-lift:focus-visible {
+    transform: none !important;
+    translate: none !important;
+  }
+
+  button:not(:disabled) {
+    transition-duration: 0ms !important;
+  }
+
+  button:not(:disabled):active {
+    transform: none !important;
+  }
+
+  html {
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}

@@ -40,7 +40,12 @@ export function normalizeBaseUrl(raw: string): string {
     }
     return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, "");
   } catch {
-    // Allow relative path prefixes such as "/ferriscd"
+    // Allow relative path prefixes such as "/ferriscd", but never a
+    // protocol-relative host (`//evil.example`): that is not a path prefix and
+    // would silently redirect every bearer-token request to a foreign origin.
+    if (trimmed.startsWith("//") || trimmed.startsWith("\\\\")) {
+      return "";
+    }
     const withoutQueryOrHash = trimmed.split(/[?#]/, 1)[0] ?? "";
     return withoutQueryOrHash.replace(/\/+$/, "");
   }
@@ -53,8 +58,10 @@ export function getStoredToken(): string | null {
   const storage = getSessionStorage();
   const stored = storage?.getItem(SESSION_TOKEN_KEY) ?? null;
   if (stored && stored.trim().length > 0) {
-    inMemoryToken = stored;
-    return stored;
+    // Re-trim: a hand-edited/whitespace-padded entry must not produce an
+    // invalid `Authorization` header.
+    inMemoryToken = stored.trim();
+    return inMemoryToken;
   }
   return null;
 }

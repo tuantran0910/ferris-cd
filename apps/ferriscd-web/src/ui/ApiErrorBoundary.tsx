@@ -1,6 +1,7 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { AlertTriangle, LogOut, RotateCcw } from "lucide-react";
 import { ApiClientError } from "../api/client";
+import { Button } from "./Button";
 
 interface ApiErrorBoundaryProps {
   children: ReactNode;
@@ -45,7 +46,7 @@ export class ApiErrorBoundary extends Component<
     return (
       <div
         role="alert"
-        className="mx-auto my-12 max-w-xl rounded-xl border border-rose-500/40 bg-slate-900 p-6 shadow-xl"
+        className="mx-auto my-12 max-w-xl rounded-xl border border-rose-500/40 bg-slate-900 p-6 shadow-xl motion-fade-in"
       >
         <div className="flex items-start gap-3">
           <div className="rounded-lg bg-rose-500/15 p-2 text-rose-400">
@@ -64,26 +65,27 @@ export class ApiErrorBoundary extends Component<
               {error.message || "An unexpected error occurred while rendering."}
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
-              <button
-                type="button"
+              <Button
+                variant="primary"
+                size="md"
                 onClick={this.handleReset}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-indigo-500"
+                icon={<RotateCcw className="h-3.5 w-3.5" />}
+                className="font-medium"
               >
-                <RotateCcw className="h-3.5 w-3.5" />
                 Try Again
-              </button>
+              </Button>
               {this.props.onLogout && (
-                <button
-                  type="button"
+                <Button
+                  variant="secondary"
+                  size="md"
                   onClick={() => {
                     this.setState({ error: null });
                     this.props.onLogout?.();
                   }}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3.5 py-2 text-xs font-medium text-slate-200 hover:bg-slate-700"
+                  icon={<LogOut className="h-3.5 w-3.5" />}
                 >
-                  <LogOut className="h-3.5 w-3.5" />
                   Sign Out
-                </button>
+                </Button>
               )}
             </div>
           </div>
@@ -103,32 +105,41 @@ export function ApiErrorAlert({
   const apiError = error instanceof ApiClientError ? error : null;
   const message =
     error instanceof Error ? error.message : "Failed to load data from API.";
+  // `status === 0` means the request never reached the server: showing
+  // "HTTP_0 (HTTP 0)" would send the operator looking for an HTTP problem.
+  const networkError = apiError !== null && apiError.status === 0;
+  const heading = networkError
+    ? "API Server Unreachable"
+    : apiError
+      ? `${apiError.code} (HTTP ${apiError.status})`
+      : "API Request Failed";
 
   return (
     <div
       role="alert"
-      className="rounded-xl border border-rose-500/40 bg-rose-950/30 p-4 text-sm text-rose-200"
+      className="rounded-xl border border-rose-500/40 bg-rose-950/30 p-4 text-sm text-rose-200 motion-fade-in"
     >
       <div className="flex items-start justify-between gap-4">
         <div className="flex items-start gap-2.5">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
-          <div>
-            <p className="font-medium text-rose-100">
-              {apiError
-                ? `${apiError.code} (HTTP ${apiError.status})`
-                : "API Request Failed"}
+          <div className="min-w-0">
+            <p className="font-medium text-rose-100">{heading}</p>
+            <p className="mt-0.5 break-words text-rose-200/90">
+              {networkError
+                ? "The FerrisCD API server could not be reached. Check the API Server URL and your connection, then retry."
+                : message}
             </p>
-            <p className="mt-0.5 text-rose-200/90">{message}</p>
           </div>
         </div>
         {onRetry && (
-          <button
-            type="button"
+          <Button
+            variant="danger"
+            size="sm"
             onClick={onRetry}
-            className="shrink-0 rounded-md border border-rose-500/40 bg-rose-500/15 px-3 py-1 text-xs font-medium text-rose-100 hover:bg-rose-500/25"
+            className="shrink-0"
           >
             Retry
-          </button>
+          </Button>
         )}
       </div>
     </div>
