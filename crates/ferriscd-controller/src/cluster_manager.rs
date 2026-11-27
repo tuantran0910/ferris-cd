@@ -1292,6 +1292,18 @@ impl ClusterManager {
         source: Arc<dyn ClusterSecretSource>,
         stop: CancellationToken,
     ) {
+        self.run_with_readiness(source, stop, None).await;
+    }
+
+    /// Drives the registry from a `Secret` event stream until `stop` is cancelled, optionally
+    /// signalling [`ControlPlaneReadiness::mark_clusters_seeded`](crate::ControlPlaneReadiness::mark_clusters_seeded)
+    /// once a bracketed initial list (`Init`..`InitDone`) completes (`T17.1`).
+    pub async fn run_with_readiness(
+        self: Arc<Self>,
+        source: Arc<dyn ClusterSecretSource>,
+        stop: CancellationToken,
+        readiness: Option<crate::ControlPlaneReadiness>,
+    ) {
         let mut events = source.events();
         // `Secret` names observed since the last `Init`, while a re-list is in progress.
         let mut seen: HashSet<String> = HashSet::new();
@@ -1335,6 +1347,9 @@ impl ClusterManager {
                              forgetting them so no Application keeps deploying with a credential \
                              that was revoked"
                         );
+                    }
+                    if let Some(gate) = &readiness {
+                        gate.mark_clusters_seeded();
                     }
                 }
                 Ok(ClusterSecretEvent::Upsert(secret)) => {

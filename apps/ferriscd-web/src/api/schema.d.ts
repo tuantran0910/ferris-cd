@@ -132,8 +132,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Lists every addressable cluster: `in-cluster` plus every registered registration (`T13.1`).
-         * @description The cluster registry: `in-cluster` first, then every registered cluster name.
+         * Lists addressable clusters visible to the caller's authorized `AppProject`s (`T13.1`, `T17.1`).
+         * @description The cluster registry filtered to clusters permitted by the caller's visible `AppProject`s: `in-cluster` first, then matching registered cluster names.
          */
         get: operations["list_clusters"];
         put?: never;
@@ -249,15 +249,9 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Readiness probe: `503` until the readiness seam says the control plane can serve traffic.
-         * @description **Limitation, tracked as `TODO(T15.x)`:** readiness is the API server's own verdict (the router
-         *     answers, and the seam wired today is [`crate::state::ServingReadiness`]). It does **not** yet
-         *     reflect controller watch readiness — whether the `Application`/`AppProject` watches (and, with
-         *     `T13.1`, the cluster-registry `Secret` watch) have completed their initial list. So a pod can
-         *     report `ready` while its controller is still listing: a client may observe an empty
-         *     `/api/v1/applications` for a few seconds after a restart. `T15.x` (health/metrics) is where the
-         *     watch state becomes part of this answer; until then the false-`ready` window is bounded by the
-         *     initial list and nothing is served from a cache.
+         * Readiness probe: `503` until the control plane's startup gates (`Application` watches,
+         *     `ClusterManager` initial `Secret` seed, and initial `ferriscd-rbac-cm` load) have all completed
+         *     `InitDone` (`T17.1`).
          */
         get: operations["readyz"];
         put?: never;
@@ -1039,7 +1033,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The cluster registry */
+            /** @description Project-visible clusters */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1050,6 +1044,15 @@ export interface operations {
             };
             /** @description Authentication required */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The cluster could not be read */
+            502: {
                 headers: {
                     [name: string]: unknown;
                 };

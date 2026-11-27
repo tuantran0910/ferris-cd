@@ -2298,6 +2298,7 @@ mod tests {
             GIT_FETCH_DURATION_SECONDS,
             RENDER_CACHE_TOTAL,
             ACTIVE_RECONCILES,
+            crate::metrics::RBAC_RELOAD_TOTAL,
         ]
         .into_iter()
         .collect();

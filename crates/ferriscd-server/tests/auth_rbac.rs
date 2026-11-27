@@ -1035,3 +1035,233 @@ rules:
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// `T17.1`: `/readyz` returns `503 Service Unavailable` with a secret-free reason until all three
+/// control-plane readiness gates (`Application` watches, `ClusterManager` seed, and initial RBAC
+/// policy load) signal `InitDone`.
+#[tokio::test]
+async fn readyz_flips_503_to_200_strictly_after_all_three_init_done_gates() {
+    let readiness = ferriscd_controller::ControlPlaneReadiness::new();
+    let state = state_with(
+        tenants(),
+        Arc::new(Tokens::with_policy_identities()),
+        policy(),
+        IdentityCache::default(),
+    )
+    .with_readiness(Arc::new(
+        ferriscd_server::kube::KubeControlPlaneReadiness::new(readiness.clone()),
+    ));
+
+    // Cold pod: 503 with secret-free reason.
+    let (status, body) = get_as(state.clone(), "/readyz", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["status"], "not ready");
+    assert!(
+        body["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("application watches")
+                && r.contains("cluster registry seed")
+                && r.contains("RBAC policy")),
+        "{body}"
+    );
+
+    // Two of three gates done: still 503.
+    readiness.mark_clusters_seeded();
+    readiness.mark_rbac_loaded();
+    let (status, body) = get_as(state.clone(), "/readyz", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("application watches") && !r.contains("RBAC")),
+        "{body}"
+    );
+
+    // Final gate signals InitDone: 200 OK with no reason.
+    readiness.mark_controllers_ready();
+    let (status, body) = get_as(state, "/readyz", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ready");
+    assert!(body.get("reason").is_none(), "{body}");
+}
+
+/// `T17.1`: live `RbacPolicyStore` updates take effect immediately on the running router without
+/// restart; invalid updates retain the last known-good policy; ConfigMap deletion fails closed.
+#[tokio::test]
+async fn live_rbac_reload_transitions_403_to_200_and_deletion_fails_closed() {
+    let store = ferriscd_server::RbacPolicyStore::new(
+        RbacPolicy::parse(POLICY).expect("valid initial policy"),
+    );
+    let state = state_with(
+        tenants(),
+        Arc::new(Tokens::with_policy_identities()),
+        Arc::new(RbacPolicy::empty()),
+        IdentityCache::default(),
+    )
+    .with_rbac_store(store.clone());
+
+    // Initially `payments-team` is read-only: sync is 403 Forbidden.
+    let (status, _) = post_as(
+        state.clone(),
+        "/api/v1/applications/ferriscd-system/payments-api/sync",
+        Some("team-token"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Live ConfigMap update grants `sync` to `payments-team`: takes effect immediately (`202`).
+    let expanded = r#"
+rules:
+  - subject: {kind: group, name: payments-team}
+    project: payments
+    actions: [get, diff, sync]
+"#;
+    assert_eq!(
+        store.apply_event(ferriscd_server::RbacConfigMapEvent::Applied(Some(
+            expanded.to_owned()
+        ))),
+        ferriscd_controller::RbacReloadOutcome::Ok
+    );
+    let (status, _) = post_as(
+        state.clone(),
+        "/api/v1/applications/ferriscd-system/payments-api/sync",
+        Some("team-token"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // Malformed update retains last known-good policy (still authorized).
+    assert_eq!(
+        store.apply_event(ferriscd_server::RbacConfigMapEvent::Applied(Some(
+            "rules: [not-valid".to_owned()
+        ))),
+        ferriscd_controller::RbacReloadOutcome::Error
+    );
+    let (status, _) = get_as(
+        state.clone(),
+        "/api/v1/applications/ferriscd-system/payments-api",
+        Some("team-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Deleting `ferriscd-rbac-cm` transitions immediately to default-deny (404 hides existence).
+    assert_eq!(
+        store.apply_event(ferriscd_server::RbacConfigMapEvent::Deleted),
+        ferriscd_controller::RbacReloadOutcome::Deleted
+    );
+    let (status, _) = get_as(
+        state,
+        "/api/v1/applications/ferriscd-system/payments-api",
+        Some("team-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// `T17.1` trap guard: `GET /api/v1/clusters` hides clusters belonging exclusively to another
+/// tenant's `AppProject`, while wildcard `*` and `PassThrough` still see the full registry.
+#[tokio::test]
+async fn list_clusters_hides_cross_tenant_clusters() {
+    struct MultiClusterCatalog;
+    impl ClusterCatalog for MultiClusterCatalog {
+        fn list(&self) -> Vec<ClusterEntry> {
+            vec![
+                ClusterEntry {
+                    name: "in-cluster".to_owned(),
+                    in_cluster: true,
+                },
+                ClusterEntry {
+                    name: "eu-payments-prod".to_owned(),
+                    in_cluster: false,
+                },
+                ClusterEntry {
+                    name: "tenant-a-cluster".to_owned(),
+                    in_cluster: false,
+                },
+            ]
+        }
+    }
+
+    struct ScopedProjects(Vec<AppProject>);
+    impl ProjectCatalog for ScopedProjects {
+        fn list(&self) -> SeamFuture<'_, Vec<AppProject>> {
+            Box::pin(async { Ok(self.0.clone()) })
+        }
+    }
+
+    let project_with_clusters = |name: &str, clusters: &[&str]| -> AppProject {
+        let destinations: Vec<Value> = clusters
+            .iter()
+            .map(|c| json!({ "cluster": c, "namespace": "*" }))
+            .collect();
+        let spec: ferriscd_crd::AppProjectSpec = serde_json::from_value(json!({
+            "destinations": destinations,
+        }))
+        .expect("valid AppProjectSpec");
+        AppProject::new(name, spec)
+    };
+
+    let mut state = state_with(
+        tenants(),
+        Arc::new(Tokens::with_policy_identities()),
+        policy(),
+        IdentityCache::default(),
+    );
+    state.clusters = Arc::new(MultiClusterCatalog);
+    state.projects = Arc::new(ScopedProjects(vec![
+        project_with_clusters("payments", &["in-cluster", "eu-payments-*"]),
+        project_with_clusters("tenant-a", &["tenant-a-cluster"]),
+    ]));
+
+    // `payments-team` sees `in-cluster` + `eu-payments-prod`, NEVER `tenant-a-cluster`.
+    let (status, body) = get_as(state.clone(), "/api/v1/clusters", Some("team-token")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["in-cluster", "eu-payments-prod"]);
+
+    // `tenant-a` sees ONLY `tenant-a-cluster`, NEVER `in-cluster` or `eu-payments-prod`.
+    let (status, body) = get_as(state.clone(), "/api/v1/clusters", Some("tenant-a-token")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["tenant-a-cluster"]);
+
+    // `platform-admins` sees all visible project clusters (3).
+    let (status, body) = get_as(state.clone(), "/api/v1/clusters", Some("admin-token")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["in-cluster", "eu-payments-prod", "tenant-a-cluster"]
+    );
+
+    // Caller with zero project grants sees an empty list (never leaks cluster names or count).
+    let mut empty_policy_state = state.clone();
+    empty_policy_state.rbac = ferriscd_server::RbacPolicyStore::empty();
+    let (status, body) = get_as(empty_policy_state, "/api/v1/clusters", Some("team-token")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().expect("items").len(), 0);
+
+    // Unrestricted `PassThrough` sees the full registry.
+    let pass_through = state.with_auth(AuthPolicy::PassThrough);
+    let (status, body) = get_as(pass_through, "/api/v1/clusters", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().expect("items").len(), 3);
+}

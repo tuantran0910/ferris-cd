@@ -22,7 +22,7 @@ use futures::future::BoxFuture;
 
 use crate::auth::{AuthPolicy, IdentityCache, TokenAuthenticator, UnconfiguredTokenAuthenticator};
 use crate::error::ApiError;
-use crate::rbac::RbacPolicy;
+use crate::rbac::{RbacPolicy, RbacPolicyStore};
 use crate::webhooks::{DeliveryDedupe, FanOut, RefreshSink, WebhookConfig};
 
 /// A boxed fallible future, so the seams stay object-safe.
@@ -432,8 +432,9 @@ pub struct AppState {
     pub tokens: Arc<dyn TokenAuthenticator>,
     /// `T14.3` positive-only `TokenReview` cache, keyed by token SHA-256.
     pub identities: Arc<IdentityCache>,
-    /// `T14.4` project-scoped authorization policy (empty = deny every authenticated caller).
-    pub rbac: Arc<RbacPolicy>,
+    /// `T14.4` / `T17.1` live-reloading project-scoped authorization policy store (empty = deny
+    /// every authenticated caller).
+    pub rbac: RbacPolicyStore,
     /// `T14.2` webhook configuration (secrets, caps, debounce).
     pub webhooks: WebhookConfig,
     /// `T14.2` bounded replay cache for `X-GitHub-Delivery` ids.
@@ -491,7 +492,7 @@ impl AppState {
             auth: AuthPolicy::default(),
             tokens: Arc::new(UnconfiguredTokenAuthenticator),
             identities: Arc::new(IdentityCache::default()),
-            rbac: Arc::new(RbacPolicy::empty()),
+            rbac: RbacPolicyStore::empty(),
             webhooks,
             dedupe,
             refreshes,
@@ -543,6 +544,13 @@ impl AppState {
     /// Replaces the project-scoped authorization policy (`T14.4`).
     #[must_use]
     pub fn with_rbac(mut self, rbac: Arc<RbacPolicy>) -> Self {
+        self.rbac = RbacPolicyStore::from_arc(rbac);
+        self
+    }
+
+    /// Replaces the live-reloading project-scoped authorization policy store (`T17.1`).
+    #[must_use]
+    pub fn with_rbac_store(mut self, rbac: RbacPolicyStore) -> Self {
         self.rbac = rbac;
         self
     }

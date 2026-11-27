@@ -559,16 +559,9 @@ pub async fn healthz() -> Json<HealthResponse> {
     })
 }
 
-/// Readiness probe: `503` until the readiness seam says the control plane can serve traffic.
-///
-/// **Limitation, tracked as `TODO(T15.x)`:** readiness is the API server's own verdict (the router
-/// answers, and the seam wired today is [`crate::state::ServingReadiness`]). It does **not** yet
-/// reflect controller watch readiness — whether the `Application`/`AppProject` watches (and, with
-/// `T13.1`, the cluster-registry `Secret` watch) have completed their initial list. So a pod can
-/// report `ready` while its controller is still listing: a client may observe an empty
-/// `/api/v1/applications` for a few seconds after a restart. `T15.x` (health/metrics) is where the
-/// watch state becomes part of this answer; until then the false-`ready` window is bounded by the
-/// initial list and nothing is served from a cache.
+/// Readiness probe: `503` until the control plane's startup gates (`Application` watches,
+/// `ClusterManager` initial `Secret` seed, and initial `ferriscd-rbac-cm` load) have all completed
+/// `InitDone` (`T17.1`).
 #[utoipa::path(
     get,
     path = "/readyz",
@@ -578,15 +571,21 @@ pub async fn healthz() -> Json<HealthResponse> {
         (status = 503, description = "Not ready", body = ReadyResponse),
     ),
 )]
-pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
+pub async fn readyz(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::HeaderValue;
+    use axum::response::IntoResponse as _;
+
     if state.readiness.is_ready() {
+        // Steady-state `200 OK` path allocates zero heap memory (`T17.1` non-functional requirement).
         (
             StatusCode::OK,
-            Json(ReadyResponse {
-                status: "ready".to_owned(),
-                reason: None,
-            }),
+            [(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            axum::body::Body::from(r#"{"status":"ready"}"#),
         )
+            .into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -595,6 +594,7 @@ pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<ReadyRes
                 reason: state.readiness.reason(),
             }),
         )
+            .into_response()
     }
 }
 
@@ -628,7 +628,8 @@ pub async fn list_applications(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthenticatedIdentity>,
 ) -> Result<Json<ApplicationListView>, ApiError> {
-    let actor = Actor::new(&state.rbac, &identity);
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
     let applications = state.applications.list().await?;
     Ok(Json(ApplicationListView {
         items: applications
@@ -670,7 +671,8 @@ pub async fn get_application(
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<ApplicationDetailView>, ApiError> {
-    let actor = Actor::new(&state.rbac, &identity);
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
     authorize(&actor, &app, &namespace, &name, Action::Get, "read")?;
     Ok(Json(application_detail(&app)))
@@ -731,7 +733,8 @@ pub async fn get_resources(
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<ResourceGraphView>, ApiError> {
-    let actor = Actor::new(&state.rbac, &identity);
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
     authorize(&actor, &app, &namespace, &name, Action::Get, "read")?;
     let live = state.inventory.read(&app).await?;
@@ -876,7 +879,8 @@ pub async fn get_diff(
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<DiffView>, ApiError> {
-    let actor = Actor::new(&state.rbac, &identity);
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
     authorize(&actor, &app, &namespace, &name, Action::Diff, "diff")?;
     let preview = state.diffs.diff(&app).await?;
@@ -976,7 +980,8 @@ pub async fn sync_application(
             )));
         }
     }
-    let actor = Actor::new(&state.rbac, &identity);
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
     authorize(&actor, &app, &namespace, &name, Action::Sync, "sync")?;
     let operation = OperationRequest::Sync;
@@ -1032,7 +1037,8 @@ pub async fn rollback_application(
 ) -> Result<(StatusCode, Json<OperationResponse>), ApiError> {
     let body = require_body(state.webhooks.max_body_bytes(), body)?;
     let request: RollbackRequestBody = parse_body(&body)?;
-    let actor = Actor::new(&state.rbac, &identity);
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
     authorize(
         &actor,
@@ -1253,7 +1259,8 @@ pub async fn list_projects(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthenticatedIdentity>,
 ) -> Result<Json<ProjectListView>, ApiError> {
-    let actor = Actor::new(&state.rbac, &identity);
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
     let projects = state.projects.list().await?;
     Ok(Json(ProjectListView {
         items: projects
@@ -1264,30 +1271,65 @@ pub async fn list_projects(
     }))
 }
 
-/// Lists every addressable cluster: `in-cluster` plus every registered registration (`T13.1`).
+/// Lists addressable clusters visible to the caller's authorized `AppProject`s (`T13.1`, `T17.1`).
+///
+/// An authenticated caller sees `in-cluster` or a registered remote cluster only when at least one
+/// `AppProject` visible to them (`actor.can_see(project)`) allows that cluster in
+/// `spec.destinations` (matching with [`ferriscd_engine::policy::wildcard_matches`]). Unrestricted
+/// (`PassThrough`) callers see the full cluster registry.
+///
+/// # Errors
+///
+/// [`ApiError::Backend`] when the `AppProject` catalog cannot be listed.
 #[utoipa::path(
     get,
     path = "/api/v1/clusters",
-    description = "The cluster registry: `in-cluster` first, then every registered cluster name.",
+    description = "The cluster registry filtered to clusters permitted by the caller's visible `AppProject`s: `in-cluster` first, then matching registered cluster names.",
     tag = "platform",
     responses(
-        (status = 200, description = "The cluster registry", body = ClusterListView),
+        (status = 200, description = "Project-visible clusters", body = ClusterListView),
         (status = 401, description = "Authentication required", body = ApiErrorBody),
+        (status = 502, description = "The cluster could not be read", body = ApiErrorBody),
     ),
     security(("bearer_auth" = [])),
 )]
 pub async fn list_clusters(
     State(state): State<AppState>,
-    _identity: Extension<AuthenticatedIdentity>,
-) -> Json<ClusterListView> {
-    Json(ClusterListView {
-        items: state
-            .clusters
-            .list()
-            .into_iter()
-            .map(|ClusterEntry { name, in_cluster }| ClusterView { name, in_cluster })
-            .collect(),
-    })
+    Extension(identity): Extension<AuthenticatedIdentity>,
+) -> Result<Json<ClusterListView>, ApiError> {
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
+    let all_clusters = state.clusters.list();
+    if actor.is_unrestricted() {
+        return Ok(Json(ClusterListView {
+            items: all_clusters
+                .into_iter()
+                .map(|ClusterEntry { name, in_cluster }| ClusterView { name, in_cluster })
+                .collect(),
+        }));
+    }
+    let projects = state.projects.list().await?;
+    let visible_destinations: Vec<&str> = projects
+        .iter()
+        .filter(|project| actor.can_see(&project.name_any()))
+        .flat_map(|project| {
+            project
+                .spec
+                .destinations
+                .iter()
+                .map(|dest| dest.cluster.trim())
+        })
+        .collect();
+    let items = all_clusters
+        .into_iter()
+        .filter(|entry| {
+            visible_destinations
+                .iter()
+                .any(|pattern| ferriscd_engine::policy::wildcard_matches(pattern, &entry.name))
+        })
+        .map(|ClusterEntry { name, in_cluster }| ClusterView { name, in_cluster })
+        .collect();
+    Ok(Json(ClusterListView { items }))
 }
 
 /// Serves the OpenAPI 3.1 document (`T14.1`).

@@ -63,7 +63,7 @@ pub use auth::{
 pub use error::{ApiError, ApiErrorBody, ApiErrorDetail};
 pub use rbac::{
     Action, Actor, DEFAULT_RBAC_NAMESPACE, Grant, RBAC_CONFIGMAP_KEY, RBAC_CONFIGMAP_NAME,
-    RbacPolicy, RbacPolicyError, Rule, SubjectKind,
+    RbacConfigMapEvent, RbacPolicy, RbacPolicyError, RbacPolicyStore, Rule, SubjectKind,
 };
 pub use state::{
     AppState, ApplicationSource, ClusterCatalog, ClusterEntry, DiffSource, GraphRequest,
