@@ -609,6 +609,7 @@ mod tests {
             &mut bundle.hooks.permanent_mut()[0],
             "ferriscd-system",
             "payments",
+            ferriscd_engine::inventory::StampOptions::default(),
         )
         .expect("stamping a plain object never fails");
         bundle.replan().expect("the plan is re-derivable");

@@ -501,6 +501,47 @@ Operational notes:
   `apiGroups: ["events.k8s.io"], resources: ["events"], verbs: ["create", "patch", "get", "list"]` (included in
   the `ClusterRole` above).
 
+### Ownership labels for the opt-in drift watcher (`T18.1`)
+
+Under Model 1 a `DriftWatcher` (opt-in, `--enable-drift-watcher`) can only be *label*-scoped: the
+Kubernetes API server cannot filter a watch on annotations. `--enable-drift-watcher`
+(`FERRISCD_ENABLE_DRIFT_WATCHER`, default `false`) therefore also stamps two bounded top-level
+labels onto every **non-hook** managed resource, alongside the existing
+`ferriscd.io/tracking-id` annotation:
+
+| Label | Value | Why |
+|---|---|---|
+| `ferriscd.io/managed-by` | `ferriscd` | the server-side selector (`ferriscd.io/managed-by=ferriscd`) so unmanaged objects never cross the wire |
+| `ferriscd.io/app-hash` | 16 lowercase hex characters | first 16 hex chars (64 bits) of `SHA-256("<app-namespace>/<app-name>")` — identifies the owning `Application` without a 253-character name overflowing the **63-character** label-value limit, and without `ns-a/app` colliding with `ns-b/app` (Finding M5) |
+
+Operational notes:
+
+* **The env value is exactly `true` or `false`.** `FERRISCD_ENABLE_DRIFT_WATCHER` is parsed as a
+  bool, not tested for truthiness: unset (or the flag absent) means **off**, and any other value —
+  including the empty string and `1`/`yes`/`True` — is a **usage error** that stops the controller at
+  startup instead of silently leaving the labels off. In the Helm chart there is no dedicated value;
+  wire it through `server.extraArgs: ["--enable-drift-watcher"]` or
+  `server.extraEnv: [{name: FERRISCD_ENABLE_DRIFT_WATCHER, value: "true"}]`, which
+  `templates/deployment.yaml` passes straight to the `ferriscd` container.
+* **Off by default, and additive when on.** With the flag off the apply body is unchanged (the
+  annotation only). Turning it on adds the pair; turning it back off removes nothing from the
+  desired body and the next sync's Server-Side Apply converges the two labels away — one no-op diff
+  per resource, never a drift loop.
+* **Never in an immutable selector.** The labels go on the object's own `metadata.labels` only.
+  `spec.selector.matchLabels` and `spec.template.metadata.labels` are untouched: they are immutable
+  on `Deployment`/`StatefulSet`/`DaemonSet`, so writing there would fail every later apply with
+  `422 Immutable`.
+* **Lifecycle hooks are never stamped.** A stamped hook would look prunable to the pruner even
+  though its lifetime belongs to its `ferriscd.io/hook-delete-policy`.
+* **No extra RBAC is needed for the labels themselves** — they ride on objects the controller
+  already applies. (The metadata watch a future `DriftWatcher` runs needs
+  `get`/`list`/`watch` on the resource kinds it watches; that is its own opt-in grant.)
+* **Cluster lifecycle is broadcast internally.** `ClusterManager` publishes `Added`, `Rebuilt` and
+  `Removed` events on a bounded (64) channel for `ferriscd.io/secret-type=cluster` secrets —
+  including a cluster whose `Secret` vanished while the watch was reconnecting, which Kubernetes
+  never reports as a delete. A subscriber that falls behind is told so (`Lagged`) and resynchronises
+  against the registry's live name set; the registry never waits for a consumer.
+
 ### Multi-tenancy RBAC matrix
 
 | Controller verb (`T12.2`/`T12.3`) | Why | Scope |
