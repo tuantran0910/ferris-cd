@@ -335,7 +335,9 @@ jobs:
       - name: Restore cached RustSec advisory database
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
         with:
-          path: ~/.cargo/advisory-db
+          path: |
+            ~/.cargo/advisory-db
+            ~/.cargo/advisory-db-deny
           key: advisory-db-${{ github.run_id }}
           restore-keys: |
             advisory-db-
@@ -343,10 +345,12 @@ jobs:
       - name: Repair cached advisory database if it is not a git checkout
         run: |
           set -euo pipefail
-          if [[ -d "${HOME}/.cargo/advisory-db" && ! -d "${HOME}/.cargo/advisory-db/.git" ]]; then
-            echo "cached advisory DB is not a git checkout; dropping it"
-            rm -rf "${HOME}/.cargo/advisory-db"
-          fi
+          for db in "${HOME}/.cargo/advisory-db" "${HOME}/.cargo/advisory-db-deny"; do
+            if [[ -d "${db}" && ! -d "${db}/.git" ]]; then
+              echo "cached advisory DB ${db} is not a git checkout; dropping it"
+              rm -rf "${db}"
+            fi
+          done
 
       - name: Install cargo-deny (host binary so the cached advisory DB applies)
         uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
