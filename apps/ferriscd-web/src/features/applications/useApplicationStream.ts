@@ -16,6 +16,26 @@ export interface ApplicationStreamState {
   snapshot: ApplicationListView | null;
 }
 
+/** Streamed data is authoritative only while the stream is actually live; polling otherwise. */
+export function selectApplicationsData(
+  status: ApplicationStreamStatus,
+  snapshot: ApplicationListView | null,
+  polled: ApplicationListView | undefined,
+): ApplicationListView | undefined {
+  return status === "live" && snapshot ? snapshot : polled;
+}
+
+/** No snapshot for this long means the connection is half-open (a proxy black-holed it). */
+export const STREAM_STALL_MS = 15_000;
+
+export function isStreamStalled(
+  lastFrameAt: number,
+  now: number,
+  thresholdMs = STREAM_STALL_MS,
+): boolean {
+  return now - lastFrameAt >= thresholdMs;
+}
+
 /** Five fast retries (0.5 s, 1 s, 2 s, 4 s, 8 s with jitter) before falling back to polling. */
 export const MAX_FAST_ATTEMPTS = 5;
 export const BASE_RETRY_MS = 500;
@@ -60,8 +80,11 @@ export function useApplicationStream(enabled = true): ApplicationStreamState {
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let watchdog: ReturnType<typeof setInterval> | undefined;
     let controller: AbortController | undefined;
     let attempt = 0;
+    let lastFrameAt = Date.now();
+    let stalled = false;
 
     const schedule = (delayMs: number) => {
       timer = setTimeout(() => {
@@ -74,15 +97,29 @@ export function useApplicationStream(enabled = true): ApplicationStreamState {
         return;
       }
       controller = new AbortController();
+      stalled = false;
+      lastFrameAt = Date.now();
       setStatus("connecting");
+      // Server snapshots arrive every ~2 s; silence means a half-open socket that will never
+      // reject on its own. Force it into the retry path instead of freezing a "live" dashboard.
+      watchdog = setInterval(() => {
+        if (isStreamStalled(lastFrameAt, Date.now())) {
+          stalled = true;
+          controller?.abort();
+        }
+      }, 1_000);
       try {
         await openApplicationStream({
           baseUrl,
           token,
           signal: controller.signal,
           onSnapshot: (snapshot) => {
+            lastFrameAt = Date.now();
             // A slower in-flight poll must not overwrite a newer streamed snapshot.
-            void queryClient.cancelQueries({ queryKey: queryKeys.applications() });
+            void queryClient.cancelQueries(
+              { queryKey: queryKeys.applications() },
+              { revert: false },
+            );
             queryClient.setQueryData(queryKeys.applications(), snapshot);
             setSnapshot(snapshot);
             setStatus("live");
@@ -96,7 +133,10 @@ export function useApplicationStream(enabled = true): ApplicationStreamState {
         setStatus("polling");
         schedule(1_000);
       } catch (error) {
-        if (cancelled || controller.signal.aborted) {
+        if (cancelled) {
+          return;
+        }
+        if (controller.signal.aborted && !stalled) {
           return;
         }
         if (error instanceof ApiClientError && error.isUnauthorized) {
@@ -112,6 +152,11 @@ export function useApplicationStream(enabled = true): ApplicationStreamState {
           return;
         }
         schedule(retryDelayMs(attempt));
+      } finally {
+        if (watchdog !== undefined) {
+          clearInterval(watchdog);
+          watchdog = undefined;
+        }
       }
     };
 
@@ -122,6 +167,9 @@ export function useApplicationStream(enabled = true): ApplicationStreamState {
       controller?.abort();
       if (timer !== undefined) {
         clearTimeout(timer);
+      }
+      if (watchdog !== undefined) {
+        clearInterval(watchdog);
       }
     };
   }, [enabled, token, baseUrl, queryClient, logout]);

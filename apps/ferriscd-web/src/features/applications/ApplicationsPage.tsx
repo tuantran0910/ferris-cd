@@ -6,7 +6,10 @@ import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Button } from "../../ui/Button";
 import { EmptyState } from "../../ui/EmptyState";
 import { LiveRegion } from "../../ui/LiveRegion";
-import { useApplicationStream } from "./useApplicationStream";
+import {
+  selectApplicationsData,
+  useApplicationStream,
+} from "./useApplicationStream";
 import { Skeleton } from "../../ui/Skeleton";
 import {
   HealthStatusBadge,
@@ -102,7 +105,7 @@ export function ApplicationsPage() {
       true,
       streamStatus === "live" ? false : APPLICATIONS_POLL_INTERVAL_MS,
     );
-  const data = streamedSnapshot ?? polledData;
+  const data = selectApplicationsData(streamStatus, streamedSnapshot, polledData);
 
   const apps: ApplicationSummary[] = useMemo(() => data?.items ?? [], [data]);
 

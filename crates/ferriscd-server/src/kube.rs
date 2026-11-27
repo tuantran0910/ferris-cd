@@ -277,29 +277,26 @@ impl EventSource for KubeEventSource {
         };
         let api = event_api(self.client.clone(), &namespace);
         Box::pin(async move {
-            // Follow `metadata.continue` for a bounded number of pages so >limit stale events
-            // cannot push the newest ones out of the window (the API server does not order by time).
-            let mut items = Vec::new();
-            let mut token: Option<String> = None;
-            for _ in 0..EVENT_LIST_MAX_PAGES {
-                let mut params = ListParams::default()
-                    .fields(&selector)
-                    .limit(EVENT_LIST_LIMIT);
-                if let Some(token) = token.as_deref() {
-                    params = params.continue_token(token);
+            let api = api;
+            let selector = selector;
+            collect_event_pages(|token| {
+                let api = api.clone();
+                let selector = selector.clone();
+                async move {
+                    // Follow `metadata.continue` for a bounded number of pages so >limit stale
+                    // events cannot push the newest ones out of the window.
+                    let mut params = ListParams::default()
+                        .fields(&selector)
+                        .limit(EVENT_LIST_LIMIT);
+                    if let Some(token) = token.as_deref() {
+                        params = params.continue_token(token);
+                    }
+                    api.list(&params)
+                        .await
+                        .map_err(|err| ApiError::backend(&err))
                 }
-                let listed = api
-                    .list(&params)
-                    .await
-                    .map_err(|err| ApiError::backend(&err))?;
-                let next = continues_with(&listed);
-                items.extend(listed.items);
-                match next {
-                    Some(next) => token = Some(next),
-                    None => break,
-                }
-            }
-            Ok(event_page(items))
+            })
+            .await
         })
     }
 }
@@ -323,6 +320,26 @@ pub const EVENT_LIST_LIMIT: u32 = 200;
 
 /// How many `continue` pages one timeline read may follow (bounded work, newest 50 selection).
 pub const EVENT_LIST_MAX_PAGES: usize = 5;
+
+/// Merges at most [`EVENT_LIST_MAX_PAGES`] `continue`-linked pages, newest first.
+async fn collect_event_pages<F, Fut>(mut fetch: F) -> Result<Vec<ApplicationEvent>, ApiError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<kube::core::ObjectList<Event>, ApiError>>,
+{
+    let mut items = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..EVENT_LIST_MAX_PAGES {
+        let listed = fetch(token.clone()).await?;
+        let next = continues_with(&listed);
+        items.extend(listed.items);
+        match next {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    Ok(event_page(items))
+}
 
 /// Whether a listed page asks for another page: only a non-empty `continue` token continues.
 #[must_use]
@@ -458,7 +475,8 @@ pub const SSE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
 /// per feed instance. 20 open dashboards therefore cost one scoped list per interval, not 20 — the
 /// per-connection read fan-out the first review flagged. The task starts with the first subscriber
 /// and exits when the last receiver is dropped (`send` fails), clearing the slot so a later
-/// subscriber starts a fresh loop.
+/// subscriber starts a fresh loop: a slot holding a closed sender (the previous task has not yet
+/// cleared it) is never reused.
 ///
 /// # Backpressure and cleanup
 ///
@@ -1616,6 +1634,63 @@ mod tests {
         assert_eq!(continues_with(&page(Some("next"))), Some("next".to_owned()));
         assert_eq!(continues_with(&page(Some(""))), None);
         assert_eq!(continues_with(&page(None)), None);
+    }
+
+    #[tokio::test]
+    async fn event_pages_merge_and_stop_at_the_bounded_page_count() {
+        use std::collections::VecDeque;
+
+        let page = |name: &str, next: Option<&str>| -> kube::core::ObjectList<Event> {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "continue": next },
+                "items": [{ "metadata": { "name": name } }],
+            }))
+            .expect("a valid list")
+        };
+
+        let pages = Arc::new(Mutex::new(VecDeque::from(vec![
+            page("one", Some("two")),
+            page("two", None),
+        ])));
+        let mut calls = 0;
+        let merged = collect_event_pages(|_token| {
+            calls += 1;
+            let pages = Arc::clone(&pages);
+            async move {
+                pages
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pop_front()
+                    .ok_or_else(|| ApiError::backend(&std::io::Error::other("exhausted")))
+            }
+        })
+        .await
+        .expect("both pages merge");
+        assert_eq!(calls, 2);
+        assert_eq!(merged.len(), 2);
+
+        // Always-continuing pages stop at the budget instead of looping forever.
+        let endless = Arc::new(Mutex::new(VecDeque::from(
+            (0..10)
+                .map(|_index| page("row", Some("more")))
+                .collect::<Vec<_>>(),
+        )));
+        let mut calls = 0;
+        let merged = collect_event_pages(|_| {
+            calls += 1;
+            let endless = Arc::clone(&endless);
+            async move {
+                endless
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pop_front()
+                    .ok_or_else(|| ApiError::backend(&std::io::Error::other("exhausted")))
+            }
+        })
+        .await
+        .expect("bounded pagination");
+        assert_eq!(calls, EVENT_LIST_MAX_PAGES);
+        assert_eq!(merged.len(), EVENT_LIST_MAX_PAGES);
     }
 
     #[test]

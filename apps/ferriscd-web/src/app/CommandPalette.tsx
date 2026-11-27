@@ -74,13 +74,13 @@ export function useCommandPaletteShortcut(onToggle: () => void) {
       if (event.key.toLowerCase() !== "k") {
         return;
       }
+      event.preventDefault();
       // Never open a second focus trap on top of Sync/Rollback (Escape would close both); the
       // palette's own dialog is marked so Cmd+K still toggles it closed.
       const paletteOpen = document.querySelector('[data-command-palette]') !== null;
       if (!paletteOpen && document.querySelector('[role="dialog"]')) {
         return;
       }
-      event.preventDefault();
       onToggleRef.current();
     };
     document.addEventListener("keydown", onKeyDown);

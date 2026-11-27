@@ -12,7 +12,10 @@ import {
   MAX_RETRY_MS,
   RETRY_WHILE_POLLING_MS,
   retryDelayMs,
+  selectApplicationsData,
   shouldFallBackToPolling,
+  STREAM_STALL_MS,
+  isStreamStalled,
 } from "../features/applications/useApplicationStream";
 
 const snapshot: ApplicationListView = { items: [] };
@@ -113,5 +116,23 @@ describe("application stream retry policy", () => {
     expect(shouldFallBackToPolling(MAX_FAST_ATTEMPTS)).toBe(false);
     expect(shouldFallBackToPolling(MAX_FAST_ATTEMPTS + 1)).toBe(true);
     expect(RETRY_WHILE_POLLING_MS).toBe(60_000);
+  });
+});
+
+describe("application stream fallback and liveness", () => {
+  const polled: ApplicationListView = { items: [{ name: "polled" } as never] };
+  const streamed: ApplicationListView = { items: [{ name: "streamed" } as never] };
+
+  it("uses the streamed snapshot only while live and falls back to polled data", () => {
+    expect(selectApplicationsData("live", streamed, polled)).toBe(streamed);
+    expect(selectApplicationsData("polling", streamed, polled)).toBe(polled);
+    expect(selectApplicationsData("connecting", null, polled)).toBe(polled);
+    expect(selectApplicationsData("live", null, polled)).toBe(polled);
+  });
+
+  it("detects a half-open connection after the stall threshold", () => {
+    const now = 1_000_000;
+    expect(isStreamStalled(now - STREAM_STALL_MS + 1, now)).toBe(false);
+    expect(isStreamStalled(now - STREAM_STALL_MS, now)).toBe(true);
   });
 });
