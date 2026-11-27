@@ -58,6 +58,10 @@ impl ControlPlaneReadiness {
     ///
     /// Only the replica that actually runs the controller set marks this. An HA standby uses
     /// [`Self::mark_standby_serving`] instead.
+    ///
+    /// The gate is monotonic for the process lifetime: after a leader term ends and the replica
+    /// leads again, it does not re-arm, so a handoff cannot flap `/readyz`. Its stores are warm
+    /// from the previous term.
     pub fn mark_controllers_ready(&self) {
         self.inner.controllers_ready.store(true, Ordering::Release);
     }

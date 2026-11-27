@@ -952,6 +952,8 @@ pub fn denies_every_authenticated_caller(state: &AppState) -> bool {
 ///   immediately to [`RbacPolicy::empty`] (default-deny) and increments
 ///   `ferriscd_rbac_reload_total{outcome="deleted"}`.
 /// - Marks `readiness.mark_rbac_loaded()` once the initial watch snapshot (`InitDone`) completes.
+/// - Counts watch-stream failures on `ferriscd_rbac_watch_errors_total` (a fault that yields an
+///   `Err` followed by the end of the stream is counted once).
 pub async fn watch_rbac_policy(
     client: Client,
     namespace: String,
@@ -996,6 +998,7 @@ pub async fn drive_rbac_watch<S, E>(
     let mut listing = false;
     let mut initial_sync_done = false;
     let mut last_resource_version: Option<String> = None;
+    let mut last_event_was_error = false;
 
     loop {
         let next = tokio::select! {
@@ -1008,9 +1011,12 @@ pub async fn drive_rbac_watch<S, E>(
                 configmap = RBAC_CONFIGMAP_NAME,
                 "RBAC ConfigMap watch stream ended; active policy snapshot remains in effect"
             );
-            metrics.record_rbac_watch_error();
+            if !last_event_was_error {
+                metrics.record_rbac_watch_error();
+            }
             break;
         };
+        last_event_was_error = false;
         match event {
             Ok(WatcherEvent::Init) => {
                 seen_in_init = false;
@@ -1081,6 +1087,7 @@ pub async fn drive_rbac_watch<S, E>(
                     "RBAC ConfigMap watch error; retrying with backoff while retaining active policy"
                 );
                 metrics.record_rbac_watch_error();
+                last_event_was_error = true;
             }
         }
     }
@@ -1631,8 +1638,8 @@ rules:
         );
         assert_eq!(
             rbac_watch_error_count(&metrics),
-            2,
-            "the stream error and the trailing stream end must be visible on the dedicated counter"
+            1,
+            "one fault (Err followed by stream end) must be counted exactly once"
         );
         assert_eq!(rbac_reload_count(&metrics, "deleted"), 0);
     }

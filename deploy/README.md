@@ -460,6 +460,8 @@ Exposed families — and nothing else:
 | `ferriscd_git_fetch_duration_seconds` | histogram | *(none)* |
 | `ferriscd_render_cache_total` | counter | `outcome` = `hit` \| `miss` |
 | `ferriscd_active_reconciles` | gauge | *(none)* |
+| `ferriscd_rbac_reload_total` | counter | `outcome` = `ok` \| `error` \| `deleted` |
+| `ferriscd_rbac_watch_errors_total` | counter | *(none)* |
 
 Operational notes:
 

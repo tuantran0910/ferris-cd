@@ -109,10 +109,12 @@ where
         });
     }
     serde_saphyr::from_str_with_options(document, parse_options()).map_err(|err| {
-        // Alias-replay limits are enforced during deserialization; classify them as a budget
-        // breach so callers can distinguish a bomb from an ordinary shape/type error without
-        // ever echoing document content.
-        if err.to_string().contains("replay") {
+        // Alias-replay limits are enforced during deserialization. The parser wraps the typed
+        // variants, so match the guard's own fixed phrases ("alias replay ...", "alias expansion
+        // ...") — never a bare user-controlled token such as `replay`, which could come from an
+        // unknown-field error and misreport a typo as a budget breach.
+        let message = err.to_string();
+        if message.contains("alias replay") || message.contains("alias expansion") {
             YamlGuardError::Budget {
                 limit: "alias-replay".to_owned(),
             }
@@ -740,6 +742,20 @@ rules: *e
                 panic!("replay breaches must not be reported as generic parse errors")
             }
         }
+    }
+
+    #[test]
+    fn parse_document_classifies_per_anchor_expansion_breaches_as_budget() {
+        // One anchor expanded more than `max_alias_expansions_per_anchor`: a typed
+        // `AliasExpansionLimitExceeded`, which must also surface as a budget breach.
+        let aliases = " *a,".repeat(101);
+        let bomb = format!("a: &a [1]\nb: [{aliases}]\n");
+        let err = parse_document::<serde_json::Value>(&bomb)
+            .expect_err("the per-anchor expansion guard must reject the bomb");
+        assert!(
+            matches!(err, YamlGuardError::Budget { .. }),
+            "expected a budget-specific guard error, got: {err:?}"
+        );
     }
 
     #[test]
