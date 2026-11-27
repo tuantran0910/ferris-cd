@@ -402,7 +402,8 @@ affinity: {}
 # When empty and `replicaCount > 1`, a default hostname topologySpreadConstraint is added.
 topologySpreadConstraints: []
 priorityClassName: ""
-# Must cover the controller drain (default 30 s) plus the <= 2 s audit-sink flush.
+# Must cover the controller drain (default 30 s), the API server's graceful drain, the OTLP flush,
+# and the <= 2 s audit-sink flush (8 s headroom).
 terminationGracePeriodSeconds: 40
 
 # Optional FerrisCD Modern Web Dashboard (`apps/ferriscd-web`).

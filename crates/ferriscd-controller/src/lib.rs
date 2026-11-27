@@ -570,12 +570,14 @@ impl ControlPlane {
     /// from that one decision. A lost leader lease ends the term through the same token, exactly as
     /// before.
     ///
-    /// # Errors
+    /// # Shutdown
     ///
-    /// **Caller obligation (`T17.2`):** this method no longer closes the external audit sinks.
+    /// **Caller obligation (`T17.2`):** this method does not close the external audit sinks.
     /// After every producer (including an in-process API server sharing the plane) has drained,
     /// call [`Self::audit_sink_handles`]`().flush().await`, or queued JSONL/webhook audit records
     /// are lost at exit.
+    ///
+    /// # Errors
     ///
     /// See [`run_with`].
     pub async fn run_until(
@@ -616,7 +618,13 @@ impl ControlPlane {
         // The registry is a background watcher: stopping it is enough, nothing is buffered.
         self.cluster_stop.cancel();
         // Give the registry watcher a bounded chance to observe cancellation before the sinks close.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), self.cluster_watch).await;
+        match tokio::time::timeout(std::time::Duration::from_secs(1), self.cluster_watch).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "cluster registry watcher panicked during shutdown")
+            }
+            Err(_) => tracing::warn!("cluster registry watcher did not stop before the deadline"),
+        }
         // The controller has drained: stop the listener too (idempotent — a `SIGTERM` already
         // cancelled the token) and report its outcome, so a dead `/metrics` endpoint can never be
         // mistaken for a healthy process.

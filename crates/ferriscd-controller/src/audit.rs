@@ -534,15 +534,26 @@ impl AuditSink for JsonlFileAuditSink {
 #[must_use]
 pub fn redact_audit_url(raw: &str) -> String {
     let trimmed = raw.trim();
-    // Credential pre-pass: `user:password@` without a `/` in the userinfo (SCP-style remotes and
-    // non-special schemes that `Url::parse` would keep verbatim). Query/fragment still stripped.
-    if let Some((userinfo, rest)) = trimmed.rsplit_once('@')
-        && !userinfo.contains('/')
-        && userinfo.contains(':')
+    // Note: this is credential-shaped matching, not URL semantics; a non-web value such as
+    // `mailto:user@example.com` is redacted as if `mailto` were a username (it is never echoed raw).
+    //
+    // Credential pre-pass for SCP-style remotes and non-special schemes that `Url::parse` keeps
+    // verbatim (its `set_username`/`set_password` fail for cannot-be-a-base URLs). Restrict the
+    // search to the segment before the first path/query/fragment delimiter, then redact between
+    // the first and last `@` inside it, so a password containing `@`, `/`, `?` or `#` cannot leak.
+    let head_end = trimmed.find(['/', '?', '#']).unwrap_or(trimmed.len());
+    let head = &trimmed[..head_end];
+    if let (Some(first_at), Some(last_at)) = (head.find('@'), head.rfind('@'))
+        && head[..first_at].contains(':')
     {
-        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
-        let user = userinfo.split_once(':').map_or("***", |(user, _)| user);
+        let user = head[..first_at]
+            .split_once(':')
+            .map_or("***", |(user, _)| user);
         let redacted = if user.is_empty() { "***" } else { user };
+        let rest = trimmed[last_at + 1..]
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default();
         return format!("{redacted}:***@{rest}");
     }
     if let Ok(mut parsed) = reqwest::Url::parse(trimmed) {
@@ -1473,6 +1484,18 @@ mod tests {
         let multi_at = redact_audit_url("deploy:pa@ss@git.example.com:org/repo.git");
         assert!(!multi_at.contains("ss@"), "{multi_at}");
         assert!(!multi_at.contains("pa@"), "{multi_at}");
+
+        // A later `@` in the path/query/fragment must not defeat the redaction.
+        for leaked in [
+            "deploy:s3cr3t@git.example.com:org/re@po.git",
+            "deploy:s3cr3t@git.example.com:org/repo.git?ref=user@example.com",
+            "deploy:s3cr3t@git.example.com:org/repo.git#frag@x",
+            "user:pass@host:path/file@tag",
+        ] {
+            let redacted = redact_audit_url(leaked);
+            assert!(!redacted.contains("s3cr3t"), "{leaked} -> {redacted}");
+            assert!(!redacted.contains("pass@"), "{leaked} -> {redacted}");
+        }
         assert_eq!(
             redact_audit_url("git@github.com:org/repo.git"),
             "git@github.com:org/repo.git",
