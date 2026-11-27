@@ -320,6 +320,10 @@ jobs:
   security:
     name: Supply-Chain Security (cargo-deny, cargo-audit, npm audit, SHA pinning)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # `rustsec/audit-check` publishes a check run on pull requests.
+      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -336,10 +340,13 @@ jobs:
           restore-keys: |
             advisory-db-
 
-      - name: Run cargo-deny (licenses, advisories, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2
+      - name: Install cargo-deny (host binary so the cached advisory DB applies)
+        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
         with:
-          arguments: --hide-inclusion-graph
+          tool: cargo-deny@0.20.2
+
+      - name: Run cargo-deny (licenses, advisories, bans, sources)
+        run: cargo deny check --hide-inclusion-graph
 
       - name: Run cargo-audit (RUSTSEC database)
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
@@ -357,4 +364,3 @@ jobs:
       - name: Audit production Web UI dependencies
         working-directory: apps/ferriscd-web
         run: npm audit --omit=dev --audit-level=high
-

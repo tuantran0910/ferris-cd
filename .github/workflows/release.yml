@@ -112,8 +112,8 @@ jobs:
           # 0.5.x has no workspace-aggregation mode: `--top-level` means "direct dependencies
           # only" (17 of 366 components here), and each BOM is written next to its Cargo.toml.
           # Generate the full graph for every crate and merge them into one workspace BOM.
-          cargo cyclonedx --format json --spec-version 1.5
-          test "$(find crates -name '*.cdx.json' | wc -l)" -eq 5
+          cargo cyclonedx --format json --spec-version 1.5 --target all
+          test "$(find crates -name '*.cdx.json' | wc -l)" -ge 5
           ruby .github/scripts/merge-cyclonedx.rb \
             "dist/sbom/ferriscd-${VERSION}-workspace.cdx.json" \
             crates/*/*.cdx.json
@@ -291,7 +291,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ needs.metadata.outputs.is_tag == 'true' && needs.metadata.outputs.is_prerelease == 'false' }}
-            type=raw,value=${{ needs.metadata.outputs.version }},enable=${{ needs.metadata.outputs.is_tag != 'true' }}
+            type=raw,value=${{ needs.metadata.outputs.version }},enable=${{ needs.metadata.outputs.should_push != 'true' }}
             type=raw,value=${{ needs.metadata.outputs.version }}-dryrun,enable=${{ inputs.sign_dry_run == true }}
 
       - name: Build and push multi-arch control-plane image
@@ -335,20 +335,20 @@ jobs:
           cosign sign --yes "${IMAGE_REF}"
           cosign attest --yes --type cyclonedx --predicate "${SBOM_FILE}" "${IMAGE_REF}"
 
-      - name: Verify keyless signature & SBOM attestation (dry-run)
-        if: needs.metadata.outputs.is_tag != 'true' && inputs.sign_dry_run == true
+      - name: Verify keyless signature & SBOM attestation
+        if: needs.metadata.outputs.should_push == 'true'
         env:
           IMAGE_REF: ghcr.io/${{ needs.metadata.outputs.repo_lower }}@${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           cosign verify \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/heads/" \
+            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/(heads|tags)/" \
             "${IMAGE_REF}"
           cosign verify-attestation \
             --type cyclonedx \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/heads/" \
+            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/(heads|tags)/" \
             "${IMAGE_REF}"
 
       - name: Generate SLSA Level 3 build provenance attestation for control-plane image digest
@@ -403,7 +403,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ needs.metadata.outputs.is_tag == 'true' && needs.metadata.outputs.is_prerelease == 'false' }}
-            type=raw,value=${{ needs.metadata.outputs.version }},enable=${{ needs.metadata.outputs.is_tag != 'true' }}
+            type=raw,value=${{ needs.metadata.outputs.version }},enable=${{ needs.metadata.outputs.should_push != 'true' }}
             type=raw,value=${{ needs.metadata.outputs.version }}-dryrun,enable=${{ inputs.sign_dry_run == true }}
 
       - name: Build and push multi-arch web UI image
@@ -447,20 +447,20 @@ jobs:
           cosign sign --yes "${IMAGE_REF}"
           cosign attest --yes --type cyclonedx --predicate "${SBOM_FILE}" "${IMAGE_REF}"
 
-      - name: Verify keyless signature & SBOM attestation (dry-run)
-        if: needs.metadata.outputs.is_tag != 'true' && inputs.sign_dry_run == true
+      - name: Verify keyless signature & SBOM attestation
+        if: needs.metadata.outputs.should_push == 'true'
         env:
           IMAGE_REF: ghcr.io/${{ needs.metadata.outputs.repo_lower }}-web@${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           cosign verify \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/heads/" \
+            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/(heads|tags)/" \
             "${IMAGE_REF}"
           cosign verify-attestation \
             --type cyclonedx \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/heads/" \
+            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/(heads|tags)/" \
             "${IMAGE_REF}"
 
       - name: Generate SLSA Level 3 build provenance attestation for Web UI image digest
