@@ -1644,8 +1644,8 @@ rules:
         assert_eq!(rbac_reload_count(&metrics, "deleted"), 0);
     }
 
-    /// **`T17.1`:** the "fault ended the stream" suppression is per fault: a successful event
-    /// between two failures resets it, so the trailing clean end still counts.
+    /// **`T17.1`:** one `Err` and the trailing clean stream end are counted separately, while a
+    /// fatal fault (`Err` then end) is counted once; a successful event resets the suppression.
     #[tokio::test]
     async fn watch_error_accounting_resets_after_a_successful_event() {
         let events: Vec<Result<WatcherEvent<ConfigMap>, &'static str>> = vec![

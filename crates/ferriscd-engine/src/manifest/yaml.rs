@@ -126,6 +126,9 @@ fn is_alias_limit_breach(err: &serde_saphyr::Error) -> bool {
     let mut current = err;
     loop {
         current = match current {
+            // `WithSnippet` is unreachable with `with_snippet: false`, but unwrap it for parity
+            // with the library's own `original_error` helper: keep it if a future option turns
+            // snippets on.
             serde_saphyr::Error::AliasError { error, .. }
             | serde_saphyr::Error::WithSnippet { error, .. } => error,
             serde_saphyr::Error::AliasReplayCounterOverflow { .. }
@@ -755,6 +758,22 @@ rules: *e
                 panic!("replay breaches must not be reported as generic parse errors")
             }
         }
+    }
+
+    #[test]
+    fn a_user_field_named_alias_replay_is_a_parse_error_not_a_budget_breach() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct Strict {
+            rules: Vec<String>,
+        }
+
+        // Matching rendered text would misreport this operator typo as an alias-replay budget
+        // breach; the typed match must keep it an ordinary parse error.
+        let err = parse_document::<Strict>("rules: []\nalias replay: 1\n")
+            .expect_err("an unknown field must be rejected");
+        assert_eq!(err, YamlGuardError::Parse);
     }
 
     #[test]
