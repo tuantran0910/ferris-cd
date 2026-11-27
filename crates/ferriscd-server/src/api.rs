@@ -1017,12 +1017,12 @@ pub async fn get_application_events(
 ///
 /// # Termination and boundedness
 ///
-/// The body is a pull-based stream over [`crate::state::ApplicationSnapshotSource::subscribe`]: the
-/// server produces a snapshot only when the previous one has been written, so a slow client applies
-/// backpressure instead of being buffered. Dropping the response body (a client disconnect) drops the
-/// subscription with it — no detached task keeps reading the cluster. A failing snapshot ends the
-/// stream with one `error` frame (the standard `{"error":{"code","message"}}` shape) so the client can
-/// fall back to polling.
+/// The body is a stream over [`crate::state::ApplicationSnapshotSource::subscribe`], backed by one
+/// shared refresher per feed: the watch channel keeps only the latest snapshot, so a slow client
+/// skips intermediate frames instead of growing a queue. Dropping the response body (a client
+/// disconnect) drops the subscription, and the refresher stops with the last receiver. A failing
+/// snapshot ends the stream with one `error` frame (the standard `{"error":{"code","message"}}`
+/// shape) so the client can fall back to polling.
 #[utoipa::path(
     get,
     path = "/api/v1/applications/stream",

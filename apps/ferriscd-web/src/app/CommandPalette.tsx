@@ -74,8 +74,10 @@ export function useCommandPaletteShortcut(onToggle: () => void) {
       if (event.key.toLowerCase() !== "k") {
         return;
       }
-      // Never open a second focus trap on top of Sync/Rollback (Escape would close both).
-      if (document.querySelector('[role="dialog"]')) {
+      // Never open a second focus trap on top of Sync/Rollback (Escape would close both); the
+      // palette's own dialog is marked so Cmd+K still toggles it closed.
+      const paletteOpen = document.querySelector('[data-command-palette]') !== null;
+      if (!paletteOpen && document.querySelector('[role="dialog"]')) {
         return;
       }
       event.preventDefault();
@@ -217,7 +219,7 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
 
   return (
     <Modal open labelledBy="command-palette-title" dialogRef={dialogRef} panelClassName="max-w-xl">
-      <h2 id="command-palette-title" className="sr-only">
+      <h2 id="command-palette-title" data-command-palette="true" className="sr-only">
         Command palette
       </h2>
 

@@ -52,7 +52,7 @@ describe("EventsTimeline (T17.3)", () => {
   it("says so when the server truncated the timeline", () => {
     render(<EventsTimeline events={sampleEvents.items ?? []} truncated />);
 
-    expect(screen.getByText(/Showing the most recent 50 events/i)).toBeInTheDocument();
+    expect(screen.getByText(/Showing the most recent events/i)).toBeInTheDocument();
   });
 });
 

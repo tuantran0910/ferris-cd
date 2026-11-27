@@ -292,10 +292,11 @@ impl EventSource for KubeEventSource {
                     .list(&params)
                     .await
                     .map_err(|err| ApiError::backend(&err))?;
+                let next = continues_with(&listed);
                 items.extend(listed.items);
-                match listed.metadata.continue_ {
-                    Some(next) if !next.is_empty() => token = Some(next),
-                    _ => break,
+                match next {
+                    Some(next) => token = Some(next),
+                    None => break,
                 }
             }
             Ok(event_page(items))
@@ -323,6 +324,17 @@ pub const EVENT_LIST_LIMIT: u32 = 200;
 /// How many `continue` pages one timeline read may follow (bounded work, newest 50 selection).
 pub const EVENT_LIST_MAX_PAGES: usize = 5;
 
+/// Whether a listed page asks for another page: only a non-empty `continue` token continues.
+#[must_use]
+pub fn continues_with(metadata: &kube::core::ObjectList<Event>) -> Option<String> {
+    metadata
+        .metadata
+        .continue_
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 /// The `field_selector` that narrows an `events.k8s.io/v1` list to events about `app`.
 ///
 /// Returns `None` — meaning "do not query at all" — when the `Application` has no usable
@@ -342,8 +354,8 @@ pub fn regarding_uid_selector(app: &Application) -> Option<String> {
 /// Maps a listed `Event` page onto timeline entries, **newest first**.
 ///
 /// Split from the API call so ordering (the thing a timeline is for) is a pure, testable function:
-/// `deprecatedLastTimestamp` and `eventTime` are both considered, so an event written by an older
-/// emitter still lands in the right place.
+/// `series.lastObservedTime`, `deprecatedLastTimestamp` and `eventTime` are all considered, so both
+/// a still-firing event and one written by an older emitter land in the right place.
 #[must_use]
 pub fn event_page(mut events: Vec<Event>) -> Vec<ApplicationEvent> {
     events.sort_by_key(|event| std::cmp::Reverse(event_instant(event)));
@@ -491,7 +503,7 @@ impl PollingApplicationSnapshot {
     /// Returns the current channel, starting the shared refresher if it is not running.
     fn subscribe_watch(&self) -> SnapshotReceiver {
         let mut guard = self.channel.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(sender) = guard.as_ref() {
+        if let Some(sender) = guard.as_ref().filter(|sender| !sender.is_closed()) {
             return sender.subscribe();
         }
         let (sender, receiver) = tokio::sync::watch::channel(None);
@@ -515,7 +527,12 @@ impl PollingApplicationSnapshot {
                 }
             }
             let mut guard = channel.lock().unwrap_or_else(PoisonError::into_inner);
-            *guard = None;
+            if guard
+                .as_ref()
+                .is_some_and(|current| current.same_channel(&sender))
+            {
+                *guard = None;
+            }
         });
         receiver
     }
@@ -1580,6 +1597,25 @@ mod tests {
             None
         );
         assert_eq!(regarding_uid_selector(&app_with_uid(Some("x=y"))), None);
+        assert_eq!(
+            regarding_uid_selector(&app_with_uid(Some("a b"))),
+            None,
+            "whitespace is selector-significant too"
+        );
+    }
+
+    #[test]
+    fn only_a_non_empty_continue_token_requests_another_page() {
+        let page = |token: Option<&str>| -> kube::core::ObjectList<Event> {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "continue": token },
+                "items": [],
+            }))
+            .expect("a valid list")
+        };
+        assert_eq!(continues_with(&page(Some("next"))), Some("next".to_owned()));
+        assert_eq!(continues_with(&page(Some(""))), None);
+        assert_eq!(continues_with(&page(None)), None);
     }
 
     #[test]
@@ -1717,36 +1753,33 @@ mod tests {
         }
     }
 
-    /// **Bounded per connection + cleanup on disconnect:** the feed produces exactly one snapshot per
-    /// poll (never on wall-clock alone, so a slow client cannot be buffered), and dropping the stream
-    /// stops the cluster reads entirely — there is no detached task left behind.
+    /// **Cleanup on disconnect:** after the last subscriber goes away the shared refresher stops
+    /// reading, and a later subscriber starts a fresh loop (never the closed channel).
     #[tokio::test(start_paused = true)]
-    async fn the_sse_feed_is_demand_driven_and_stops_when_dropped() {
+    async fn the_sse_feed_stops_after_the_last_drop_and_restarts_fresh() {
         let source = Arc::new(CountingApplications::default());
         let feed = PollingApplicationSnapshot::new(source.clone(), Duration::from_secs(2));
         assert_eq!(feed.interval(), Duration::from_secs(2));
 
         let mut stream = feed.subscribe();
         assert!(stream.next().await.is_some(), "the first snapshot");
-        assert_eq!(source.reads(), 1, "one snapshot per poll, immediately");
-
-        // Nobody polls: no read happens, however much virtual time passes.
-        tokio::time::advance(Duration::from_secs(30)).await;
-        assert_eq!(source.reads(), 1, "production follows consumption");
-
-        // Polling again produces exactly one more snapshot (missed ticks are delayed, not replayed).
-        assert!(stream.next().await.is_some());
-        assert_eq!(source.reads(), 2);
-        tokio::time::advance(Duration::from_secs(30)).await;
-        assert!(stream.next().await.is_some());
-        assert_eq!(source.reads(), 3, "a stalled client never receives a burst");
+        assert_eq!(source.reads(), 1);
 
         drop(stream);
-        tokio::time::advance(Duration::from_secs(600)).await;
+        tokio::time::advance(Duration::from_secs(30)).await;
         assert_eq!(
             source.reads(),
-            3,
+            1,
             "a dropped connection must stop the reads: nothing keeps running for a gone client"
+        );
+
+        // A subscriber arriving after teardown must get a fresh snapshot, not a dead channel.
+        let mut restarted = feed.subscribe();
+        assert!(restarted.next().await.is_some(), "a restarted feed");
+        assert_eq!(
+            source.reads(),
+            2,
+            "the new subscriber starts a new refresher"
         );
     }
 

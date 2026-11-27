@@ -46,13 +46,16 @@ export function pollUnlessTerminalError(query: {
   return DETAIL_POLL_INTERVAL_MS;
 }
 
-export function useApplications(enabled = true) {
+export function useApplications(
+  enabled = true,
+  refetchInterval: number | false = APPLICATIONS_POLL_INTERVAL_MS,
+) {
   const { apiClient } = useAuth();
   return useQuery({
     queryKey: queryKeys.applications(),
     queryFn: () => apiClient.listApplications(),
     enabled,
-    refetchInterval: APPLICATIONS_POLL_INTERVAL_MS,
+    refetchInterval,
   });
 }
 

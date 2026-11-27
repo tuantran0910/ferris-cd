@@ -126,7 +126,7 @@ export function EventsTimeline({ events, truncated = false }: EventsTimelineProp
 
       {truncated && (
         <p role="status" className="text-xs text-slate-300">
-          Showing the most recent 50 events. Older events are still in the cluster
+          Showing the most recent events. Older events are still in the cluster
           (<code className="font-mono">kubectl get events</code>).
         </p>
       )}

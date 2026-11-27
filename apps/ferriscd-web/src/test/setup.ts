@@ -1,10 +1,13 @@
 import "@testing-library/jest-dom/vitest";
-import { vi } from "vitest";
+import { afterEach, vi } from "vitest";
 
 // The dashboard opens the SSE feed on mount. Tests never talk to a network: the stream stays open
 // (and aborts cleanly) unless a test overrides `fetch` itself.
 const nativeFetch = globalThis.fetch?.bind(globalThis);
-globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+afterEach(() => {
+  vi.clearAllMocks();
+});
+const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
   const url =
     typeof input === "string"
       ? input
@@ -32,6 +35,7 @@ globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
   }
   return nativeFetch(input, init);
 }) as typeof fetch;
+globalThis.fetch = fetchMock;
 
 class ResizeObserverStub {
   observe() {}

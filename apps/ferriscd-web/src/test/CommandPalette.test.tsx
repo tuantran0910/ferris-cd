@@ -226,6 +226,17 @@ describe("CommandPalette (T17.3)", () => {
     expect(selected).toBeDefined();
   });
 
+  it("toggles closed with Ctrl+K while the palette is open", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.keyboard("{Control>}k{/Control}");
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    await user.keyboard("{Control>}k{/Control}");
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+  });
+
   it("closes with Escape while leaving focus restored, and never opens on a bare 'k'", async () => {
     const user = userEvent.setup();
     renderPalette();

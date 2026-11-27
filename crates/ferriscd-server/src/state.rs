@@ -303,10 +303,9 @@ impl EventSource for NoEvents {
 ///
 /// # Boundedness and cleanup
 ///
-/// The returned stream is **pull-based**: it produces nothing until the response body is polled, so a
-/// slow client applies backpressure instead of making the server queue snapshots. Dropping the stream
-/// (which is what a client disconnect does to the response body) tears the subscription down — there
-/// is no detached task, no background buffer, and no further cluster reads.
+/// Implementations share one refresher across subscribers: the stream carries the latest snapshot
+/// (a slow client skips frames rather than growing a queue), and the refresher stops when the last
+/// subscription is dropped. A client disconnect therefore costs no further cluster reads.
 pub trait ApplicationSnapshotSource: Send + Sync + 'static {
     /// Opens one subscription for one connection.
     fn subscribe(&self) -> BoxStream<'static, Result<Vec<Application>, ApiError>>;

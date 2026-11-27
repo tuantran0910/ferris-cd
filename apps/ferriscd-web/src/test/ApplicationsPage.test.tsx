@@ -1,11 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError } from "../api/client";
 import { AuthProvider } from "../auth/AuthContext";
-import { resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
+import { getStoredToken, resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
 import { ApplicationsPage } from "../features/applications/ApplicationsPage";
 import { createMockApiClient, sampleApps } from "./fixtures";
 
@@ -94,6 +94,17 @@ describe("ApplicationsPage (T16.2 & Trap Guard T16.2)", () => {
       renderApplicationsPage();
       expect(await screen.findByText("live-only")).toBeInTheDocument();
       expect(screen.getByText(/Live updates connected/)).toBeInTheDocument();
+    } finally {
+      globalThis.fetch = nativeFetch;
+    }
+  });
+
+  it("signs out instead of retrying when the stream rejects the token", async () => {
+    const nativeFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async () => new Response(null, { status: 401 })) as typeof fetch;
+    try {
+      renderApplicationsPage();
+      await waitFor(() => expect(getStoredToken()).toBeNull());
     } finally {
       globalThis.fetch = nativeFetch;
     }

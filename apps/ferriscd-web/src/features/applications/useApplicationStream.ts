@@ -3,18 +3,36 @@ import { useQueryClient } from "@tanstack/react-query";
 
 import { ApiClientError } from "../../api/client";
 import { openApplicationStream } from "../../api/sse";
+import type { ApplicationListView } from "../../api/types";
 import { useAuth } from "../../auth/AuthContext";
 import { queryKeys } from "./hooks";
 
 /** Connection state surfaced to the page so the operator knows how the list is updated. */
 export type ApplicationStreamStatus = "idle" | "connecting" | "live" | "polling";
 
+export interface ApplicationStreamState {
+  status: ApplicationStreamStatus;
+  /** The latest streamed snapshot, preferred over a slower poll while connected. */
+  snapshot: ApplicationListView | null;
+}
+
 /** Five fast retries (0.5 s, 1 s, 2 s, 4 s, 8 s with jitter) before falling back to polling. */
-const MAX_FAST_ATTEMPTS = 5;
-const BASE_RETRY_MS = 500;
-const MAX_RETRY_MS = 30_000;
+export const MAX_FAST_ATTEMPTS = 5;
+export const BASE_RETRY_MS = 500;
+export const MAX_RETRY_MS = 30_000;
 /** While polling, keep trying the stream once a minute so a recovered proxy resumes live updates. */
-const RETRY_WHILE_POLLING_MS = 60_000;
+export const RETRY_WHILE_POLLING_MS = 60_000;
+
+/** Bounded exponential backoff with jitter for one failed attempt (1-based). */
+export function retryDelayMs(attempt: number, random: () => number = Math.random): number {
+  const backoff = Math.min(MAX_RETRY_MS, BASE_RETRY_MS * 2 ** Math.max(0, attempt - 1));
+  return backoff * (1 + random() * 0.2);
+}
+
+/** Whether the fast-retry budget is exhausted (the hook then falls back to polling). */
+export function shouldFallBackToPolling(attempt: number): boolean {
+  return attempt > MAX_FAST_ATTEMPTS;
+}
 
 /**
  * Consumes `GET /api/v1/applications/stream` (`T17.3`) and writes every RBAC-filtered snapshot into
@@ -28,10 +46,11 @@ const RETRY_WHILE_POLLING_MS = 60_000;
  * - a `401` stops the stream and signs the session out instead of retrying with a dead token;
  * - the `AbortController` is aborted on unmount, so no reader outlives the page.
  */
-export function useApplicationStream(enabled = true): ApplicationStreamStatus {
+export function useApplicationStream(enabled = true): ApplicationStreamState {
   const { token, baseUrl, logout } = useAuth();
   const queryClient = useQueryClient();
   const [status, setStatus] = useState<ApplicationStreamStatus>("idle");
+  const [snapshot, setSnapshot] = useState<ApplicationListView | null>(null);
 
   useEffect(() => {
     if (!enabled || !token) {
@@ -62,7 +81,10 @@ export function useApplicationStream(enabled = true): ApplicationStreamStatus {
           token,
           signal: controller.signal,
           onSnapshot: (snapshot) => {
+            // A slower in-flight poll must not overwrite a newer streamed snapshot.
+            void queryClient.cancelQueries({ queryKey: queryKeys.applications() });
             queryClient.setQueryData(queryKeys.applications(), snapshot);
+            setSnapshot(snapshot);
             setStatus("live");
           },
         });
@@ -83,15 +105,13 @@ export function useApplicationStream(enabled = true): ApplicationStreamStatus {
           return;
         }
         attempt += 1;
-        if (attempt > MAX_FAST_ATTEMPTS) {
+        if (shouldFallBackToPolling(attempt)) {
           attempt = 0;
           setStatus("polling");
           schedule(RETRY_WHILE_POLLING_MS);
           return;
         }
-        const backoff = Math.min(MAX_RETRY_MS, BASE_RETRY_MS * 2 ** (attempt - 1));
-        const jittered = backoff * (1 + Math.random() * 0.2);
-        schedule(jittered);
+        schedule(retryDelayMs(attempt));
       }
     };
 
@@ -106,5 +126,5 @@ export function useApplicationStream(enabled = true): ApplicationStreamStatus {
     };
   }, [enabled, token, baseUrl, queryClient, logout]);
 
-  return status;
+  return { status, snapshot };
 }

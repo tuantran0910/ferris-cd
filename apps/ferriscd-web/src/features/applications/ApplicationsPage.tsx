@@ -95,8 +95,14 @@ export function ApplicationsPage() {
     );
   }, [setSearchParams]);
 
-  const { data, isLoading, isFetching, error, refetch } = useApplications();
-  const streamStatus = useApplicationStream();
+  const { status: streamStatus, snapshot: streamedSnapshot } =
+    useApplicationStream();
+  const { data: polledData, isLoading, isFetching, error, refetch } =
+    useApplications(
+      true,
+      streamStatus === "live" ? false : APPLICATIONS_POLL_INTERVAL_MS,
+    );
+  const data = streamedSnapshot ?? polledData;
 
   const apps: ApplicationSummary[] = useMemo(() => data?.items ?? [], [data]);
 
@@ -195,11 +201,13 @@ export function ApplicationsPage() {
           <p className="mt-1 text-xs text-slate-400">
             Showing {filteredApps.length} of {apps.length} watched applications
             •{" "}
-            {streamStatus === "live"
-              ? "Live updates connected"
-              : `Polling every ${APPLICATIONS_POLL_INTERVAL_MS / 1000}s${
-                  streamStatus === "connecting" ? " (live updates connecting)" : ""
-                }`}
+            <span aria-live="polite">
+              {streamStatus === "live"
+                ? "Live updates connected"
+                : `Polling every ${APPLICATIONS_POLL_INTERVAL_MS / 1000}s${
+                    streamStatus === "connecting" ? " (live updates connecting)" : ""
+                  }`}
+            </span>
           </p>
         </div>
 

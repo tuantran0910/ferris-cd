@@ -6,6 +6,14 @@ import {
   SseParser,
 } from "../api/sse";
 import type { ApplicationListView } from "../api/types";
+import {
+  BASE_RETRY_MS,
+  MAX_FAST_ATTEMPTS,
+  MAX_RETRY_MS,
+  RETRY_WHILE_POLLING_MS,
+  retryDelayMs,
+  shouldFallBackToPolling,
+} from "../features/applications/useApplicationStream";
 
 const snapshot: ApplicationListView = { items: [] };
 
@@ -93,5 +101,17 @@ describe("openApplicationStream", () => {
         fetchImpl,
       }),
     ).rejects.toMatchObject({ code: "BackendUnavailable" });
+  });
+});
+
+describe("application stream retry policy", () => {
+  it("backs off exponentially with bounded jitter and falls back after the budget", () => {
+    expect(retryDelayMs(1, () => 0)).toBe(BASE_RETRY_MS);
+    expect(retryDelayMs(2, () => 0)).toBe(BASE_RETRY_MS * 2);
+    expect(retryDelayMs(4, () => 0)).toBe(BASE_RETRY_MS * 8);
+    expect(retryDelayMs(10, () => 1)).toBeCloseTo(MAX_RETRY_MS * 1.2);
+    expect(shouldFallBackToPolling(MAX_FAST_ATTEMPTS)).toBe(false);
+    expect(shouldFallBackToPolling(MAX_FAST_ATTEMPTS + 1)).toBe(true);
+    expect(RETRY_WHILE_POLLING_MS).toBe(60_000);
   });
 });
