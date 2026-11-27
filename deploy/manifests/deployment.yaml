@@ -23,7 +23,7 @@ spec:
     spec:
       serviceAccountName: ferriscd
       automountServiceAccountToken: true
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 40
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

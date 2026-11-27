@@ -65,6 +65,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use ferriscd_engine::diff::sha256;
 
+use crate::audit::{RequestId, TokenFingerprint, record_auth_denied};
 use crate::error::ApiError;
 use crate::state::{AppState, SeamFuture};
 
@@ -487,6 +488,11 @@ pub async fn authenticate(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|id| id.0.clone());
+    let path = request.uri().path().to_owned();
     match state.auth {
         AuthPolicy::PassThrough => {
             request
@@ -495,15 +501,31 @@ pub async fn authenticate(
             next.run(request).await
         }
         // No token is parsed and no cluster call is made: lockdown means lockdown.
-        AuthPolicy::DenyAll => unauthorized("authentication is disabled on this server (deny-all)"),
+        AuthPolicy::DenyAll => {
+            record_auth_denied(
+                &state.audit,
+                request_id.as_deref(),
+                &path,
+                None,
+                "authentication is disabled on this server (deny-all)",
+            );
+            unauthorized("authentication is disabled on this server (deny-all)")
+        }
         AuthPolicy::TokenReview => {
             let token = match BearerToken::parse(request.headers()) {
                 Ok(token) => token,
                 Err(error) => {
                     tracing::debug!(
-                        path = %request.uri().path(),
+                        path = %path,
                         reason = error.as_str(),
                         "protected request refused: no usable bearer token"
+                    );
+                    record_auth_denied(
+                        &state.audit,
+                        request_id.as_deref(),
+                        &path,
+                        None,
+                        error.as_str(),
                     );
                     return unauthorized("a valid Kubernetes bearer token is required");
                 }
@@ -512,30 +534,37 @@ pub async fn authenticate(
             let label = fingerprint_label(&fingerprint);
             if let Some(identity) = state.identities.get(&fingerprint) {
                 tracing::debug!(
-                    path = %request.uri().path(),
+                    path = %path,
                     fingerprint = %label,
                     user = %identity.username.as_deref().unwrap_or_default(),
                     "bearer token accepted from the positive cache"
                 );
-                return allow(request, identity, next).await;
+                return allow(request, identity, Some(TokenFingerprint(label)), next).await;
             }
             match state.tokens.authenticate(token.expose()).await {
                 Ok(Some(identity)) => {
                     state.identities.insert(fingerprint, identity.clone());
                     tracing::debug!(
-                        path = %request.uri().path(),
+                        path = %path,
                         fingerprint = %label,
                         user = %identity.username.as_deref().unwrap_or_default(),
                         groups = identity.groups.len(),
                         "TokenReview accepted the bearer token"
                     );
-                    allow(request, identity, next).await
+                    allow(request, identity, Some(TokenFingerprint(label)), next).await
                 }
                 Ok(None) => {
                     tracing::info!(
-                        path = %request.uri().path(),
+                        path = %path,
                         fingerprint = %label,
                         "TokenReview rejected the bearer token"
+                    );
+                    record_auth_denied(
+                        &state.audit,
+                        request_id.as_deref(),
+                        &path,
+                        Some(&label),
+                        "TokenReview rejected bearer token",
                     );
                     unauthorized("a valid Kubernetes bearer token is required")
                 }
@@ -543,10 +572,17 @@ pub async fn authenticate(
                 // needs it, and the client is told nothing it could use to probe the cluster.
                 Err(error) => {
                     tracing::warn!(
-                        path = %request.uri().path(),
+                        path = %path,
                         fingerprint = %label,
                         error = %error,
                         "the token could not be reviewed; refusing the request (fail closed)"
+                    );
+                    record_auth_denied(
+                        &state.audit,
+                        request_id.as_deref(),
+                        &path,
+                        Some(&label),
+                        "TokenReview backend error (fail closed)",
                     );
                     unauthorized("the bearer token could not be reviewed; try again")
                 }
@@ -555,9 +591,18 @@ pub async fn authenticate(
     }
 }
 
-/// Inserts the resolved identity and runs the rest of the chain.
-async fn allow(mut request: Request, identity: AuthenticatedIdentity, next: Next) -> Response {
+/// Inserts the resolved identity (and optional 12-hex token fingerprint) and runs the rest of the
+/// chain.
+async fn allow(
+    mut request: Request,
+    identity: AuthenticatedIdentity,
+    fingerprint: Option<TokenFingerprint>,
+    next: Next,
+) -> Response {
     request.extensions_mut().insert(identity);
+    if let Some(fingerprint) = fingerprint {
+        request.extensions_mut().insert(fingerprint);
+    }
     next.run(request).await
 }
 

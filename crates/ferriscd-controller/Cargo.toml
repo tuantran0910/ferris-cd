@@ -32,6 +32,11 @@ ferriscd-engine.workspace = true
 # Stream combinators for driving `kube_runtime::Controller` and boxing the
 # pipeline/status-writer seams.
 futures.workspace = true
+# `T17.2`: OS CSPRNG for audit `eventId` UUIDv4 generation (already in Cargo.lock).
+getrandom.workspace = true
+# `T17.2`: optional async batched HTTPS audit webhook sink (already in workspace deps).
+reqwest.workspace = true
+serde.workspace = true
 # `T12.3`: the `Impersonate-User`/`Impersonate-Group` tower layer, and the ONE shared hyper
 # connector every impersonated `kube::Client` is built over (no per-reconcile connector).
 http.workspace = true

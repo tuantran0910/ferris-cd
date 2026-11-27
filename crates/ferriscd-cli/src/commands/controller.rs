@@ -7,7 +7,10 @@ use anyhow::Result;
 use clap::Args;
 
 /// Arguments for `ferriscd controller`.
-#[derive(Debug, Args)]
+///
+/// `Debug` is implemented manually so `--audit-webhook-url` never prints query-string tokens or
+/// embedded credentials into startup logs or panic messages (`T17.2`).
+#[derive(Args)]
 pub struct ControllerArgs {
     /// Namespace whose `Application` objects this controller owns.
     ///
@@ -182,6 +185,70 @@ pub struct ControllerArgs {
         default_value = ferriscd_controller::DEFAULT_METRICS_ADDR
     )]
     pub metrics_addr: String,
+
+    /// Optional append-only JSONL compliance audit log file path (`T17.2`).
+    ///
+    /// Structured JSON audit events are always emitted to stdout (`ferriscd::audit` target); this
+    /// adds a non-blocking local JSONL file sink. The sink keeps the file handle for the process
+    /// lifetime, so rotate with `copytruncate` (or a sidecar that does), never plain `mv`:
+    /// logrotate's default rename+create would leave the trail writing to the renamed file.
+    #[arg(
+        long = "audit-log-path",
+        value_name = "PATH",
+        env = "FERRISCD_AUDIT_LOG_PATH"
+    )]
+    pub audit_log_path: Option<PathBuf>,
+
+    /// Optional async batched HTTPS compliance audit webhook URL (`T17.2`).
+    ///
+    /// Must use `https://` with no embedded credentials; loopback and link-local/IMDS targets are
+    /// refused by the built-in SSRF guard.
+    #[arg(
+        long = "audit-webhook-url",
+        value_name = "HTTPS_URL",
+        env = "FERRISCD_AUDIT_WEBHOOK_URL",
+        hide_env_values = true
+    )]
+    pub audit_webhook_url: Option<String>,
+}
+
+impl std::fmt::Debug for ControllerArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControllerArgs")
+            .field("namespace", &self.namespace)
+            .field("application_namespaces", &self.application_namespaces)
+            .field("allow_local_repos", &self.allow_local_repos)
+            .field("work_root", &self.work_root)
+            .field(
+                "allow_insecure_cluster_tls",
+                &self.allow_insecure_cluster_tls,
+            )
+            .field("leader_election", &self.leader_election)
+            .field(
+                "leader_election_lease_name",
+                &self.leader_election_lease_name,
+            )
+            .field(
+                "leader_election_lease_duration_seconds",
+                &self.leader_election_lease_duration_seconds,
+            )
+            .field(
+                "leader_election_renew_interval_seconds",
+                &self.leader_election_renew_interval_seconds,
+            )
+            .field("shard_id", &self.shard_id)
+            .field("total_shards", &self.total_shards)
+            .field("metrics_addr", &self.metrics_addr)
+            .field("audit_log_path", &self.audit_log_path)
+            .field(
+                "audit_webhook_url",
+                &self
+                    .audit_webhook_url
+                    .as_deref()
+                    .map(ferriscd_controller::audit::redact_audit_url),
+            )
+            .finish()
+    }
 }
 
 /// Executes `ferriscd controller`, blocking until `SIGINT`/`SIGTERM`.
@@ -228,6 +295,8 @@ pub(crate) fn run_options(args: ControllerArgs) -> ferriscd_controller::RunOptio
         // `T15.1`: the CLI always serves `/metrics`; the library default (`None`) keeps tests and
         // other embedders off a socket. The controller parses and binds this before any client.
         metrics_addr: Some(args.metrics_addr),
+        audit_log_path: args.audit_log_path,
+        audit_webhook_url: args.audit_webhook_url,
     }
 }
 

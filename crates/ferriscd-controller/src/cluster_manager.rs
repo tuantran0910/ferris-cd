@@ -1078,6 +1078,7 @@ pub struct ClusterManager {
     options: ClusterOptions,
     builder: Arc<dyn ClusterHandleBuilder>,
     rebuilds: AtomicUsize,
+    audit: Option<crate::audit::AuditLogger>,
 }
 
 impl fmt::Debug for ClusterManager {
@@ -1112,6 +1113,36 @@ impl ClusterManager {
             options,
             builder,
             rebuilds: AtomicUsize::new(0),
+            audit: None,
+        }
+    }
+
+    /// Attaches a compliance [`AuditLogger`](crate::audit::AuditLogger) for `cluster.registry`
+    /// lifecycle events (`T17.2`).
+    #[must_use]
+    pub fn with_audit(mut self, audit: crate::audit::AuditLogger) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    fn emit_audit(
+        &self,
+        cluster_name: Option<&str>,
+        secret_name: Option<&str>,
+        action: &str,
+        outcome: crate::audit::AuditOutcome,
+        reason: Option<&str>,
+    ) {
+        if let Some(audit) = &self.audit {
+            crate::audit::record_cluster_registry(
+                audit,
+                &self.namespace,
+                cluster_name,
+                secret_name,
+                action,
+                outcome,
+                reason,
+            );
         }
     }
 
@@ -1218,15 +1249,37 @@ impl ClusterManager {
             })
             .map(|entry| entry.key().clone())
             .collect();
+        let secret_name = material.secret.clone();
         self.store(material, Arc::new(handle));
         for old in stale {
-            self.remove(&old);
+            if self.remove(&old) {
+                self.emit_audit(
+                    Some(old.as_str()),
+                    Some(&secret_name),
+                    "cluster.removed",
+                    crate::audit::AuditOutcome::Accepted,
+                    Some("cluster Secret renamed to a different target cluster"),
+                );
+            }
         }
-        Ok(if replaced {
+        let change = if replaced {
             ClusterChange::Rebuilt
         } else {
             ClusterChange::Added
-        })
+        };
+        let action = match change {
+            ClusterChange::Added => "cluster.added",
+            ClusterChange::Rebuilt => "cluster.rebuilt",
+            ClusterChange::Unchanged => "cluster.unchanged",
+        };
+        self.emit_audit(
+            Some(name.as_str()),
+            Some(&secret_name),
+            action,
+            crate::audit::AuditOutcome::Accepted,
+            None,
+        );
+        Ok(change)
     }
 
     /// Forgets the cluster named `name` (its `Secret` was deleted).
@@ -1238,7 +1291,17 @@ impl ClusterManager {
         let Ok(parsed) = ClusterName::parse(name) else {
             return false;
         };
-        self.remove(&parsed)
+        let removed = self.remove(&parsed);
+        if removed {
+            self.emit_audit(
+                Some(parsed.as_str()),
+                None,
+                "cluster.removed",
+                crate::audit::AuditOutcome::Accepted,
+                Some("cluster registration forgotten"),
+            );
+        }
+        removed
     }
 
     /// Forgets every registration built from the `Secret` named `secret_name`.
@@ -1256,6 +1319,13 @@ impl ClusterManager {
         let mut forgotten = Vec::with_capacity(names.len());
         for name in names {
             if self.remove(&name) {
+                self.emit_audit(
+                    Some(name.as_str()),
+                    Some(secret_name),
+                    "cluster.removed",
+                    crate::audit::AuditOutcome::Accepted,
+                    Some("backing cluster Secret deleted or invalidated"),
+                );
                 forgotten.push(name.as_str().to_owned());
             }
         }
@@ -1367,11 +1437,19 @@ impl ClusterManager {
                             "cluster registration observed"
                         ),
                         Err(err) => {
+                            let reason = err.to_string();
                             tracing::warn!(
                                 secret = %name,
-                                error = %err,
+                                error = %reason,
                                 "cluster Secret cannot be used; forgetting the cluster so no \
                                  Application keeps deploying with credentials it no longer has"
+                            );
+                            self.emit_audit(
+                                None,
+                                Some(&name),
+                                "cluster.rejected",
+                                crate::audit::AuditOutcome::Failed,
+                                Some(&reason),
                             );
                             self.forget_secret(&name);
                         }
@@ -1407,6 +1485,13 @@ impl ClusterManager {
         let mut forgotten = Vec::with_capacity(stale.len());
         for name in stale {
             if self.remove(&name) {
+                self.emit_audit(
+                    Some(name.as_str()),
+                    None,
+                    "cluster.removed",
+                    crate::audit::AuditOutcome::Accepted,
+                    Some("backing cluster Secret absent from completed watch re-list"),
+                );
                 forgotten.push(name.as_str().to_owned());
             }
         }
@@ -2928,5 +3013,70 @@ VvvhRCE9YVNC/nP/0IrzmyUJjadxsSjY9K50kjOxukR8diF5fBhlpWz5n11sh+Sw
         let rendered = format!("{err} {err:?}");
         assert!(!rendered.contains(TOKEN), "{rendered}");
         assert!(!rendered.contains("not-a-real-key"), "{rendered}");
+    }
+
+    /// **`T17.2`:** `ClusterManager` emits secret-free `cluster.registry` audit events on Added,
+    /// Rebuilt, Removed (including re-list omission), and Rejected cluster secrets.
+    #[tokio::test]
+    async fn cluster_registry_lifecycle_emits_secret_free_audit_events() {
+        let recorder = Arc::new(crate::audit::RecordingAuditSink::new());
+        let audit = crate::audit::AuditLogger::with_sinks(
+            vec![recorder.clone()],
+            crate::metrics::Metrics::with_fixed_series(),
+        );
+        let manager = Arc::new(manager(Arc::new(FakeBuilder::default())).with_audit(audit));
+
+        let v1 = token_secret("eu-prod");
+        let v2 = with_data(
+            token_secret("eu-prod"),
+            KEY_BEARER_TOKEN,
+            b"rotated-bearer-secret",
+        );
+        let mut invalid = token_secret("bad-cluster");
+        invalid
+            .data
+            .as_mut()
+            .expect("data")
+            .remove(KEY_BEARER_TOKEN);
+
+        manager
+            .clone()
+            .run(
+                scripted(vec![
+                    Ok(ClusterSecretEvent::Init),
+                    Ok(ClusterSecretEvent::Upsert(Box::new(v1))),
+                    Ok(ClusterSecretEvent::InitDone),
+                    Ok(ClusterSecretEvent::Upsert(Box::new(v2))),
+                    Ok(ClusterSecretEvent::Upsert(Box::new(invalid))),
+                    // Re-list omitting eu-prod -> cluster.removed.
+                    Ok(ClusterSecretEvent::Init),
+                    Ok(ClusterSecretEvent::InitDone),
+                ]),
+                CancellationToken::new(),
+            )
+            .await;
+
+        let events = recorder.events();
+        let actions: Vec<&str> = events.iter().map(|ev| ev.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                "cluster.added",
+                "cluster.rebuilt",
+                "cluster.rejected",
+                "cluster.removed",
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|ev| ev.category == crate::audit::AuditCategory::ClusterRegistry)
+        );
+        let serialized = serde_json::to_string(&events).expect("serialize");
+        assert!(!serialized.contains(TOKEN), "{serialized}");
+        assert!(
+            !serialized.contains("rotated-bearer-secret"),
+            "{serialized}"
+        );
     }
 }

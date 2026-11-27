@@ -55,6 +55,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::audit::{
+    self, AuditOutcome, RequestId, TokenFingerprint, record_api_operation, record_rbac_denied,
+};
 use crate::auth::{self, AuthenticatedIdentity};
 use crate::error::{ApiError, ApiErrorBody};
 use crate::openapi;
@@ -539,6 +542,9 @@ pub fn router(state: AppState) -> Router {
         .merge(public)
         .merge(webhooks)
         .layer(DefaultBodyLimit::max(state.webhooks.max_body_bytes()))
+        // `T17.2`: outermost correlation layer so every protected handler, 401 auth rejection,
+        // and webhook delivery receives a sanitized `X-Request-Id` and echoes it on the response.
+        .layer(middleware::from_fn(audit::request_id_middleware))
         .with_state(state)
 }
 
@@ -670,12 +676,25 @@ pub async fn list_applications(
 pub async fn get_application(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthenticatedIdentity>,
+    request_id: Option<Extension<RequestId>>,
+    fingerprint: Option<Extension<TokenFingerprint>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<ApplicationDetailView>, ApiError> {
     let rbac = state.rbac.snapshot();
     let actor = Actor::new(&rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
-    authorize(&actor, &app, &namespace, &name, Action::Get, "read")?;
+    authorize(
+        &state,
+        &actor,
+        &identity,
+        request_id.as_ref().map(|Extension(id)| id.as_str()),
+        fingerprint.as_ref().map(|Extension(fp)| fp),
+        &app,
+        &namespace,
+        &name,
+        Action::Get,
+        "read",
+    )?;
     Ok(Json(application_detail(&app)))
 }
 
@@ -732,12 +751,25 @@ pub async fn get_application(
 pub async fn get_resources(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthenticatedIdentity>,
+    request_id: Option<Extension<RequestId>>,
+    fingerprint: Option<Extension<TokenFingerprint>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<ResourceGraphView>, ApiError> {
     let rbac = state.rbac.snapshot();
     let actor = Actor::new(&rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
-    authorize(&actor, &app, &namespace, &name, Action::Get, "read")?;
+    authorize(
+        &state,
+        &actor,
+        &identity,
+        request_id.as_ref().map(|Extension(id)| id.as_str()),
+        fingerprint.as_ref().map(|Extension(fp)| fp),
+        &app,
+        &namespace,
+        &name,
+        Action::Get,
+        "read",
+    )?;
     let live = state.inventory.read(&app).await?;
     let status = app.status.clone().unwrap_or_default();
     let per_resource = resource_health(&status);
@@ -878,12 +910,25 @@ pub async fn get_resources(
 pub async fn get_diff(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthenticatedIdentity>,
+    request_id: Option<Extension<RequestId>>,
+    fingerprint: Option<Extension<TokenFingerprint>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<DiffView>, ApiError> {
     let rbac = state.rbac.snapshot();
     let actor = Actor::new(&rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
-    authorize(&actor, &app, &namespace, &name, Action::Diff, "diff")?;
+    authorize(
+        &state,
+        &actor,
+        &identity,
+        request_id.as_ref().map(|Extension(id)| id.as_str()),
+        fingerprint.as_ref().map(|Extension(fp)| fp),
+        &app,
+        &namespace,
+        &name,
+        Action::Diff,
+        "diff",
+    )?;
     let preview = state.diffs.diff(&app).await?;
     Ok(Json(DiffView {
         revision: preview.revision,
@@ -957,6 +1002,8 @@ pub async fn get_diff(
 pub async fn sync_application(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthenticatedIdentity>,
+    request_id: Option<Extension<RequestId>>,
+    fingerprint: Option<Extension<TokenFingerprint>>,
     Path((namespace, name)): Path<(String, String)>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<OperationResponse>), ApiError> {
@@ -981,12 +1028,25 @@ pub async fn sync_application(
             )));
         }
     }
+    let req_id = request_id.as_ref().map(|Extension(id)| id.as_str());
+    let fp = fingerprint.as_ref().map(|Extension(fp)| fp);
     let rbac = state.rbac.snapshot();
     let actor = Actor::new(&rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
-    authorize(&actor, &app, &namespace, &name, Action::Sync, "sync")?;
+    authorize(
+        &state,
+        &actor,
+        &identity,
+        req_id,
+        fp,
+        &app,
+        &namespace,
+        &name,
+        Action::Sync,
+        "sync",
+    )?;
     let operation = OperationRequest::Sync;
-    request_operation(&state, &app, operation).await
+    request_operation(&state, &identity, req_id, fp, &app, operation).await
 }
 
 /// Requests a rollback to a history entry (`T14.1`).
@@ -1033,16 +1093,24 @@ pub async fn sync_application(
 pub async fn rollback_application(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthenticatedIdentity>,
+    request_id: Option<Extension<RequestId>>,
+    fingerprint: Option<Extension<TokenFingerprint>>,
     Path((namespace, name)): Path<(String, String)>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<OperationResponse>), ApiError> {
     let body = require_body(state.webhooks.max_body_bytes(), body)?;
     let request: RollbackRequestBody = parse_body(&body)?;
+    let req_id = request_id.as_ref().map(|Extension(id)| id.as_str());
+    let fp = fingerprint.as_ref().map(|Extension(fp)| fp);
     let rbac = state.rbac.snapshot();
     let actor = Actor::new(&rbac, &identity);
     let app = require_application(&state, &namespace, &name).await?;
     authorize(
+        &state,
         &actor,
+        &identity,
+        req_id,
+        fp,
         &app,
         &namespace,
         &name,
@@ -1055,17 +1123,41 @@ pub async fn rollback_application(
         .map_or(&[], |status| status.history.as_slice());
     if !history.iter().any(|entry| entry.id == request.id) {
         let known: Vec<i64> = history.iter().map(|entry| entry.id).collect();
+        record_api_operation(
+            &state.audit,
+            req_id,
+            &identity,
+            fp,
+            &app,
+            "rollback",
+            AuditOutcome::Failed,
+            Some(&format!(
+                "requested history id {} not found in status.history",
+                request.id
+            )),
+        );
         return Err(ApiError::unprocessable(format!(
             "status.history has no entry with id {}; known ids: {known:?}",
             request.id
         )));
     }
-    request_operation(&state, &app, OperationRequest::Rollback { id: request.id }).await
+    request_operation(
+        &state,
+        &identity,
+        req_id,
+        fp,
+        &app,
+        OperationRequest::Rollback { id: request.id },
+    )
+    .await
 }
 
 /// Patches `ferriscd.io/operation` according to the single annotation slot.
 async fn request_operation(
     state: &AppState,
+    identity: &AuthenticatedIdentity,
+    request_id: Option<&str>,
+    fingerprint: Option<&TokenFingerprint>,
     app: &Application,
     operation: OperationRequest,
 ) -> Result<(StatusCode, Json<OperationResponse>), ApiError> {
@@ -1080,6 +1172,16 @@ async fn request_operation(
         // Idempotent: the controller has not consumed the manual sync yet, and a second request is
         // the same request. Writing again would only churn `resourceVersion`.
         (PendingOperation::ManualSync(value), OperationRequest::Sync) => {
+            record_api_operation(
+                &state.audit,
+                request_id,
+                identity,
+                fingerprint,
+                app,
+                operation.label(),
+                AuditOutcome::Accepted,
+                Some("manual sync already pending (idempotent)"),
+            );
             tracing::info!(
                 app.namespace = %namespace,
                 app.name = %name,
@@ -1101,6 +1203,16 @@ async fn request_operation(
         // The single slot cannot carry both, and silently cancelling an explicit rollback would
         // redeploy the wrong commit. Transient: the controller consumes a rollback once applied.
         (PendingOperation::Rollback(value), OperationRequest::Sync) => {
+            record_api_operation(
+                &state.audit,
+                request_id,
+                identity,
+                fingerprint,
+                app,
+                operation.label(),
+                AuditOutcome::Failed,
+                Some("conflict: rollback operation already pending"),
+            );
             return Err(ApiError::conflict(format!(
                 "a rollback is pending on {namespace}/{name} ({} = {value:?}) and has not been \
                  applied yet; it replaces the manual sync this request asks for, so remove the \
@@ -1116,10 +1228,39 @@ async fn request_operation(
             _,
         ) => {}
     }
-    state
+    if let Err(error) = state
         .operations
         .request(&namespace, &name, resource_version.as_deref(), operation)
-        .await?;
+        .await
+    {
+        record_api_operation(
+            &state.audit,
+            request_id,
+            identity,
+            fingerprint,
+            app,
+            operation.label(),
+            AuditOutcome::Failed,
+            Some("failed to record operation annotation on Application"),
+        );
+        return Err(error);
+    }
+    let audit_reason = match operation {
+        OperationRequest::Sync => "manual sync operation recorded".to_owned(),
+        OperationRequest::Rollback { id } => {
+            format!("rollback operation recorded for history id {id}")
+        }
+    };
+    record_api_operation(
+        &state.audit,
+        request_id,
+        identity,
+        fingerprint,
+        app,
+        operation.label(),
+        AuditOutcome::Accepted,
+        Some(&audit_reason),
+    );
     tracing::info!(
         app.namespace = %namespace,
         app.name = %name,
@@ -1393,8 +1534,13 @@ async fn require_application(
 ///
 /// `namespace`/`name` are the ones from the request path, not from the object, so the hidden `404` is
 /// byte-identical to [`ApiError::not_found`]'s answer for a missing object.
+#[allow(clippy::too_many_arguments)]
 fn authorize(
+    state: &AppState,
     actor: &Actor<'_>,
+    identity: &AuthenticatedIdentity,
+    request_id: Option<&str>,
+    fingerprint: Option<&TokenFingerprint>,
     app: &Application,
     namespace: &str,
     name: &str,
@@ -1403,11 +1549,29 @@ fn authorize(
 ) -> Result<(), ApiError> {
     let grant = actor.grant(&app.spec.project);
     if !grant.is_visible() {
+        record_rbac_denied(
+            &state.audit,
+            request_id,
+            identity,
+            fingerprint,
+            app,
+            action,
+            StatusCode::NOT_FOUND,
+        );
         return Err(ApiError::not_found("Application", namespace, name));
     }
     if grant.allows(action) {
         return Ok(());
     }
+    record_rbac_denied(
+        &state.audit,
+        request_id,
+        identity,
+        fingerprint,
+        app,
+        action,
+        StatusCode::FORBIDDEN,
+    );
     Err(ApiError::Forbidden {
         message: format!(
             "not permitted to {verb} Application {namespace}/{name}: this identity has no `{}` \

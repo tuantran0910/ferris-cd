@@ -20,6 +20,7 @@ use ferriscd_crd::{AppProject, Application};
 use ferriscd_engine::manifest::ResourceKey;
 use futures::future::BoxFuture;
 
+use crate::audit::AuditLogger;
 use crate::auth::{AuthPolicy, IdentityCache, TokenAuthenticator, UnconfiguredTokenAuthenticator};
 use crate::error::ApiError;
 use crate::rbac::{RbacPolicy, RbacPolicyStore};
@@ -445,6 +446,9 @@ pub struct AppState {
     pub refreshes: Arc<dyn RefreshSink>,
     /// Per-repository debounce + jittered fan-out (`T14.2`).
     pub fan_out: Arc<FanOut>,
+    /// Compliance audit logger (`T17.2`): lossless stdout JSON (`ferriscd::audit`) plus optional
+    /// non-blocking file/webhook sinks.
+    pub audit: AuditLogger,
 }
 
 impl fmt::Debug for AppState {
@@ -500,6 +504,7 @@ impl AppState {
             dedupe,
             refreshes,
             fan_out,
+            audit: AuditLogger::default(),
         }
     }
 
@@ -569,6 +574,13 @@ impl AppState {
     #[must_use]
     pub fn with_readiness(mut self, readiness: Arc<dyn Readiness>) -> Self {
         self.readiness = readiness;
+        self
+    }
+
+    /// Replaces the compliance audit logger (`T17.2`).
+    #[must_use]
+    pub fn with_audit(mut self, audit: AuditLogger) -> Self {
+        self.audit = audit;
         self
     }
 }

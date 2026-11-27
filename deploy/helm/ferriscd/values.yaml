@@ -121,6 +121,24 @@ telemetry:
   otlpEndpoint: ""
   serviceName: ferriscd-controller
 
+# Compliance audit trail configuration (`T17.2`).
+# Structured JSON audit events (`schemaVersion: ferriscd.io/audit/v1`) are always emitted to
+# stdout on the `ferriscd::audit` tracing target for FluentBit/Vector collection.
+audit:
+  # Optional append-only JSONL file path inside the writable `/tmp` volume (e.g. `/tmp/audit.jsonl`).
+  # In-cluster this needs a rotation sidecar or `copytruncate` and a `tmpSizeLimit`; prefer
+  # `webhookUrlSecret` for production SIEM delivery.
+  logPath: ""
+  # Optional async batched HTTPS webhook URL for SIEM ingestion (HTTPS-only, SSRF-guarded).
+  # Rendered as a plain pod argument: prefer `webhookUrlSecret` in production.
+  webhookUrl: ""
+  # Production: source the webhook URL (which may embed a SIEM API key in its query string) from
+  # an existing Secret via `secretKeyRef`, so `kubectl get pod -o yaml` never exposes it.
+  # Takes precedence over `webhookUrl`.
+  webhookUrlSecret:
+    name: ""
+    key: "audit-webhook-url"
+
 # Multi-tenancy (`T12.2`): namespaces allowed to host `Application` CRs.
 # Empty list (default) restricts watching to the release control-plane namespace only.
 # Provide explicit namespace names (e.g. `["team-a", "team-b"]`) to create least-privilege
@@ -384,7 +402,9 @@ affinity: {}
 # When empty and `replicaCount > 1`, a default hostname topologySpreadConstraint is added.
 topologySpreadConstraints: []
 priorityClassName: ""
-terminationGracePeriodSeconds: 30
+# Must cover the controller drain (default 30 s), the API server's graceful drain, the OTLP flush,
+# and the <= 2 s audit-sink flush (8 s headroom).
+terminationGracePeriodSeconds: 40
 
 # Optional FerrisCD Modern Web Dashboard (`apps/ferriscd-web`).
 # Runs under the same `restricted` PodSecurityStandard (`readOnlyRootFilesystem: true`,

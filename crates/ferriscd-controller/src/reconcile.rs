@@ -2300,6 +2300,8 @@ mod tests {
             ACTIVE_RECONCILES,
             crate::metrics::RBAC_RELOAD_TOTAL,
             crate::metrics::RBAC_WATCH_ERRORS_TOTAL,
+            crate::metrics::AUDIT_EVENTS_TOTAL,
+            crate::metrics::AUDIT_DROPPED_TOTAL,
         ]
         .into_iter()
         .collect();

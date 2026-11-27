@@ -354,37 +354,49 @@ async fn serve(args: ServerArgs) -> Result<()> {
         ferriscd_server::serve(address, state, api_stop.cancelled_owned()).await
     });
     let controller_stop = stop.clone();
+    // `T17.2`: keep the external audit sinks alive past the controller task so audit events from
+    // in-flight API handlers are not dropped; flush them only after both producers have drained.
+    let audit = plane.audit_sink_handles();
     let mut controller = tokio::spawn(async move { plane.run_until(controller_stop).await });
 
-    tokio::select! {
+    let outcome: Result<()> = tokio::select! {
         // The controller ended (a signal, or a leader lease that will not be renewed).
         result = &mut controller => {
             stop.cancel();
-            let served = api
-                .await
-                .context("the API server task panicked")?;
-            rbac_watch
-                .await
-                .context("the RBAC policy watch task panicked")?;
-            result.context("the controller task panicked")??;
-            served?;
-            Ok(())
+            async {
+                let served = api
+                    .await
+                    .context("the API server task panicked")?;
+                rbac_watch
+                    .await
+                    .context("the RBAC policy watch task panicked")?;
+                result.context("the controller task panicked")??;
+                served?;
+                Ok(())
+            }
+            .await
         }
         // The API server ended first: stop the controller through the same token and wait for it to
         // drain, so a failed listener never leaves a reconciling process that nobody can reach.
         served = &mut api => {
             stop.cancel();
-            let drained = controller
-                .await
-                .context("the controller task panicked")?;
-            rbac_watch
-                .await
-                .context("the RBAC policy watch task panicked")?;
-            served.context("the API server task panicked")??;
-            drained?;
-            Ok(())
+            async {
+                let drained = controller
+                    .await
+                    .context("the controller task panicked")?;
+                rbac_watch
+                    .await
+                    .context("the RBAC policy watch task panicked")?;
+                served.context("the API server task panicked")??;
+                drained?;
+                Ok(())
+            }
+            .await
         }
-    }
+    };
+
+    audit.flush().await;
+    outcome
 }
 
 #[cfg(test)]
@@ -702,11 +714,36 @@ mod tests {
             "--metrics-addr",
             "FERRISCD_METRICS_ADDR",
             "ferriscd_reconcile_total",
+            "--audit-log-path",
+            "FERRISCD_AUDIT_LOG_PATH",
+            "--audit-webhook-url",
+            "FERRISCD_AUDIT_WEBHOOK_URL",
         ] {
             assert!(
                 help.contains(expected),
                 "the flag help must document {expected:?}: {help}"
             );
         }
+    }
+
+    #[test]
+    fn audit_flags_parse_and_redact_userinfo_and_query_in_debug() {
+        let args = parse(&[
+            "ferriscd",
+            "server",
+            "--audit-log-path",
+            "/tmp/audit.jsonl",
+            "--audit-webhook-url",
+            "https://user:s3cr3t-audit-key@siem.example.com/ingest?api_key=q-secret#frag",
+        ]);
+        assert_eq!(
+            args.controller.audit_log_path,
+            Some(PathBuf::from("/tmp/audit.jsonl"))
+        );
+        let rendered = format!("{args:?}");
+        assert!(!rendered.contains("s3cr3t-audit-key"), "{rendered}");
+        assert!(!rendered.contains("q-secret"), "{rendered}");
+        assert!(!rendered.contains("frag"), "{rendered}");
+        assert!(rendered.contains("siem.example.com/ingest"), "{rendered}");
     }
 }

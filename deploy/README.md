@@ -462,6 +462,8 @@ Exposed families — and nothing else:
 | `ferriscd_active_reconciles` | gauge | *(none)* |
 | `ferriscd_rbac_reload_total` | counter | `outcome` = `ok` \| `error` \| `deleted` |
 | `ferriscd_rbac_watch_errors_total` | counter | *(none)* |
+| `ferriscd_audit_events_total` | counter | `category` = `api.operation` \| `api.authz_denied` \| `webhook.delivery` \| `controller.impersonation` \| `cluster.registry`, `outcome` = `allowed` \| `denied` \| `accepted` \| `failed` |
+| `ferriscd_audit_dropped_total` | counter | *(none)* — one per `try_send` drop, one per failed JSONL write/flush, one per event in a rejected/failed webhook batch, and one per timed-out sink flush (the exact backlog is unknown after the channel closes) |
 
 Operational notes:
 
@@ -470,7 +472,7 @@ Operational notes:
   the only free-form labels are the `Application`'s own `metadata.namespace`/`metadata.name`. Series
   therefore grow with the number of `Application`s, never with commits, failures, resources or
   scrapes. The two per-`Application` families exist **after a pass has observed that
-  `Application`** (a status nobody observed is never invented); the other seven are exported from
+  `Application`** (a status nobody observed is never invented); the other nine are exported from
   startup with zero values, so a "no data yet" alert does not fire on a fresh pod.
 * **Prometheus scraping fails loudly if the listener dies.** The metrics server is an independent
   Tokio task, and its failure cancels the controller's own shutdown path instead of leaving a

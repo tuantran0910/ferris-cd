@@ -105,6 +105,8 @@ pub fn app_state(plane: &ControlPlane, webhooks: WebhookConfig) -> AppState {
     // `T14.4` / `T17.1`: deny everything until `load_rbac_policy` / `watch_rbac_policy` loads
     // `ferriscd-rbac-cm`.
     .with_rbac_store(RbacPolicyStore::empty())
+    // `T17.2`: share the control plane's compliance audit logger and Prometheus audit counters.
+    .with_audit(plane.audit())
     .with_webhooks(webhooks)
 }
 

@@ -233,7 +233,7 @@ fn the_sharding_flags_and_per_shard_leases_are_documented() {
 }
 
 /// **`T15.1`:** the metrics listener is a documented, separate port with an env fallback, and the
-/// cardinality trap guard is stated where an operator (or a future contributor) reads it — the seven
+/// cardinality trap guard is stated where an operator (or a future contributor) reads it — the eleven
 /// families must all be listed, or a dashboard is built against metrics nothing exports.
 #[test]
 fn the_metrics_listener_and_its_cardinality_contract_are_documented() {
@@ -249,6 +249,10 @@ fn the_metrics_listener_and_its_cardinality_contract_are_documented() {
         "ferriscd_git_fetch_duration_seconds",
         "ferriscd_render_cache_total",
         "ferriscd_active_reconciles",
+        "ferriscd_rbac_reload_total",
+        "ferriscd_rbac_watch_errors_total",
+        "ferriscd_audit_events_total",
+        "ferriscd_audit_dropped_total",
     ] {
         assert!(
             README.contains(expected),
