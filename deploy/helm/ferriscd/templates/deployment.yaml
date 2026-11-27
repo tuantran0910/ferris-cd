@@ -100,6 +100,9 @@ spec:
             - {{ .webhookUrl | quote }}
             {{- end }}
             {{- end }}
+            {{- /* Switches the chart has no dedicated value for (e.g. `--enable-drift-watcher`,
+                   `T18.1`) are wired here and through `server.extraEnv` below, so both the flag
+                   and its `FERRISCD_ENABLE_DRIFT_WATCHER` fallback are reachable from values. */}}
             {{- range .Values.server.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -133,6 +136,8 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: {{ .Values.telemetry.serviceName | quote }}
             {{- end }}
+            {{- /* The env half of the same escape hatch, e.g.
+                   `FERRISCD_ENABLE_DRIFT_WATCHER: "true"` (must be exactly `true`/`false`). */}}
             {{- with .Values.server.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
