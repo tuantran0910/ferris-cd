@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use ferriscd_crd::{AppProject, Application};
 use ferriscd_engine::manifest::ResourceKey;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 
 use crate::audit::AuditLogger;
 use crate::auth::{AuthPolicy, IdentityCache, TokenAuthenticator, UnconfiguredTokenAuthenticator};
@@ -230,6 +231,97 @@ pub trait ProjectCatalog: Send + Sync + 'static {
     fn list(&self) -> SeamFuture<'_, Vec<AppProject>>;
 }
 
+/// The most Kubernetes `Event`s one `GET .../events` response carries (`T17.3`).
+///
+/// A namespace keeps Events for roughly an hour and a long-failing `Application` can accumulate
+/// hundreds of them, so the response is a bounded *timeline* (the latest 50, newest first) instead
+/// of a dump: the UI renders one screenful and `truncated` says the rest exists.
+pub const MAX_APPLICATION_EVENTS: usize = 50;
+
+/// One Kubernetes `events.k8s.io/v1` `Event` about an `Application`, reduced to a timeline entry.
+///
+/// `note` is deliberately carried **unredacted** here: [`crate::api`] runs every note through
+/// `ferriscd_controller::events::sanitize_note` (URL credentials, embedded secret payloads, 1 KiB
+/// cap) so a new [`EventSource`] implementation cannot bypass redaction by forgetting to call it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplicationEvent {
+    /// `metadata.name` of the `Event`.
+    pub name: String,
+    /// `type`: `Normal`, `Warning`, or `Unknown` when the field is absent.
+    pub event_type: String,
+    /// `reason` — a machine-readable, bounded label (`SyncSucceeded`, `SyncFailed`, ...).
+    pub reason: String,
+    /// `note` — the human-readable message, **not yet redacted** (see the type docs).
+    pub note: String,
+    /// `action` (`Sync`, `Prune`, ...).
+    pub action: Option<String>,
+    /// `series.count` (or `deprecatedCount`): how many times the event recurred.
+    pub count: i32,
+    /// `reportingController` — the component that emitted the event.
+    pub reporting_component: Option<String>,
+    /// When the event was last observed, as RFC 3339 UTC.
+    pub last_observed_at: Option<String>,
+    /// When the event was first observed, as RFC 3339 UTC.
+    pub first_observed_at: Option<String>,
+}
+
+/// Reads the Kubernetes `Event`s that regard one `Application` (`GET .../events`, `T17.3`).
+///
+/// The one thing every implementation must get right is the **scope**: an implementation has to
+/// query `events.k8s.io/v1` `Event`s in the `Application`'s own namespace, filtered server-side by
+/// `regarding.uid`, and must never fall back to a namespace-wide or cluster-wide listing (trap
+/// guard). `ferriscd-server`'s own adapter (`crate::kube::KubeEventSource`) refuses to query at all
+/// when the `Application` has no `metadata.uid`.
+pub trait EventSource: Send + Sync + 'static {
+    /// The latest events about `app`, newest first, at most [`MAX_APPLICATION_EVENTS`].
+    fn list<'a>(&'a self, app: &'a Application) -> SeamFuture<'a, Vec<ApplicationEvent>>;
+}
+
+/// No event source is configured: the timeline is empty.
+///
+/// This is the default for a state built without one (tests, and any embedder that does not want
+/// the endpoint). It answers "no events", never an error, so a partially wired control plane still
+/// serves every other page.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoEvents;
+
+impl EventSource for NoEvents {
+    fn list<'a>(&'a self, _app: &'a Application) -> SeamFuture<'a, Vec<ApplicationEvent>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// Streams `Application` snapshots for the SSE dashboard feed (`GET /api/v1/applications/stream`).
+///
+/// # Why a stream of *snapshots*
+///
+/// A control plane has no event log to replay: the authoritative answer to "what changed" is always
+/// "re-read the `Application`s". Each item is therefore a complete, caller-filtered snapshot that the
+/// UI replaces its list with, which makes a missed or dropped frame harmless — the next snapshot
+/// repairs it. That is also why the feed never carries another tenant's object: the handler filters
+/// every snapshot through the live RBAC policy before it is written to the socket.
+///
+/// # Boundedness and cleanup
+///
+/// The returned stream is **pull-based**: it produces nothing until the response body is polled, so a
+/// slow client applies backpressure instead of making the server queue snapshots. Dropping the stream
+/// (which is what a client disconnect does to the response body) tears the subscription down — there
+/// is no detached task, no background buffer, and no further cluster reads.
+pub trait ApplicationSnapshotSource: Send + Sync + 'static {
+    /// Opens one subscription for one connection.
+    fn subscribe(&self) -> BoxStream<'static, Result<Vec<Application>, ApiError>>;
+}
+
+/// No snapshot feed is configured: the stream ends immediately.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoSnapshots;
+
+impl ApplicationSnapshotSource for NoSnapshots {
+    fn subscribe(&self) -> BoxStream<'static, Result<Vec<Application>, ApiError>> {
+        Box::pin(futures::stream::empty())
+    }
+}
+
 /// One registered cluster, as `GET /api/v1/clusters` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterEntry {
@@ -415,6 +507,10 @@ pub struct AppState {
     pub applications: Arc<dyn ApplicationSource>,
     /// `AppProject` reads.
     pub projects: Arc<dyn ProjectCatalog>,
+    /// Kubernetes `Event` reads for the `Application` events timeline (`T17.3`).
+    pub events: Arc<dyn EventSource>,
+    /// The SSE snapshot feed (`GET /api/v1/applications/stream`, `T17.3`).
+    pub snapshots: Arc<dyn ApplicationSnapshotSource>,
     /// The cluster registry.
     pub clusters: Arc<dyn ClusterCatalog>,
     /// `ferriscd.io/operation` writes.
@@ -489,6 +585,8 @@ impl AppState {
         Self {
             applications,
             projects,
+            events: Arc::new(NoEvents),
+            snapshots: Arc::new(NoSnapshots),
             clusters,
             operations,
             inventory,
@@ -581,6 +679,20 @@ impl AppState {
     #[must_use]
     pub fn with_audit(mut self, audit: AuditLogger) -> Self {
         self.audit = audit;
+        self
+    }
+
+    /// Replaces the Kubernetes `Event` reader (`T17.3`).
+    #[must_use]
+    pub fn with_event_source(mut self, events: Arc<dyn EventSource>) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Replaces the SSE snapshot feed (`T17.3`).
+    #[must_use]
+    pub fn with_snapshot_source(mut self, snapshots: Arc<dyn ApplicationSnapshotSource>) -> Self {
+        self.snapshots = snapshots;
         self
     }
 }

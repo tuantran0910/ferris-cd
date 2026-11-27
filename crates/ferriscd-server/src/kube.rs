@@ -12,6 +12,7 @@
 //! the controller — duplicating any of it here is exactly the flaw finding C9 removed.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ferriscd_controller::{
     ClusterManager, ControlPlane, ControlPlaneReadiness, DiffPreview, Metrics, RbacReloadOutcome,
@@ -22,9 +23,11 @@ use ferriscd_crd::{AppProject, Application};
 use ferriscd_engine::inventory::{self, Inventory};
 use ferriscd_engine::manifest::ResourceKey;
 use futures::StreamExt as _;
+use futures::stream::BoxStream;
 use k8s_openapi::api::apps::v1::ReplicaSet;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
+use k8s_openapi::api::events::v1::Event;
 use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::WatchStreamExt as _;
 use kube::runtime::watcher::{self, Event as WatcherEvent};
@@ -40,10 +43,10 @@ use crate::rbac::{
     RbacPolicyStore,
 };
 use crate::state::{
-    AppState, ApplicationSource, ChildNode, ClusterCatalog, ClusterEntry, DiffSource,
-    GRAPH_LIST_LIMIT, GraphRequest, GraphTraversal, InventoryReader, ListKey, ListedNode,
-    LiveResourceState, OperationRequest, OperationWriter, ProjectCatalog, Readiness, SeamFuture,
-    WorkloadGraphSource,
+    AppState, ApplicationEvent, ApplicationSnapshotSource, ApplicationSource, ChildNode,
+    ClusterCatalog, ClusterEntry, DiffSource, EventSource, GRAPH_LIST_LIMIT, GraphRequest,
+    GraphTraversal, InventoryReader, ListKey, ListedNode, LiveResourceState, OperationRequest,
+    OperationWriter, ProjectCatalog, Readiness, SeamFuture, WorkloadGraphSource,
 };
 use crate::webhooks::{RefreshSink, RefreshTarget, WebhookConfig};
 
@@ -107,6 +110,16 @@ pub fn app_state(plane: &ControlPlane, webhooks: WebhookConfig) -> AppState {
     .with_rbac_store(RbacPolicyStore::empty())
     // `T17.2`: share the control plane's compliance audit logger and Prometheus audit counters.
     .with_audit(plane.audit())
+    // `T17.3`: the read-only `events.k8s.io/v1` timeline and the RBAC-filtered SSE snapshot feed,
+    // both over the controller's own client (no second connector pool, no informer).
+    .with_event_source(Arc::new(KubeEventSource::new(client.clone())))
+    .with_snapshot_source(Arc::new(PollingApplicationSnapshot::new(
+        Arc::new(KubeApplicationSource::new(
+            client.clone(),
+            plane.application_scope(),
+        )),
+        SSE_SNAPSHOT_INTERVAL,
+    )))
     .with_webhooks(webhooks)
 }
 
@@ -221,11 +234,221 @@ impl ProjectCatalog for KubeProjectCatalog {
     }
 }
 
+/// Reads the Kubernetes `Event`s that regard one `Application` (`GET .../events`, `T17.3`).
+///
+/// # Scope is the whole security story here
+///
+/// Two narrowings, both server-side, and **no fallback of any kind**:
+///
+/// 1. `Api::<events.k8s.io/v1 Event>::namespaced(client, app.metadata.namespace)` — never
+///    `Api::all`, so a mismatched selector can only ever reach events of one namespace.
+/// 2. `ListParams::fields("regarding.uid=<app uid>")` — the API server, not `ferriscd`, decides which
+///    events regard this object, so events about a *different* `Application` in the same namespace
+///    (or a tenant workload) never cross the wire.
+///
+/// An `Application` without a `metadata.uid` (an unpersisted object, or a fake) answers an **empty
+/// timeline**: falling back to a namespace-wide list there would turn "we cannot scope this" into
+/// "show every event in the namespace", which is exactly the leak the trap guard forbids.
+pub struct KubeEventSource {
+    client: Client,
+}
+
+impl std::fmt::Debug for KubeEventSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KubeEventSource").finish_non_exhaustive()
+    }
+}
+
+impl KubeEventSource {
+    /// Builds the reader over the control-plane client (the `Application`'s own cluster: that is
+    /// where the controller's `EventRecorder` publishes them).
+    #[must_use]
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+impl EventSource for KubeEventSource {
+    fn list<'a>(&'a self, app: &'a Application) -> SeamFuture<'a, Vec<ApplicationEvent>> {
+        let (Some(selector), Some(namespace)) = (regarding_uid_selector(app), app.namespace())
+        else {
+            // Unscopable: answer "no events" instead of widening the query (trap guard).
+            return Box::pin(async { Ok(Vec::new()) });
+        };
+        let api: Api<Event> = Api::namespaced(self.client.clone(), &namespace);
+        Box::pin(async move {
+            let listed = api
+                .list(
+                    &ListParams::default()
+                        .fields(&selector)
+                        .limit(EVENT_LIST_LIMIT),
+                )
+                .await
+                .map_err(|err| ApiError::backend(&err))?;
+            Ok(event_page(listed.items))
+        })
+    }
+}
+
+/// The `ListParams::limit` of one `/events` read.
+///
+/// `events.k8s.io/v1` events are namespaced, short-lived, and per-`Application` few (one object per
+/// `(reason, reportingController)`, with a `series.count` for repeats). The listing is still bounded
+/// so a pathological namespace cannot make one HTTP request allocate an unbounded event list, and
+/// the newest [`MAX_APPLICATION_EVENTS`](crate::state::MAX_APPLICATION_EVENTS) are what the response
+/// carries.
+pub const EVENT_LIST_LIMIT: u32 = 200;
+
+/// The `field_selector` that narrows an `events.k8s.io/v1` list to events about `app`.
+///
+/// Returns `None` — meaning "do not query at all" — when the `Application` has no usable
+/// `metadata.uid`, and for a UID that carries selector syntax (`=`, `,`): a field selector built by
+/// concatenation must never be able to smuggle in a second term.
+#[must_use]
+pub fn regarding_uid_selector(app: &Application) -> Option<String> {
+    let uid = app
+        .metadata
+        .uid
+        .as_deref()
+        .map(str::trim)
+        .filter(|uid| !uid.is_empty() && !uid.contains(',') && !uid.contains('='))?;
+    Some(format!("regarding.uid={uid}"))
+}
+
+/// Maps a listed `Event` page onto timeline entries, **newest first**.
+///
+/// Split from the API call so ordering (the thing a timeline is for) is a pure, testable function:
+/// `deprecatedLastTimestamp` and `eventTime` are both considered, so an event written by an older
+/// emitter still lands in the right place.
+#[must_use]
+pub fn event_page(mut events: Vec<Event>) -> Vec<ApplicationEvent> {
+    events.sort_by_key(|event| std::cmp::Reverse(event_instant(event)));
+    events.into_iter().map(application_event).collect()
+}
+
+/// The instant an `Event` last happened.
+fn event_instant(event: &Event) -> Option<k8s_openapi::jiff::Timestamp> {
+    event
+        .deprecated_last_timestamp
+        .as_ref()
+        .map(|time| time.0)
+        .or_else(|| event.event_time.as_ref().map(|time| time.0))
+        .or_else(|| event.deprecated_first_timestamp.as_ref().map(|time| time.0))
+}
+
+/// One listed `Event`, reduced to the timeline entry the API renders.
+fn application_event(event: Event) -> ApplicationEvent {
+    let count = event
+        .series
+        .as_ref()
+        .map(|series| series.count)
+        .or(event.deprecated_count)
+        .unwrap_or(1);
+    ApplicationEvent {
+        name: event.name_any(),
+        event_type: event
+            .type_
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Unknown")
+            .to_owned(),
+        reason: event.reason.unwrap_or_default(),
+        // Redacted by `crate::api::event_view`, not here: every source implementation gets the same
+        // treatment that way.
+        note: event.note.unwrap_or_default(),
+        action: event.action.filter(|action| !action.trim().is_empty()),
+        count,
+        reporting_component: event
+            .reporting_controller
+            .filter(|component| !component.trim().is_empty()),
+        last_observed_at: event
+            .deprecated_last_timestamp
+            .as_ref()
+            .and_then(time_string),
+        first_observed_at: event
+            .deprecated_first_timestamp
+            .as_ref()
+            .and_then(time_string),
+    }
+}
+
+/// RFC 3339 rendering of a Kubernetes `Time`, via the type's own `serde` implementation.
+fn time_string(time: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> Option<String> {
+    serde_json::to_value(time)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+}
+
+/// How often the SSE feed re-reads the `Application` list (`T17.3`).
+///
+/// Two seconds is the point where an incident dashboard feels live without turning one open browser
+/// tab into a `kubectl get` loop: the previous 10 s polling lag is what this feed exists to remove,
+/// and a snapshot is one namespaced `list` per interval — never a watch, never a cluster-wide read.
+pub const SSE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Turns the `ApplicationSource` seam into the SSE snapshot feed (`T17.3`).
+///
+/// # Bounded per connection
+///
+/// The stream is a pull-based generator: it holds at most **one** pending snapshot (the one the
+/// response body is currently waiting for), so a client that stops reading stops the production
+/// instead of growing a queue. `MissedTickBehavior::Delay` keeps a stalled client from receiving a
+/// burst of catch-up snapshots when it resumes.
+///
+/// # Cleanup on disconnect
+///
+/// Nothing is spawned: the `Interval` lives inside the stream, so dropping the body drops the
+/// subscription, the interval, and any in-flight `list`. There is no detached task that could keep
+/// reading the cluster for a client that has gone.
+pub struct PollingApplicationSnapshot {
+    source: Arc<dyn ApplicationSource>,
+    interval: Duration,
+}
+
+impl std::fmt::Debug for PollingApplicationSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PollingApplicationSnapshot")
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PollingApplicationSnapshot {
+    /// Builds the feed over `source`, re-reading it every `interval`.
+    #[must_use]
+    pub fn new(source: Arc<dyn ApplicationSource>, interval: Duration) -> Self {
+        Self { source, interval }
+    }
+
+    /// The re-read interval (for logs and assertions).
+    #[must_use]
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+}
+
+impl ApplicationSnapshotSource for PollingApplicationSnapshot {
+    fn subscribe(&self) -> BoxStream<'static, Result<Vec<Application>, ApiError>> {
+        let source = Arc::clone(&self.source);
+        let mut interval = tokio::time::interval(self.interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `unfold` is the whole buffer: one snapshot in flight, produced only when polled.
+        Box::pin(futures::stream::unfold(interval, move |mut interval| {
+            let source = Arc::clone(&source);
+            async move {
+                interval.tick().await;
+                let snapshot = source.list().await;
+                Some((snapshot, interval))
+            }
+        }))
+    }
+}
+
 /// Lists the cluster registry (`T13.1`): `in-cluster` first, then every registration.
 pub struct RegistryClusterCatalog {
     clusters: Arc<ClusterManager>,
 }
-
 impl std::fmt::Debug for RegistryClusterCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegistryClusterCatalog")
@@ -1098,6 +1321,7 @@ pub async fn drive_rbac_watch<S, E>(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 
@@ -1211,6 +1435,172 @@ mod tests {
         assert_eq!(list_kind_for("Pod"), None);
         assert_eq!(child_group(GraphListKind::ReplicaSet), "apps");
         assert_eq!(child_group(GraphListKind::Pod), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // T17.3: the events timeline
+    // -----------------------------------------------------------------------
+
+    fn app_with_uid(uid: Option<&str>) -> Application {
+        let spec: ferriscd_crd::ApplicationSpec = serde_json::from_value(serde_json::json!({
+            "project": "payments",
+            "source": {"git": {"repoURL": "https://example.com/r.git", "path": "deploy"}},
+            "destination": {"cluster": "in-cluster", "namespace": "payments"},
+        }))
+        .expect("a valid ApplicationSpec");
+        let mut app = Application::new("payments-api", spec);
+        app.metadata.namespace = Some("ferriscd-system".to_owned());
+        app.metadata.uid = uid.map(ToOwned::to_owned);
+        app
+    }
+
+    /// **Trap guard:** without a `metadata.uid` there is no scoped query at all — and in particular no
+    /// namespace-wide fallback, which would hand one tenant every event in the namespace.
+    #[test]
+    fn the_event_selector_requires_a_uid_and_never_widens() {
+        assert_eq!(
+            regarding_uid_selector(&app_with_uid(Some("0f6d1c9a-2a91-4c8e-9b6c-1d2e3f4a5b6c"))),
+            Some("regarding.uid=0f6d1c9a-2a91-4c8e-9b6c-1d2e3f4a5b6c".to_owned())
+        );
+        for uid in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                regarding_uid_selector(&app_with_uid(uid)),
+                None,
+                "a uid of {uid:?} must not produce a query"
+            );
+        }
+        // A uid carrying field-selector syntax must never append a second selector term.
+        assert_eq!(
+            regarding_uid_selector(&app_with_uid(Some("x,reason=SyncFailed"))),
+            None
+        );
+        assert_eq!(regarding_uid_selector(&app_with_uid(Some("x=y"))), None);
+    }
+
+    fn kube_event(spec: serde_json::Value) -> Event {
+        serde_json::from_value(spec).expect("a valid events.k8s.io/v1 Event")
+    }
+
+    /// The timeline is ordered newest-first across both the `events.k8s.io/v1` `eventTime` and the
+    /// core/v1 compatibility timestamps, and it maps every field the UI renders.
+    #[test]
+    fn events_are_ordered_newest_first_and_mapped() {
+        let page = event_page(vec![
+            kube_event(serde_json::json!({
+                "metadata": {"name": "old"},
+                "type": "Normal",
+                "reason": "SyncSucceeded",
+                "note": "applied 15 resources",
+                "action": "Sync",
+                "reportingController": "ferriscd.io/controller",
+                "deprecatedFirstTimestamp": "2027-01-15T09:00:00Z",
+                "deprecatedLastTimestamp": "2027-01-15T09:00:00Z",
+            })),
+            kube_event(serde_json::json!({
+                "metadata": {"name": "newest"},
+                "type": "Warning",
+                "reason": "SyncFailed",
+                "note": "apply failed",
+                "deprecatedCount": 4,
+                "eventTime": "2027-01-15T11:00:00.000000Z",
+            })),
+            kube_event(serde_json::json!({
+                "metadata": {"name": "middle"},
+                "type": "Normal",
+                "reason": "ResourcePruned",
+                "note": "pruned 1 resource",
+                "deprecatedLastTimestamp": "2027-01-15T10:00:00Z",
+            })),
+        ]);
+        let names: Vec<&str> = page.iter().map(|event| event.name.as_str()).collect();
+        assert_eq!(names, vec!["newest", "middle", "old"]);
+        assert_eq!(page[0].event_type, "Warning");
+        assert_eq!(page[0].count, 4, "deprecatedCount is the recurrence count");
+        assert_eq!(page[1].count, 1, "a singleton event counts once");
+        assert_eq!(
+            page[2].reporting_component.as_deref(),
+            Some("ferriscd.io/controller")
+        );
+        assert_eq!(
+            page[2].last_observed_at.as_deref(),
+            Some("2027-01-15T09:00:00Z")
+        );
+        // The note is carried verbatim: redaction belongs to the API layer, for every source.
+        assert_eq!(page[0].note, "apply failed");
+    }
+
+    /// A series count comes from `series.count` when the emitter wrote one.
+    #[test]
+    fn a_series_event_reports_its_count() {
+        let page = event_page(vec![kube_event(serde_json::json!({
+            "metadata": {"name": "series"},
+            "type": "Warning",
+            "reason": "SyncFailed",
+            "series": {"count": 9, "lastObservedTime": "2027-01-15T11:00:00.000000Z"},
+            "deprecatedCount": 1,
+        }))]);
+        assert_eq!(page[0].count, 9);
+        assert_eq!(page[0].event_type, "Warning");
+    }
+
+    // -----------------------------------------------------------------------
+    // T17.3: the SSE snapshot feed
+    // -----------------------------------------------------------------------
+
+    /// An `ApplicationSource` that counts its reads, so the feed's behaviour is observable.
+    #[derive(Debug, Default)]
+    struct CountingApplications {
+        reads: AtomicUsize,
+    }
+
+    impl CountingApplications {
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ApplicationSource for CountingApplications {
+        fn list(&self) -> SeamFuture<'_, Vec<Application>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![app_with_uid(Some("uid"))]) })
+        }
+
+        fn get(&self, _namespace: &str, _name: &str) -> SeamFuture<'_, Option<Application>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// **Bounded per connection + cleanup on disconnect:** the feed produces exactly one snapshot per
+    /// poll (never on wall-clock alone, so a slow client cannot be buffered), and dropping the stream
+    /// stops the cluster reads entirely — there is no detached task left behind.
+    #[tokio::test(start_paused = true)]
+    async fn the_sse_feed_is_demand_driven_and_stops_when_dropped() {
+        let source = Arc::new(CountingApplications::default());
+        let feed = PollingApplicationSnapshot::new(source.clone(), Duration::from_secs(2));
+        assert_eq!(feed.interval(), Duration::from_secs(2));
+
+        let mut stream = feed.subscribe();
+        assert!(stream.next().await.is_some(), "the first snapshot");
+        assert_eq!(source.reads(), 1, "one snapshot per poll, immediately");
+
+        // Nobody polls: no read happens, however much virtual time passes.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(source.reads(), 1, "production follows consumption");
+
+        // Polling again produces exactly one more snapshot (missed ticks are delayed, not replayed).
+        assert!(stream.next().await.is_some());
+        assert_eq!(source.reads(), 2);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(stream.next().await.is_some());
+        assert_eq!(source.reads(), 3, "a stalled client never receives a burst");
+
+        drop(stream);
+        tokio::time::advance(Duration::from_secs(600)).await;
+        assert_eq!(
+            source.reads(),
+            3,
+            "a dropped connection must stop the reads: nothing keeps running for a gone client"
+        );
     }
 
     /// Records every listing it is asked for, so the graph's cost is asserted, not assumed.

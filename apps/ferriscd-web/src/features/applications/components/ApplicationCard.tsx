@@ -62,40 +62,46 @@ export function ApplicationCard({ app, listState, index = 0 }: ApplicationCardPr
           <HealthStatusBadge status={app.health?.status} />
         </div>
 
-        <dl className="mt-4 space-y-1.5 text-xs text-slate-400">
-          <div className="flex items-center gap-2">
-            <FolderGit2 className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+        {/* A list, not a `<dl>`: these rows are source/destination facts, and a definition list
+            whose items carry no `<dt>`/`<dd>` pair is an accessibility defect (WCAG 1.3.1, axe
+            `definition-list`). */}
+        <ul
+          aria-label="Source and destination"
+          className="mt-4 space-y-1.5 text-xs text-slate-300"
+        >
+          <li className="flex items-center gap-2">
+            <FolderGit2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-slate-400" />
             <span
               className="min-w-0 truncate font-mono text-slate-300"
               title={app.source.repoUrl}
             >
               {app.source.repoUrl}
             </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <GitBranch className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+          </li>
+          <li className="flex items-center gap-2">
+            <GitBranch aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-slate-400" />
             <span
               className="min-w-0 truncate font-mono"
               title={`${app.source.targetRevision} @ ${app.sync?.revision ?? "unknown revision"}`}
             >
               {app.source.targetRevision} ({shortRevision(app.sync?.revision)})
             </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <Server className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+          </li>
+          <li className="flex items-center gap-2">
+            <Server aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-slate-400" />
             <span className="min-w-0 truncate font-mono">
               {app.destination.cluster} / {app.destination.namespace}
             </span>
-          </div>
-        </dl>
+          </li>
+        </ul>
       </div>
 
-      <div className="mt-4 flex items-center justify-between border-t border-slate-800/80 pt-3 text-[11px] text-slate-400">
+      <div className="mt-4 flex items-center justify-between border-t border-slate-800/80 pt-3 text-[11px] text-slate-300">
         <span className="inline-flex items-center gap-1">
-          <Box className="h-3.5 w-3.5 text-slate-500" />
+          <Box aria-hidden="true" className="h-3.5 w-3.5 text-slate-400" />
           {app.resourceCount} resources
         </span>
-        <span className="font-mono text-slate-500">{app.source.renderer}</span>
+        <span className="font-mono text-slate-300">{app.source.renderer}</span>
       </div>
     </Link>
   );

@@ -24,6 +24,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/applications/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The SSE dashboard feed (`T17.3`): `text/event-stream` of RBAC-filtered `Application` snapshots.
+         * @description A `text/event-stream` feed of `Application` snapshots, each filtered to the projects the caller is authorized for (a snapshot never contains another tenant's application). Authenticated with the standard `Authorization: Bearer` header — never a query parameter, which is why the UI consumes it with `fetch()` streaming. A snapshot failure ends the stream with one `error` frame so the client can fall back to polling.
+         */
+        get: operations["stream_applications"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/applications/{namespace}/{name}": {
         parameters: {
             query?: never;
@@ -56,6 +76,26 @@ export interface paths {
          * @description The live, `Secret`-redacted Server-Side-Apply dry-run diff. Computed by the controller's own pipeline in-process, and read-only: nothing is applied, pruned, or patched.
          */
         get: operations["get_diff"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/applications/{namespace}/{name}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Reads the Kubernetes `Event`s that regard an `Application` (`T17.3`).
+         * @description The latest Kubernetes `events.k8s.io/v1` events about one `Application` (`Normal`/`Warning`), newest first and bounded to 50. Read strictly from the `Application`'s own namespace with a `regarding.uid` field selector (never cluster-wide), and every note is `Secret`/token redacted.
+         */
+        get: operations["get_application_events"];
         put?: never;
         post?: never;
         delete?: never;
@@ -293,6 +333,37 @@ export interface components {
             /** @description Last `status.history` entries, oldest first. */
             history?: components["schemas"]["HistoryView"][];
             operation?: null | components["schemas"]["OperationView"];
+        };
+        /** @description `GET /api/v1/applications/{namespace}/{name}/events` body (`T17.3`). */
+        ApplicationEventListView: {
+            /** @description The latest events, newest first, at most [`MAX_APPLICATION_EVENTS`]. */
+            items: components["schemas"]["ApplicationEventView"][];
+            /** @description Whether the cluster holds more events about this `Application` than [`Self::items`] carries. */
+            truncated: boolean;
+        };
+        /** @description One Kubernetes `Event` about an `Application`, as the timeline renders it. */
+        ApplicationEventView: {
+            /** @description `action` (`Sync`, `Prune`, ...), when recorded. */
+            action?: string | null;
+            /**
+             * Format: int32
+             * @description How many times the event recurred.
+             */
+            count: number;
+            /** @description When it was first observed (RFC 3339 UTC), when the cluster recorded it. */
+            firstObservedAt?: string | null;
+            /** @description When it was last observed (RFC 3339 UTC), when the cluster recorded it. */
+            lastObservedAt?: string | null;
+            /** @description `note`, redacted: no URL credential, `Secret` payload, or token survives here. */
+            message: string;
+            /** @description `metadata.name` of the `Event` object. */
+            name: string;
+            /** @description `reason` (`SyncSucceeded`, `SyncFailed`, `ResourcePruned`, ...). */
+            reason: string;
+            /** @description `reportingController` — the component that emitted it. */
+            reportingComponent?: string | null;
+            /** @description `type`: `Normal`, `Warning`, or `Unknown`. */
+            type: string;
         };
         /** @description `GET /api/v1/applications` body. */
         ApplicationListView: {
@@ -647,6 +718,33 @@ export interface operations {
             };
         };
     };
+    stream_applications: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A `text/event-stream` of RBAC-filtered `Application` snapshots (`event: applications`, one `ApplicationListView` JSON body per frame) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
     get_application: {
         parameters: {
             query?: never;
@@ -759,6 +857,67 @@ export interface operations {
                 };
             };
             /** @description The diff could not be computed */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    get_application_events: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Namespace of the Application */
+                namespace: string;
+                /** @description Name of the Application */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The bounded, redacted events timeline */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApplicationEventListView"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The caller may see this Application but not read it */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description No such Application, or none visible to the caller */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The cluster could not be read */
             502: {
                 headers: {
                     [name: string]: unknown;

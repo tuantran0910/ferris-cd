@@ -8,9 +8,11 @@
 //! webhooks    POST /api/v1/webhooks/github         (HMAC-authenticated, T14.2)
 //!             POST /api/v1/webhooks/gitlab         (token-authenticated, T14.2)
 //! protected   GET  /api/v1/applications
+//!             GET  /api/v1/applications/stream
 //!             GET  /api/v1/applications/{ns}/{name}
 //!             GET  /api/v1/applications/{ns}/{name}/resources
 //!             GET  /api/v1/applications/{ns}/{name}/diff
+//!             GET  /api/v1/applications/{ns}/{name}/events
 //!             POST /api/v1/applications/{ns}/{name}/sync
 //!             POST /api/v1/applications/{ns}/{name}/rollback
 //!             GET  /api/v1/projects
@@ -35,12 +37,16 @@
 //! documented `413` and a malformed one never echoes what was sent (finding `P14-M1`).
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::http::StatusCode;
 use axum::middleware;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferriscd_crd::annotations;
@@ -50,6 +56,8 @@ use ferriscd_crd::status::{
 use ferriscd_crd::{AppProject, Application};
 use ferriscd_engine::diff::ResourceDiff;
 use ferriscd_engine::manifest::ResourceKey;
+use futures::StreamExt as _;
+use futures::stream::BoxStream;
 use kube::ResourceExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -61,9 +69,10 @@ use crate::audit::{
 use crate::auth::{self, AuthenticatedIdentity};
 use crate::error::{ApiError, ApiErrorBody};
 use crate::openapi;
-use crate::rbac::{Action, Actor};
+use crate::rbac::{Action, Actor, RbacPolicyStore};
 use crate::state::{
-    AppState, ClusterEntry, GraphRequest, GraphTraversal, MAX_GRAPH_LIST_REQUESTS, OperationRequest,
+    AppState, ApplicationEvent, ClusterEntry, GraphRequest, GraphTraversal, MAX_APPLICATION_EVENTS,
+    MAX_GRAPH_LIST_REQUESTS, OperationRequest,
 };
 use crate::webhooks;
 
@@ -485,6 +494,44 @@ pub struct ClusterView {
     pub in_cluster: bool,
 }
 
+/// `GET /api/v1/applications/{namespace}/{name}/events` body (`T17.3`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApplicationEventListView {
+    /// The latest events, newest first, at most [`MAX_APPLICATION_EVENTS`].
+    pub items: Vec<ApplicationEventView>,
+    /// Whether the cluster holds more events about this `Application` than [`Self::items`] carries.
+    pub truncated: bool,
+}
+
+/// One Kubernetes `Event` about an `Application`, as the timeline renders it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplicationEventView {
+    /// `metadata.name` of the `Event` object.
+    pub name: String,
+    /// `type`: `Normal`, `Warning`, or `Unknown`.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// `reason` (`SyncSucceeded`, `SyncFailed`, `ResourcePruned`, ...).
+    pub reason: String,
+    /// `note`, redacted: no URL credential, `Secret` payload, or token survives here.
+    pub message: String,
+    /// `action` (`Sync`, `Prune`, ...), when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// How many times the event recurred.
+    pub count: i32,
+    /// `reportingController` — the component that emitted it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reporting_component: Option<String>,
+    /// When it was last observed (RFC 3339 UTC), when the cluster recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observed_at: Option<String>,
+    /// When it was first observed (RFC 3339 UTC), when the cluster recorded it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_observed_at: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -497,6 +544,9 @@ pub struct ClusterView {
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/v1/applications", get(list_applications))
+        // `T17.3`: the SSE feed is a **fixed** path, registered before the parameterised routes so
+        // `stream` can never be read as an `Application` namespace.
+        .route("/api/v1/applications/stream", get(stream_applications))
         .route(
             "/api/v1/applications/{namespace}/{name}",
             get(get_application),
@@ -508,6 +558,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/applications/{namespace}/{name}/diff",
             get(get_diff),
+        )
+        .route(
+            "/api/v1/applications/{namespace}/{name}/events",
+            get(get_application_events),
         )
         .route(
             "/api/v1/applications/{namespace}/{name}/sync",
@@ -874,6 +928,247 @@ pub async fn get_resources(
         nodes,
         truncated,
     }))
+}
+
+/// Reads the Kubernetes `Event`s that regard an `Application` (`T17.3`).
+///
+/// This is the timeline an operator reads during an incident: `Normal`/`Warning` `events.k8s.io/v1`
+/// events emitted by the controller for this `Application` (`SyncSucceeded`, `SyncFailed`,
+/// `ResourcePruned`, ...), newest first, bounded to [`MAX_APPLICATION_EVENTS`].
+///
+/// # Scope (trap guard)
+///
+/// The read is *always* narrowed twice, in [`crate::state::EventSource`]'s implementation:
+/// `Api::<Event>::namespaced(app.namespace)` and `field_selector("regarding.uid=<app uid>")`. There is
+/// no namespace-wide and no cluster-wide fallback: an `Application` without a `metadata.uid` answers
+/// an empty timeline rather than every event in its namespace, and Events about *other* Applications
+/// (or other tenants' workloads in the same namespace) are never fetched at all.
+///
+/// # Redaction
+///
+/// Every `note` goes through `ferriscd_controller::events::sanitize_note` — the controller's own
+/// redactor, which masks URL credentials and embedded secret payloads and caps the message at the
+/// `events.k8s.io/v1` 1 KiB limit. An `Event` note can quote a repository URL or a failed apply, so
+/// the redaction happens here, on the way out, for **every** source implementation.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] when the `Application` does not exist **or** the caller has no grant on its
+/// project (byte-identical answers), [`ApiError::Forbidden`] when it is visible but `get` is not
+/// granted, [`ApiError::Backend`] when the cluster cannot be read.
+#[utoipa::path(
+    get,
+    path = "/api/v1/applications/{namespace}/{name}/events",
+    description = "The latest Kubernetes `events.k8s.io/v1` events about one `Application` (`Normal`/`Warning`), newest first and bounded to 50. Read strictly from the `Application`'s own namespace with a `regarding.uid` field selector (never cluster-wide), and every note is `Secret`/token redacted.",
+    tag = "applications",
+    params(
+        ("namespace" = String, Path, description = "Namespace of the Application"),
+        ("name" = String, Path, description = "Name of the Application"),
+    ),
+    responses(
+        (status = 200, description = "The bounded, redacted events timeline", body = ApplicationEventListView),
+        (status = 401, description = "Authentication required", body = ApiErrorBody),
+        (status = 403, description = "The caller may see this Application but not read it", body = ApiErrorBody),
+        (status = 404, description = "No such Application, or none visible to the caller", body = ApiErrorBody),
+        (status = 502, description = "The cluster could not be read", body = ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn get_application_events(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
+    request_id: Option<Extension<RequestId>>,
+    fingerprint: Option<Extension<TokenFingerprint>>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Result<Json<ApplicationEventListView>, ApiError> {
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
+    let app = require_application(&state, &namespace, &name).await?;
+    authorize(
+        &state,
+        &actor,
+        &identity,
+        request_id.as_ref().map(|Extension(id)| id.as_str()),
+        fingerprint.as_ref().map(|Extension(fp)| fp),
+        &app,
+        &namespace,
+        &name,
+        Action::Get,
+        "read",
+    )?;
+    let events = state.events.list(&app).await?;
+    Ok(Json(event_list_view(events)))
+}
+
+/// The SSE dashboard feed (`T17.3`): `text/event-stream` of RBAC-filtered `Application` snapshots.
+///
+/// Each `applications` frame is the same `ApplicationListView` body `GET /api/v1/applications`
+/// answers, re-read from the live RBAC store and filtered to the projects **this caller** may see
+/// before it is written to the socket: a snapshot can therefore never carry another tenant's
+/// application, and a policy change takes effect on the next frame without reconnecting.
+///
+/// # Authentication (trap guard)
+///
+/// The credentials come from the ordinary `Authorization: Bearer` header, exactly like every other
+/// protected route: this route is authenticated by the shared middleware, and the handler reads no
+/// token from the query string. That is deliberate — `EventSource` cannot set headers, which is why
+/// the UI consumes this feed with `fetch()` streaming (and why a token must never be put in a URL,
+/// where it would land in access logs, proxies and `Referer` headers).
+///
+/// # Termination and boundedness
+///
+/// The body is a pull-based stream over [`crate::state::ApplicationSnapshotSource::subscribe`]: the
+/// server produces a snapshot only when the previous one has been written, so a slow client applies
+/// backpressure instead of being buffered. Dropping the response body (a client disconnect) drops the
+/// subscription with it — no detached task keeps reading the cluster. A failing snapshot ends the
+/// stream with one `error` frame (the standard `{"error":{"code","message"}}` shape) so the client can
+/// fall back to polling.
+#[utoipa::path(
+    get,
+    path = "/api/v1/applications/stream",
+    description = "A `text/event-stream` feed of `Application` snapshots, each filtered to the projects the caller is authorized for (a snapshot never contains another tenant's application). Authenticated with the standard `Authorization: Bearer` header — never a query parameter, which is why the UI consumes it with `fetch()` streaming. A snapshot failure ends the stream with one `error` frame so the client can fall back to polling.",
+    tag = "applications",
+    responses(
+        (status = 200, description = "A `text/event-stream` of RBAC-filtered `Application` snapshots (`event: applications`, one `ApplicationListView` JSON body per frame)"),
+        (status = 401, description = "Authentication required", body = ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn stream_applications(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
+) -> Response {
+    let feed = sse_feed(state.snapshots.subscribe(), state.rbac.clone(), identity);
+    Sse::new(feed)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE).text("keep-alive"))
+        .into_response()
+}
+
+/// The SSE event name of one application snapshot.
+pub const SSE_EVENT_APPLICATIONS: &str = "applications";
+
+/// The SSE event name of a terminal feed error.
+pub const SSE_EVENT_ERROR: &str = "error";
+
+/// How often an idle SSE connection sends a comment frame.
+///
+/// Corporate proxies routinely drop a connection with no bytes for 30–60 s; a 15 s keep-alive keeps
+/// the connection alive without producing any RBAC-filtered payload.
+pub const SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// One connection's SSE state machine.
+struct SseFeedState {
+    source: BoxStream<'static, Result<Vec<Application>, ApiError>>,
+    rbac: RbacPolicyStore,
+    identity: AuthenticatedIdentity,
+    done: bool,
+}
+
+/// Maps a snapshot source into SSE frames, filtering **every** frame through the live RBAC policy.
+///
+/// Split out of the handler so a test can drive it frame by frame without an HTTP stack, and so the
+/// two invariants live in one place: a snapshot is filtered before it is serialized, and a failure
+/// ends the stream (instead of looping on the same error forever).
+fn sse_feed(
+    source: BoxStream<'static, Result<Vec<Application>, ApiError>>,
+    rbac: RbacPolicyStore,
+    identity: AuthenticatedIdentity,
+) -> impl futures::Stream<Item = Result<SseEvent, Infallible>> {
+    let state = SseFeedState {
+        source,
+        rbac,
+        identity,
+        done: false,
+    };
+    futures::stream::unfold(state, |mut state| async move {
+        if state.done {
+            return None;
+        }
+        let snapshot = state.source.next().await?;
+        let event = match snapshot {
+            Ok(applications) => {
+                // The live store, re-read per frame: revoking a project takes effect on the next
+                // snapshot instead of on the next reconnect.
+                let policy = state.rbac.snapshot();
+                let actor = Actor::new(&policy, &state.identity);
+                let items: Vec<ApplicationSummary> = applications
+                    .iter()
+                    .filter(|app| actor.can_see(&app.spec.project))
+                    .map(application_summary)
+                    .collect();
+                match SseEvent::default()
+                    .event(SSE_EVENT_APPLICATIONS)
+                    .json_data(ApplicationListView { items })
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "an application snapshot could not be serialized for the SSE feed"
+                        );
+                        state.done = true;
+                        error_frame(&ApiError::backend(&error))
+                    }
+                }
+            }
+            Err(error) => {
+                // One terminal frame, then the stream ends: the client reconnects (or falls back to
+                // polling) instead of receiving the same failure as an infinite loop.
+                tracing::warn!(
+                    code = error.code(),
+                    "the application snapshot feed failed; ending the SSE stream"
+                );
+                state.done = true;
+                error_frame(&error)
+            }
+        };
+        Some((Ok(event), state))
+    })
+}
+
+/// One terminal `error` frame carrying the standard `{"error":{...}}` body.
+fn error_frame(error: &ApiError) -> SseEvent {
+    let body = ApiErrorBody::from(error.clone());
+    SseEvent::default()
+        .event(SSE_EVENT_ERROR)
+        .json_data(body)
+        .unwrap_or_else(|_| {
+            // A DTO that carries two `String`s cannot fail to serialize; this keeps the handler
+            // total (no `unwrap`) even if that ever changes.
+            SseEvent::default()
+                .event(SSE_EVENT_ERROR)
+                .data(r#"{"error":{"code":"BackendUnavailable","message":"the stream failed"}}"#)
+        })
+}
+
+/// Maps an `EventSource` answer onto the wire body: bounded, newest first, every note redacted.
+fn event_list_view(events: Vec<ApplicationEvent>) -> ApplicationEventListView {
+    let truncated = events.len() > MAX_APPLICATION_EVENTS;
+    ApplicationEventListView {
+        items: events
+            .into_iter()
+            .take(MAX_APPLICATION_EVENTS)
+            .map(event_view)
+            .collect(),
+        truncated,
+    }
+}
+
+/// One event, with its note through the controller's redactor.
+fn event_view(event: ApplicationEvent) -> ApplicationEventView {
+    ApplicationEventView {
+        name: event.name,
+        type_: event.event_type,
+        reason: event.reason,
+        // The controller's own redactor (`T15.2`): URL credentials and embedded secret payloads are
+        // masked, and the message is capped at the `events.k8s.io/v1` 1 KiB limit.
+        message: ferriscd_controller::events::sanitize_note(&event.note),
+        action: event.action,
+        count: event.count,
+        reporting_component: event.reporting_component,
+        last_observed_at: event.last_observed_at,
+        first_observed_at: event.first_observed_at,
+    }
 }
 
 /// Computes the live, Secret-redacted diff of an `Application` (`T14.1`).

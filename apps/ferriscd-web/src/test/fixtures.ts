@@ -1,10 +1,12 @@
 import type { FerrisApiClient } from "../api/client";
 import type {
   ApplicationDetailView,
+  ApplicationEventListView,
   ApplicationSummary,
   DiffPayload,
   DiffView,
   OperationResponse,
+  ProjectListView,
   ResourceGraphView,
   ResourceNodeView,
 } from "../api/types";
@@ -432,6 +434,62 @@ export const sampleDiffPayload: DiffPayload = {
   ],
 };
 
+export const sampleProjects: ProjectListView = {
+  items: [
+    {
+      name: "payments",
+      description: "PCI-scoped payment services",
+      sourceRepos: ["https://github.com/acme/gitops-payments.git"],
+      sourceNamespaces: ["ferriscd-system"],
+      destinations: ["prod-us-east/payments", "in-cluster/payments"],
+      allowedServiceAccounts: ["payments-deployer"],
+    },
+    {
+      name: "storefront",
+      description: "Customer-facing storefront",
+      sourceRepos: ["https://github.com/acme/gitops-storefront.git"],
+      sourceNamespaces: ["ferriscd-system"],
+      destinations: ["in-cluster/storefront"],
+      allowedServiceAccounts: [],
+    },
+  ],
+};
+
+export const sampleClusters = {
+  items: [
+    { name: "in-cluster", inCluster: true },
+    { name: "prod-us-east", inCluster: false },
+  ],
+};
+
+export const sampleEvents: ApplicationEventListView = {
+  items: [
+    {
+      name: "payments-api.18f1",
+      type: "Warning",
+      reason: "SyncFailed",
+      message: "failed to apply Deployment payments/api: quota exceeded",
+      action: "Sync",
+      count: 3,
+      reportingComponent: "ferriscd.io/controller",
+      lastObservedAt: "2026-11-25T19:15:00Z",
+      firstObservedAt: "2026-11-25T18:55:00Z",
+    },
+    {
+      name: "payments-api.18e2",
+      type: "Normal",
+      reason: "SyncSucceeded",
+      message: "applied 15 resources from revision a1b2c3d",
+      action: "Sync",
+      count: 1,
+      reportingComponent: "ferriscd.io/controller",
+      lastObservedAt: "2026-11-25T18:00:00Z",
+      firstObservedAt: "2026-11-25T18:00:00Z",
+    },
+  ],
+  truncated: false,
+};
+
 export function createMockApiClient(
   overrides: Partial<FerrisApiClient> = {},
 ): FerrisApiClient {
@@ -450,14 +508,15 @@ export function createMockApiClient(
     getApplication: async () => sampleAppDetail,
     getResources: async () => make15NodeResourceGraph(),
     getDiff: async () => sampleDiffPayload as unknown as DiffView,
+    getApplicationEvents: async () => sampleEvents,
     syncApplication: async () => defaultOp,
     rollbackApplication: async (_ns, _name, body) => ({
       ...defaultOp,
       operation: "rollback",
       request: JSON.stringify({ rollback: { id: body.id } }),
     }),
-    listProjects: async () => ({ items: [] }),
-    listClusters: async () => ({ items: [] }),
+    listProjects: async () => sampleProjects,
+    listClusters: async () => sampleClusters,
     ...overrides,
   };
 }

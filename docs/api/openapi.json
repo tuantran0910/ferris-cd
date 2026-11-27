@@ -56,6 +56,36 @@
         ]
       }
     },
+    "/api/v1/applications/stream": {
+      "get": {
+        "tags": [
+          "applications"
+        ],
+        "summary": "The SSE dashboard feed (`T17.3`): `text/event-stream` of RBAC-filtered `Application` snapshots.",
+        "description": "A `text/event-stream` feed of `Application` snapshots, each filtered to the projects the caller is authorized for (a snapshot never contains another tenant's application). Authenticated with the standard `Authorization: Bearer` header — never a query parameter, which is why the UI consumes it with `fetch()` streaming. A snapshot failure ends the stream with one `error` frame so the client can fall back to polling.",
+        "operationId": "stream_applications",
+        "responses": {
+          "200": {
+            "description": "A `text/event-stream` of RBAC-filtered `Application` snapshots (`event: applications`, one `ApplicationListView` JSON body per frame)"
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/applications/{namespace}/{name}": {
       "get": {
         "tags": [
@@ -214,6 +244,93 @@
           },
           "502": {
             "description": "The diff could not be computed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/applications/{namespace}/{name}/events": {
+      "get": {
+        "tags": [
+          "applications"
+        ],
+        "summary": "Reads the Kubernetes `Event`s that regard an `Application` (`T17.3`).",
+        "description": "The latest Kubernetes `events.k8s.io/v1` events about one `Application` (`Normal`/`Warning`), newest first and bounded to 50. Read strictly from the `Application`'s own namespace with a `regarding.uid` field selector (never cluster-wide), and every note is `Secret`/token redacted.",
+        "operationId": "get_application_events",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the Application",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bounded, redacted events timeline",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationEventListView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller may see this Application but not read it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such Application, or none visible to the caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The cluster could not be read",
             "content": {
               "application/json": {
                 "schema": {
@@ -994,6 +1111,89 @@
                 "description": "The running operation, when one is recorded."
               }
             ]
+          }
+        }
+      },
+      "ApplicationEventListView": {
+        "type": "object",
+        "description": "`GET /api/v1/applications/{namespace}/{name}/events` body (`T17.3`).",
+        "required": [
+          "items",
+          "truncated"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApplicationEventView"
+            },
+            "description": "The latest events, newest first, at most [`MAX_APPLICATION_EVENTS`]."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether the cluster holds more events about this `Application` than [`Self::items`] carries."
+          }
+        }
+      },
+      "ApplicationEventView": {
+        "type": "object",
+        "description": "One Kubernetes `Event` about an `Application`, as the timeline renders it.",
+        "required": [
+          "name",
+          "type",
+          "reason",
+          "message",
+          "count"
+        ],
+        "properties": {
+          "action": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`action` (`Sync`, `Prune`, ...), when recorded."
+          },
+          "count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many times the event recurred."
+          },
+          "firstObservedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it was first observed (RFC 3339 UTC), when the cluster recorded it."
+          },
+          "lastObservedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When it was last observed (RFC 3339 UTC), when the cluster recorded it."
+          },
+          "message": {
+            "type": "string",
+            "description": "`note`, redacted: no URL credential, `Secret` payload, or token survives here."
+          },
+          "name": {
+            "type": "string",
+            "description": "`metadata.name` of the `Event` object."
+          },
+          "reason": {
+            "type": "string",
+            "description": "`reason` (`SyncSucceeded`, `SyncFailed`, `ResourcePruned`, ...)."
+          },
+          "reportingComponent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`reportingController` — the component that emitted it."
+          },
+          "type": {
+            "type": "string",
+            "description": "`type`: `Normal`, `Warning`, or `Unknown`."
           }
         }
       },

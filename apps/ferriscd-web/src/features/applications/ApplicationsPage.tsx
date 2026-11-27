@@ -5,6 +5,7 @@ import type { ApplicationSummary } from "../../api/types";
 import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Button } from "../../ui/Button";
 import { EmptyState } from "../../ui/EmptyState";
+import { LiveRegion } from "../../ui/LiveRegion";
 import { Skeleton } from "../../ui/Skeleton";
 import {
   HealthStatusBadge,
@@ -165,8 +166,25 @@ export function ApplicationsPage() {
     syncFilter !== ALL ||
     healthFilter !== ALL;
 
+  // Announced on every poll (`T17.3`): the list updates itself, so a screen reader user gets no
+  // other signal that an application moved between sync/health states.
+  const outOfSyncCount = filteredApps.filter(
+    (app) => normalizeSyncStatus(app.sync?.status) === "OutOfSync",
+  ).length;
+  const degradedCount = filteredApps.filter(
+    (app) => normalizeHealthStatus(app.health?.status) === "Degraded",
+  ).length;
+
   return (
     <div className="space-y-6">
+      <LiveRegion
+        message={
+          data
+            ? `Showing ${filteredApps.length} of ${apps.length} applications; ${outOfSyncCount} out of sync, ${degradedCount} degraded.`
+            : ""
+        }
+        data-testid="applications-live-region"
+      />
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-slate-100">

@@ -19,10 +19,17 @@ export const queryKeys = {
     ["application-resources", namespace, name] as const,
   diff: (namespace: string, name: string) =>
     ["application-diff", namespace, name] as const,
+  events: (namespace: string, name: string) =>
+    ["application-events", namespace, name] as const,
+  projects: () => ["projects"] as const,
+  clusters: () => ["clusters"] as const,
 };
 
 export const APPLICATIONS_POLL_INTERVAL_MS = 10_000;
 export const DETAIL_POLL_INTERVAL_MS = 10_000;
+/** The `AppProject`/cluster catalogue is slow-moving: a minute is plenty, and it keeps a palette
+ *  that is opened occasionally from polling like a dashboard. */
+export const PLATFORM_POLL_INTERVAL_MS = 60_000;
 
 /**
  * Poll every 10s, except once the server has definitively answered "you may not
@@ -39,11 +46,12 @@ export function pollUnlessTerminalError(query: {
   return DETAIL_POLL_INTERVAL_MS;
 }
 
-export function useApplications() {
+export function useApplications(enabled = true) {
   const { apiClient } = useAuth();
   return useQuery({
     queryKey: queryKeys.applications(),
     queryFn: () => apiClient.listApplications(),
+    enabled,
     refetchInterval: APPLICATIONS_POLL_INTERVAL_MS,
   });
 }
@@ -82,6 +90,27 @@ export function useDiff(namespace: string, name: string, enabled = true) {
 }
 
 /**
+ * The Kubernetes events timeline (`T17.3`).
+ *
+ * Fetched only while its tab is open: the endpoint costs one namespaced `list` against the cluster,
+ * so a background tab must not pay for it. A `403`/`404` stops the polling for the same reason the
+ * detail query does (see `pollUnlessTerminalError`).
+ */
+export function useApplicationEvents(
+  namespace: string,
+  name: string,
+  enabled = true,
+) {
+  const { apiClient } = useAuth();
+  return useQuery({
+    queryKey: queryKeys.events(namespace, name),
+    queryFn: () => apiClient.getApplicationEvents(namespace, name),
+    enabled: Boolean(namespace && name && enabled),
+    refetchInterval: pollUnlessTerminalError,
+  });
+}
+
+/**
  * Refetch everything a sync/rollback can change, in the order the operator
  * reads it: the detail header first, then its resources and diff, then the list
  * the operator came from.
@@ -100,6 +129,10 @@ export function useInvalidateAfterOperation(
     });
     void queryClient.invalidateQueries({
       queryKey: queryKeys.diff(namespace, name),
+    });
+    // A sync/rollback is exactly what produces the next `SyncSucceeded`/`SyncFailed` event.
+    void queryClient.invalidateQueries({
+      queryKey: queryKeys.events(namespace, name),
     });
     void queryClient.invalidateQueries({ queryKey: queryKeys.applications() });
   };
