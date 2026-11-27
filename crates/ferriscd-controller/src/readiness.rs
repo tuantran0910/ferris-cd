@@ -15,7 +15,7 @@
 //!   performs three `Acquire` atomic loads, and [`ControlPlaneReadiness::reason`] returns `None`
 //!   without allocating whenever ready.
 //! - **Secret-free by construction:** pending reasons name only the static gate identifiers
-//!   (`application watches`, `cluster registry seed`, `RBAC policy`) — never user names, group
+//!   (`application watch initialization`, `cluster registry seed`, `RBAC policy`) — never user names, group
 //!   names, cluster credentials, or namespace contents.
 
 use std::sync::Arc;
@@ -67,6 +67,10 @@ impl ControlPlaneReadiness {
     ///
     /// A standby serves stateless API requests and therefore must report ready once the cluster
     /// registry and RBAC snapshot are seeded, even though it never runs the controller set.
+    ///
+    /// The flag is cleared when this replica acquires the lease. It is deliberately sticky while a
+    /// foreign leader has been seen: readiness must not flap during the short re-acquire handoff,
+    /// and the gap between lease expiry and winner election is bounded by the election retry delay.
     pub fn mark_standby_serving(&self) {
         self.inner.standby_serving.store(true, Ordering::Release);
     }
@@ -139,7 +143,7 @@ impl ControlPlaneReadiness {
         let mut pending: [&'static str; 3] = [""; 3];
         let mut len = 0_usize;
         if !controllers && !standby {
-            pending[len] = "application watches (or a healthy active leader)";
+            pending[len] = "application watch initialization";
             len += 1;
         }
         if !clusters {
@@ -166,7 +170,7 @@ mod tests {
         let readiness = ControlPlaneReadiness::new();
         assert!(!readiness.is_ready());
         let initial_reason = readiness.reason().expect("unready must explain why");
-        assert!(initial_reason.contains("application watches"));
+        assert!(initial_reason.contains("application watch"));
         assert!(initial_reason.contains("cluster registry seed"));
         assert!(initial_reason.contains("RBAC policy"));
 
@@ -174,7 +178,7 @@ mod tests {
         assert!(!readiness.is_ready());
         let after_clusters = readiness.reason().expect("still missing two gates");
         assert!(!after_clusters.contains("cluster registry seed"));
-        assert!(after_clusters.contains("application watches"));
+        assert!(after_clusters.contains("application watch"));
         assert!(after_clusters.contains("RBAC policy"));
 
         readiness.mark_rbac_loaded();
@@ -182,7 +186,7 @@ mod tests {
         let after_rbac = readiness.reason().expect("still missing controllers");
         assert_eq!(
             after_rbac,
-            "waiting for initial control-plane readiness: application watches (or a healthy active leader)"
+            "waiting for initial control-plane readiness: application watch initialization"
         );
 
         // Clones share the exact same underlying atomic state.
@@ -216,7 +220,7 @@ mod tests {
             readiness
                 .reason()
                 .expect("leader is cold")
-                .contains("application watches")
+                .contains("application watch")
         );
 
         readiness.mark_controllers_ready();

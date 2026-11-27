@@ -14,7 +14,7 @@ A liveness probe (`/healthz`) answers *"is the process wedged?"*; a readiness pr
 
 FerrisCD coordinates startup with a lock-free three-gate barrier (`ControlPlaneReadiness` in `crates/ferriscd-controller/src/readiness.rs`) backed by three `AtomicBool` flags:
 
-1. `controllers_ready`: flipped when `ApplicationControllers::wait_until_ready()` completes (or, in active/standby `--leader-election` mode, once `LeaderElection::from_client` succeeds so standby replicas can serve stateless API requests without deadlocking `helm upgrade --wait`).
+1. `controllers_ready`: flipped when `ApplicationControllers::wait_until_ready()` completes. In active/standby `--leader-election` mode a standby instead sets a distinct `standby_serving` gate once it observes a **healthy foreign leader**, and the gate is cleared when it acquires the lease — a leader always waits for its own controller `InitDone`, so a cold replica cannot accept traffic and `helm upgrade --wait` cannot deadlock.
 2. `clusters_seeded`: flipped after the initial namespaced `Secret` list or the first bracketed `Init..InitDone` watch snapshot.
 3. `rbac_loaded`: flipped after an authoritative initial API read of `ferriscd-rbac-cm` (including `404` missing or invalid YAML, which fail closed to deny-all) or after `watch_rbac_policy`'s first `InitDone`.
 
@@ -27,7 +27,7 @@ Restarting every control-plane pod to rotate an RBAC rule is unacceptable in pro
 |---|---|---|
 | Valid YAML update (new `resourceVersion`) | Atomic swap to new policy | `ferriscd_rbac_reload_total{outcome="ok"}` |
 | Unchanged `resourceVersion` (410 reconnect re-list) | No-op (deduplicated) | None |
-| Malformed YAML, duplicate keys, alias bomb, or missing `policy.yaml` | **Retain last known-good policy** (fail-safe against operator typos) | `ferriscd_rbac_reload_total{outcome="error"}` |
+| Malformed YAML, duplicate keys, alias bomb, or missing `policy.yaml` | **Retain last known-good policy** (fail-safe against operator typos) | `ferriscd_rbac_reload_total{outcome="error"}` (watch failures count on `ferriscd_rbac_watch_errors_total`) |
 | `Delete` or omission from completed re-list (`Init` → `InitDone`) | **Fail closed** to `RbacPolicy::empty()` (default-deny) | `ferriscd_rbac_reload_total{outcome="deleted"}` |
 
 Separately, `GET /api/v1/clusters` filters the cluster registry through the caller's visible `AppProject.spec.destinations` via `wildcard_matches`, closing cross-tenant cluster enumeration.

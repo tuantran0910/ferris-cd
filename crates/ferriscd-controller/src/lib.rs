@@ -1016,11 +1016,12 @@ async fn run_as_leader(
         let token = term.token();
         // Boxed so one `select!` can poll both halves without moving either: the controller set has
         // to be awaited *after* the term ends, so in-flight passes drain like a `SIGTERM`.
-        let mut controllers = Box::pin(controller::run_as_leader(
+        let mut controllers = Box::pin(controller::run_as_leader_with_readiness(
             client.clone(),
             config.clone(),
             ctx.clone(),
             token.clone(),
+            readiness.clone(),
         ));
         let mut hold = Box::pin(term.hold(&stop));
         let outcome = match race_term(&mut controllers, &mut hold, &token).await {

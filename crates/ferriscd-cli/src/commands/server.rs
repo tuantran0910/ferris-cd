@@ -289,7 +289,8 @@ async fn serve(args: ServerArgs) -> Result<()> {
     }
     let state = ferriscd_server::kube::app_state(&plane, webhooks)
         .with_auth(args.auth_policy)
-        .with_rbac_store(rbac_store.clone());
+        .with_rbac_store(rbac_store.clone())
+        .with_rbac_namespace(plane.namespace().to_owned());
     if let Some(metrics_addr) = plane.metrics_addr() {
         // `T15.1`: said out loud where the API address is decided, so a scrape that fails is not
         // diagnosed as a missing endpoint.

@@ -435,6 +435,8 @@ pub struct AppState {
     /// `T14.4` / `T17.1` live-reloading project-scoped authorization policy store (empty = deny
     /// every authenticated caller).
     pub rbac: RbacPolicyStore,
+    /// Control-plane namespace the RBAC `ConfigMap` is read from (`--namespace`).
+    pub rbac_namespace: String,
     /// `T14.2` webhook configuration (secrets, caps, debounce).
     pub webhooks: WebhookConfig,
     /// `T14.2` bounded replay cache for `X-GitHub-Delivery` ids.
@@ -493,6 +495,7 @@ impl AppState {
             tokens: Arc::new(UnconfiguredTokenAuthenticator),
             identities: Arc::new(IdentityCache::default()),
             rbac: RbacPolicyStore::empty(),
+            rbac_namespace: crate::rbac::DEFAULT_RBAC_NAMESPACE.to_owned(),
             webhooks,
             dedupe,
             refreshes,
@@ -552,6 +555,13 @@ impl AppState {
     #[must_use]
     pub fn with_rbac_store(mut self, rbac: RbacPolicyStore) -> Self {
         self.rbac = rbac;
+        self
+    }
+
+    /// Sets the control-plane namespace used by the empty-RBAC startup warning (`T17.1`).
+    #[must_use]
+    pub fn with_rbac_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.rbac_namespace = namespace.into();
         self
     }
 

@@ -224,13 +224,18 @@ fn wait_for_ready(address: SocketAddr) -> String {
                     status, 503,
                     "the first /readyz response must be 503 before InitDone, got {status}: {body}"
                 );
+                assert!(
+                    body.contains("application watch"),
+                    "the 503 must name the pending controller gate, got: {body}"
+                );
                 first_response = false;
             }
             if status == 200 {
                 return body;
             }
         }
-        sleep(Duration::from_millis(100));
+        // Before the first response, poll fast enough to catch the narrow pre-InitDone window.
+        sleep(Duration::from_millis(if first_response { 5 } else { 100 }));
     }
     panic!("the API server did not reach /readyz == 200 within {STARTUP_BUDGET:?}");
 }

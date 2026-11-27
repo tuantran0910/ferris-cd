@@ -1008,6 +1008,7 @@ pub async fn drive_rbac_watch<S, E>(
                 configmap = RBAC_CONFIGMAP_NAME,
                 "RBAC ConfigMap watch stream ended; active policy snapshot remains in effect"
             );
+            metrics.record_rbac_watch_error();
             break;
         };
         match event {
@@ -1079,7 +1080,7 @@ pub async fn drive_rbac_watch<S, E>(
                     error = %error,
                     "RBAC ConfigMap watch error; retrying with backoff while retaining active policy"
                 );
-                metrics.record_rbac_reload(RbacReloadOutcome::Error);
+                metrics.record_rbac_watch_error();
             }
         }
     }
@@ -1414,6 +1415,16 @@ mod tests {
         }
     }
 
+    fn rbac_watch_error_count(metrics: &Metrics) -> u64 {
+        let encoded = metrics.encode().expect("metrics encode");
+        let prefix = "ferriscd_rbac_watch_errors_total ";
+        encoded
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .expect("rbac watch error series must be registered")
+    }
+
     fn rbac_reload_count(metrics: &Metrics, outcome: &str) -> u64 {
         let encoded = metrics.encode().expect("metrics encode");
         let prefix = format!(r#"ferriscd_rbac_reload_total{{outcome="{outcome}"}} "#);
@@ -1615,8 +1626,13 @@ rules:
         assert_eq!(rbac_reload_count(&metrics, "ok"), 0);
         assert_eq!(
             rbac_reload_count(&metrics, "error"),
-            3,
-            "two malformed updates plus the watch error must surface as three error outcomes"
+            2,
+            "malformed updates alone must drive the reload error counter"
+        );
+        assert_eq!(
+            rbac_watch_error_count(&metrics),
+            2,
+            "the stream error and the trailing stream end must be visible on the dedicated counter"
         );
         assert_eq!(rbac_reload_count(&metrics, "deleted"), 0);
     }

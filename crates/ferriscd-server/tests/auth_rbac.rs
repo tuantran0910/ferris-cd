@@ -1059,7 +1059,7 @@ async fn readyz_flips_503_to_200_strictly_after_all_three_init_done_gates() {
     assert!(
         body["reason"]
             .as_str()
-            .is_some_and(|r| r.contains("application watches")
+            .is_some_and(|r| r.contains("application watch")
                 && r.contains("cluster registry seed")
                 && r.contains("RBAC policy")),
         "{body}"
@@ -1073,7 +1073,7 @@ async fn readyz_flips_503_to_200_strictly_after_all_three_init_done_gates() {
     assert!(
         body["reason"]
             .as_str()
-            .is_some_and(|r| r.contains("application watches") && !r.contains("RBAC")),
+            .is_some_and(|r| r.contains("application watch") && !r.contains("RBAC")),
         "{body}"
     );
 

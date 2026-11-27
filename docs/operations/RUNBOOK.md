@@ -430,14 +430,16 @@ in the control-plane namespace (default-deny: `rules: []`) and watches it live v
 - **Malformed YAML / duplicate keys / invalid rule / missing `policy.yaml`:** **Retains the last
   known-good policy** (or remains default-deny if startup never succeeded), logs a content-free
   `WARN` (never echoing group/user names), and increments
-  `ferriscd_rbac_reload_total{outcome="error"}`.
+  `ferriscd_rbac_reload_total{outcome="error"}`. Watch-stream failures (API blips, terminated
+  watches) are counted separately on `ferriscd_rbac_watch_errors_total` so the reload error series
+  keeps meaning "a bad policy edit was rejected".
 - **ConfigMap deletion:** Immediately transitions to default-deny (`rules: []`, refusing all
   authenticated callers) and increments `ferriscd_rbac_reload_total{outcome="deleted"}`.
 - **Readiness (`/readyz`):** Returns `503 Service Unavailable` until `Application` watches
-  (`InitDone`, or active/standby leader-election candidacy when `--leader-election` is enabled so
-  standby pods behind a shared `Service` do not deadlock `helm upgrade --wait`), the
-  `ClusterManager` initial `Secret` seed, and the initial `ferriscd-rbac-cm` API load have all
-  completed.
+  (`InitDone`; with `--leader-election`, a standby replica that has observed a **healthy foreign
+  leader** uses a separate gate, and a replica that acquires the lease must complete its own
+  controller `InitDone`), the `ClusterManager` initial `Secret` seed, and the initial
+  `ferriscd-rbac-cm` API load have all completed.
 
 > **Important security behavior:** An identity with **no** grant on an application's project
 > receives `404 Not Found` (identical to a nonexistent app) to prevent name enumeration. An identity

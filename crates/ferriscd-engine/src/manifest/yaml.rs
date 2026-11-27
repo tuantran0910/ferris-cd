@@ -108,8 +108,18 @@ where
             limit: format!("{breach:?}"),
         });
     }
-    serde_saphyr::from_str_with_options(document, parse_options())
-        .map_err(|_| YamlGuardError::Parse)
+    serde_saphyr::from_str_with_options(document, parse_options()).map_err(|err| {
+        // Alias-replay limits are enforced during deserialization; classify them as a budget
+        // breach so callers can distinguish a bomb from an ordinary shape/type error without
+        // ever echoing document content.
+        if err.to_string().contains("replay") {
+            YamlGuardError::Budget {
+                limit: "alias-replay".to_owned(),
+            }
+        } else {
+            YamlGuardError::Parse
+        }
+    })
 }
 
 /// Parses a single manifest file into zero or more validated [`DesiredResource`]s.
@@ -711,19 +721,25 @@ data:
     }
 
     #[test]
-    fn parse_document_reports_budget_breach_before_deserialization() {
-        // `parse_document` must surface the whole-stream budget verdict (not a generic parse
-        // error): exceed the 1_024-document stream budget with well-formed documents.
-        let mut stream = String::new();
-        for _ in 0..1_025 {
-            stream.push_str("---\na: 1\n");
+    fn parse_document_classifies_alias_replay_breaches_as_budget_not_type_errors() {
+        // Structurally valid document whose only failure mode is the alias-replay guard: if the
+        // guard were removed this would deserialize (or fail as a type error), not report Budget.
+        let bomb = r#"
+a: &a ["lol", "lol", "lol", "lol", "lol", "lol", "lol", "lol", "lol", "lol"]
+b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]
+c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]
+d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]
+e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d, *d]
+rules: *e
+"#;
+        let err = parse_document::<serde_json::Value>(bomb)
+            .expect_err("the alias-replay guard must reject the bomb");
+        match err {
+            YamlGuardError::Budget { limit } => assert_eq!(limit, "alias-replay"),
+            YamlGuardError::Parse => {
+                panic!("replay breaches must not be reported as generic parse errors")
+            }
         }
-        let err = parse_document::<serde_json::Value>(&stream)
-            .expect_err("the document budget must reject the stream");
-        assert!(
-            matches!(err, YamlGuardError::Budget { .. }),
-            "expected a budget-specific guard error, got: {err:?}"
-        );
     }
 
     #[test]
@@ -786,7 +802,13 @@ g: &g [*f, *f, *f, *f, *f, *f, *f, *f, *f]
 h: &h [*g, *g, *g, *g, *g, *g, *g, *g, *g]
 "#;
         let err = parse_document::<Value>(bomb).expect_err("an alias bomb must be refused");
-        assert_eq!(err, YamlGuardError::Parse);
+        assert_eq!(
+            err,
+            YamlGuardError::Budget {
+                limit: "alias-replay".to_owned()
+            },
+            "a replay breach must be classified as a budget breach, not a type error"
+        );
         assert!(!err.to_string().contains("lol"), "{err}");
     }
 
