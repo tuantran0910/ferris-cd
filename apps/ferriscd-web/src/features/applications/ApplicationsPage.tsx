@@ -6,6 +6,7 @@ import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Button } from "../../ui/Button";
 import { EmptyState } from "../../ui/EmptyState";
 import { LiveRegion } from "../../ui/LiveRegion";
+import { useApplicationStream } from "./useApplicationStream";
 import { Skeleton } from "../../ui/Skeleton";
 import {
   HealthStatusBadge,
@@ -95,6 +96,7 @@ export function ApplicationsPage() {
   }, [setSearchParams]);
 
   const { data, isLoading, isFetching, error, refetch } = useApplications();
+  const streamStatus = useApplicationStream();
 
   const apps: ApplicationSummary[] = useMemo(() => data?.items ?? [], [data]);
 
@@ -192,7 +194,12 @@ export function ApplicationsPage() {
           </h1>
           <p className="mt-1 text-xs text-slate-400">
             Showing {filteredApps.length} of {apps.length} watched applications
-            • Live polling every {APPLICATIONS_POLL_INTERVAL_MS / 1000}s
+            •{" "}
+            {streamStatus === "live"
+              ? "Live updates connected"
+              : `Polling every ${APPLICATIONS_POLL_INTERVAL_MS / 1000}s${
+                  streamStatus === "connecting" ? " (live updates connecting)" : ""
+                }`}
           </p>
         </div>
 

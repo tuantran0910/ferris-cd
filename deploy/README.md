@@ -50,7 +50,7 @@ rules:
   # events attached to each `Application` (`kubectl describe application`).
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
-    verbs: ["create", "patch"]
+    verbs: ["create", "patch", "get", "list"]
 
   # --- The workloads the Applications declare (`T06`–`T08`) -------------------------
   # Enumerated on purpose. Do NOT write `apiGroups: ["*"] / resources: ["*"]` here: that also
@@ -498,7 +498,7 @@ Operational notes:
   consecutive `Warning` reasons for the same `Application` are deduplicated within a 5-minute
   window in front of `kube::runtime::events::Recorder` so a failing app cannot spam `etcd`;
   publishing errors are logged as warnings and never fail reconciliation. Grant
-  `apiGroups: ["events.k8s.io"], resources: ["events"], verbs: ["create", "patch"]` (included in
+  `apiGroups: ["events.k8s.io"], resources: ["events"], verbs: ["create", "patch", "get", "list"]` (included in
   the `ClusterRole` above).
 
 ### Multi-tenancy RBAC matrix

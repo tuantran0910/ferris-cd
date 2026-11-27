@@ -11,7 +11,7 @@
 //! failures onto [`ApiError`]. All policy, rendering, diffing and redaction stay in the engine and
 //! the controller — duplicating any of it here is exactly the flaw finding C9 removed.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use ferriscd_controller::{
@@ -275,19 +275,40 @@ impl EventSource for KubeEventSource {
             // Unscopable: answer "no events" instead of widening the query (trap guard).
             return Box::pin(async { Ok(Vec::new()) });
         };
-        let api: Api<Event> = Api::namespaced(self.client.clone(), &namespace);
+        let api = event_api(self.client.clone(), &namespace);
         Box::pin(async move {
-            let listed = api
-                .list(
-                    &ListParams::default()
-                        .fields(&selector)
-                        .limit(EVENT_LIST_LIMIT),
-                )
-                .await
-                .map_err(|err| ApiError::backend(&err))?;
-            Ok(event_page(listed.items))
+            // Follow `metadata.continue` for a bounded number of pages so >limit stale events
+            // cannot push the newest ones out of the window (the API server does not order by time).
+            let mut items = Vec::new();
+            let mut token: Option<String> = None;
+            for _ in 0..EVENT_LIST_MAX_PAGES {
+                let mut params = ListParams::default()
+                    .fields(&selector)
+                    .limit(EVENT_LIST_LIMIT);
+                if let Some(token) = token.as_deref() {
+                    params = params.continue_token(token);
+                }
+                let listed = api
+                    .list(&params)
+                    .await
+                    .map_err(|err| ApiError::backend(&err))?;
+                items.extend(listed.items);
+                match listed.metadata.continue_ {
+                    Some(next) if !next.is_empty() => token = Some(next),
+                    _ => break,
+                }
+            }
+            Ok(event_page(items))
         })
     }
+}
+
+/// Builds the **strictly namespaced** `events.k8s.io/v1` API used by the timeline reader.
+///
+/// Kept separate so a unit test can assert `Api::namespace()`: switching this to `Api::all` would
+/// otherwise leave the whole suite green while listing every namespace's events.
+fn event_api(client: Client, namespace: &str) -> Api<Event> {
+    Api::namespaced(client, namespace)
 }
 
 /// The `ListParams::limit` of one `/events` read.
@@ -299,6 +320,9 @@ impl EventSource for KubeEventSource {
 /// carries.
 pub const EVENT_LIST_LIMIT: u32 = 200;
 
+/// How many `continue` pages one timeline read may follow (bounded work, newest 50 selection).
+pub const EVENT_LIST_MAX_PAGES: usize = 5;
+
 /// The `field_selector` that narrows an `events.k8s.io/v1` list to events about `app`.
 ///
 /// Returns `None` — meaning "do not query at all" — when the `Application` has no usable
@@ -306,12 +330,12 @@ pub const EVENT_LIST_LIMIT: u32 = 200;
 /// concatenation must never be able to smuggle in a second term.
 #[must_use]
 pub fn regarding_uid_selector(app: &Application) -> Option<String> {
-    let uid = app
-        .metadata
-        .uid
-        .as_deref()
-        .map(str::trim)
-        .filter(|uid| !uid.is_empty() && !uid.contains(',') && !uid.contains('='))?;
+    let uid = app.metadata.uid.as_deref().map(str::trim).filter(|uid| {
+        !uid.is_empty()
+            && !uid.contains(',')
+            && !uid.contains('=')
+            && !uid.chars().any(char::is_whitespace)
+    })?;
     Some(format!("regarding.uid={uid}"))
 }
 
@@ -327,13 +351,27 @@ pub fn event_page(mut events: Vec<Event>) -> Vec<ApplicationEvent> {
 }
 
 /// The instant an `Event` last happened.
+///
+/// `kube-runtime`'s recorder sets only `event_time` on create and, for repeats, keeps it while
+/// patching `series.lastObservedTime`; the series timestamp must therefore win, or a still-firing
+/// `Warning` would sort by its first occurrence and sink below stale one-shots.
 fn event_instant(event: &Event) -> Option<k8s_openapi::jiff::Timestamp> {
     event
-        .deprecated_last_timestamp
+        .series
         .as_ref()
-        .map(|time| time.0)
+        .map(|series| series.last_observed_time.0)
+        .or_else(|| event.deprecated_last_timestamp.as_ref().map(|time| time.0))
         .or_else(|| event.event_time.as_ref().map(|time| time.0))
         .or_else(|| event.deprecated_first_timestamp.as_ref().map(|time| time.0))
+}
+
+/// RFC 3339 rendering of a `series.lastObservedTime` (a `MicroTime`).
+fn micro_time_string(
+    time: &k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime,
+) -> Option<String> {
+    serde_json::to_value(time)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
 }
 
 /// One listed `Event`, reduced to the timeline entry the API renders.
@@ -363,13 +401,26 @@ fn application_event(event: Event) -> ApplicationEvent {
             .reporting_controller
             .filter(|component| !component.trim().is_empty()),
         last_observed_at: event
-            .deprecated_last_timestamp
+            .series
             .as_ref()
-            .and_then(time_string),
+            .and_then(|series| micro_time_string(&series.last_observed_time))
+            .or_else(|| event.event_time.as_ref().and_then(micro_time_string))
+            .or_else(|| {
+                event
+                    .deprecated_last_timestamp
+                    .as_ref()
+                    .and_then(time_string)
+            }),
         first_observed_at: event
-            .deprecated_first_timestamp
+            .event_time
             .as_ref()
-            .and_then(time_string),
+            .and_then(micro_time_string)
+            .or_else(|| {
+                event
+                    .deprecated_first_timestamp
+                    .as_ref()
+                    .and_then(time_string)
+            }),
     }
 }
 
@@ -389,21 +440,27 @@ pub const SSE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Turns the `ApplicationSource` seam into the SSE snapshot feed (`T17.3`).
 ///
-/// # Bounded per connection
+/// # One shared read loop
 ///
-/// The stream is a pull-based generator: it holds at most **one** pending snapshot (the one the
-/// response body is currently waiting for), so a client that stops reading stops the production
-/// instead of growing a queue. `MissedTickBehavior::Delay` keeps a stalled client from receiving a
-/// burst of catch-up snapshots when it resumes.
+/// Connections subscribe to a [`tokio::sync::watch`] channel served by a **single** refresher task
+/// per feed instance. 20 open dashboards therefore cost one scoped list per interval, not 20 — the
+/// per-connection read fan-out the first review flagged. The task starts with the first subscriber
+/// and exits when the last receiver is dropped (`send` fails), clearing the slot so a later
+/// subscriber starts a fresh loop.
 ///
-/// # Cleanup on disconnect
+/// # Backpressure and cleanup
 ///
-/// Nothing is spawned: the `Interval` lives inside the stream, so dropping the body drops the
-/// subscription, the interval, and any in-flight `list`. There is no detached task that could keep
-/// reading the cluster for a client that has gone.
+/// The watch channel keeps only the latest snapshot; a slow client skips intermediate frames instead
+/// of growing a queue (the correct behaviour for an authoritative snapshot: the next one repairs it).
+/// Dropping the response body drops the receiver, and with the last one the refresher stops.
+type Snapshot = Result<Vec<Application>, ApiError>;
+type SnapshotSender = tokio::sync::watch::Sender<Option<Snapshot>>;
+type SnapshotReceiver = tokio::sync::watch::Receiver<Option<Snapshot>>;
+
 pub struct PollingApplicationSnapshot {
     source: Arc<dyn ApplicationSource>,
     interval: Duration,
+    channel: Arc<Mutex<Option<SnapshotSender>>>,
 }
 
 impl std::fmt::Debug for PollingApplicationSnapshot {
@@ -418,7 +475,11 @@ impl PollingApplicationSnapshot {
     /// Builds the feed over `source`, re-reading it every `interval`.
     #[must_use]
     pub fn new(source: Arc<dyn ApplicationSource>, interval: Duration) -> Self {
-        Self { source, interval }
+        Self {
+            source,
+            interval,
+            channel: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// The re-read interval (for logs and assertions).
@@ -426,20 +487,64 @@ impl PollingApplicationSnapshot {
     pub fn interval(&self) -> Duration {
         self.interval
     }
+
+    /// Returns the current channel, starting the shared refresher if it is not running.
+    fn subscribe_watch(&self) -> SnapshotReceiver {
+        let mut guard = self.channel.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(sender) = guard.as_ref() {
+            return sender.subscribe();
+        }
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        *guard = Some(sender.clone());
+        drop(guard);
+
+        let source = Arc::clone(&self.source);
+        let interval = self.interval;
+        let channel = Arc::clone(&self.channel);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if sender.is_closed() {
+                    break;
+                }
+                let snapshot = source.list().await;
+                if sender.send(Some(snapshot)).is_err() {
+                    break;
+                }
+            }
+            let mut guard = channel.lock().unwrap_or_else(PoisonError::into_inner);
+            *guard = None;
+        });
+        receiver
+    }
 }
 
 impl ApplicationSnapshotSource for PollingApplicationSnapshot {
     fn subscribe(&self) -> BoxStream<'static, Result<Vec<Application>, ApiError>> {
-        let source = Arc::clone(&self.source);
-        let mut interval = tokio::time::interval(self.interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // `unfold` is the whole buffer: one snapshot in flight, produced only when polled.
-        Box::pin(futures::stream::unfold(interval, move |mut interval| {
-            let source = Arc::clone(&source);
-            async move {
-                interval.tick().await;
-                let snapshot = source.list().await;
-                Some((snapshot, interval))
+        struct FeedState {
+            receiver: SnapshotReceiver,
+            started: bool,
+        }
+        let state = FeedState {
+            receiver: self.subscribe_watch(),
+            started: false,
+        };
+        Box::pin(futures::stream::unfold(state, |mut state| async move {
+            loop {
+                if state.started {
+                    state.receiver.changed().await.ok()?;
+                } else {
+                    state.started = true;
+                }
+                let snapshot = state.receiver.borrow_and_update().clone();
+                if let Some(snapshot) = snapshot {
+                    return Some((snapshot, state));
+                }
+                if state.receiver.has_changed().is_err() {
+                    return None;
+                }
             }
         }))
     }
@@ -1477,6 +1582,48 @@ mod tests {
         assert_eq!(regarding_uid_selector(&app_with_uid(Some("x=y"))), None);
     }
 
+    #[test]
+    fn a_series_event_sorts_by_last_observed_time_and_carries_it() {
+        let page = event_page(vec![
+            kube_event(serde_json::json!({
+                "metadata": {"name": "stale"},
+                "type": "Normal",
+                "reason": "SyncSucceeded",
+                "deprecatedLastTimestamp": "2027-01-15T09:00:00Z",
+            })),
+            kube_event(serde_json::json!({
+                "metadata": {"name": "still-firing"},
+                "type": "Warning",
+                "reason": "SyncFailed",
+                "eventTime": "2027-01-15T09:30:00.000000Z",
+                "series": {
+                    "count": 50,
+                    "lastObservedTime": "2027-01-15T12:00:00.000000Z"
+                },
+            })),
+        ]);
+        assert_eq!(page[0].name, "still-firing");
+        assert_eq!(page[0].count, 50);
+        assert_eq!(
+            page[0].last_observed_at.as_deref(),
+            Some("2027-01-15T12:00:00.000000Z")
+        );
+        assert_eq!(
+            page[0].first_observed_at.as_deref(),
+            Some("2027-01-15T09:30:00.000000Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_event_api_is_namespaced_and_never_cluster_wide()
+    -> Result<(), Box<dyn std::error::Error>> {
+        ferriscd_controller::impersonation::ensure_crypto_provider();
+        let config = kube::Config::new("https://127.0.0.1:1".parse()?);
+        let client = Client::try_from(config)?;
+        assert_eq!(event_api(client, "team-a").namespace(), Some("team-a"));
+        Ok(())
+    }
+
     fn kube_event(spec: serde_json::Value) -> Event {
         serde_json::from_value(spec).expect("a valid events.k8s.io/v1 Event")
     }
@@ -1601,6 +1748,34 @@ mod tests {
             3,
             "a dropped connection must stop the reads: nothing keeps running for a gone client"
         );
+    }
+
+    /// Two dashboard connections cost **one** scoped list per interval: the refresher is shared.
+    #[tokio::test(start_paused = true)]
+    async fn the_sse_feed_shares_one_cluster_read_across_subscribers() {
+        let source = Arc::new(CountingApplications::default());
+        let feed = PollingApplicationSnapshot::new(source.clone(), Duration::from_secs(2));
+
+        let mut first = feed.subscribe();
+        let mut second = feed.subscribe();
+        assert!(
+            first.next().await.is_some(),
+            "the first subscriber's snapshot"
+        );
+        assert!(
+            second.next().await.is_some(),
+            "the second sees the same snapshot"
+        );
+        assert_eq!(
+            source.reads(),
+            1,
+            "one refresher, not one list per connection"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(first.next().await.is_some());
+        assert!(second.next().await.is_some());
+        assert_eq!(source.reads(), 2, "the next tick is shared too");
     }
 
     /// Records every listing it is asked for, so the graph's cost is asserted, not assumed.

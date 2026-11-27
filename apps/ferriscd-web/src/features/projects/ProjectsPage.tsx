@@ -8,6 +8,7 @@ import { Card } from "../../ui/Card";
 import { EmptyState } from "../../ui/EmptyState";
 import { LiveRegion } from "../../ui/LiveRegion";
 import { Skeleton } from "../../ui/Skeleton";
+import { normalizeSyncStatus } from "../../ui/StatusBadges";
 import { useApplications } from "../applications/hooks";
 import { useProjects } from "./hooks";
 
@@ -44,7 +45,7 @@ export function ProjectsPage() {
     for (const app of applications) {
       const current = counts.get(app.project) ?? { total: 0, outOfSync: 0 };
       current.total += 1;
-      if (app.sync?.status === "OutOfSync") {
+      if (normalizeSyncStatus(app.sync?.status) === "OutOfSync") {
         current.outOfSync += 1;
       }
       counts.set(app.project, current);

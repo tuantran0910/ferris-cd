@@ -497,9 +497,9 @@ pub struct ClusterView {
 /// `GET /api/v1/applications/{namespace}/{name}/events` body (`T17.3`).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApplicationEventListView {
-    /// The latest events, newest first, at most [`MAX_APPLICATION_EVENTS`].
+    /// The latest events, newest first, at most 50.
     pub items: Vec<ApplicationEventView>,
-    /// Whether the cluster holds more events about this `Application` than [`Self::items`] carries.
+    /// Whether the cluster holds more events about this `Application` than the `items` list carries.
     pub truncated: bool,
 }
 
@@ -1159,13 +1159,19 @@ fn event_view(event: ApplicationEvent) -> ApplicationEventView {
     ApplicationEventView {
         name: event.name,
         type_: event.event_type,
-        reason: event.reason,
+        reason: ferriscd_controller::events::sanitize_note(&event.reason),
         // The controller's own redactor (`T15.2`): URL credentials and embedded secret payloads are
         // masked, and the message is capped at the `events.k8s.io/v1` 1 KiB limit.
         message: ferriscd_controller::events::sanitize_note(&event.note),
-        action: event.action,
+        action: event
+            .action
+            .as_deref()
+            .map(ferriscd_controller::events::sanitize_note),
         count: event.count,
-        reporting_component: event.reporting_component,
+        reporting_component: event
+            .reporting_component
+            .as_deref()
+            .map(ferriscd_controller::events::sanitize_note),
         last_observed_at: event.last_observed_at,
         first_observed_at: event.first_observed_at,
     }

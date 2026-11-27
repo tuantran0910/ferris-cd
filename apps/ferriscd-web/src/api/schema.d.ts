@@ -336,9 +336,9 @@ export interface components {
         };
         /** @description `GET /api/v1/applications/{namespace}/{name}/events` body (`T17.3`). */
         ApplicationEventListView: {
-            /** @description The latest events, newest first, at most [`MAX_APPLICATION_EVENTS`]. */
+            /** @description The latest events, newest first, at most 50. */
             items: components["schemas"]["ApplicationEventView"][];
-            /** @description Whether the cluster holds more events about this `Application` than [`Self::items`] carries. */
+            /** @description Whether the cluster holds more events about this `Application` than the `items` list carries. */
             truncated: boolean;
         };
         /** @description One Kubernetes `Event` about an `Application`, as the timeline renders it. */

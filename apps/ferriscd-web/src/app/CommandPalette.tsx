@@ -74,6 +74,10 @@ export function useCommandPaletteShortcut(onToggle: () => void) {
       if (event.key.toLowerCase() !== "k") {
         return;
       }
+      // Never open a second focus trap on top of Sync/Rollback (Escape would close both).
+      if (document.querySelector('[role="dialog"]')) {
+        return;
+      }
       event.preventDefault();
       onToggleRef.current();
     };

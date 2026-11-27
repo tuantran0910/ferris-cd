@@ -1127,11 +1127,11 @@
             "items": {
               "$ref": "#/components/schemas/ApplicationEventView"
             },
-            "description": "The latest events, newest first, at most [`MAX_APPLICATION_EVENTS`]."
+            "description": "The latest events, newest first, at most 50."
           },
           "truncated": {
             "type": "boolean",
-            "description": "Whether the cluster holds more events about this `Application` than [`Self::items`] carries."
+            "description": "Whether the cluster holds more events about this `Application` than the `items` list carries."
           }
         }
       },

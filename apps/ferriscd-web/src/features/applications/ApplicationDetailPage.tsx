@@ -281,12 +281,14 @@ function ApplicationDetailContent({
       >
         <TabButton
           active={activeTab === "resources"}
+          tabKey="resources"
           onClick={() => selectTab("resources")}
           icon={<GitFork className="h-4 w-4" />}
           label={`Resources (${app.resourceCount})`}
         />
         <TabButton
           active={activeTab === "diff"}
+          tabKey="diff"
           onClick={() => {
             setDiffFilterKey("");
             selectTab("diff");
@@ -296,18 +298,21 @@ function ApplicationDetailContent({
         />
         <TabButton
           active={activeTab === "events"}
+          tabKey="events"
           onClick={() => selectTab("events")}
           icon={<TriangleAlert className="h-4 w-4" />}
           label="Events"
         />
         <TabButton
           active={activeTab === "conditions"}
+          tabKey="conditions"
           onClick={() => selectTab("conditions")}
           icon={<Clock className="h-4 w-4" />}
           label={`Conditions (${conditions.length})`}
         />
         <TabButton
           active={activeTab === "history"}
+          tabKey="history"
           onClick={() => selectTab("history")}
           icon={<History className="h-4 w-4" />}
           label={`History (${history.length})`}
@@ -316,7 +321,13 @@ function ApplicationDetailContent({
 
       {/* The panel is keyed by tab so switching sections replays the fade
           instead of hard-cutting the content. */}
-      <div role="tabpanel" key={activeTab} className="motion-fade-in">
+      <div
+        role="tabpanel"
+        id="app-tabpanel"
+        aria-labelledby={`app-tab-${activeTab}`}
+        key={activeTab}
+        className="motion-fade-in"
+      >
         {activeTab === "resources" && (
           <div>
             {resourcesQuery.isLoading ? (
@@ -442,20 +453,48 @@ function ApplicationDetailContent({
 
 function TabButton({
   active,
+  tabKey,
   onClick,
   icon,
   label,
 }: {
   active: boolean;
+  tabKey: string;
   onClick: () => void;
   icon: ReactNode;
   label: string;
 }) {
+  const onKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    const keys = ["ArrowRight", "ArrowLeft", "Home", "End"];
+    if (!keys.includes(event.key)) {
+      return;
+    }
+    event.preventDefault();
+    const tabs = Array.from(
+      event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [],
+    );
+    const index = tabs.indexOf(event.currentTarget);
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? tabs.length - 1
+          : event.key === "ArrowRight"
+            ? (index + 1) % tabs.length
+            : (index - 1 + tabs.length) % tabs.length;
+    tabs[next]?.focus();
+    tabs[next]?.click();
+  };
+
   return (
     <button
       type="button"
       role="tab"
+      id={`app-tab-${tabKey}`}
+      aria-controls="app-tabpanel"
       aria-selected={active}
+      tabIndex={active ? 0 : -1}
+      onKeyDown={onKeyDown}
       onClick={onClick}
       className={`inline-flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-xs font-semibold transition-colors ${
         active

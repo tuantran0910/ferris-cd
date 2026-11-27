@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError } from "../api/client";
 import { AuthProvider } from "../auth/AuthContext";
 import { resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
@@ -64,6 +64,39 @@ describe("ApplicationsPage (T16.2 & Trap Guard T16.2)", () => {
     expect(
       within(checkoutCard).getByTestId("health-status-badge"),
     ).toHaveTextContent("Health:Degraded");
+  });
+
+  it("applies an SSE snapshot to the list without a refetch", async () => {
+    const streamed = { ...sampleApps[0], name: "live-only" };
+    const encoder = new TextEncoder();
+    const nativeFetch = globalThis.fetch;
+    const streamFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/api/v1/applications/stream")) {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                `event: applications\ndata: ${JSON.stringify({ items: [streamed] })}\n\n`,
+              ),
+            );
+            init?.signal?.addEventListener("abort", () =>
+              controller.error(new DOMException("aborted", "AbortError")),
+            );
+          },
+        });
+        return new Response(body, { status: 200 });
+      }
+      return nativeFetch(input, init);
+    });
+    globalThis.fetch = streamFetch as typeof fetch;
+
+    try {
+      renderApplicationsPage();
+      expect(await screen.findByText("live-only")).toBeInTheDocument();
+      expect(screen.getByText(/Live updates connected/)).toBeInTheDocument();
+    } finally {
+      globalThis.fetch = nativeFetch;
+    }
   });
 
   it("filters instantly by project, syncStatus, healthStatus, and search query", async () => {
