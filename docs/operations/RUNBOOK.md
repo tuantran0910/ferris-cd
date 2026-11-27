@@ -422,11 +422,30 @@ Checklist when `ferriscd login` or API calls return `401`:
 ### 7.2 `403 Forbidden` or `404 Not Found` (`ferriscd-rbac-cm`)
 
 `ferriscd server` loads project-scoped RBAC from `ConfigMap/ferriscd-rbac-cm` (key `policy.yaml`)
-in the control-plane namespace **at startup** (default-deny: `rules: []`).
+in the control-plane namespace (default-deny: `rules: []`) and watches it live via a namespaced
+`ConfigMap` watch (`T17.1`), so updates apply automatically without restarting pods:
+
+- **Valid update:** Atomically swaps the active policy snapshot and increments
+  `ferriscd_rbac_reload_total{outcome="ok"}`.
+- **Malformed YAML / duplicate keys / invalid rule / missing `policy.yaml`:** **Retains the last
+  known-good policy** (or remains default-deny if startup never succeeded), logs a content-free
+  `WARN` (never echoing group/user names), and increments
+  `ferriscd_rbac_reload_total{outcome="error"}`. Watch-stream failures (API blips, terminated
+  watches) are counted separately on `ferriscd_rbac_watch_errors_total` so the reload error series
+  keeps meaning "a bad policy edit was rejected".
+- **ConfigMap deletion:** Immediately transitions to default-deny (`rules: []`, refusing all
+  authenticated callers) and increments `ferriscd_rbac_reload_total{outcome="deleted"}`.
+- **Readiness (`/readyz`):** Returns `503 Service Unavailable` until `Application` watches
+  (`InitDone`; with `--leader-election`, a standby replica that has observed a **healthy foreign
+  leader** uses a separate gate, and a replica that acquires the lease must complete its own
+  controller `InitDone`), the `ClusterManager` initial `Secret` seed, and the initial
+  `ferriscd-rbac-cm` API load have all completed.
 
 > **Important security behavior:** An identity with **no** grant on an application's project
 > receives `404 Not Found` (identical to a nonexistent app) to prevent name enumeration. An identity
 > that has `get` (read-only) receives `403 Forbidden` when attempting `sync` or `rollback`.
+> `GET /api/v1/clusters` returns only clusters permitted by at least one `AppProject` visible to
+> the caller.
 
 Inspect and update `ferriscd-rbac-cm`:
 
@@ -444,10 +463,9 @@ kubectl -n ferriscd-system get configmap ferriscd-rbac-cm -o jsonpath='{.data.po
 #       project: default
 #       actions: [get, diff, sync]
 
-# 3. If edited directly with `kubectl` (rather than `helm upgrade`, which rolls pods via
-#    `checksum/rbac-policy`), restart the Deployment so `ferriscd server` reloads `policy.yaml`:
-kubectl -n ferriscd-system rollout restart deployment/ferriscd
-kubectl -n ferriscd-system rollout status deployment/ferriscd
+# 3. Apply the updated ConfigMap — changes hot-reload in <= 2s without restarting pods;
+#    confirm via `ferriscd_rbac_reload_total{outcome="ok"}` on `:9090/metrics`:
+kubectl -n ferriscd-system apply -f ferriscd-rbac-cm.yaml
 ```
 
 ### 7.3 GitHub & GitLab Webhook Triage

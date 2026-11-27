@@ -13,29 +13,65 @@
 
 use std::sync::Arc;
 
-use ferriscd_controller::{ClusterManager, ControlPlane, DiffPreview, TrackingOwner};
+use ferriscd_controller::{
+    ClusterManager, ControlPlane, ControlPlaneReadiness, DiffPreview, Metrics, RbacReloadOutcome,
+    TrackingOwner,
+};
 use ferriscd_crd::annotations;
 use ferriscd_crd::{AppProject, Application};
 use ferriscd_engine::inventory::{self, Inventory};
 use ferriscd_engine::manifest::ResourceKey;
+use futures::StreamExt as _;
 use k8s_openapi::api::apps::v1::ReplicaSet;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
+use kube::runtime::WatchStreamExt as _;
+use kube::runtime::watcher::{self, Event as WatcherEvent};
 use kube::{Client, ResourceExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::auth::{
     AuthPolicy, AuthenticatedIdentity, IdentityCache, MAX_BEARER_TOKEN_CHARS, TokenAuthenticator,
 };
 use crate::error::ApiError;
-use crate::rbac::{RBAC_CONFIGMAP_KEY, RBAC_CONFIGMAP_NAME, RbacPolicy, RbacPolicyError};
+use crate::rbac::{
+    RBAC_CONFIGMAP_KEY, RBAC_CONFIGMAP_NAME, RbacConfigMapEvent, RbacPolicy, RbacPolicyError,
+    RbacPolicyStore,
+};
 use crate::state::{
     AppState, ApplicationSource, ChildNode, ClusterCatalog, ClusterEntry, DiffSource,
     GRAPH_LIST_LIMIT, GraphRequest, GraphTraversal, InventoryReader, ListKey, ListedNode,
-    LiveResourceState, OperationRequest, OperationWriter, ProjectCatalog, SeamFuture,
-    ServingReadiness, WorkloadGraphSource,
+    LiveResourceState, OperationRequest, OperationWriter, ProjectCatalog, Readiness, SeamFuture,
+    WorkloadGraphSource,
 };
 use crate::webhooks::{RefreshSink, RefreshTarget, WebhookConfig};
+
+/// Adapter connecting [`ControlPlaneReadiness`] (`ferriscd-controller`) to [`Readiness`] (`GET /readyz`, `T17.1`).
+///
+/// Allocates zero heap memory on the steady-state ready path.
+#[derive(Debug, Clone)]
+pub struct KubeControlPlaneReadiness {
+    inner: ControlPlaneReadiness,
+}
+
+impl KubeControlPlaneReadiness {
+    /// Wraps the control plane's startup readiness barrier.
+    #[must_use]
+    pub fn new(inner: ControlPlaneReadiness) -> Self {
+        Self { inner }
+    }
+}
+
+impl Readiness for KubeControlPlaneReadiness {
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.inner.reason()
+    }
+}
 
 /// Builds the whole [`AppState`] from the shared control plane.
 ///
@@ -57,7 +93,7 @@ pub fn app_state(plane: &ControlPlane, webhooks: WebhookConfig) -> AppState {
         Arc::new(KubeInventoryReader::new(clusters.clone())),
         Arc::new(KubeWorkloadGraphSource::new(clusters)),
         Arc::new(PipelineDiff::new(plane.sync_pipeline())),
-        Arc::new(ServingReadiness),
+        Arc::new(KubeControlPlaneReadiness::new(plane.readiness())),
     )
     .with_refresh_sink(refreshes)
     // `T14.3`: the production bearer-token validator. `AppState` defaults to a validator that
@@ -66,8 +102,9 @@ pub fn app_state(plane: &ControlPlane, webhooks: WebhookConfig) -> AppState {
         plane.client().clone(),
     )))
     .with_identity_cache(Arc::new(IdentityCache::default()))
-    // `T14.4`: deny everything until the binary loads `ferriscd-rbac-cm` (`load_rbac_policy`).
-    .with_rbac(Arc::new(RbacPolicy::empty()))
+    // `T14.4` / `T17.1`: deny everything until `load_rbac_policy` / `watch_rbac_policy` loads
+    // `ferriscd-rbac-cm`.
+    .with_rbac_store(RbacPolicyStore::empty())
     .with_webhooks(webhooks)
 }
 
@@ -780,8 +817,8 @@ pub enum RbacLoadError {
 ///
 /// Deliberately **not** a per-request load: an `Application` list or a diff already costs cluster
 /// reads, and an authorization decision that costs an etcd read per request would be a fine denial
-/// of service against the API server. The policy is a startup snapshot (`T14.4`); changing it means
-/// restarting the API server, which is documented as a limitation rather than hidden.
+/// of service against the API server. The initial snapshot is loaded at startup (`T14.4`), and
+/// [`watch_rbac_policy`] keeps the active [`RbacPolicyStore`] hot-reloaded without restarts (`T17.1`).
 #[derive(Debug, Clone)]
 pub struct KubeRbacLoader {
     api: Api<ConfigMap>,
@@ -851,8 +888,21 @@ impl KubeRbacLoader {
 /// webhooks are unaffected, and an operator can fix the ConfigMap and restart) instead of crashing
 /// into a crash loop that hides the actual problem.
 pub async fn load_rbac_policy(plane: &ControlPlane) -> RbacPolicy {
+    load_initial_rbac_policy(plane).await.0
+}
+
+/// Loads the initial RBAC policy and reports whether the Kubernetes API call itself succeeded.
+///
+/// Returns `(policy, api_reachable)`:
+/// - `Ok(_)`, `Err(Missing)`, `Err(MissingKey)`, and `Err(Invalid)` all represent an authoritative
+///   answer from the API server (`api_reachable = true`), so `/readyz` can mark the RBAC gate
+///   complete (failing closed to deny-all on missing/malformed policy).
+/// - `Err(RbacLoadError::Read { .. })` means the API server could not be read (`api_reachable =
+///   false`), so `/readyz` stays `503` until [`watch_rbac_policy`]'s first `InitDone` completes.
+pub async fn load_initial_rbac_policy(plane: &ControlPlane) -> (RbacPolicy, bool) {
     let loader = KubeRbacLoader::new(plane.client().clone(), plane.namespace());
     let result = loader.load().await;
+    let api_reachable = !matches!(result, Err(RbacLoadError::Read { .. }));
     if result.is_ok() {
         tracing::info!(
             configmap = %format!("{}/{}", loader.namespace(), RBAC_CONFIGMAP_NAME),
@@ -860,7 +910,7 @@ pub async fn load_rbac_policy(plane: &ControlPlane) -> RbacPolicy {
             "loaded the project-scoped RBAC policy"
         );
     }
-    fallback_to_deny_all(result)
+    (fallback_to_deny_all(result), api_reachable)
 }
 
 /// The binary's fail-closed fallback: a load error becomes an **empty** policy.
@@ -875,7 +925,8 @@ pub fn fallback_to_deny_all(result: Result<RbacPolicy, RbacLoadError>) -> RbacPo
             tracing::error!(
                 error = %error,
                 "the RBAC policy could not be loaded; every authenticated request will be refused \
-                 (fail closed). Fix the `{}` ConfigMap (key `{}`) and restart the server",
+                 (fail closed). Publish or fix the `{}` ConfigMap (key `{}`) — changes reload \
+                 automatically without restarting",
                 RBAC_CONFIGMAP_NAME,
                 RBAC_CONFIGMAP_KEY,
             );
@@ -888,6 +939,158 @@ pub fn fallback_to_deny_all(result: Result<RbacPolicy, RbacLoadError>) -> RbacPo
 #[must_use]
 pub fn denies_every_authenticated_caller(state: &AppState) -> bool {
     state.auth == AuthPolicy::TokenReview && state.rbac.is_empty()
+}
+
+/// Watches `ferriscd-rbac-cm` in `namespace` (**strictly namespaced**, never cluster-wide —
+/// `T17.1` trap guard) and updates `store` live without restarting `ferriscd server`.
+///
+/// - Valid updates atomically swap the active [`RbacPolicy`] and increment
+///   `ferriscd_rbac_reload_total{outcome="ok"}`.
+/// - Malformed updates or missing `policy.yaml` keys **retain the last known-good policy** and
+///   increment `ferriscd_rbac_reload_total{outcome="error"}`.
+/// - Deleting `ferriscd-rbac-cm` (or omitting it from a completed watch re-list) transitions
+///   immediately to [`RbacPolicy::empty`] (default-deny) and increments
+///   `ferriscd_rbac_reload_total{outcome="deleted"}`.
+/// - Marks `readiness.mark_rbac_loaded()` once the initial watch snapshot (`InitDone`) completes.
+/// - Counts watch-stream failures on `ferriscd_rbac_watch_errors_total` (a fault that yields an
+///   `Err` followed by the end of the stream is counted once).
+pub async fn watch_rbac_policy(
+    client: Client,
+    namespace: String,
+    store: RbacPolicyStore,
+    readiness: ControlPlaneReadiness,
+    metrics: Metrics,
+    stop: CancellationToken,
+) {
+    let api = rbac_configmap_api(client, &namespace);
+    let config = watcher::Config::default().fields(&format!("metadata.name={RBAC_CONFIGMAP_NAME}"));
+    let stream = watcher::watcher(api, config).default_backoff();
+    drive_rbac_watch(stream, &namespace, store, readiness, metrics, stop).await;
+}
+
+/// Builds the **strictly namespaced** `ConfigMap` API used by the live RBAC watcher.
+///
+/// The control-plane namespace comes from `--namespace`; this must never be a cluster-wide `Api`
+/// (`T17.1` Trap Guard).
+fn rbac_configmap_api(client: Client, namespace: &str) -> Api<ConfigMap> {
+    Api::namespaced(client, namespace)
+}
+
+/// Drives the live RBAC policy state machine over any Kubernetes `ConfigMap` watch stream.
+///
+/// Split out from [`watch_rbac_policy`] so every transition (`Init`/`InitApply`/`InitDone`,
+/// re-list omission -> fail-closed `Deleted`, unchanged reconnect deduplication by
+/// `resourceVersion`, live `Apply`/`Delete`, watch errors, and `InitDone` readiness) is unit-tested
+/// deterministically without a cluster.
+pub async fn drive_rbac_watch<S, E>(
+    stream: S,
+    namespace: &str,
+    store: RbacPolicyStore,
+    readiness: ControlPlaneReadiness,
+    metrics: Metrics,
+    stop: CancellationToken,
+) where
+    S: futures::Stream<Item = Result<WatcherEvent<ConfigMap>, E>>,
+    E: std::fmt::Display,
+{
+    let mut stream = std::pin::pin!(stream);
+    let mut seen_in_init = false;
+    let mut listing = false;
+    let mut initial_sync_done = false;
+    let mut last_resource_version: Option<String> = None;
+    let mut last_event_was_error = false;
+
+    loop {
+        let next = tokio::select! {
+            () = stop.cancelled() => break,
+            event = stream.next() => event,
+        };
+        let Some(event) = next else {
+            tracing::warn!(
+                namespace = %namespace,
+                configmap = RBAC_CONFIGMAP_NAME,
+                "RBAC ConfigMap watch stream ended; active policy snapshot remains in effect"
+            );
+            if !last_event_was_error {
+                metrics.record_rbac_watch_error();
+            }
+            break;
+        };
+        last_event_was_error = false;
+        match event {
+            Ok(WatcherEvent::Init) => {
+                seen_in_init = false;
+                listing = true;
+            }
+            Ok(WatcherEvent::InitApply(cm)) => {
+                if listing {
+                    seen_in_init = true;
+                }
+                let rv = cm.metadata.resource_version.clone();
+                if initial_sync_done && rv.is_some() && rv == last_resource_version {
+                    // Routine watch reconnect / 410 re-list of the identical ConfigMap revision:
+                    // skip re-parsing and do not inflate `ferriscd_rbac_reload_total`.
+                    continue;
+                }
+                let doc = cm
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get(RBAC_CONFIGMAP_KEY))
+                    .cloned();
+                let outcome = store.apply_event(RbacConfigMapEvent::Applied(doc));
+                if outcome == RbacReloadOutcome::Ok {
+                    last_resource_version = rv;
+                }
+                if initial_sync_done || outcome == RbacReloadOutcome::Error {
+                    metrics.record_rbac_reload(outcome);
+                }
+            }
+            Ok(WatcherEvent::InitDone) => {
+                if std::mem::take(&mut listing) && !seen_in_init {
+                    // The ConfigMap was absent from the complete list snapshot. If we had a policy
+                    // loaded (e.g. ConfigMap deleted during a watch reconnect), fail closed now.
+                    last_resource_version = None;
+                    if !store.is_empty() {
+                        let outcome = store.apply_event(RbacConfigMapEvent::Deleted);
+                        metrics.record_rbac_reload(outcome);
+                    }
+                }
+                initial_sync_done = true;
+                readiness.mark_rbac_loaded();
+            }
+            Ok(WatcherEvent::Apply(cm)) => {
+                let rv = cm.metadata.resource_version.clone();
+                if rv.is_some() && rv == last_resource_version {
+                    continue;
+                }
+                let doc = cm
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get(RBAC_CONFIGMAP_KEY))
+                    .cloned();
+                let outcome = store.apply_event(RbacConfigMapEvent::Applied(doc));
+                if outcome == RbacReloadOutcome::Ok {
+                    last_resource_version = rv;
+                }
+                metrics.record_rbac_reload(outcome);
+            }
+            Ok(WatcherEvent::Delete(_)) => {
+                last_resource_version = None;
+                let outcome = store.apply_event(RbacConfigMapEvent::Deleted);
+                metrics.record_rbac_reload(outcome);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    namespace = %namespace,
+                    configmap = RBAC_CONFIGMAP_NAME,
+                    error = %error,
+                    "RBAC ConfigMap watch error; retrying with backoff while retaining active policy"
+                );
+                metrics.record_rbac_watch_error();
+                last_event_was_error = true;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -929,6 +1132,29 @@ mod tests {
             },
             ..Pod::default()
         }
+    }
+
+    #[tokio::test]
+    async fn rbac_configmap_watch_is_namespaced_and_never_cluster_wide()
+    -> Result<(), Box<dyn std::error::Error>> {
+        ferriscd_controller::impersonation::ensure_crypto_provider();
+        let config = kube::Config::new("https://127.0.0.1:1".parse()?);
+        let client = Client::try_from(config)?;
+
+        let default = rbac_configmap_api(client.clone(), "ferriscd-system");
+        assert_eq!(
+            default.namespace(),
+            Some("ferriscd-system"),
+            "the RBAC watch must be scoped to the control-plane namespace"
+        );
+
+        let custom = rbac_configmap_api(client, "custom-plane");
+        assert_eq!(
+            custom.namespace(),
+            Some("custom-plane"),
+            "the RBAC watch must follow --namespace"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1178,5 +1404,350 @@ mod tests {
             "the cluster is never read beyond the budget"
         );
         assert!(traversal.is_exhausted());
+    }
+
+    fn rbac_configmap(rv: Option<&str>, policy_yaml: Option<&str>) -> ConfigMap {
+        let data = policy_yaml.map(|doc| {
+            std::collections::BTreeMap::from([(RBAC_CONFIGMAP_KEY.to_owned(), doc.to_owned())])
+        });
+        ConfigMap {
+            metadata: ObjectMeta {
+                name: Some(RBAC_CONFIGMAP_NAME.to_owned()),
+                namespace: Some("ferriscd-system".to_owned()),
+                resource_version: rv.map(ToOwned::to_owned),
+                ..ObjectMeta::default()
+            },
+            data,
+            ..ConfigMap::default()
+        }
+    }
+
+    fn rbac_watch_error_count(metrics: &Metrics) -> u64 {
+        let encoded = metrics.encode().expect("metrics encode");
+        let prefix = "ferriscd_rbac_watch_errors_total ";
+        encoded
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .expect("rbac watch error series must be registered")
+    }
+
+    fn rbac_reload_count(metrics: &Metrics, outcome: &str) -> u64 {
+        let encoded = metrics.encode().expect("metrics encode");
+        let prefix = format!(r#"ferriscd_rbac_reload_total{{outcome="{outcome}"}} "#);
+        encoded
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .expect("rbac reload series must be pre-registered")
+    }
+
+    /// **`T17.1`:** `drive_rbac_watch` marks the RBAC readiness gate on `InitDone`, activates the
+    /// initial policy, and suppresses the startup `ok` counter increment so routine boot is not
+    /// miscounted as a live reload.
+    #[tokio::test]
+    async fn drive_rbac_watch_marks_readiness_on_init_done_and_suppresses_startup_ok_metric() {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<WatcherEvent<ConfigMap>, &'static str>>();
+        let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
+        let store = RbacPolicyStore::empty();
+        let readiness = ControlPlaneReadiness::new();
+        readiness.mark_controllers_ready();
+        readiness.mark_clusters_seeded();
+        let metrics = Metrics::with_fixed_series();
+        let stop = CancellationToken::new();
+
+        let task = tokio::spawn(drive_rbac_watch(
+            stream,
+            "ferriscd-system",
+            store.clone(),
+            readiness.clone(),
+            metrics.clone(),
+            stop.clone(),
+        ));
+
+        let policy_v1 = r#"
+rules:
+  - subject: { kind: group, name: payments-dev }
+    project: payments
+    actions: [get]
+"#;
+        tx.send(Ok(WatcherEvent::Init)).expect("send Init");
+        tx.send(Ok(WatcherEvent::InitApply(rbac_configmap(
+            Some("10"),
+            Some(policy_v1),
+        ))))
+        .expect("send InitApply");
+        tokio::task::yield_now().await;
+        assert!(
+            !readiness.is_ready(),
+            "readiness must stay false until InitDone completes"
+        );
+
+        tx.send(Ok(WatcherEvent::InitDone)).expect("send InitDone");
+        drop(tx);
+        task.await.expect("watch task finishes cleanly");
+
+        assert!(
+            readiness.is_ready(),
+            "InitDone must flip the RBAC readiness gate to ready"
+        );
+        let identity = AuthenticatedIdentity::new("alice", vec!["payments-dev".to_owned()]);
+        assert!(
+            store
+                .snapshot()
+                .grants(&identity, "payments")
+                .allows(crate::rbac::Action::Get)
+        );
+        assert_eq!(
+            rbac_reload_count(&metrics, "ok"),
+            0,
+            "initial InitApply must not inflate live reload ok counter"
+        );
+        assert_eq!(rbac_reload_count(&metrics, "error"), 0);
+        assert_eq!(rbac_reload_count(&metrics, "deleted"), 0);
+    }
+
+    /// **`T17.1`:** routine watch reconnects (`410 Gone` re-lists) and duplicate `Apply` events
+    /// carrying the already-active `resourceVersion` must neither re-parse nor inflate
+    /// `ferriscd_rbac_reload_total`, while a genuinely new `resourceVersion` hot-reloads immediately.
+    #[tokio::test]
+    async fn drive_rbac_watch_deduplicates_unchanged_resource_version_and_reloads_updates() {
+        let policy_v1 = r#"
+rules:
+  - subject: { kind: group, name: payments-dev }
+    project: payments
+    actions: [get]
+"#;
+        let policy_v2 = r#"
+rules:
+  - subject: { kind: group, name: payments-dev }
+    project: payments
+    actions: [get, sync]
+"#;
+        let events: Vec<Result<WatcherEvent<ConfigMap>, &'static str>> = vec![
+            Ok(WatcherEvent::Init),
+            Ok(WatcherEvent::InitApply(rbac_configmap(
+                Some("10"),
+                Some(policy_v1),
+            ))),
+            Ok(WatcherEvent::InitDone),
+            // Reconnect re-list with the exact same RV: must be deduplicated.
+            Ok(WatcherEvent::Init),
+            Ok(WatcherEvent::InitApply(rbac_configmap(
+                Some("10"),
+                Some(policy_v1),
+            ))),
+            Ok(WatcherEvent::InitDone),
+            // Duplicate Apply with the exact same RV: must be deduplicated.
+            Ok(WatcherEvent::Apply(rbac_configmap(
+                Some("10"),
+                Some(policy_v1),
+            ))),
+            // Real policy edit at RV 11: must hot-reload and count exactly once.
+            Ok(WatcherEvent::Apply(rbac_configmap(
+                Some("11"),
+                Some(policy_v2),
+            ))),
+        ];
+
+        let store = RbacPolicyStore::empty();
+        let readiness = ControlPlaneReadiness::new();
+        let metrics = Metrics::with_fixed_series();
+        let stop = CancellationToken::new();
+
+        drive_rbac_watch(
+            futures::stream::iter(events),
+            "ferriscd-system",
+            store.clone(),
+            readiness,
+            metrics.clone(),
+            stop,
+        )
+        .await;
+
+        let identity = AuthenticatedIdentity::new("alice", vec!["payments-dev".to_owned()]);
+        assert!(
+            store
+                .snapshot()
+                .grants(&identity, "payments")
+                .allows(crate::rbac::Action::Sync)
+        );
+        assert_eq!(rbac_reload_count(&metrics, "ok"), 1);
+        assert_eq!(rbac_reload_count(&metrics, "error"), 0);
+        assert_eq!(rbac_reload_count(&metrics, "deleted"), 0);
+    }
+
+    /// **`T17.1`:** malformed YAML updates, missing `policy.yaml` keys, and transient watch stream
+    /// errors must retain the last known-good policy and record `outcome="error"` without breaking
+    /// readiness or existing grants.
+    #[tokio::test]
+    async fn drive_rbac_watch_retains_last_good_on_malformed_updates_and_watch_errors() {
+        let valid = r#"
+rules:
+  - subject: { kind: group, name: payments-dev }
+    project: payments
+    actions: [get]
+"#;
+        let events: Vec<Result<WatcherEvent<ConfigMap>, &'static str>> = vec![
+            Ok(WatcherEvent::Init),
+            Ok(WatcherEvent::InitApply(rbac_configmap(
+                Some("10"),
+                Some(valid),
+            ))),
+            Ok(WatcherEvent::InitDone),
+            // Malformed YAML at RV 11 -> retain RV 10, increment error.
+            Ok(WatcherEvent::Apply(rbac_configmap(
+                Some("11"),
+                Some("rules: [unterminated"),
+            ))),
+            // Missing policy.yaml key at RV 12 -> retain RV 10, increment error.
+            Ok(WatcherEvent::Apply(rbac_configmap(Some("12"), None))),
+            // Transient watch error -> retain RV 10, do not crash or clear store.
+            Err("simulated watch disconnect"),
+        ];
+
+        let store = RbacPolicyStore::empty();
+        let readiness = ControlPlaneReadiness::new();
+        let metrics = Metrics::with_fixed_series();
+        let stop = CancellationToken::new();
+
+        drive_rbac_watch(
+            futures::stream::iter(events),
+            "ferriscd-system",
+            store.clone(),
+            readiness,
+            metrics.clone(),
+            stop,
+        )
+        .await;
+
+        let identity = AuthenticatedIdentity::new("alice", vec!["payments-dev".to_owned()]);
+        assert!(
+            store
+                .snapshot()
+                .grants(&identity, "payments")
+                .allows(crate::rbac::Action::Get),
+            "last known-good policy must remain active after malformed updates and watch errors"
+        );
+        assert_eq!(rbac_reload_count(&metrics, "ok"), 0);
+        assert_eq!(
+            rbac_reload_count(&metrics, "error"),
+            2,
+            "malformed updates alone must drive the reload error counter"
+        );
+        assert_eq!(
+            rbac_watch_error_count(&metrics),
+            1,
+            "one fault (Err followed by stream end) must be counted exactly once"
+        );
+        assert_eq!(rbac_reload_count(&metrics, "deleted"), 0);
+    }
+
+    /// **`T17.1`:** one `Err` and the trailing clean stream end are counted separately, while a
+    /// fatal fault (`Err` then end) is counted once; a successful event resets the suppression.
+    #[tokio::test]
+    async fn watch_error_accounting_resets_after_a_successful_event() {
+        let events: Vec<Result<WatcherEvent<ConfigMap>, &'static str>> = vec![
+            Ok(WatcherEvent::Init),
+            Err("first disconnect"),
+            Ok(WatcherEvent::InitDone),
+        ];
+        let metrics = Metrics::with_fixed_series();
+        drive_rbac_watch(
+            futures::stream::iter(events),
+            "ferriscd-system",
+            RbacPolicyStore::empty(),
+            ControlPlaneReadiness::new(),
+            metrics.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            rbac_watch_error_count(&metrics),
+            2,
+            "one Err plus the trailing clean stream end must each be counted"
+        );
+    }
+
+    /// **`T17.1`:** deleting `ferriscd-rbac-cm` directly (`Delete`) or omitting it from a completed
+    /// reconnect re-list (`Init` -> `InitDone` without `InitApply`) must fail closed to
+    /// `RbacPolicy::empty()` and increment `outcome="deleted"` once per transition.
+    #[tokio::test]
+    async fn drive_rbac_watch_fails_closed_on_delete_and_relist_omission() {
+        let valid = r#"
+rules:
+  - subject: { kind: group, name: payments-dev }
+    project: payments
+    actions: [get]
+"#;
+        let events: Vec<Result<WatcherEvent<ConfigMap>, &'static str>> = vec![
+            // Startup loads RV 10.
+            Ok(WatcherEvent::Init),
+            Ok(WatcherEvent::InitApply(rbac_configmap(
+                Some("10"),
+                Some(valid),
+            ))),
+            Ok(WatcherEvent::InitDone),
+            // Explicit Delete -> fail closed (deleted = 1).
+            Ok(WatcherEvent::Delete(rbac_configmap(
+                Some("11"),
+                Some(valid),
+            ))),
+            // Re-created at RV 12 -> live reload (ok = 1).
+            Ok(WatcherEvent::Apply(rbac_configmap(Some("12"), Some(valid)))),
+            // Deleted while disconnected; reconnect re-list sees nothing -> fail closed (deleted = 2).
+            Ok(WatcherEvent::Init),
+            Ok(WatcherEvent::InitDone),
+            // Another empty re-list while already empty -> must not double-count deleted.
+            Ok(WatcherEvent::Init),
+            Ok(WatcherEvent::InitDone),
+        ];
+
+        let store = RbacPolicyStore::empty();
+        let readiness = ControlPlaneReadiness::new();
+        let metrics = Metrics::with_fixed_series();
+        let stop = CancellationToken::new();
+
+        drive_rbac_watch(
+            futures::stream::iter(events),
+            "ferriscd-system",
+            store.clone(),
+            readiness,
+            metrics.clone(),
+            stop,
+        )
+        .await;
+
+        assert!(
+            store.is_empty(),
+            "store must fail closed to empty after deletion / re-list omission"
+        );
+        assert_eq!(rbac_reload_count(&metrics, "ok"), 1);
+        assert_eq!(rbac_reload_count(&metrics, "error"), 0);
+        assert_eq!(rbac_reload_count(&metrics, "deleted"), 2);
+    }
+
+    /// **`T17.1`:** cancelling the shutdown token exits `drive_rbac_watch` promptly even while the
+    /// underlying stream is idle.
+    #[tokio::test]
+    async fn drive_rbac_watch_stops_promptly_on_cancellation() {
+        let stop = CancellationToken::new();
+        let cancel_handle = stop.clone();
+        let stream = futures::stream::pending::<Result<WatcherEvent<ConfigMap>, &'static str>>();
+        let task = tokio::spawn(drive_rbac_watch(
+            stream,
+            "ferriscd-system",
+            RbacPolicyStore::empty(),
+            ControlPlaneReadiness::new(),
+            Metrics::with_fixed_series(),
+            stop,
+        ));
+        cancel_handle.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("watch task must exit promptly on cancellation")
+            .expect("watch task must not panic");
     }
 }

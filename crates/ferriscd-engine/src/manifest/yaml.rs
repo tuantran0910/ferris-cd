@@ -108,8 +108,36 @@ where
             limit: format!("{breach:?}"),
         });
     }
-    serde_saphyr::from_str_with_options(document, parse_options())
-        .map_err(|_| YamlGuardError::Parse)
+    serde_saphyr::from_str_with_options(document, parse_options()).map_err(|err| {
+        if is_alias_limit_breach(&err) {
+            YamlGuardError::Budget {
+                limit: "alias-replay".to_owned(),
+            }
+        } else {
+            YamlGuardError::Parse
+        }
+    })
+}
+
+/// Whether `err` (possibly wrapped in `AliasError`/`WithSnippet`) is one of the parser's
+/// alias-replay guards. Matching the typed variants — never rendered text — keeps a user key such
+/// as `unknown field \`alias replay\`` classified as an ordinary parse error.
+fn is_alias_limit_breach(err: &serde_saphyr::Error) -> bool {
+    let mut current = err;
+    loop {
+        current = match current {
+            // `WithSnippet` is unreachable with `with_snippet: false`, but unwrap it for parity
+            // with the library's own `original_error` helper: keep it if a future option turns
+            // snippets on.
+            serde_saphyr::Error::AliasError { error, .. }
+            | serde_saphyr::Error::WithSnippet { error, .. } => error,
+            serde_saphyr::Error::AliasReplayCounterOverflow { .. }
+            | serde_saphyr::Error::AliasReplayLimitExceeded { .. }
+            | serde_saphyr::Error::AliasExpansionLimitExceeded { .. }
+            | serde_saphyr::Error::AliasReplayStackDepthExceeded { .. } => return true,
+            _ => return false,
+        };
+    }
 }
 
 /// Parses a single manifest file into zero or more validated [`DesiredResource`]s.
@@ -711,6 +739,70 @@ data:
     }
 
     #[test]
+    fn parse_document_classifies_alias_replay_breaches_as_budget_not_type_errors() {
+        // Structurally valid document whose only failure mode is the alias-replay guard: if the
+        // guard were removed this would deserialize (or fail as a type error), not report Budget.
+        let bomb = r#"
+a: &a ["lol", "lol", "lol", "lol", "lol", "lol", "lol", "lol", "lol", "lol"]
+b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]
+c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]
+d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]
+e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d, *d]
+rules: *e
+"#;
+        let err = parse_document::<serde_json::Value>(bomb)
+            .expect_err("the alias-replay guard must reject the bomb");
+        match err {
+            YamlGuardError::Budget { limit } => assert_eq!(limit, "alias-replay"),
+            YamlGuardError::Parse => {
+                panic!("replay breaches must not be reported as generic parse errors")
+            }
+        }
+    }
+
+    #[test]
+    fn a_user_field_named_alias_replay_is_a_parse_error_not_a_budget_breach() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct Strict {
+            rules: Vec<String>,
+        }
+
+        // Matching rendered text would misreport this operator typo as an alias-replay budget
+        // breach; the typed match must keep it an ordinary parse error.
+        let err = parse_document::<Strict>("rules: []\nalias replay: 1\n")
+            .expect_err("an unknown field must be rejected");
+        assert_eq!(err, YamlGuardError::Parse);
+    }
+
+    #[test]
+    fn parse_document_classifies_per_anchor_expansion_breaches_as_budget() {
+        // One anchor expanded more than `max_alias_expansions_per_anchor`: a typed
+        // `AliasExpansionLimitExceeded`, which must also surface as a budget breach.
+        // 12 anchors keep the whole-stream alias/anchor ratio heuristic quiet (101 <= 10 * 12),
+        // so the failure comes from the deserializer's per-anchor expansion limit itself.
+        let mut bomb = String::from("a: &a [1]\n");
+        for index in 0..11 {
+            bomb.push_str(&format!("extra{index}: &e{index} [1]\n"));
+        }
+        bomb.push_str("b: [");
+        for _ in 0..101 {
+            bomb.push_str(" *a,");
+        }
+        bomb.push_str("]\n");
+        let err = parse_document::<serde_json::Value>(&bomb)
+            .expect_err("the per-anchor expansion guard must reject the bomb");
+        assert_eq!(
+            err,
+            YamlGuardError::Budget {
+                limit: "alias-replay".to_owned()
+            },
+            "the deserializer branch must be reached and classified as alias-replay"
+        );
+    }
+
+    #[test]
     fn whole_stream_budget_breach_is_reported_as_yaml_budget() {
         // 1_025 documents exceed the library default per-stream document budget (1_024).
         let mut stream = String::new();
@@ -770,7 +862,13 @@ g: &g [*f, *f, *f, *f, *f, *f, *f, *f, *f]
 h: &h [*g, *g, *g, *g, *g, *g, *g, *g, *g]
 "#;
         let err = parse_document::<Value>(bomb).expect_err("an alias bomb must be refused");
-        assert_eq!(err, YamlGuardError::Parse);
+        assert_eq!(
+            err,
+            YamlGuardError::Budget {
+                limit: "alias-replay".to_owned()
+            },
+            "a replay breach must be classified as a budget breach, not a type error"
+        );
         assert!(!err.to_string().contains("lol"), "{err}");
     }
 

@@ -118,6 +118,18 @@ pub const RENDER_CACHE_TOTAL: &str = "ferriscd_render_cache_total";
 /// Scraped name of the in-flight reconcile gauge.
 pub const ACTIVE_RECONCILES: &str = "ferriscd_active_reconciles";
 
+/// Registered name of the live RBAC reload counter (`T17.1`).
+pub const RBAC_RELOAD_COUNTER: &str = "ferriscd_rbac_reload";
+
+/// Scraped name of the live RBAC reload counter (`T17.1`).
+pub const RBAC_RELOAD_TOTAL: &str = "ferriscd_rbac_reload_total";
+
+/// Registered name of the RBAC watch error counter (`T17.1`).
+pub const RBAC_WATCH_ERRORS: &str = "ferriscd_rbac_watch_errors";
+
+/// Scraped name of the RBAC watch error counter (`T17.1`).
+pub const RBAC_WATCH_ERRORS_TOTAL: &str = "ferriscd_rbac_watch_errors_total";
+
 /// The **complete** `result` label set, in the order it is documented.
 pub const RECONCILE_RESULTS: [&str; 3] = ["success", "retryable", "terminal"];
 
@@ -136,6 +148,9 @@ pub const HEALTH_STATUS_VALUES: [&str; 6] = [
 
 /// The **complete** `outcome` label set of [`RENDER_CACHE_TOTAL`].
 pub const CACHE_OUTCOMES: [&str; 2] = ["hit", "miss"];
+
+/// The **complete** `outcome` label set of [`RBAC_RELOAD_TOTAL`] (`T17.1`).
+pub const RBAC_RELOAD_OUTCOMES: [&str; 3] = ["ok", "error", "deleted"];
 
 /// First bucket of the latency histograms (5 ms).
 const BUCKET_START_SECONDS: f64 = 0.005;
@@ -225,6 +240,31 @@ impl ResultLabels {
     }
 }
 
+/// Outcome of one live `ferriscd-rbac-cm` policy reload (`T17.1`).
+///
+/// The variants are the fixed `outcome` label set ([`RBAC_RELOAD_OUTCOMES`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RbacReloadOutcome {
+    /// A valid policy replaced the active snapshot.
+    Ok,
+    /// The ConfigMap update failed validation; the last known-good snapshot was retained.
+    Error,
+    /// The ConfigMap was deleted; the active snapshot transitioned to default-deny.
+    Deleted,
+}
+
+impl RbacReloadOutcome {
+    /// The label value. Always one of [`RBAC_RELOAD_OUTCOMES`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => RBAC_RELOAD_OUTCOMES[0],
+            Self::Error => RBAC_RELOAD_OUTCOMES[1],
+            Self::Deleted => RBAC_RELOAD_OUTCOMES[2],
+        }
+    }
+}
+
 /// `outcome` label set (private, `&'static str` only).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct OutcomeLabels {
@@ -233,6 +273,12 @@ struct OutcomeLabels {
 
 impl OutcomeLabels {
     fn of(outcome: CacheOutcome) -> Self {
+        Self {
+            outcome: outcome.as_str(),
+        }
+    }
+
+    fn of_rbac_reload(outcome: RbacReloadOutcome) -> Self {
         Self {
             outcome: outcome.as_str(),
         }
@@ -294,6 +340,8 @@ pub struct Metrics {
     git_fetch_duration: Histogram,
     render_cache_total: Family<OutcomeLabels, Counter>,
     active_reconciles: Gauge,
+    rbac_reload_total: Family<OutcomeLabels, Counter>,
+    rbac_watch_errors: Counter,
     render_cache_seen: Arc<Mutex<RenderCacheSeen>>,
 }
 
@@ -313,7 +361,7 @@ impl std::fmt::Debug for Metrics {
 /// **Advisory only:** it is hand-maintained documentation of the registry, not the source of truth
 /// — the registration in [`Metrics::new`] and the `T15.1` tests are. A family added there without a
 /// row here does not break anything (and is caught by the tests), it just reads as an omission.
-const FAMILY_DESCRIPTIONS: [(&str, &str); 7] = [
+const FAMILY_DESCRIPTIONS: [(&str, &str); 9] = [
     (RECONCILE_DURATION_SECONDS, "histogram"),
     (RECONCILE_TOTAL, "counter"),
     (APP_SYNC_STATUS, "gauge"),
@@ -321,6 +369,8 @@ const FAMILY_DESCRIPTIONS: [(&str, &str); 7] = [
     (GIT_FETCH_DURATION_SECONDS, "histogram"),
     (RENDER_CACHE_TOTAL, "counter"),
     (ACTIVE_RECONCILES, "gauge"),
+    (RBAC_RELOAD_TOTAL, "counter"),
+    (RBAC_WATCH_ERRORS_TOTAL, "counter"),
 ];
 
 /// Builds a latency histogram (same buckets for reconcile and Git fetch).
@@ -333,7 +383,7 @@ fn latency_histogram() -> Histogram {
 }
 
 impl Metrics {
-    /// Creates a registry with every `T15.1` family registered.
+    /// Creates a registry with every `T15.1` / `T17.1` family registered.
     #[must_use]
     pub fn new() -> Self {
         let reconcile_duration =
@@ -344,6 +394,8 @@ impl Metrics {
         let git_fetch_duration = latency_histogram();
         let render_cache_total = Family::<OutcomeLabels, Counter>::default();
         let active_reconciles = Gauge::default();
+        let rbac_reload_total = Family::<OutcomeLabels, Counter>::default();
+        let rbac_watch_errors = Counter::default();
 
         let mut registry = Registry::default();
         registry.register(
@@ -381,6 +433,16 @@ impl Metrics {
             "Application reconciles in flight",
             active_reconciles.clone(),
         );
+        registry.register(
+            RBAC_RELOAD_COUNTER,
+            "Live ferriscd-rbac-cm policy reload attempts, by outcome",
+            rbac_reload_total.clone(),
+        );
+        registry.register(
+            RBAC_WATCH_ERRORS,
+            "ferriscd-rbac-cm watch errors while retaining the active policy snapshot",
+            rbac_watch_errors.clone(),
+        );
 
         Self {
             registry: Arc::new(Mutex::new(registry)),
@@ -391,6 +453,8 @@ impl Metrics {
             git_fetch_duration,
             render_cache_total,
             active_reconciles,
+            rbac_reload_total,
+            rbac_watch_errors,
             render_cache_seen: Arc::new(Mutex::new(RenderCacheSeen::default())),
         }
     }
@@ -425,7 +489,32 @@ impl Metrics {
                 .render_cache_total
                 .get_or_create_owned(&OutcomeLabels::of(outcome));
         }
+        for outcome in [
+            RbacReloadOutcome::Ok,
+            RbacReloadOutcome::Error,
+            RbacReloadOutcome::Deleted,
+        ] {
+            metrics
+                .rbac_reload_total
+                .get_or_create_owned(&OutcomeLabels::of_rbac_reload(outcome));
+        }
         metrics
+    }
+
+    /// Records one live `ferriscd-rbac-cm` policy reload outcome (`T17.1`).
+    pub fn record_rbac_reload(&self, outcome: RbacReloadOutcome) {
+        self.rbac_reload_total
+            .get_or_create_owned(&OutcomeLabels::of_rbac_reload(outcome))
+            .inc();
+    }
+
+    /// Records one RBAC watch failure (`T17.1`).
+    ///
+    /// Kept separate from [`Self::record_rbac_reload`]: an operator alerting on
+    /// `outcome="error"` must see *bad policy edits*, not API-server watch blips, while a
+    /// permanently dead watch still has to be visible.
+    pub fn record_rbac_watch_error(&self) {
+        self.rbac_watch_errors.inc();
     }
 
     /// Marks a reconcile as started and returns the guard that ends it.
@@ -1021,6 +1110,8 @@ mod tests {
             (GIT_FETCH_DURATION_SECONDS, "histogram"),
             (RENDER_CACHE_TOTAL, "counter"),
             (ACTIVE_RECONCILES, "gauge"),
+            (RBAC_RELOAD_TOTAL, "counter"),
+            (RBAC_WATCH_ERRORS_TOTAL, "counter"),
         ] {
             assert!(
                 response.body.contains(&format!("# HELP {family} ")),
@@ -1312,9 +1403,14 @@ mod tests {
             capacity: 8,
         });
 
+        metrics.record_rbac_reload(RbacReloadOutcome::Ok);
+        metrics.record_rbac_reload(RbacReloadOutcome::Error);
+        metrics.record_rbac_reload(RbacReloadOutcome::Deleted);
+        metrics.record_rbac_watch_error();
+
         let (body, samples) = scrape(&metrics);
         let families = exposition::label_names(&samples);
-        let expected: [(&str, &[&str]); 7] = [
+        let expected: [(&str, &[&str]); 9] = [
             (RECONCILE_DURATION_SECONDS, &["result", "le"]),
             (RECONCILE_TOTAL, &["result"]),
             (APP_SYNC_STATUS, &["app_namespace", "app_name", "status"]),
@@ -1322,6 +1418,8 @@ mod tests {
             (GIT_FETCH_DURATION_SECONDS, &["le"]),
             (RENDER_CACHE_TOTAL, &["outcome"]),
             (ACTIVE_RECONCILES, &[]),
+            (RBAC_RELOAD_TOTAL, &["outcome"]),
+            (RBAC_WATCH_ERRORS_TOTAL, &[]),
         ];
         assert_eq!(
             families.len(),
@@ -1664,12 +1762,21 @@ mod tests {
             GIT_FETCH_DURATION_SECONDS,
             RENDER_CACHE_TOTAL,
             ACTIVE_RECONCILES,
+            RBAC_RELOAD_TOTAL,
+            RBAC_WATCH_ERRORS_TOTAL,
         ]
         .into_iter()
         .collect();
         assert_eq!(
             families, expected,
             "the fixed series, and no per-Application one:\n{body}"
+        );
+        assert_eq!(
+            exposition::label_values(&samples, RBAC_RELOAD_TOTAL, "outcome"),
+            RBAC_RELOAD_OUTCOMES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
         );
         assert_eq!(
             exposition::label_values(&samples, RECONCILE_TOTAL, "result"),

@@ -152,7 +152,7 @@ Design decisions that matter more than the YAML:
   create a rule that looks real and grants nothing.
 * **The policy is a startup snapshot.** Authorization happens on every request; an `etcd` read per
   request would make the API's own policy a denial-of-service vector. The trade-off is documented as
-  a limitation (§9): change the `ConfigMap`, restart the server.
+  a limitation (§9): change the `ConfigMap`, restart the server (no longer required since `T17.1`: the `ferriscd-rbac-cm` watch hot-reloads the policy — see Lesson 17).
 
 ### The existence-leak rule
 

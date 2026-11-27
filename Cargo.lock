@@ -903,7 +903,6 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "serde",
- "serde-saphyr",
  "serde_json",
  "subtle",
  "tempfile",

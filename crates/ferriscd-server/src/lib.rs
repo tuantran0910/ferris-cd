@@ -63,7 +63,7 @@ pub use auth::{
 pub use error::{ApiError, ApiErrorBody, ApiErrorDetail};
 pub use rbac::{
     Action, Actor, DEFAULT_RBAC_NAMESPACE, Grant, RBAC_CONFIGMAP_KEY, RBAC_CONFIGMAP_NAME,
-    RbacPolicy, RbacPolicyError, Rule, SubjectKind,
+    RbacConfigMapEvent, RbacPolicy, RbacPolicyError, RbacPolicyStore, Rule, SubjectKind,
 };
 pub use state::{
     AppState, ApplicationSource, ClusterCatalog, ClusterEntry, DiffSource, GraphRequest,
@@ -163,13 +163,13 @@ where
     if state.auth == AuthPolicy::TokenReview && state.rbac.is_empty() {
         tracing::warn!(
             auth = state.auth.as_str(),
-            configmap = %format!("{}/{}", rbac::DEFAULT_RBAC_NAMESPACE, rbac::RBAC_CONFIGMAP_NAME),
+            configmap = %format!("{}/{}", state.rbac_namespace, rbac::RBAC_CONFIGMAP_NAME),
             key = rbac::RBAC_CONFIGMAP_KEY,
             "the RBAC policy is EMPTY (default-deny): every authenticated request will be refused \
              unless a policy rule grants it. Publish the `{}` ConfigMap in the control-plane \
              namespace (default `{}`) with a `{}` document",
             rbac::RBAC_CONFIGMAP_NAME,
-            rbac::DEFAULT_RBAC_NAMESPACE,
+            state.rbac_namespace,
             rbac::RBAC_CONFIGMAP_KEY,
         );
     }

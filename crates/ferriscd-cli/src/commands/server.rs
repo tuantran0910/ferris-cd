@@ -277,13 +277,20 @@ async fn serve(args: ServerArgs) -> Result<()> {
     // The ONE control plane: the same caches, registry, pipeline and discovery every handler and
     // every reconcile uses (finding C9).
     let plane = ferriscd_controller::prepare(run_options(args.controller)).await?;
-    // `T14.4`: the project-scoped policy is a startup snapshot read from `ferriscd-rbac-cm` in the
-    // control-plane namespace. A missing or malformed policy is deny-all with a loud log, never
-    // allow-all (`fallback_to_deny_all`).
-    let rbac = ferriscd_server::kube::load_rbac_policy(&plane).await;
+    // `T14.4` / `T17.1`: load the initial `ferriscd-rbac-cm` snapshot (fail-closed to deny-all on
+    // missing/malformed policy). Mark the RBAC readiness gate complete only when the Kubernetes API
+    // read itself succeeded; on transient read failure (`RbacLoadError::Read`), `/readyz` stays 503
+    // until `watch_rbac_policy`'s first `InitDone` completes.
+    let (initial_rbac, rbac_api_reachable) =
+        ferriscd_server::kube::load_initial_rbac_policy(&plane).await;
+    let rbac_store = ferriscd_server::RbacPolicyStore::new(initial_rbac);
+    if rbac_api_reachable {
+        plane.readiness().mark_rbac_loaded();
+    }
     let state = ferriscd_server::kube::app_state(&plane, webhooks)
         .with_auth(args.auth_policy)
-        .with_rbac(std::sync::Arc::new(rbac));
+        .with_rbac_store(rbac_store.clone())
+        .with_rbac_namespace(plane.namespace().to_owned());
     if let Some(metrics_addr) = plane.metrics_addr() {
         // `T15.1`: said out loud where the API address is decided, so a scrape that fails is not
         // diagnosed as a missing endpoint.
@@ -310,8 +317,8 @@ async fn serve(args: ServerArgs) -> Result<()> {
         tracing::warn!(
             auth = state.auth.as_str(),
             "the RBAC policy is empty: every authenticated request will be refused (default-deny). \
-             Publish the ferriscd-rbac-cm ConfigMap (key policy.yaml) in the control-plane \
-             namespace and restart the server"
+             Publish or update the ferriscd-rbac-cm ConfigMap (key policy.yaml) in the \
+             control-plane namespace; changes reload automatically without restarting"
         );
     }
     if !state.webhooks.is_configured() {
@@ -334,6 +341,14 @@ async fn serve(args: ServerArgs) -> Result<()> {
         signal.cancel();
     });
 
+    let rbac_watch = tokio::spawn(ferriscd_server::kube::watch_rbac_policy(
+        plane.client().clone(),
+        plane.namespace().to_owned(),
+        rbac_store,
+        plane.readiness(),
+        plane.metrics().clone(),
+        stop.clone(),
+    ));
     let api_stop = stop.clone();
     let mut api = tokio::spawn(async move {
         ferriscd_server::serve(address, state, api_stop.cancelled_owned()).await
@@ -348,6 +363,9 @@ async fn serve(args: ServerArgs) -> Result<()> {
             let served = api
                 .await
                 .context("the API server task panicked")?;
+            rbac_watch
+                .await
+                .context("the RBAC policy watch task panicked")?;
             result.context("the controller task panicked")??;
             served?;
             Ok(())
@@ -359,6 +377,9 @@ async fn serve(args: ServerArgs) -> Result<()> {
             let drained = controller
                 .await
                 .context("the controller task panicked")?;
+            rbac_watch
+                .await
+                .context("the RBAC policy watch task panicked")?;
             served.context("the API server task panicked")??;
             drained?;
             Ok(())

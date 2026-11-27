@@ -51,8 +51,11 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::{Arc, PoisonError, RwLock};
 
+use ferriscd_controller::RbacReloadOutcome;
 use ferriscd_crd::CONTROL_PLANE_NAMESPACE;
+use ferriscd_engine::manifest::{YamlGuardError, parse_document};
 use serde::Deserialize;
 
 use crate::auth::AuthenticatedIdentity;
@@ -331,24 +334,26 @@ impl RbacPolicy {
         Self::default()
     }
 
-    /// Parses the `policy.yaml` document of `ferriscd-rbac-cm`.
+    /// Parses the `policy.yaml` document of `ferriscd-rbac-cm` under FerrisCD's guarded YAML
+    /// parser (`ferriscd_engine::manifest::parse_document`, `T17.1`).
+    ///
+    /// Rejects duplicate keys and billion-laughs alias bombs without quoting any policy content
+    /// (user names, group names, or project names) in error messages.
     ///
     /// # Errors
     ///
     /// [`RbacPolicyError`] for anything that is not the documented document. A caller must treat
-    /// that as "deny everything" — an unparseable policy never degrades to a permissive one.
+    /// that as "deny everything" on startup or retain the last known-good policy on live reload —
+    /// an unparseable policy never degrades to a permissive one.
     pub fn parse(document: &str) -> Result<Self, RbacPolicyError> {
-        let parsed: PolicyDocument =
-            serde_saphyr::from_str(document).map_err(|err| RbacPolicyError::Malformed {
-                // Only the **position** is kept. The deserializer's own message quotes the offending
-                // YAML (it renders a snippet with the line under a caret), and a policy line names a
-                // group or a user, so forwarding it would publish exactly the names this policy is
-                // about into an error and a log line.
-                reason: err.location().map_or_else(
-                    || "the document is not valid YAML".to_owned(),
-                    |location| format!("line {}, column {}", location.line(), location.column()),
-                ),
-            })?;
+        let parsed: PolicyDocument = parse_document(document).map_err(|err| match err {
+            YamlGuardError::Budget { limit } => RbacPolicyError::Malformed {
+                reason: format!("exceeds YAML parser budget ({limit})"),
+            },
+            YamlGuardError::Parse => RbacPolicyError::Malformed {
+                reason: "the document is not valid YAML for the RBAC policy".to_owned(),
+            },
+        })?;
         let mut rules = Vec::with_capacity(parsed.rules.len());
         for (index, rule) in parsed.rules.into_iter().enumerate() {
             let kind = SubjectKind::parse(&rule.subject.kind)
@@ -443,6 +448,140 @@ impl RbacPolicy {
             .filter(|project| self.grants(identity, project).is_visible())
             .map(ToOwned::to_owned)
             .collect()
+    }
+}
+
+/// One `ferriscd-rbac-cm` ConfigMap change delivered to [`RbacPolicyStore::apply_event`] (`T17.1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RbacConfigMapEvent {
+    /// The `ferriscd-rbac-cm` ConfigMap exists with `data["policy.yaml"]` (or `None` if the key is
+    /// missing).
+    Applied(Option<String>),
+    /// The `ferriscd-rbac-cm` ConfigMap was deleted (or omitted from a completed watch re-list).
+    Deleted,
+}
+
+/// Live-reloading, snapshot-based store for the active [`RbacPolicy`] (`T17.1`).
+///
+/// Reads on the HTTP request hot path take an `O(1)` cloned `Arc<RbacPolicy>` snapshot so
+/// concurrent requests never contend on parsing or validation. Live updates from the namespaced
+/// `ferriscd-rbac-cm` watch swap the inner `Arc` atomically:
+///
+/// - **Valid update:** replaces the active policy immediately (`RbacReloadOutcome::Ok`).
+/// - **Malformed update / missing key:** **retains the last known-good policy** (or stays
+///   deny-all if startup never succeeded) and logs a content-free warning
+///   (`RbacReloadOutcome::Error`).
+/// - **ConfigMap deletion:** immediately transitions to [`RbacPolicy::empty`] (default-deny,
+///   `RbacReloadOutcome::Deleted`).
+#[derive(Clone)]
+pub struct RbacPolicyStore {
+    inner: Arc<RwLock<Arc<RbacPolicy>>>,
+}
+
+impl Default for RbacPolicyStore {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl fmt::Debug for RbacPolicyStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RbacPolicyStore")
+            .field("rule_count", &self.rule_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RbacPolicyStore {
+    /// Creates a store initialized with `policy`.
+    #[must_use]
+    pub fn new(policy: RbacPolicy) -> Self {
+        Self::from_arc(Arc::new(policy))
+    }
+
+    /// Creates a store initialized with a shared `Arc<RbacPolicy>`.
+    #[must_use]
+    pub fn from_arc(policy: Arc<RbacPolicy>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(policy)),
+        }
+    }
+
+    /// Creates a default-deny store holding [`RbacPolicy::empty`].
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(RbacPolicy::empty())
+    }
+
+    /// Returns an `O(1)` atomic snapshot of the currently active [`RbacPolicy`].
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<RbacPolicy> {
+        let guard = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(&guard)
+    }
+
+    /// Atomically replaces the active [`RbacPolicy`].
+    pub fn replace(&self, policy: RbacPolicy) {
+        let mut guard = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        *guard = Arc::new(policy);
+    }
+
+    /// Number of rules in the currently active policy snapshot.
+    #[must_use]
+    pub fn rule_count(&self) -> usize {
+        self.snapshot().rule_count()
+    }
+
+    /// Whether the currently active policy snapshot grants nothing at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.snapshot().is_empty()
+    }
+
+    /// Applies one `ferriscd-rbac-cm` ConfigMap event according to `T17.1` fail-safe/fail-closed
+    /// rules and returns the reload outcome for Prometheus metrics.
+    pub fn apply_event(&self, event: RbacConfigMapEvent) -> RbacReloadOutcome {
+        match event {
+            RbacConfigMapEvent::Applied(Some(document)) => match RbacPolicy::parse(&document) {
+                Ok(policy) => {
+                    let rules = policy.rule_count();
+                    self.replace(policy);
+                    tracing::info!(
+                        configmap = RBAC_CONFIGMAP_NAME,
+                        rules,
+                        "reloaded live project-scoped RBAC policy"
+                    );
+                    RbacReloadOutcome::Ok
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        configmap = RBAC_CONFIGMAP_NAME,
+                        error = %error,
+                        retained_rules = self.rule_count(),
+                        "live RBAC policy update failed validation; retaining last known-good policy"
+                    );
+                    RbacReloadOutcome::Error
+                }
+            },
+            RbacConfigMapEvent::Applied(None) => {
+                tracing::warn!(
+                    configmap = RBAC_CONFIGMAP_NAME,
+                    key = RBAC_CONFIGMAP_KEY,
+                    retained_rules = self.rule_count(),
+                    "live RBAC ConfigMap is missing key `{RBAC_CONFIGMAP_KEY}`; retaining last \
+                     known-good policy"
+                );
+                RbacReloadOutcome::Error
+            }
+            RbacConfigMapEvent::Deleted => {
+                self.replace(RbacPolicy::empty());
+                tracing::warn!(
+                    configmap = RBAC_CONFIGMAP_NAME,
+                    "RBAC ConfigMap was deleted; transitioned immediately to default-deny"
+                );
+                RbacReloadOutcome::Deleted
+            }
+        }
     }
 }
 
@@ -627,15 +766,18 @@ rules:
         }
     }
 
-    /// The parse error must name the position and nothing else: the document is full of group and
-    /// user names, and an error (or the log line that quotes it) must not publish them.
+    /// The parse error must remain strictly content-free: the document is full of group and user
+    /// names, and an error (or the log line that quotes it) must not publish them.
     #[test]
     fn a_malformed_policy_error_never_quotes_the_document() {
         let document =
             "rules:\n  - subject: {kind: group, name: secret-group-name}\n    actionz: [get]\n";
         let error = RbacPolicy::parse(document).expect_err("the field name is unknown");
         let rendered = error.to_string();
-        assert!(rendered.contains("line 3"), "{rendered}");
+        assert!(
+            matches!(error, RbacPolicyError::Malformed { .. }),
+            "expected Malformed, got {error:?}"
+        );
         assert!(
             !rendered.contains("secret-group-name"),
             "the error must not quote the policy: {rendered}"
@@ -818,6 +960,116 @@ rules:
             policy
                 .visible_projects(&identity("nobody", &[]), ["payments"])
                 .is_empty()
+        );
+    }
+
+    /// `T17.1`: `RbacPolicy::parse` runs through `ferriscd_engine::manifest::parse_document`,
+    /// rejecting duplicate keys and billion-laughs alias bombs without echoing user or group names.
+    #[test]
+    fn guarded_parser_rejects_duplicate_keys_and_alias_bombs_without_leaking_names() {
+        let duplicate_keys = r#"
+rules:
+  - subject:
+      kind: group
+      name: secret-payroll-admins
+    project: payments
+    actions: [get]
+    actions: [admin]
+"#;
+        let err = RbacPolicy::parse(duplicate_keys).expect_err("duplicate keys must be rejected");
+        let rendered = err.to_string();
+        assert!(
+            matches!(err, RbacPolicyError::Malformed { .. }),
+            "expected Malformed, got {err:?}"
+        );
+        assert!(
+            !rendered.contains("secret-payroll-admins"),
+            "error must never echo group/user names: {rendered}"
+        );
+
+        let alias_bomb = r#"
+a: &a ["secret-group-alpha", "secret-group-alpha", "secret-group-alpha", "secret-group-alpha", "secret-group-alpha", "secret-group-alpha", "secret-group-alpha", "secret-group-alpha", "secret-group-alpha", "secret-group-alpha"]
+b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]
+c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]
+d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]
+e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d, *d]
+rules: *e
+"#;
+        let err = RbacPolicy::parse(alias_bomb).expect_err("alias bomb must be rejected");
+        let rendered = err.to_string();
+        assert!(
+            matches!(err, RbacPolicyError::Malformed { .. }),
+            "expected Malformed, got {err:?}"
+        );
+        assert!(
+            !rendered.contains("secret-group-alpha"),
+            "error must never echo alias contents: {rendered}"
+        );
+    }
+
+    /// `T17.1`: `RbacPolicyStore::apply_event` swaps valid updates atomically, retains the last
+    /// known-good policy on malformed updates or missing keys, and transitions immediately to
+    /// default-deny when `ferriscd-rbac-cm` is deleted.
+    #[test]
+    fn policy_store_hot_reloads_retains_last_good_on_error_and_fails_closed_on_delete() {
+        let store = RbacPolicyStore::empty();
+        assert!(store.is_empty());
+
+        // Malformed startup update keeps empty (deny-all) policy.
+        assert_eq!(
+            store.apply_event(RbacConfigMapEvent::Applied(Some("rules: [".to_owned()))),
+            RbacReloadOutcome::Error
+        );
+        assert!(store.is_empty());
+
+        // Valid live update activates immediately.
+        assert_eq!(
+            store.apply_event(RbacConfigMapEvent::Applied(Some(POLICY.to_owned()))),
+            RbacReloadOutcome::Ok
+        );
+        let payments_team = identity("alice", &["payments-team"]);
+        assert!(
+            store
+                .snapshot()
+                .grants(&payments_team, "payments")
+                .allows(Action::Get)
+        );
+        assert_eq!(store.rule_count(), 4);
+
+        // Malformed live update retains the last known-good policy (never wipes or widens).
+        assert_eq!(
+            store.apply_event(RbacConfigMapEvent::Applied(Some(
+                "rules:\n  - subject: {kind: group, name: x}\n    project: '*'\n    actions: [bogus]\n"
+                    .to_owned()
+            ))),
+            RbacReloadOutcome::Error
+        );
+        assert_eq!(store.rule_count(), 4);
+        assert!(
+            store
+                .snapshot()
+                .grants(&payments_team, "payments")
+                .allows(Action::Get)
+        );
+
+        // Missing `policy.yaml` key also retains the last known-good policy.
+        assert_eq!(
+            store.apply_event(RbacConfigMapEvent::Applied(None)),
+            RbacReloadOutcome::Error
+        );
+        assert_eq!(store.rule_count(), 4);
+
+        // Deleting the ConfigMap transitions immediately to default-deny.
+        assert_eq!(
+            store.apply_event(RbacConfigMapEvent::Deleted),
+            RbacReloadOutcome::Deleted
+        );
+        assert!(store.is_empty());
+        assert!(
+            !store
+                .snapshot()
+                .grants(&payments_team, "payments")
+                .is_visible()
         );
     }
 }

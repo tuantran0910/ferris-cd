@@ -22,6 +22,7 @@ pub mod metrics;
 pub mod predicate;
 pub mod project;
 pub mod prune;
+pub mod readiness;
 pub mod reconcile;
 pub mod scope;
 pub mod sharding;
@@ -87,14 +88,16 @@ pub use live_state::{
 pub use metrics::{
     ACTIVE_RECONCILES, APP_HEALTH_STATUS, APP_SYNC_STATUS, CACHE_OUTCOMES, DEFAULT_METRICS_ADDR,
     GIT_FETCH_DURATION_SECONDS, METRICS_ADDR_ENV, METRICS_PATH, Metrics, MetricsEncodeError,
-    MetricsServeError, MetricsStatusWriter, RECONCILE_DURATION_SECONDS, RECONCILE_RESULTS,
-    RECONCILE_TOTAL, RENDER_CACHE_TOTAL, ReconcileGuard, ReconcileResult, SYNC_STATUS_VALUES,
+    MetricsServeError, MetricsStatusWriter, RBAC_RELOAD_COUNTER, RBAC_RELOAD_OUTCOMES,
+    RBAC_RELOAD_TOTAL, RECONCILE_DURATION_SECONDS, RECONCILE_RESULTS, RECONCILE_TOTAL,
+    RENDER_CACHE_TOTAL, RbacReloadOutcome, ReconcileGuard, ReconcileResult, SYNC_STATUS_VALUES,
 };
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
 pub use project::{ApiProjectSource, ProjectSource};
 pub use prune::{
     OwnershipVerifiedPruner, PruneResult, ResourcePruner, RetainReason, prune_opted_out, prune_rail,
 };
+pub use readiness::ControlPlaneReadiness;
 pub use reconcile::{
     ApiStatusWriter, ApplyOutcome, CleanupDisposition, CleanupMode, CleanupOutcome,
     ControllerError, DiffPreview, FINALIZER, ReconcileContext, ReconcileError, StatusWriter,
@@ -392,6 +395,8 @@ pub struct ControlPlane {
     metrics_addr: Option<std::net::SocketAddr>,
     /// `T15.2`: owns the optional OpenTelemetry `SdkTracerProvider` so spans flush on shutdown.
     telemetry: telemetry::TelemetryGuard,
+    /// `T17.1`: lock-free startup readiness barrier shared with `/readyz`.
+    readiness: ControlPlaneReadiness,
     cluster_stop: tokio_util::sync::CancellationToken,
     cluster_watch: tokio::task::JoinHandle<()>,
 }
@@ -470,6 +475,12 @@ impl ControlPlane {
         &self.telemetry
     }
 
+    /// Lock-free startup readiness barrier (`T17.1`) for `/readyz`.
+    #[must_use]
+    pub fn readiness(&self) -> ControlPlaneReadiness {
+        self.readiness.clone()
+    }
+
     /// Runs the controller loop until `SIGINT`/`SIGTERM`, then stops the cluster registry watch.
     ///
     /// # Errors
@@ -516,11 +527,12 @@ impl ControlPlane {
         let result: anyhow::Result<()> = match self.leader_election.clone() {
             // The non-leader path reuses the public per-term driver: it treats the token as its only
             // shutdown input, which is precisely the contract this method promises.
-            None => controller::run_as_leader(
+            None => controller::run_as_leader_with_readiness(
                 self.client.clone(),
                 self.config.clone(),
                 self.ctx.clone(),
                 stop.clone(),
+                self.readiness.clone(),
             )
             .await
             .map_err(anyhow::Error::from),
@@ -530,6 +542,7 @@ impl ControlPlane {
                     self.config.clone(),
                     self.ctx.clone(),
                     leader,
+                    self.readiness.clone(),
                     self.cluster_stop.clone(),
                     stop.clone(),
                 )
@@ -784,17 +797,21 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         cluster_options,
         Arc::new(KubeClusterBuilder::new(cluster_options)),
     ));
+    let readiness = ControlPlaneReadiness::new();
     // Seed from one initial list before the watch starts: an `Application` that already references
     // a remote cluster must not fail terminally in the window between the watch being spawned and
     // its first event arriving. The watch then owns every subsequent add/change/delete.
-    seed_registry(&clusters, client.clone(), &config.namespace).await;
+    if seed_registry(&clusters, client.clone(), &config.namespace).await {
+        readiness.mark_clusters_seeded();
+    }
     let cluster_stop = tokio_util::sync::CancellationToken::new();
-    let cluster_watch = tokio::spawn(clusters.clone().run(
+    let cluster_watch = tokio::spawn(clusters.clone().run_with_readiness(
         Arc::new(SecretClusterSource::new(
             client.clone(),
             config.namespace.clone(),
         )),
         cluster_stop.clone(),
+        Some(readiness.clone()),
     ));
     tracing::info!(
         namespace = %config.namespace,
@@ -870,6 +887,7 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         metrics_listener,
         metrics_addr,
         telemetry,
+        readiness,
         cluster_stop,
         cluster_watch,
     })
@@ -877,8 +895,10 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
 
 /// Seeds the cluster registry from one label-filtered list of the control-plane namespace.
 ///
-/// Failure is logged, never fatal: the watch performs the same reads and retries on its own.
-async fn seed_registry(clusters: &ClusterManager, client: Client, namespace: &str) {
+/// Returns `true` when the initial list succeeded (so `/readyz` can mark cluster seeding complete)
+/// and `false` on error (leaving the background watch's `InitDone` to mark readiness once recovery
+/// succeeds).
+async fn seed_registry(clusters: &ClusterManager, client: Client, namespace: &str) -> bool {
     let secrets: Api<k8s_openapi::api::core::v1::Secret> = Api::namespaced(client, namespace);
     let params = kube::api::ListParams::default().labels(&SecretClusterSource::label_selector());
     let listed = match secrets.list(&params).await {
@@ -889,7 +909,7 @@ async fn seed_registry(clusters: &ClusterManager, client: Client, namespace: &st
                 namespace = %namespace,
                 "could not list the cluster registration Secrets at startup; the watch will retry"
             );
-            return;
+            return false;
         }
     };
     let mut registered = 0_usize;
@@ -909,6 +929,7 @@ async fn seed_registry(clusters: &ClusterManager, client: Client, namespace: &st
         clusters = ?clusters.names(),
         "cluster registry seeded"
     );
+    true
 }
 
 /// Which half of a leader term ended first.
@@ -958,12 +979,19 @@ async fn run_as_leader(
     config: ControllerConfig,
     ctx: Arc<ReconcileContext>,
     leader: LeaderElectionConfig,
+    readiness: ControlPlaneReadiness,
     cluster_stop: tokio_util::sync::CancellationToken,
     stop: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     let election = LeaderElection::from_client(client.clone(), leader)?;
+    // Leader-election config validated: in active/standby HA mode, standby replicas serve
+    // stateless API requests behind the shared Service while campaigning on the Lease, so gating
+    // `/readyz` on winning the Lease would deadlock `helm upgrade --wait` for `replicaCount > 1`.
+    // The standby gate is marked only after a live foreign leader is observed; the leader clears
+    // it and must then complete its own controller watches before it reports ready.
+    let standby_readiness = readiness.clone();
     // `stop` is owned by the caller (`ControlPlane::run` wires it to `SIGINT`/`SIGTERM`): releasing
     // the lease (and cancelling the leader token) is `Leadership::hold`'s job, so the release happens
     // in one place, and a CLI that stops the API server stops the lease too.
@@ -978,20 +1006,22 @@ async fn run_as_leader(
 
     loop {
         let Some(term) = election
-            .campaign(&stop)
+            .campaign_with(&stop, || standby_readiness.mark_standby_serving())
             .await
             .context("leader election failed")?
         else {
             break;
         };
+        readiness.clear_standby_serving();
         let token = term.token();
         // Boxed so one `select!` can poll both halves without moving either: the controller set has
         // to be awaited *after* the term ends, so in-flight passes drain like a `SIGTERM`.
-        let mut controllers = Box::pin(controller::run_as_leader(
+        let mut controllers = Box::pin(controller::run_as_leader_with_readiness(
             client.clone(),
             config.clone(),
             ctx.clone(),
             token.clone(),
+            readiness.clone(),
         ));
         let mut hold = Box::pin(term.hold(&stop));
         let outcome = match race_term(&mut controllers, &mut hold, &token).await {

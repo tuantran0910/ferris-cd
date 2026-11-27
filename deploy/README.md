@@ -460,6 +460,8 @@ Exposed families — and nothing else:
 | `ferriscd_git_fetch_duration_seconds` | histogram | *(none)* |
 | `ferriscd_render_cache_total` | counter | `outcome` = `hit` \| `miss` |
 | `ferriscd_active_reconciles` | gauge | *(none)* |
+| `ferriscd_rbac_reload_total` | counter | `outcome` = `ok` \| `error` \| `deleted` |
+| `ferriscd_rbac_watch_errors_total` | counter | *(none)* |
 
 Operational notes:
 
@@ -468,7 +470,7 @@ Operational notes:
   the only free-form labels are the `Application`'s own `metadata.namespace`/`metadata.name`. Series
   therefore grow with the number of `Application`s, never with commits, failures, resources or
   scrapes. The two per-`Application` families exist **after a pass has observed that
-  `Application`** (a status nobody observed is never invented); the other five are exported from
+  `Application`** (a status nobody observed is never invented); the other seven are exported from
   startup with zero values, so a "no data yet" alert does not fire on a fresh pod.
 * **Prometheus scraping fails loudly if the listener dies.** The metrics server is an independent
   Tokio task, and its failure cancels the controller's own shutdown path instead of leaving a

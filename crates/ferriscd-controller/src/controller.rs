@@ -621,7 +621,7 @@ pub async fn run(
 ) -> Result<(), crate::ShutdownError> {
     let stop = CancellationToken::new();
     spawn_shutdown_listener(stop.clone());
-    run_until(client, config, ctx, stop).await
+    run_until_with_readiness(client, config, ctx, stop, None).await
 }
 
 /// Runs the controller set for **one leader term** (`T13.2`).
@@ -639,7 +639,24 @@ pub async fn run_as_leader(
     ctx: Arc<ReconcileContext>,
     token: CancellationToken,
 ) -> Result<(), crate::ShutdownError> {
-    run_until(client, config, ctx, token).await
+    run_until_with_readiness(client, config, ctx, token, None).await
+}
+
+/// Same as [`run_as_leader`], additionally signalling [`ControlPlaneReadiness::mark_controllers_ready`](crate::ControlPlaneReadiness::mark_controllers_ready)
+/// once every watched `Application` reflector store completes `InitDone` (`T17.1`).
+///
+/// # Errors
+///
+/// Returns [`crate::ShutdownError::DrainTimeout`] when a reconcile is still running after
+/// `config.drain_timeout`.
+pub async fn run_as_leader_with_readiness(
+    client: Client,
+    config: ControllerConfig,
+    ctx: Arc<ReconcileContext>,
+    token: CancellationToken,
+    readiness: crate::ControlPlaneReadiness,
+) -> Result<(), crate::ShutdownError> {
+    run_until_with_readiness(client, config, ctx, token, Some(readiness)).await
 }
 
 /// Drives the controller set until `stop` is cancelled, then drains in-flight reconciles.
@@ -648,11 +665,12 @@ pub async fn run_as_leader(
 ///
 /// Returns [`crate::ShutdownError::DrainTimeout`] when a reconcile is still running after
 /// `config.drain_timeout`.
-async fn run_until(
+async fn run_until_with_readiness(
     client: Client,
     config: ControllerConfig,
     ctx: Arc<ReconcileContext>,
     stop: CancellationToken,
+    readiness_gate: Option<crate::ControlPlaneReadiness>,
 ) -> Result<(), crate::ShutdownError> {
     let drain_timeout = config.drain_timeout;
     let controllers = build_controllers(client, &config);
@@ -699,11 +717,16 @@ async fn run_until(
     // completed its first list, and a watch that dies before that is reported instead of hidden.
     let readiness = async move {
         match readiness.await {
-            Ok(objects) => tracing::info!(
-                scopes = ?scopes,
-                objects = ?objects,
-                "every Application watch is ready"
-            ),
+            Ok(objects) => {
+                if let Some(gate) = readiness_gate {
+                    gate.mark_controllers_ready();
+                }
+                tracing::info!(
+                    scopes = ?scopes,
+                    objects = ?objects,
+                    "every Application watch is ready"
+                );
+            }
             Err(err) => tracing::warn!(
                 error = %err,
                 "an Application watch ended before it became ready"

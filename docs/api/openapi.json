@@ -600,12 +600,12 @@
         "tags": [
           "platform"
         ],
-        "summary": "Lists every addressable cluster: `in-cluster` plus every registered registration (`T13.1`).",
-        "description": "The cluster registry: `in-cluster` first, then every registered cluster name.",
+        "summary": "Lists addressable clusters visible to the caller's authorized `AppProject`s (`T13.1`, `T17.1`).",
+        "description": "The cluster registry filtered to clusters permitted by the caller's visible `AppProject`s: `in-cluster` first, then matching registered cluster names.",
         "operationId": "list_clusters",
         "responses": {
           "200": {
-            "description": "The cluster registry",
+            "description": "Project-visible clusters",
             "content": {
               "application/json": {
                 "schema": {
@@ -616,6 +616,16 @@
           },
           "401": {
             "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The cluster could not be read",
             "content": {
               "application/json": {
                 "schema": {
@@ -896,8 +906,7 @@
         "tags": [
           "health"
         ],
-        "summary": "Readiness probe: `503` until the readiness seam says the control plane can serve traffic.",
-        "description": "**Limitation, tracked as `TODO(T15.x)`:** readiness is the API server's own verdict (the router\nanswers, and the seam wired today is [`crate::state::ServingReadiness`]). It does **not** yet\nreflect controller watch readiness — whether the `Application`/`AppProject` watches (and, with\n`T13.1`, the cluster-registry `Secret` watch) have completed their initial list. So a pod can\nreport `ready` while its controller is still listing: a client may observe an empty\n`/api/v1/applications` for a few seconds after a restart. `T15.x` (health/metrics) is where the\nwatch state becomes part of this answer; until then the false-`ready` window is bounded by the\ninitial list and nothing is served from a cache.",
+        "summary": "Readiness probe: `503` until the control plane's startup gates (`Application` watches,\n`ClusterManager` initial `Secret` seed, and initial `ferriscd-rbac-cm` load) have all completed\n`InitDone` (`T17.1`).",
         "operationId": "readyz",
         "responses": {
           "200": {
