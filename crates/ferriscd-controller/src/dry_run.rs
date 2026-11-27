@@ -138,6 +138,14 @@ pub enum DryRunOutcome {
         /// Parsed conflicts, never empty (an unparseable `409` yields one unknown entry).
         conflicts: Vec<FieldConflict>,
     },
+    /// The API server rejected the dry-run with `422 Invalid` because an immutable field changed
+    /// (`immutable: true` `ConfigMap`/`Secret`, `Job.spec.template`, `StatefulSet.spec.*`).
+    ///
+    /// Falling back to a local canonical diff against the desired body keeps `GET .../diff` usable
+    /// (with full `Secret` redaction) and lets the sync stage either execute `SyncAction::Replace`
+    /// when `ferriscd.io/sync-options: Replace=true` is set, or fail cleanly during apply with the
+    /// actionable `Replace=true` guidance.
+    ImmutableField,
 }
 
 impl std::fmt::Debug for DryRunOutcome {
@@ -150,6 +158,7 @@ impl std::fmt::Debug for DryRunOutcome {
                 .debug_struct("DryRunOutcome::Conflict")
                 .field("conflicts", conflicts)
                 .finish(),
+            Self::ImmutableField => f.write_str("DryRunOutcome::ImmutableField"),
         }
     }
 }
@@ -340,6 +349,11 @@ fn classify_result(
         Err(kube::Error::Api(status)) if status.code == 409 => Ok(DryRunOutcome::Conflict {
             conflicts: parse_conflict_status(&status),
         }),
+        Err(kube::Error::Api(status))
+            if crate::sync_recovery::is_immutable_field_error(&status) =>
+        {
+            Ok(DryRunOutcome::ImmutableField)
+        }
         Err(err) => Err(DryRunError::api(key, &err)),
     }
 }
@@ -653,6 +667,31 @@ impl DryRunEvaluator {
             }
             DryRunOutcome::Conflict { conflicts } => {
                 ResourceDiff::conflicted(key.clone(), conflicts)
+            }
+            DryRunOutcome::ImmutableField => {
+                // Kubernetes rejected the in-place SSA dry-run because an immutable field changed
+                // (`422 Invalid`). Compare live against the desired apply body locally so the diff
+                // stays visible (and Secret-redacted) and the sync executor can either run
+                // `Replace=true` or report the actionable immutable-field guidance.
+                let live_document = document(live_object, key)?;
+                let desired_document = document(&body, key)?;
+                let diff = ResourceDiff::compare(key, &live_document, &desired_document, rules);
+                if diff.is_synced()
+                    && ResourceDiff::compare(
+                        key,
+                        &live_document,
+                        &desired_document,
+                        &IgnoreRuleSet::default(),
+                    )
+                    .is_synced()
+                {
+                    // No local field diff existed (and `ignoreDifferences` did not suppress one),
+                    // yet Kubernetes rejected the SSA dry-run as immutable (for example, a mutating
+                    // admission webhook modified an immutable field). Never masquerade as `Synced`.
+                    ResourceDiff::immutable(key.clone())
+                } else {
+                    diff
+                }
             }
         })
     }
@@ -1613,6 +1652,215 @@ mod tests {
         assert!(err.is_retryable());
     }
 
+    #[test]
+    fn classify_result_turns_an_immutable_422_into_immutable_field_outcome() {
+        let config_map_key = key("", "ConfigMap", Some("payments"), "immutable");
+        let immutable = status_from(json!({
+            "status": "Failure",
+            "message": "ConfigMap \"immutable\" is invalid: data: Forbidden: field is immutable when `immutable` is set",
+            "reason": "Invalid",
+            "code": 422,
+        }));
+        let outcome = classify_result(Err(kube::Error::Api(Box::new(immutable))), &config_map_key)
+            .expect("immutable-field 422 must classify instead of aborting dry-run");
+        assert!(matches!(outcome, DryRunOutcome::ImmutableField));
+
+        // Non-immutable 422s remain terminal API errors.
+        let other_invalid = status_from(json!({
+            "status": "Failure",
+            "message": "ConfigMap \"settings\" is invalid: data[bad]: Invalid value",
+            "reason": "Invalid",
+            "code": 422,
+        }));
+        let err = classify_result(
+            Err(kube::Error::Api(Box::new(other_invalid))),
+            &config_map_key,
+        )
+        .expect_err("non-immutable 422 must remain a DryRunError");
+        assert!(matches!(err, DryRunError::Api { code: 422, .. }), "{err}");
+        assert!(!err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn immutable_field_dry_run_falls_back_to_redacted_local_diff() {
+        let cm_key = key("", "ConfigMap", Some("payments"), "immutable");
+        let desired_cm = desired(
+            "",
+            "v1",
+            "ConfigMap",
+            Some("payments"),
+            "immutable",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": "immutable", "namespace": "payments" },
+                "immutable": true,
+                "data": { "key": "b" },
+            }),
+        );
+        let live_cm = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "immutable",
+                "namespace": "payments",
+                "resourceVersion": "42",
+                "uid": "abc",
+            },
+            "immutable": true,
+            "data": { "key": "a" },
+        });
+        let fake = Arc::new(FakeDryRun::default());
+        fake.responses
+            .lock()
+            .unwrap()
+            .insert(cm_key.canonical(), DryRunOutcome::ImmutableField);
+
+        let live = live_map(vec![(
+            cm_key.clone(),
+            present(live_cm, Ownership::OwnedBySelf),
+        )]);
+        let diffs = evaluate(&fake, std::slice::from_ref(&desired_cm), &[], &live).await;
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].status(), &DiffStatus::OutOfSync);
+        assert!(
+            diffs[0].changes().iter().any(|c| c.path == "/data/key"),
+            "expected /data/key diff, got: {:?}",
+            diffs[0].changes()
+        );
+    }
+
+    /// Trap T4: an immutable `v1/Secret` falling back to local diff must redact all `.data` /
+    /// `.stringData` values from `changes()`, `Debug`, and JSON serialization.
+    #[tokio::test]
+    async fn immutable_field_dry_run_redacts_secret_values() {
+        const OLD_B64: &str = "b2xkLXNlY3JldC10b2tlbi12YWx1ZQ==";
+        const NEW_B64: &str = "bmV3LXNlY3JldC10b2tlbi12YWx1ZQ==";
+
+        let secret_key = key("", "Secret", Some("payments"), "immutable-creds");
+        let desired_secret = desired(
+            "",
+            "v1",
+            "Secret",
+            Some("payments"),
+            "immutable-creds",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": { "name": "immutable-creds", "namespace": "payments" },
+                "immutable": true,
+                "data": { "token": NEW_B64 },
+            }),
+        );
+        let live_secret = json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "immutable-creds",
+                "namespace": "payments",
+                "resourceVersion": "9",
+                "uid": "sec-uid",
+            },
+            "immutable": true,
+            "data": { "token": OLD_B64 },
+        });
+        let fake = Arc::new(FakeDryRun::default());
+        fake.responses
+            .lock()
+            .unwrap()
+            .insert(secret_key.canonical(), DryRunOutcome::ImmutableField);
+
+        let live = live_map(vec![(
+            secret_key.clone(),
+            present(live_secret, Ownership::OwnedBySelf),
+        )]);
+        let diffs = evaluate(&fake, std::slice::from_ref(&desired_secret), &[], &live).await;
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].status(), &DiffStatus::OutOfSync);
+        assert!(
+            diffs[0].changes().iter().any(|c| {
+                c.path == "/data/token"
+                    && c.live
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|v| v.starts_with("***REDACTED(sha256:"))
+                    && c.predicted
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|v| v.starts_with("***REDACTED(sha256:"))
+            }),
+            "Secret diff must carry redacted sha256 placeholders: {:?}",
+            diffs[0].changes()
+        );
+        let debug_rendered = format!("{:?}", diffs[0]);
+        let json_rendered = serde_json::to_string(&diffs[0]).expect("serialize diff");
+        for needle in [OLD_B64, NEW_B64] {
+            assert!(
+                !debug_rendered.contains(needle),
+                "Secret value leaked in Debug: {debug_rendered}"
+            );
+            assert!(
+                !json_rendered.contains(needle),
+                "Secret value leaked in JSON: {json_rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn immutable_field_dry_run_never_silently_reports_synced_without_ignore_rule() {
+        let cm_key = key("", "ConfigMap", Some("payments"), "webhook-immutable");
+        let same_doc = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "webhook-immutable", "namespace": "payments" },
+            "immutable": true,
+            "data": { "key": "same" },
+        });
+        let desired_cm = desired(
+            "",
+            "v1",
+            "ConfigMap",
+            Some("payments"),
+            "webhook-immutable",
+            same_doc.clone(),
+        );
+        let fake = Arc::new(FakeDryRun::default());
+        fake.responses
+            .lock()
+            .unwrap()
+            .insert(cm_key.canonical(), DryRunOutcome::ImmutableField);
+
+        let live = live_map(vec![(
+            cm_key.clone(),
+            present(same_doc, Ownership::OwnedBySelf),
+        )]);
+        let diffs = evaluate(&fake, std::slice::from_ref(&desired_cm), &[], &live).await;
+        assert_eq!(
+            diffs[0].status(),
+            &DiffStatus::OutOfSync,
+            "an unexplained immutable 422 must stay OutOfSync so Replace/guidance still runs"
+        );
+
+        // Contrast: when `ignoreDifferences` explicitly suppresses the changed immutable field,
+        // the diff legitimately stays `Synced`.
+        let mut modified = desired_cm.clone();
+        modified.object.data["data"]["key"] = json!("ignored-change");
+        let rules = IgnoreRuleSet::from_ignore_differences(&[ferriscd_crd::IgnoreDifference {
+            kind: "ConfigMap".to_owned(),
+            name: Some("webhook-immutable".to_owned()),
+            namespace: Some("payments".to_owned()),
+            json_pointers: vec!["/data/key".to_owned()],
+            ..ferriscd_crd::IgnoreDifference::default()
+        }]);
+        let ignored =
+            evaluate_with_rules(&fake, std::slice::from_ref(&modified), &live, &rules).await;
+        assert_eq!(
+            ignored[0].status(),
+            &DiffStatus::Synced,
+            "an explicitly ignored field difference stays Synced"
+        );
+    }
+
     /// Finding M2: a `400`/`422` message for a `Secret` can quote the offending value, so it is
     /// never carried verbatim. Every other kind keeps the actionable server text.
     #[test]
@@ -2324,6 +2572,7 @@ mod tests {
             "refusing to run against the non-kind context '{context}'"
         );
 
+        crate::impersonation::ensure_crypto_provider();
         let client = kube::Client::try_default()
             .await
             .expect("kubeconfig must point at the kind cluster");
@@ -2338,25 +2587,31 @@ mod tests {
             "default",
             &api_resource("", "v1", "ConfigMap"),
         );
+        // Clean up any leftover smoke ConfigMap from a previously aborted run.
+        let _ = config_maps
+            .delete("ferriscd-diff-smoke", &kube::api::DeleteParams::default())
+            .await;
+        let initial_manifest = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "ferriscd-diff-smoke", "namespace": "default" },
+            "data": { "owner": "kubectl" },
+        });
         let created = config_maps
             .patch(
                 "ferriscd-diff-smoke",
                 &PatchParams::apply("kubectl-client-side-apply"),
-                &Patch::Apply(serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "ConfigMap",
-                    "metadata": { "name": "ferriscd-diff-smoke", "namespace": "default" },
-                    "data": { "owner": "kubectl" },
-                })),
+                &Patch::Apply(initial_manifest.clone()),
             )
             .await
             .expect("the smoke-test ConfigMap must be created");
 
         // (1) A desired object identical to live (the API server defaulted nothing else here)
         //     must produce zero diff.
+        let created_json = serde_json::to_value(&created).expect("serialize live ConfigMap");
         let live = live_map(vec![(
             config_map_key.clone(),
-            present(created.data.clone(), Ownership::OwnedBySelf),
+            present(created_json, Ownership::OwnedBySelf),
         )]);
         let matching = desired(
             "",
@@ -2364,7 +2619,7 @@ mod tests {
             "ConfigMap",
             Some("default"),
             "ferriscd-diff-smoke",
-            created.data.clone(),
+            initial_manifest.clone(),
         );
         let evaluator = DryRunEvaluator::new(client.clone(), discovery);
         let diffs = evaluator
@@ -2384,7 +2639,7 @@ mod tests {
         );
 
         // (2) Changing a field another manager owns must be reported as a structured conflict.
-        let mut conflicting = created.data.clone();
+        let mut conflicting = initial_manifest;
         conflicting["data"]["owner"] = json!("ferriscd");
         let conflicting = desired(
             "",
@@ -2416,24 +2671,26 @@ mod tests {
         // (3) An `ignoreDifferences` rule must remove an HPA-style difference cleanly: the same
         //     field manager applied `data.tuning`, so the dry-run predicts the *new* value
         //     (no conflict) and only the comparison decides.
+        let tuned_manifest = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "ferriscd-diff-smoke", "namespace": "default" },
+            "data": { "tuning": "a" },
+        });
         let tuned = config_maps
             .patch(
                 "ferriscd-diff-smoke",
                 &PatchParams::apply("ferriscd"),
-                &Patch::Apply(serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "ConfigMap",
-                    "metadata": { "name": "ferriscd-diff-smoke", "namespace": "default" },
-                    "data": { "tuning": "a" },
-                })),
+                &Patch::Apply(tuned_manifest.clone()),
             )
             .await
             .expect("applying the tuned key as `ferriscd` must succeed");
+        let tuned_json = serde_json::to_value(&tuned).expect("serialize tuned ConfigMap");
         let live = live_map(vec![(
             config_map_key.clone(),
-            present(tuned.data.clone(), Ownership::OwnedBySelf),
+            present(tuned_json, Ownership::OwnedBySelf),
         )]);
-        let mut retuned = tuned.data.clone();
+        let mut retuned = tuned_manifest;
         retuned["data"]["tuning"] = json!("b");
         let retuned = desired(
             "",

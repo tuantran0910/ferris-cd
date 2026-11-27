@@ -346,6 +346,18 @@ impl ResourceDiff {
         Self::assemble(key, DiffStatus::OutOfSync, Vec::new(), conflicts, false)
     }
 
+    /// A resource whose SSA dry-run failed with `422 Invalid` on an immutable field even though no
+    /// local canonical difference was visible (for example, a mutating admission webhook altered an
+    /// immutable field during dry-run).
+    ///
+    /// Marking it [`DiffStatus::OutOfSync`] guarantees the sync stage either executes
+    /// `SyncAction::Replace` (when `ferriscd.io/sync-options: Replace=true` is set) or surfaces the
+    /// actionable apply-time `Replace=true` guidance instead of silently reporting `Synced`.
+    #[must_use]
+    pub fn immutable(key: ResourceKey) -> Self {
+        Self::assemble(key, DiffStatus::OutOfSync, Vec::new(), Vec::new(), false)
+    }
+
     /// The version-agnostic identity of the resource.
     #[must_use]
     pub fn key(&self) -> &ResourceKey {

@@ -352,24 +352,44 @@ impl Harness {
         let _ = kubectl(&[
             "-n",
             CONTROL_NAMESPACE,
+            "patch",
+            "application",
+            name,
+            "--type=merge",
+            "-p",
+            r#"{"metadata":{"finalizers":[]}}"#,
+        ]);
+        let _ = kubectl(&[
+            "-n",
+            CONTROL_NAMESPACE,
             "delete",
             "application",
             name,
             "--ignore-not-found=true",
-            "--timeout=120s",
+            "--timeout=30s",
         ]);
         apply_manifest(&application_manifest(name, repo_url));
     }
 
-    /// Runs one reconcile exactly as the controller's finalizer gate would.
+    /// Runs reconcile through the controller's finalizer gate: when the `Application` does not yet
+    /// carry `ferriscd.io/finalizer`, the first `reconcile_instance` call only attaches it, so a
+    /// second call runs `Apply` against the persisted object.
     async fn reconcile(
         &self,
         name: &str,
     ) -> Result<(), ferriscd_controller::reconcile::ControllerError> {
         let app = self.read_application(name).await;
-        reconcile_instance(Arc::new(app), self.ctx.clone())
-            .await
-            .map(|_action| ())
+        let had_finalizer = app.metadata.finalizers.as_ref().is_some_and(|finalizers| {
+            finalizers
+                .iter()
+                .any(|item| item == "ferriscd.io/finalizer")
+        });
+        reconcile_instance(Arc::new(app), self.ctx.clone()).await?;
+        if !had_finalizer {
+            let app = self.read_application(name).await;
+            reconcile_instance(Arc::new(app), self.ctx.clone()).await?;
+        }
+        Ok(())
     }
 
     async fn read_application(&self, name: &str) -> Application {
@@ -513,11 +533,21 @@ impl ClusterCleanup {
             let _ = kubectl(&[
                 "-n",
                 CONTROL_NAMESPACE,
+                "patch",
+                "application",
+                name,
+                "--type=merge",
+                "-p",
+                r#"{"metadata":{"finalizers":[]}}"#,
+            ]);
+            let _ = kubectl(&[
+                "-n",
+                CONTROL_NAMESPACE,
                 "delete",
                 "application",
                 name,
                 "--ignore-not-found=true",
-                "--timeout=120s",
+                "--timeout=30s",
             ]);
         }
         for name in [SECRET_NAME, MALFORMED_SECRET_NAME, UNLABELED_SECRET_NAME] {

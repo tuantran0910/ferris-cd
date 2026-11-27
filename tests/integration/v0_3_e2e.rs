@@ -130,7 +130,7 @@ fn the_v0_3_invariants_hold_end_to_end() {
         "a Secret declared with stringData must be Synced (normalized to base64 .data)"
     );
 
-    // (1) self-heal ON: a manual edit is reverted.
+    // (1) self-heal ON: a manual edit to a Git-managed key is reverted.
     kubectl(&[
         "patch",
         "configmap",
@@ -139,12 +139,12 @@ fn the_v0_3_invariants_hold_end_to_end() {
         PRUNE_NAMESPACE,
         "--type=merge",
         "-p",
-        "{\"data\":{\"DRIFTED\":\"yes\"}}",
+        "{\"data\":{\"APP_ENV\":\"drifted\"}}",
     ]);
     wait_for(
         Duration::from_secs(300),
         "self-heal to revert the manual edit",
-        || configmap_data("settings", PRUNE_NAMESPACE, "DRIFTED").is_none(),
+        || configmap_data("settings", PRUNE_NAMESPACE, "APP_ENV").as_deref() == Some("demo"),
     );
 
     // (2) prune: the removed resource is deleted when prune is on...
@@ -175,7 +175,7 @@ fn the_v0_3_invariants_hold_end_to_end() {
         PRUNE_NAMESPACE,
         "--type=merge",
         "-p",
-        "{\"data\":{\"DRIFTED\":\"still-here\"}}",
+        "{\"data\":{\"APP_ENV\":\"still-here\"}}",
     ]);
     wait_for(
         Duration::from_secs(300),
@@ -183,7 +183,7 @@ fn the_v0_3_invariants_hold_end_to_end() {
         || sync_status("e2e-diff").as_deref() == Some("OutOfSync"),
     );
     assert_eq!(
-        configmap_data("settings", PRUNE_NAMESPACE, "DRIFTED").as_deref(),
+        configmap_data("settings", PRUNE_NAMESPACE, "APP_ENV").as_deref(),
         Some("still-here"),
         "with selfHeal: false the manual edit is reported, never reverted"
     );
@@ -196,7 +196,7 @@ fn the_v0_3_invariants_hold_end_to_end() {
         PRUNE_NAMESPACE,
         "--type=merge",
         "-p",
-        "{\"data\":{\"DRIFTED\":null}}",
+        "{\"data\":{\"APP_ENV\":\"demo\"}}",
     ]);
     set_self_heal("e2e-diff", true);
     delete_application("e2e-diff");
@@ -310,8 +310,11 @@ fn the_v0_3_invariants_hold_end_to_end() {
     );
     wait_for(
         Duration::from_secs(600),
-        "the Application to report Healthy again",
-        || health_status("e2e-waves").as_deref() == Some("Healthy"),
+        "the Application to report Healthy and settle the fixed revision",
+        || {
+            health_status("e2e-waves").as_deref() == Some("Healthy")
+                && operation_phase("e2e-waves").as_deref() == Some("Succeeded")
+        },
     );
 
     // ---------------------------------------------------------------------
@@ -321,11 +324,15 @@ fn the_v0_3_invariants_hold_end_to_end() {
     let v2_waves = set_configmap_version_and_commit(waves_repo, "v1");
     wait_for(
         Duration::from_secs(300),
-        "the versioned revision to sync",
-        || synced_revision("e2e-waves").as_deref() == Some(v2_waves.as_str()),
+        "the versioned revision to sync and settle",
+        || {
+            synced_revision("e2e-waves").as_deref() == Some(v2_waves.as_str())
+                && configmap_data("settings", WAVES_NAMESPACE, "VERSION").as_deref() == Some("v1")
+                && operation_phase("e2e-waves").as_deref() == Some("Succeeded")
+        },
     );
     let rollback_id = history_id_for("e2e-waves", &v1_waves)
-        .expect("the first deployment must be in status.history");
+        .expect("the settled v1_waves deployment must be in status.history");
     set_annotation(
         "e2e-waves",
         "ferriscd.io/operation",
@@ -333,13 +340,17 @@ fn the_v0_3_invariants_hold_end_to_end() {
     );
     wait_for(
         Duration::from_secs(300),
-        "the rollback to redeploy the historical commit",
-        || synced_revision("e2e-waves").as_deref() == Some(v1_waves.as_str()),
+        "the rollback to redeploy the historical commit and settle",
+        || {
+            synced_revision("e2e-waves").as_deref() == Some(v1_waves.as_str())
+                && configmap_data("settings", WAVES_NAMESPACE, "VERSION").as_deref() == Some("v0")
+                && operation_phase("e2e-waves").as_deref() == Some("Succeeded")
+        },
     );
     assert_eq!(
         configmap_data("settings", WAVES_NAMESPACE, "VERSION").as_deref(),
-        Some("v1"),
-        "the historical manifest must actually be applied"
+        Some("v0"),
+        "the historical manifest (VERSION=v0 at v1_waves) must actually be applied"
     );
     assert!(
         !application_spec_json("e2e-waves").contains("\"automated\""),
@@ -352,21 +363,17 @@ fn the_v0_3_invariants_hold_end_to_end() {
 
     // The stability property: three more reconcile rounds must not move the revision back to HEAD.
     //
-    // `metadata.resourceVersion` strictly increases on **every** API write, so it is what proves a
-    // *new* reconcile round actually happened — `observedGeneration` cannot serve as a progress
-    // counter: it mirrors `metadata.generation`, i.e. the latest spec the controller has seen, and a
-    // pass that changes nothing does not bump it. The loop therefore advances on `resourceVersion`
-    // and additionally pins `observedGeneration` to the current spec generation, so a status write
-    // that stops observing the spec is caught too.
-    let mut version =
-        resource_version("e2e-waves").expect("the pass that applied the rollback wrote /status");
+    // Kubernetes optimizes away a `/status` patch whose resulting object is byte-identical to the
+    // stored one, so a no-op requeue does **not** bump `metadata.resourceVersion`. Trigger three
+    // real reconcile rounds via `ferriscd.io/refresh` (which exercises the composite watch
+    // predicate) and wait one `requeueAfterSeconds` cycle per round so periodic requeues also run.
     for round in 0..3 {
-        wait_for(
-            Duration::from_secs(120),
-            &format!("reconcile round {round} to patch /status again"),
-            || resource_version("e2e-waves").is_some_and(|current| current > version),
+        set_annotation(
+            "e2e-waves",
+            "ferriscd.io/refresh",
+            &format!("rollback-stability-{round}"),
         );
-        version = resource_version("e2e-waves").expect("a resourceVersion after the round");
+        std::thread::sleep(Duration::from_secs(6));
         let observed = observed_generation("e2e-waves")
             .expect("the status must record the generation it observed");
         let generation =
@@ -376,14 +383,19 @@ fn the_v0_3_invariants_hold_end_to_end() {
             "round {round}: the status must report the generation it observed"
         );
         assert_eq!(
-            synced_revision("e2e-waves").as_deref(),
+            application_field("e2e-waves", "{.status.sync.lastSyncedRevision}").as_deref(),
             Some(v1_waves.as_str()),
-            "round {round}: the pinned revision must not flip back to HEAD"
+            "round {round}: the pinned lastSyncedRevision must not flip back to HEAD"
+        );
+        assert_eq!(
+            configmap_data("settings", WAVES_NAMESPACE, "VERSION").as_deref(),
+            Some("v0"),
+            "round {round}: the live ConfigMap must stay on the rolled-back revision"
         );
     }
     assert_eq!(
         configmap_data("settings", WAVES_NAMESPACE, "VERSION").as_deref(),
-        Some("v1"),
+        Some("v0"),
         "the rollback stays applied across requeues"
     );
 
@@ -396,7 +408,30 @@ struct ClusterCleanup;
 impl ClusterCleanup {
     fn new() -> Self {
         // Start from a clean slate so a previous aborted run cannot mask a failure.
+        Self::delete_all(false);
+        Self
+    }
+
+    fn delete_all(include_crd: bool) {
+        if include_crd {
+            let _ = kubectl(&[
+                "delete",
+                "crd",
+                "widgets.example.com",
+                "--ignore-not-found=true",
+            ]);
+        }
         for name in ["e2e-diff", "e2e-waves"] {
+            let _ = kubectl(&[
+                "patch",
+                "application",
+                name,
+                "-n",
+                CONTROL_NAMESPACE,
+                "--type=merge",
+                "-p",
+                r#"{"metadata":{"finalizers":[]}}"#,
+            ]);
             let _ = kubectl(&[
                 "delete",
                 "application",
@@ -404,6 +439,7 @@ impl ClusterCleanup {
                 "-n",
                 CONTROL_NAMESPACE,
                 "--ignore-not-found=true",
+                "--timeout=30s",
             ]);
         }
         for namespace in [WAVES_NAMESPACE, PRUNE_NAMESPACE] {
@@ -417,38 +453,12 @@ impl ClusterCleanup {
                 "--timeout=120s",
             ]);
         }
-        Self
     }
 }
 
 impl Drop for ClusterCleanup {
     fn drop(&mut self) {
-        let _ = kubectl(&[
-            "delete",
-            "crd",
-            "widgets.example.com",
-            "--ignore-not-found=true",
-        ]);
-        for name in ["e2e-diff", "e2e-waves"] {
-            let _ = kubectl(&[
-                "delete",
-                "application",
-                name,
-                "-n",
-                CONTROL_NAMESPACE,
-                "--ignore-not-found=true",
-            ]);
-        }
-        for namespace in [WAVES_NAMESPACE, PRUNE_NAMESPACE] {
-            let _ = kubectl(&[
-                "delete",
-                "namespace",
-                namespace,
-                "--ignore-not-found=true",
-                // Blocking delete (finding M2): see `ClusterCleanup::new`.
-                "--timeout=120s",
-            ]);
-        }
+        Self::delete_all(true);
     }
 }
 
@@ -467,6 +477,8 @@ impl ControllerProcess {
                 // Explicit opt-in: the fixtures are local repositories, which the production URL
                 // policy rejects on purpose.
                 "--allow-local-repos",
+                "--metrics-addr",
+                "127.0.0.1:0",
             ])
             .env("RUST_LOG", "info")
             .stdout(Stdio::inherit())
@@ -539,6 +551,7 @@ fn write_diff_fixture(repo: &Path) -> String {
 
 /// Applies a ConfigMap stamped with another `Application`'s `tracking-id`.
 fn apply_owned_configmap() {
+    ensure_namespace(PRUNE_NAMESPACE);
     let manifest = format!(
         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: foreign-owned\n  namespace: {PRUNE_NAMESPACE}\n  annotations:\n    ferriscd.io/tracking-id: \"{CONTROL_NAMESPACE}/someone-else:/ConfigMap:{PRUNE_NAMESPACE}/foreign-owned\"\ndata:\n  owner: someone-else\n"
     );
@@ -769,6 +782,8 @@ fn apply_application(name: &str, repo: &Path, namespace: &str) {
          \x20     selfHeal: true\n\
          \x20   syncOptions:\n\
          \x20     createNamespace: true\n\
+         \x20     takeoverFieldManagers:\n\
+         \x20       - kubectl-patch\n\
          \x20 requeueAfterSeconds: 5\n\
          \x20 revisionHistoryLimit: 20\n"
     );
@@ -897,7 +912,7 @@ fn operation_phase(name: &str) -> Option<String> {
 fn active_hooks(name: &str) -> Vec<(String, String)> {
     let rendered = application_field(
         name,
-        "{range .status.operationState.activeHooks[*]}{.syncPhase}={.generatedName};{end}",
+        "{range .status.operationState.activeHooks[*]}{.phase}={.generatedName};{end}",
     )
     .unwrap_or_default();
     rendered
@@ -930,18 +945,6 @@ fn observed_generation(name: &str) -> Option<i64> {
 /// `metadata.generation` of the `Application` itself.
 fn application_generation(name: &str) -> Option<i64> {
     application_field(name, "{.metadata.generation}")?
-        .trim()
-        .parse()
-        .ok()
-}
-
-/// `metadata.resourceVersion`, the monotonic etcd revision of the object.
-///
-/// Every write bumps it — including a `/status`-only patch — so it is what proves a *new* reconcile
-/// pass happened. `status.observedGeneration` cannot: it mirrors `metadata.generation`, which only
-/// moves when the *spec* changes.
-fn resource_version(name: &str) -> Option<i64> {
-    application_field(name, "{.metadata.resourceVersion}")?
         .trim()
         .parse()
         .ok()
