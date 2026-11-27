@@ -3,6 +3,7 @@ import type { paths } from "./schema";
 import type {
   ApiErrorBody,
   ApplicationDetailView,
+  ApplicationEventListView,
   ApplicationListView,
   ClusterListView,
   DiffView,
@@ -58,6 +59,11 @@ export interface FerrisApiClient {
   getApplication: (namespace: string, name: string) => Promise<ApplicationDetailView>;
   getResources: (namespace: string, name: string) => Promise<ResourceGraphView>;
   getDiff: (namespace: string, name: string) => Promise<DiffView>;
+  /** `GET .../events`: the bounded, redacted Kubernetes events timeline (`T17.3`). */
+  getApplicationEvents: (
+    namespace: string,
+    name: string,
+  ) => Promise<ApplicationEventListView>;
   syncApplication: (
     namespace: string,
     name: string,
@@ -162,6 +168,19 @@ export function createFerrisApiClient(options: FerrisClientOptions): FerrisApiCl
     async getDiff(namespace, name) {
       const { data, error, response } = await raw.GET(
         "/api/v1/applications/{namespace}/{name}/diff",
+        {
+          params: { path: { namespace, name } },
+        },
+      );
+      if (error || !data) {
+        throw extractApiError(error, response);
+      }
+      return data;
+    },
+
+    async getApplicationEvents(namespace, name) {
+      const { data, error, response } = await raw.GET(
+        "/api/v1/applications/{namespace}/{name}/events",
         {
           params: { path: { namespace, name } },
         },

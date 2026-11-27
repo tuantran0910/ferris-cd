@@ -5,6 +5,8 @@ import type { FerrisApiClient } from "../api/client";
 import { AuthProvider, useAuth } from "../auth/AuthContext";
 import { ApplicationDetailPage } from "../features/applications/ApplicationDetailPage";
 import { ApplicationsPage } from "../features/applications/ApplicationsPage";
+import { ClustersPage } from "../features/clusters/ClustersPage";
+import { ProjectsPage } from "../features/projects/ProjectsPage";
 import { ApiErrorBoundary } from "../ui/ApiErrorBoundary";
 import { Layout } from "./Layout";
 import { LoginScreen } from "./LoginScreen";
@@ -28,6 +30,8 @@ function AuthenticatedRoutes() {
       <Routes>
         <Route element={<Layout />}>
           <Route path="/" element={<ApplicationsPage />} />
+          <Route path="/projects" element={<ProjectsPage />} />
+          <Route path="/clusters" element={<ClustersPage />} />
           <Route
             path="/applications/:namespace/:name"
             element={<ApplicationDetailPage />}

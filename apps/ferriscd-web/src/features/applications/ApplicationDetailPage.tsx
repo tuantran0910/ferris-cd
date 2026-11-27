@@ -7,12 +7,14 @@ import {
   RefreshCw,
   RotateCcw,
   ShieldOff,
+  TriangleAlert,
 } from "lucide-react";
-import { useState, type ReactNode } from "react";
-import { Link, useLocation, useParams } from "react-router-dom";
+import { useCallback, useState, type ReactNode } from "react";
+import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
 import { useAuth } from "../../auth/AuthContext";
 import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Button } from "../../ui/Button";
+import { LiveRegion } from "../../ui/LiveRegion";
 import { Skeleton } from "../../ui/Skeleton";
 import { HealthStatusBadge, SyncStatusBadge } from "../../ui/StatusBadges";
 import { DiffViewer } from "../diff/DiffViewer";
@@ -20,17 +22,32 @@ import { ResourceGraph } from "../resources/ResourceGraph";
 import { RollbackModal } from "../sync/RollbackModal";
 import { SyncModal } from "../sync/SyncModal";
 import { ConditionsList } from "./components/ConditionsList";
+import { EventsTimeline } from "./components/EventsTimeline";
 import { HistoryTable } from "./components/HistoryTable";
 import { OperationBanner } from "./components/OperationBanner";
 import { SourcePanel } from "./components/SourcePanel";
 import {
   useApplicationDetail,
+  useApplicationEvents,
   useDiff,
   useInvalidateAfterOperation,
   useResources,
 } from "./hooks";
 
-type DetailTab = "resources" | "diff" | "conditions" | "history";
+const DETAIL_TABS = [
+  "resources",
+  "diff",
+  "events",
+  "conditions",
+  "history",
+] as const;
+
+type DetailTab = (typeof DETAIL_TABS)[number];
+
+/** The `?tab=` value, or the default tab for anything unrecognised (a stale bookmark). */
+function detailTabFromParam(value: string | null): DetailTab {
+  return DETAIL_TABS.find((tab) => tab === value) ?? "resources";
+}
 
 export function ApplicationDetailPage() {
   const { namespace = "", name = "" } = useParams<{
@@ -68,7 +85,29 @@ function ApplicationDetailContent({
     location.state as { listSearch?: string } | null
   )?.listSearch ?? "";
 
-  const [activeTab, setActiveTab] = useState<DetailTab>("resources");
+  // The active tab lives in the URL (`?tab=events`) so the command palette, a
+  // bookmark, or a link pasted into an incident channel can open a specific
+  // section of a specific application.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const activeTab = detailTabFromParam(searchParams.get("tab"));
+  const selectTab = useCallback(
+    (tab: DetailTab) => {
+      setSearchParams(
+        (previous) => {
+          const next = new URLSearchParams(previous);
+          if (tab === "resources") {
+            next.delete("tab");
+          } else {
+            next.set("tab", tab);
+          }
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
   const [diffFilterKey, setDiffFilterKey] = useState("");
   const [syncModalOpen, setSyncModalOpen] = useState(false);
   const [rollbackModalOpen, setRollbackModalOpen] = useState(false);
@@ -87,6 +126,13 @@ function ApplicationDetailContent({
     activeTab === "resources",
   );
   const diffQuery = useDiff(namespace, name, activeTab === "diff");
+  // The events timeline is one namespaced `list` against the cluster, so it is fetched only while
+  // its tab is open (like the resource graph).
+  const eventsQuery = useApplicationEvents(
+    namespace,
+    name,
+    activeTab === "events",
+  );
   const invalidateAfterOperation = useInvalidateAfterOperation(namespace, name);
 
   if (detailQuery.isLoading) {
@@ -124,6 +170,15 @@ function ApplicationDetailContent({
 
   return (
     <div className="space-y-6">
+      {/* The badges below change on every poll without any user action: the live region is what
+          tells a screen reader operator that the sync or health verdict moved (`T17.3`). */}
+      <LiveRegion
+        message={`${app.name}: sync ${app.sync?.status ?? "Unknown"}, health ${
+          app.health?.status ?? "Unknown"
+        }${operation ? `, operation ${operation.phase}` : ""}.`}
+        data-testid="application-status-live-region"
+      />
+
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="space-y-2">
           <Link
@@ -226,28 +281,39 @@ function ApplicationDetailContent({
       >
         <TabButton
           active={activeTab === "resources"}
-          onClick={() => setActiveTab("resources")}
+          tabKey="resources"
+          onClick={() => selectTab("resources")}
           icon={<GitFork className="h-4 w-4" />}
           label={`Resources (${app.resourceCount})`}
         />
         <TabButton
           active={activeTab === "diff"}
+          tabKey="diff"
           onClick={() => {
             setDiffFilterKey("");
-            setActiveTab("diff");
+            selectTab("diff");
           }}
           icon={<FileDiff className="h-4 w-4" />}
           label="Live Diff"
         />
         <TabButton
+          active={activeTab === "events"}
+          tabKey="events"
+          onClick={() => selectTab("events")}
+          icon={<TriangleAlert className="h-4 w-4" />}
+          label="Events"
+        />
+        <TabButton
           active={activeTab === "conditions"}
-          onClick={() => setActiveTab("conditions")}
+          tabKey="conditions"
+          onClick={() => selectTab("conditions")}
           icon={<Clock className="h-4 w-4" />}
           label={`Conditions (${conditions.length})`}
         />
         <TabButton
           active={activeTab === "history"}
-          onClick={() => setActiveTab("history")}
+          tabKey="history"
+          onClick={() => selectTab("history")}
           icon={<History className="h-4 w-4" />}
           label={`History (${history.length})`}
         />
@@ -255,7 +321,13 @@ function ApplicationDetailContent({
 
       {/* The panel is keyed by tab so switching sections replays the fade
           instead of hard-cutting the content. */}
-      <div role="tabpanel" key={activeTab} className="motion-fade-in">
+      <div
+        role="tabpanel"
+        id="app-tabpanel"
+        aria-labelledby={`app-tab-${activeTab}`}
+        key={activeTab}
+        className="motion-fade-in"
+      >
         {activeTab === "resources" && (
           <div>
             {resourcesQuery.isLoading ? (
@@ -272,7 +344,7 @@ function ApplicationDetailContent({
                 graph={resourcesQuery.data}
                 onInspectDiff={(resourceKey) => {
                   setDiffFilterKey(resourceKey);
-                  setActiveTab("diff");
+                  selectTab("diff");
                 }}
               />
             ) : null}
@@ -293,6 +365,24 @@ function ApplicationDetailContent({
                 key={diffFilterKey}
                 diff={diffQuery.data}
                 initialSearch={diffFilterKey}
+              />
+            ) : null}
+          </div>
+        )}
+
+        {activeTab === "events" && (
+          <div>
+            {eventsQuery.isLoading ? (
+              <Skeleton className="h-64" />
+            ) : eventsQuery.error ? (
+              <ApiErrorAlert
+                error={eventsQuery.error}
+                onRetry={() => void eventsQuery.refetch()}
+              />
+            ) : eventsQuery.data ? (
+              <EventsTimeline
+                events={eventsQuery.data.items ?? []}
+                truncated={eventsQuery.data.truncated}
               />
             ) : null}
           </div>
@@ -325,7 +415,7 @@ function ApplicationDetailContent({
         onForbidden={() => setSyncForbidden(true)}
         onPreviewDiff={() => {
           setDiffFilterKey("");
-          setActiveTab("diff");
+          selectTab("diff");
         }}
         onConfirm={async (body) => {
           const res = await apiClient.syncApplication(
@@ -363,20 +453,48 @@ function ApplicationDetailContent({
 
 function TabButton({
   active,
+  tabKey,
   onClick,
   icon,
   label,
 }: {
   active: boolean;
+  tabKey: string;
   onClick: () => void;
   icon: ReactNode;
   label: string;
 }) {
+  const onKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    const keys = ["ArrowRight", "ArrowLeft", "Home", "End"];
+    if (!keys.includes(event.key)) {
+      return;
+    }
+    event.preventDefault();
+    const tabs = Array.from(
+      event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [],
+    );
+    const index = tabs.indexOf(event.currentTarget);
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? tabs.length - 1
+          : event.key === "ArrowRight"
+            ? (index + 1) % tabs.length
+            : (index - 1 + tabs.length) % tabs.length;
+    tabs[next]?.focus();
+    tabs[next]?.click();
+  };
+
   return (
     <button
       type="button"
       role="tab"
+      id={`app-tab-${tabKey}`}
+      aria-controls="app-tabpanel"
       aria-selected={active}
+      tabIndex={active ? 0 : -1}
+      onKeyDown={onKeyDown}
       onClick={onClick}
       className={`inline-flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-xs font-semibold transition-colors ${
         active

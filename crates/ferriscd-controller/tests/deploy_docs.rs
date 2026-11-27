@@ -299,10 +299,12 @@ fn otlp_tracing_and_kubernetes_events_rbac_are_documented() {
                     && contains(rule, "resources", "events")
                     && contains(rule, "verbs", "create")
                     && contains(rule, "verbs", "patch")
+                    && contains(rule, "verbs", "get")
+                    && contains(rule, "verbs", "list")
             })
     });
     assert!(
         has_events_rule,
-        "the ClusterRole sample must grant create/patch on events.k8s.io/v1 events"
+        "the ClusterRole sample must grant create/patch/get/list on events.k8s.io/v1 events"
     );
 }

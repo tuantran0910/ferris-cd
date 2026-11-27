@@ -5,6 +5,11 @@ import type { ApplicationSummary } from "../../api/types";
 import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Button } from "../../ui/Button";
 import { EmptyState } from "../../ui/EmptyState";
+import { LiveRegion } from "../../ui/LiveRegion";
+import {
+  selectApplicationsData,
+  useApplicationStream,
+} from "./useApplicationStream";
 import { Skeleton } from "../../ui/Skeleton";
 import {
   HealthStatusBadge,
@@ -93,7 +98,14 @@ export function ApplicationsPage() {
     );
   }, [setSearchParams]);
 
-  const { data, isLoading, isFetching, error, refetch } = useApplications();
+  const { status: streamStatus, snapshot: streamedSnapshot } =
+    useApplicationStream();
+  const { data: polledData, isLoading, isFetching, error, refetch } =
+    useApplications(
+      true,
+      streamStatus === "live" ? false : APPLICATIONS_POLL_INTERVAL_MS,
+    );
+  const data = selectApplicationsData(streamStatus, streamedSnapshot, polledData);
 
   const apps: ApplicationSummary[] = useMemo(() => data?.items ?? [], [data]);
 
@@ -165,8 +177,25 @@ export function ApplicationsPage() {
     syncFilter !== ALL ||
     healthFilter !== ALL;
 
+  // Announced on every poll (`T17.3`): the list updates itself, so a screen reader user gets no
+  // other signal that an application moved between sync/health states.
+  const outOfSyncCount = filteredApps.filter(
+    (app) => normalizeSyncStatus(app.sync?.status) === "OutOfSync",
+  ).length;
+  const degradedCount = filteredApps.filter(
+    (app) => normalizeHealthStatus(app.health?.status) === "Degraded",
+  ).length;
+
   return (
     <div className="space-y-6">
+      <LiveRegion
+        message={
+          data
+            ? `Showing ${filteredApps.length} of ${apps.length} applications; ${outOfSyncCount} out of sync, ${degradedCount} degraded.`
+            : ""
+        }
+        data-testid="applications-live-region"
+      />
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-slate-100">
@@ -174,7 +203,14 @@ export function ApplicationsPage() {
           </h1>
           <p className="mt-1 text-xs text-slate-400">
             Showing {filteredApps.length} of {apps.length} watched applications
-            • Live polling every {APPLICATIONS_POLL_INTERVAL_MS / 1000}s
+            •{" "}
+            <span aria-live="polite">
+              {streamStatus === "live"
+                ? "Live updates connected"
+                : `Polling every ${APPLICATIONS_POLL_INTERVAL_MS / 1000}s${
+                    streamStatus === "connecting" ? " (live updates connecting)" : ""
+                  }`}
+            </span>
           </p>
         </div>
 

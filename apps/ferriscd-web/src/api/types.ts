@@ -26,6 +26,9 @@ export type ProjectListView = components["schemas"]["ProjectListView"];
 export type ProjectView = components["schemas"]["ProjectView"];
 export type ClusterListView = components["schemas"]["ClusterListView"];
 export type ClusterView = components["schemas"]["ClusterView"];
+export type ApplicationEventListView =
+  components["schemas"]["ApplicationEventListView"];
+export type ApplicationEventView = components["schemas"]["ApplicationEventView"];
 export type HealthResponse = components["schemas"]["HealthResponse"];
 export type ReadyResponse = components["schemas"]["ReadyResponse"];
 

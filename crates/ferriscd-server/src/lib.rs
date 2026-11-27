@@ -73,9 +73,10 @@ pub use rbac::{
     RbacConfigMapEvent, RbacPolicy, RbacPolicyError, RbacPolicyStore, Rule, SubjectKind,
 };
 pub use state::{
-    AppState, ApplicationSource, ClusterCatalog, ClusterEntry, DiffSource, GraphRequest,
-    GraphTraversal, InventoryReader, LiveResourceState, OperationRequest, OperationWriter,
-    ProjectCatalog, Readiness, SeamFuture, ServingReadiness, WorkloadGraphSource,
+    AppState, ApplicationEvent, ApplicationSnapshotSource, ApplicationSource, ClusterCatalog,
+    ClusterEntry, DiffSource, EventSource, GraphRequest, GraphTraversal, InventoryReader,
+    LiveResourceState, MAX_APPLICATION_EVENTS, NoEvents, NoSnapshots, OperationRequest,
+    OperationWriter, ProjectCatalog, Readiness, SeamFuture, ServingReadiness, WorkloadGraphSource,
 };
 pub use webhooks::{FanOut, RefreshSink, RefreshTarget, WebhookConfig, WebhookSecret};
 

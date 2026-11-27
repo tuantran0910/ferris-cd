@@ -11,7 +11,8 @@
 //! failures onto [`ApiError`]. All policy, rendering, diffing and redaction stay in the engine and
 //! the controller — duplicating any of it here is exactly the flaw finding C9 removed.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use ferriscd_controller::{
     ClusterManager, ControlPlane, ControlPlaneReadiness, DiffPreview, Metrics, RbacReloadOutcome,
@@ -22,9 +23,11 @@ use ferriscd_crd::{AppProject, Application};
 use ferriscd_engine::inventory::{self, Inventory};
 use ferriscd_engine::manifest::ResourceKey;
 use futures::StreamExt as _;
+use futures::stream::BoxStream;
 use k8s_openapi::api::apps::v1::ReplicaSet;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
+use k8s_openapi::api::events::v1::Event;
 use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::WatchStreamExt as _;
 use kube::runtime::watcher::{self, Event as WatcherEvent};
@@ -40,10 +43,10 @@ use crate::rbac::{
     RbacPolicyStore,
 };
 use crate::state::{
-    AppState, ApplicationSource, ChildNode, ClusterCatalog, ClusterEntry, DiffSource,
-    GRAPH_LIST_LIMIT, GraphRequest, GraphTraversal, InventoryReader, ListKey, ListedNode,
-    LiveResourceState, OperationRequest, OperationWriter, ProjectCatalog, Readiness, SeamFuture,
-    WorkloadGraphSource,
+    AppState, ApplicationEvent, ApplicationSnapshotSource, ApplicationSource, ChildNode,
+    ClusterCatalog, ClusterEntry, DiffSource, EventSource, GRAPH_LIST_LIMIT, GraphRequest,
+    GraphTraversal, InventoryReader, ListKey, ListedNode, LiveResourceState, OperationRequest,
+    OperationWriter, ProjectCatalog, Readiness, SeamFuture, WorkloadGraphSource,
 };
 use crate::webhooks::{RefreshSink, RefreshTarget, WebhookConfig};
 
@@ -107,6 +110,16 @@ pub fn app_state(plane: &ControlPlane, webhooks: WebhookConfig) -> AppState {
     .with_rbac_store(RbacPolicyStore::empty())
     // `T17.2`: share the control plane's compliance audit logger and Prometheus audit counters.
     .with_audit(plane.audit())
+    // `T17.3`: the read-only `events.k8s.io/v1` timeline and the RBAC-filtered SSE snapshot feed,
+    // both over the controller's own client (no second connector pool, no informer).
+    .with_event_source(Arc::new(KubeEventSource::new(client.clone())))
+    .with_snapshot_source(Arc::new(PollingApplicationSnapshot::new(
+        Arc::new(KubeApplicationSource::new(
+            client.clone(),
+            plane.application_scope(),
+        )),
+        SSE_SNAPSHOT_INTERVAL,
+    )))
     .with_webhooks(webhooks)
 }
 
@@ -221,11 +234,361 @@ impl ProjectCatalog for KubeProjectCatalog {
     }
 }
 
+/// Reads the Kubernetes `Event`s that regard one `Application` (`GET .../events`, `T17.3`).
+///
+/// # Scope is the whole security story here
+///
+/// Two narrowings, both server-side, and **no fallback of any kind**:
+///
+/// 1. `Api::<events.k8s.io/v1 Event>::namespaced(client, app.metadata.namespace)` — never
+///    `Api::all`, so a mismatched selector can only ever reach events of one namespace.
+/// 2. `ListParams::fields("regarding.uid=<app uid>")` — the API server, not `ferriscd`, decides which
+///    events regard this object, so events about a *different* `Application` in the same namespace
+///    (or a tenant workload) never cross the wire.
+///
+/// An `Application` without a `metadata.uid` (an unpersisted object, or a fake) answers an **empty
+/// timeline**: falling back to a namespace-wide list there would turn "we cannot scope this" into
+/// "show every event in the namespace", which is exactly the leak the trap guard forbids.
+pub struct KubeEventSource {
+    client: Client,
+}
+
+impl std::fmt::Debug for KubeEventSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KubeEventSource").finish_non_exhaustive()
+    }
+}
+
+impl KubeEventSource {
+    /// Builds the reader over the control-plane client (the `Application`'s own cluster: that is
+    /// where the controller's `EventRecorder` publishes them).
+    #[must_use]
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+impl EventSource for KubeEventSource {
+    fn list<'a>(&'a self, app: &'a Application) -> SeamFuture<'a, Vec<ApplicationEvent>> {
+        let (Some(selector), Some(namespace)) = (regarding_uid_selector(app), app.namespace())
+        else {
+            // Unscopable: answer "no events" instead of widening the query (trap guard).
+            return Box::pin(async { Ok(Vec::new()) });
+        };
+        let api = event_api(self.client.clone(), &namespace);
+        Box::pin(async move {
+            let api = api;
+            let selector = selector;
+            collect_event_pages(|token| {
+                let api = api.clone();
+                let selector = selector.clone();
+                async move {
+                    // Follow `metadata.continue` for a bounded number of pages so >limit stale
+                    // events cannot push the newest ones out of the window.
+                    let mut params = ListParams::default()
+                        .fields(&selector)
+                        .limit(EVENT_LIST_LIMIT);
+                    if let Some(token) = token.as_deref() {
+                        params = params.continue_token(token);
+                    }
+                    api.list(&params)
+                        .await
+                        .map_err(|err| ApiError::backend(&err))
+                }
+            })
+            .await
+        })
+    }
+}
+
+/// Builds the **strictly namespaced** `events.k8s.io/v1` API used by the timeline reader.
+///
+/// Kept separate so a unit test can assert `Api::namespace()`: switching this to `Api::all` would
+/// otherwise leave the whole suite green while listing every namespace's events.
+fn event_api(client: Client, namespace: &str) -> Api<Event> {
+    Api::namespaced(client, namespace)
+}
+
+/// The `ListParams::limit` of one `/events` read.
+///
+/// `events.k8s.io/v1` events are namespaced, short-lived, and per-`Application` few (one object per
+/// `(reason, reportingController)`, with a `series.count` for repeats). The listing is still bounded
+/// so a pathological namespace cannot make one HTTP request allocate an unbounded event list, and
+/// the newest [`MAX_APPLICATION_EVENTS`](crate::state::MAX_APPLICATION_EVENTS) are what the response
+/// carries.
+pub const EVENT_LIST_LIMIT: u32 = 200;
+
+/// How many `continue` pages one timeline read may follow (bounded work, newest 50 selection).
+pub const EVENT_LIST_MAX_PAGES: usize = 5;
+
+/// Merges at most [`EVENT_LIST_MAX_PAGES`] `continue`-linked pages, newest first.
+async fn collect_event_pages<F, Fut>(mut fetch: F) -> Result<Vec<ApplicationEvent>, ApiError>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<kube::core::ObjectList<Event>, ApiError>>,
+{
+    let mut items = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..EVENT_LIST_MAX_PAGES {
+        let listed = fetch(token.clone()).await?;
+        let next = continues_with(&listed);
+        items.extend(listed.items);
+        match next {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    Ok(event_page(items))
+}
+
+/// Whether a listed page asks for another page: only a non-empty `continue` token continues.
+#[must_use]
+pub fn continues_with(metadata: &kube::core::ObjectList<Event>) -> Option<String> {
+    metadata
+        .metadata
+        .continue_
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// The `field_selector` that narrows an `events.k8s.io/v1` list to events about `app`.
+///
+/// Returns `None` — meaning "do not query at all" — when the `Application` has no usable
+/// `metadata.uid`, and for a UID that carries selector syntax (`=`, `,`): a field selector built by
+/// concatenation must never be able to smuggle in a second term.
+#[must_use]
+pub fn regarding_uid_selector(app: &Application) -> Option<String> {
+    let uid = app.metadata.uid.as_deref().map(str::trim).filter(|uid| {
+        !uid.is_empty()
+            && !uid.contains(',')
+            && !uid.contains('=')
+            && !uid.chars().any(char::is_whitespace)
+    })?;
+    Some(format!("regarding.uid={uid}"))
+}
+
+/// Maps a listed `Event` page onto timeline entries, **newest first**.
+///
+/// Split from the API call so ordering (the thing a timeline is for) is a pure, testable function:
+/// `series.lastObservedTime`, `deprecatedLastTimestamp` and `eventTime` are all considered, so both
+/// a still-firing event and one written by an older emitter land in the right place.
+#[must_use]
+pub fn event_page(mut events: Vec<Event>) -> Vec<ApplicationEvent> {
+    events.sort_by_key(|event| std::cmp::Reverse(event_instant(event)));
+    events.into_iter().map(application_event).collect()
+}
+
+/// The instant an `Event` last happened.
+///
+/// `kube-runtime`'s recorder sets only `event_time` on create and, for repeats, keeps it while
+/// patching `series.lastObservedTime`; the series timestamp must therefore win, or a still-firing
+/// `Warning` would sort by its first occurrence and sink below stale one-shots.
+fn event_instant(event: &Event) -> Option<k8s_openapi::jiff::Timestamp> {
+    event
+        .series
+        .as_ref()
+        .map(|series| series.last_observed_time.0)
+        .or_else(|| event.deprecated_last_timestamp.as_ref().map(|time| time.0))
+        .or_else(|| event.event_time.as_ref().map(|time| time.0))
+        .or_else(|| event.deprecated_first_timestamp.as_ref().map(|time| time.0))
+}
+
+/// RFC 3339 rendering of a `series.lastObservedTime` (a `MicroTime`).
+fn micro_time_string(
+    time: &k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime,
+) -> Option<String> {
+    serde_json::to_value(time)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+}
+
+/// One listed `Event`, reduced to the timeline entry the API renders.
+fn application_event(event: Event) -> ApplicationEvent {
+    let count = event
+        .series
+        .as_ref()
+        .map(|series| series.count)
+        .or(event.deprecated_count)
+        .unwrap_or(1);
+    ApplicationEvent {
+        name: event.name_any(),
+        event_type: event
+            .type_
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Unknown")
+            .to_owned(),
+        reason: event.reason.unwrap_or_default(),
+        // Redacted by `crate::api::event_view`, not here: every source implementation gets the same
+        // treatment that way.
+        note: event.note.unwrap_or_default(),
+        action: event.action.filter(|action| !action.trim().is_empty()),
+        count,
+        reporting_component: event
+            .reporting_controller
+            .filter(|component| !component.trim().is_empty()),
+        last_observed_at: event
+            .series
+            .as_ref()
+            .and_then(|series| micro_time_string(&series.last_observed_time))
+            .or_else(|| event.event_time.as_ref().and_then(micro_time_string))
+            .or_else(|| {
+                event
+                    .deprecated_last_timestamp
+                    .as_ref()
+                    .and_then(time_string)
+            }),
+        first_observed_at: event
+            .event_time
+            .as_ref()
+            .and_then(micro_time_string)
+            .or_else(|| {
+                event
+                    .deprecated_first_timestamp
+                    .as_ref()
+                    .and_then(time_string)
+            }),
+    }
+}
+
+/// RFC 3339 rendering of a Kubernetes `Time`, via the type's own `serde` implementation.
+fn time_string(time: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> Option<String> {
+    serde_json::to_value(time)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+}
+
+/// How often the SSE feed re-reads the `Application` list (`T17.3`).
+///
+/// Two seconds is the point where an incident dashboard feels live without turning one open browser
+/// tab into a `kubectl get` loop: the previous 10 s polling lag is what this feed exists to remove,
+/// and a snapshot is one namespaced `list` per interval — never a watch, never a cluster-wide read.
+pub const SSE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Turns the `ApplicationSource` seam into the SSE snapshot feed (`T17.3`).
+///
+/// # One shared read loop
+///
+/// Connections subscribe to a [`tokio::sync::watch`] channel served by a **single** refresher task
+/// per feed instance. 20 open dashboards therefore cost one scoped list per interval, not 20 — the
+/// per-connection read fan-out the first review flagged. The task starts with the first subscriber
+/// and exits when the last receiver is dropped (`send` fails), clearing the slot so a later
+/// subscriber starts a fresh loop: a slot holding a closed sender (the previous task has not yet
+/// cleared it) is never reused.
+///
+/// # Backpressure and cleanup
+///
+/// The watch channel keeps only the latest snapshot; a slow client skips intermediate frames instead
+/// of growing a queue (the correct behaviour for an authoritative snapshot: the next one repairs it).
+/// Dropping the response body drops the receiver, and with the last one the refresher stops.
+type Snapshot = Result<Vec<Application>, ApiError>;
+type SnapshotSender = tokio::sync::watch::Sender<Option<Snapshot>>;
+type SnapshotReceiver = tokio::sync::watch::Receiver<Option<Snapshot>>;
+
+pub struct PollingApplicationSnapshot {
+    source: Arc<dyn ApplicationSource>,
+    interval: Duration,
+    channel: Arc<Mutex<Option<SnapshotSender>>>,
+}
+
+impl std::fmt::Debug for PollingApplicationSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PollingApplicationSnapshot")
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PollingApplicationSnapshot {
+    /// Builds the feed over `source`, re-reading it every `interval`.
+    #[must_use]
+    pub fn new(source: Arc<dyn ApplicationSource>, interval: Duration) -> Self {
+        Self {
+            source,
+            interval,
+            channel: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// The re-read interval (for logs and assertions).
+    #[must_use]
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Returns the current channel, starting the shared refresher if it is not running.
+    fn subscribe_watch(&self) -> SnapshotReceiver {
+        let mut guard = self.channel.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(sender) = guard.as_ref().filter(|sender| !sender.is_closed()) {
+            return sender.subscribe();
+        }
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        *guard = Some(sender.clone());
+        drop(guard);
+
+        let source = Arc::clone(&self.source);
+        let interval = self.interval;
+        let channel = Arc::clone(&self.channel);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if sender.is_closed() {
+                    break;
+                }
+                let snapshot = source.list().await;
+                if sender.send(Some(snapshot)).is_err() {
+                    break;
+                }
+            }
+            let mut guard = channel.lock().unwrap_or_else(PoisonError::into_inner);
+            if guard
+                .as_ref()
+                .is_some_and(|current| current.same_channel(&sender))
+            {
+                *guard = None;
+            }
+        });
+        receiver
+    }
+}
+
+impl ApplicationSnapshotSource for PollingApplicationSnapshot {
+    fn subscribe(&self) -> BoxStream<'static, Result<Vec<Application>, ApiError>> {
+        struct FeedState {
+            receiver: SnapshotReceiver,
+            started: bool,
+        }
+        let state = FeedState {
+            receiver: self.subscribe_watch(),
+            started: false,
+        };
+        Box::pin(futures::stream::unfold(state, |mut state| async move {
+            loop {
+                if state.started {
+                    state.receiver.changed().await.ok()?;
+                } else {
+                    state.started = true;
+                }
+                let snapshot = state.receiver.borrow_and_update().clone();
+                if let Some(snapshot) = snapshot {
+                    return Some((snapshot, state));
+                }
+                if state.receiver.has_changed().is_err() {
+                    return None;
+                }
+            }
+        }))
+    }
+}
+
 /// Lists the cluster registry (`T13.1`): `in-cluster` first, then every registration.
 pub struct RegistryClusterCatalog {
     clusters: Arc<ClusterManager>,
 }
-
 impl std::fmt::Debug for RegistryClusterCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegistryClusterCatalog")
@@ -1098,6 +1461,7 @@ pub async fn drive_rbac_watch<S, E>(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 
@@ -1211,6 +1575,318 @@ mod tests {
         assert_eq!(list_kind_for("Pod"), None);
         assert_eq!(child_group(GraphListKind::ReplicaSet), "apps");
         assert_eq!(child_group(GraphListKind::Pod), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // T17.3: the events timeline
+    // -----------------------------------------------------------------------
+
+    fn app_with_uid(uid: Option<&str>) -> Application {
+        let spec: ferriscd_crd::ApplicationSpec = serde_json::from_value(serde_json::json!({
+            "project": "payments",
+            "source": {"git": {"repoURL": "https://example.com/r.git", "path": "deploy"}},
+            "destination": {"cluster": "in-cluster", "namespace": "payments"},
+        }))
+        .expect("a valid ApplicationSpec");
+        let mut app = Application::new("payments-api", spec);
+        app.metadata.namespace = Some("ferriscd-system".to_owned());
+        app.metadata.uid = uid.map(ToOwned::to_owned);
+        app
+    }
+
+    /// **Trap guard:** without a `metadata.uid` there is no scoped query at all — and in particular no
+    /// namespace-wide fallback, which would hand one tenant every event in the namespace.
+    #[test]
+    fn the_event_selector_requires_a_uid_and_never_widens() {
+        assert_eq!(
+            regarding_uid_selector(&app_with_uid(Some("0f6d1c9a-2a91-4c8e-9b6c-1d2e3f4a5b6c"))),
+            Some("regarding.uid=0f6d1c9a-2a91-4c8e-9b6c-1d2e3f4a5b6c".to_owned())
+        );
+        for uid in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                regarding_uid_selector(&app_with_uid(uid)),
+                None,
+                "a uid of {uid:?} must not produce a query"
+            );
+        }
+        // A uid carrying field-selector syntax must never append a second selector term.
+        assert_eq!(
+            regarding_uid_selector(&app_with_uid(Some("x,reason=SyncFailed"))),
+            None
+        );
+        assert_eq!(regarding_uid_selector(&app_with_uid(Some("x=y"))), None);
+        assert_eq!(
+            regarding_uid_selector(&app_with_uid(Some("a b"))),
+            None,
+            "whitespace is selector-significant too"
+        );
+    }
+
+    #[test]
+    fn only_a_non_empty_continue_token_requests_another_page() {
+        let page = |token: Option<&str>| -> kube::core::ObjectList<Event> {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "continue": token },
+                "items": [],
+            }))
+            .expect("a valid list")
+        };
+        assert_eq!(continues_with(&page(Some("next"))), Some("next".to_owned()));
+        assert_eq!(continues_with(&page(Some(""))), None);
+        assert_eq!(continues_with(&page(None)), None);
+    }
+
+    #[tokio::test]
+    async fn event_pages_merge_and_stop_at_the_bounded_page_count() {
+        use std::collections::VecDeque;
+
+        let page = |name: &str, next: Option<&str>| -> kube::core::ObjectList<Event> {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "continue": next },
+                "items": [{ "metadata": { "name": name } }],
+            }))
+            .expect("a valid list")
+        };
+
+        let pages = Arc::new(Mutex::new(VecDeque::from(vec![
+            page("one", Some("two")),
+            page("two", None),
+        ])));
+        let mut calls = 0;
+        let mut tokens = Vec::new();
+        let merged = collect_event_pages(|token| {
+            calls += 1;
+            tokens.push(token.clone());
+            let pages = Arc::clone(&pages);
+            async move {
+                pages
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pop_front()
+                    .ok_or_else(|| ApiError::backend(&std::io::Error::other("exhausted")))
+            }
+        })
+        .await
+        .expect("both pages merge");
+        assert_eq!(calls, 2);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(tokens, vec![None, Some("two".to_owned())]);
+
+        // Always-continuing pages stop at the budget instead of looping forever.
+        let endless = Arc::new(Mutex::new(VecDeque::from(
+            (0..10)
+                .map(|_index| page("row", Some("more")))
+                .collect::<Vec<_>>(),
+        )));
+        let mut calls = 0;
+        let merged = collect_event_pages(|_| {
+            calls += 1;
+            let endless = Arc::clone(&endless);
+            async move {
+                endless
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pop_front()
+                    .ok_or_else(|| ApiError::backend(&std::io::Error::other("exhausted")))
+            }
+        })
+        .await
+        .expect("bounded pagination");
+        assert_eq!(calls, EVENT_LIST_MAX_PAGES);
+        assert_eq!(merged.len(), EVENT_LIST_MAX_PAGES);
+    }
+
+    #[test]
+    fn a_series_event_sorts_by_last_observed_time_and_carries_it() {
+        let page = event_page(vec![
+            kube_event(serde_json::json!({
+                "metadata": {"name": "stale"},
+                "type": "Normal",
+                "reason": "SyncSucceeded",
+                "deprecatedLastTimestamp": "2027-01-15T09:00:00Z",
+            })),
+            kube_event(serde_json::json!({
+                "metadata": {"name": "still-firing"},
+                "type": "Warning",
+                "reason": "SyncFailed",
+                "eventTime": "2027-01-15T09:30:00.000000Z",
+                "series": {
+                    "count": 50,
+                    "lastObservedTime": "2027-01-15T12:00:00.000000Z"
+                },
+            })),
+        ]);
+        assert_eq!(page[0].name, "still-firing");
+        assert_eq!(page[0].count, 50);
+        assert_eq!(
+            page[0].last_observed_at.as_deref(),
+            Some("2027-01-15T12:00:00.000000Z")
+        );
+        assert_eq!(
+            page[0].first_observed_at.as_deref(),
+            Some("2027-01-15T09:30:00.000000Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_event_api_is_namespaced_and_never_cluster_wide()
+    -> Result<(), Box<dyn std::error::Error>> {
+        ferriscd_controller::impersonation::ensure_crypto_provider();
+        let config = kube::Config::new("https://127.0.0.1:1".parse()?);
+        let client = Client::try_from(config)?;
+        assert_eq!(event_api(client, "team-a").namespace(), Some("team-a"));
+        Ok(())
+    }
+
+    fn kube_event(spec: serde_json::Value) -> Event {
+        serde_json::from_value(spec).expect("a valid events.k8s.io/v1 Event")
+    }
+
+    /// The timeline is ordered newest-first across both the `events.k8s.io/v1` `eventTime` and the
+    /// core/v1 compatibility timestamps, and it maps every field the UI renders.
+    #[test]
+    fn events_are_ordered_newest_first_and_mapped() {
+        let page = event_page(vec![
+            kube_event(serde_json::json!({
+                "metadata": {"name": "old"},
+                "type": "Normal",
+                "reason": "SyncSucceeded",
+                "note": "applied 15 resources",
+                "action": "Sync",
+                "reportingController": "ferriscd.io/controller",
+                "deprecatedFirstTimestamp": "2027-01-15T09:00:00Z",
+                "deprecatedLastTimestamp": "2027-01-15T09:00:00Z",
+            })),
+            kube_event(serde_json::json!({
+                "metadata": {"name": "newest"},
+                "type": "Warning",
+                "reason": "SyncFailed",
+                "note": "apply failed",
+                "deprecatedCount": 4,
+                "eventTime": "2027-01-15T11:00:00.000000Z",
+            })),
+            kube_event(serde_json::json!({
+                "metadata": {"name": "middle"},
+                "type": "Normal",
+                "reason": "ResourcePruned",
+                "note": "pruned 1 resource",
+                "deprecatedLastTimestamp": "2027-01-15T10:00:00Z",
+            })),
+        ]);
+        let names: Vec<&str> = page.iter().map(|event| event.name.as_str()).collect();
+        assert_eq!(names, vec!["newest", "middle", "old"]);
+        assert_eq!(page[0].event_type, "Warning");
+        assert_eq!(page[0].count, 4, "deprecatedCount is the recurrence count");
+        assert_eq!(page[1].count, 1, "a singleton event counts once");
+        assert_eq!(
+            page[2].reporting_component.as_deref(),
+            Some("ferriscd.io/controller")
+        );
+        assert_eq!(
+            page[2].last_observed_at.as_deref(),
+            Some("2027-01-15T09:00:00Z")
+        );
+        // The note is carried verbatim: redaction belongs to the API layer, for every source.
+        assert_eq!(page[0].note, "apply failed");
+    }
+
+    /// A series count comes from `series.count` when the emitter wrote one.
+    #[test]
+    fn a_series_event_reports_its_count() {
+        let page = event_page(vec![kube_event(serde_json::json!({
+            "metadata": {"name": "series"},
+            "type": "Warning",
+            "reason": "SyncFailed",
+            "series": {"count": 9, "lastObservedTime": "2027-01-15T11:00:00.000000Z"},
+            "deprecatedCount": 1,
+        }))]);
+        assert_eq!(page[0].count, 9);
+        assert_eq!(page[0].event_type, "Warning");
+    }
+
+    // -----------------------------------------------------------------------
+    // T17.3: the SSE snapshot feed
+    // -----------------------------------------------------------------------
+
+    /// An `ApplicationSource` that counts its reads, so the feed's behaviour is observable.
+    #[derive(Debug, Default)]
+    struct CountingApplications {
+        reads: AtomicUsize,
+    }
+
+    impl CountingApplications {
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ApplicationSource for CountingApplications {
+        fn list(&self) -> SeamFuture<'_, Vec<Application>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![app_with_uid(Some("uid"))]) })
+        }
+
+        fn get(&self, _namespace: &str, _name: &str) -> SeamFuture<'_, Option<Application>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// **Cleanup on disconnect:** after the last subscriber goes away the shared refresher stops
+    /// reading, and a later subscriber starts a fresh loop (never the closed channel).
+    #[tokio::test(start_paused = true)]
+    async fn the_sse_feed_stops_after_the_last_drop_and_restarts_fresh() {
+        let source = Arc::new(CountingApplications::default());
+        let feed = PollingApplicationSnapshot::new(source.clone(), Duration::from_secs(2));
+        assert_eq!(feed.interval(), Duration::from_secs(2));
+
+        let mut stream = feed.subscribe();
+        assert!(stream.next().await.is_some(), "the first snapshot");
+        assert_eq!(source.reads(), 1);
+
+        drop(stream);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(
+            source.reads(),
+            1,
+            "a dropped connection must stop the reads: nothing keeps running for a gone client"
+        );
+
+        // A subscriber arriving after teardown must get a fresh snapshot, not a dead channel.
+        let mut restarted = feed.subscribe();
+        assert!(restarted.next().await.is_some(), "a restarted feed");
+        assert_eq!(
+            source.reads(),
+            2,
+            "the new subscriber starts a new refresher"
+        );
+    }
+
+    /// Two dashboard connections cost **one** scoped list per interval: the refresher is shared.
+    #[tokio::test(start_paused = true)]
+    async fn the_sse_feed_shares_one_cluster_read_across_subscribers() {
+        let source = Arc::new(CountingApplications::default());
+        let feed = PollingApplicationSnapshot::new(source.clone(), Duration::from_secs(2));
+
+        let mut first = feed.subscribe();
+        let mut second = feed.subscribe();
+        assert!(
+            first.next().await.is_some(),
+            "the first subscriber's snapshot"
+        );
+        assert!(
+            second.next().await.is_some(),
+            "the second sees the same snapshot"
+        );
+        assert_eq!(
+            source.reads(),
+            1,
+            "one refresher, not one list per connection"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(first.next().await.is_some());
+        assert!(second.next().await.is_some());
+        assert_eq!(source.reads(), 2, "the next tick is shared too");
     }
 
     /// Records every listing it is asked for, so the graph's cost is asserted, not assumed.

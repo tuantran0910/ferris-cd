@@ -1,21 +1,45 @@
-import { Layers, LogOut, Server } from "lucide-react";
-import { useEffect } from "react";
-import { Link, Outlet, useLocation } from "react-router-dom";
+import { FolderGit2, Layers, LogOut, Search, Server } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { Button } from "../ui/Button";
+import {
+  CommandPalette,
+  COMMAND_PALETTE_HINT,
+  useCommandPaletteShortcut,
+} from "./CommandPalette";
+
+const NAV_ITEMS = [
+  { to: "/", label: "Applications", icon: Layers, end: true },
+  { to: "/projects", label: "Projects", icon: FolderGit2, end: false },
+  { to: "/clusters", label: "Clusters", icon: Server, end: false },
+] as const;
 
 /**
- * Application shell: header, primary nav and the routed content area.
+ * Application shell: skip link, header, primary nav, command palette and the routed content area.
  *
  * Page transitions: the routed content is keyed by `location.pathname`, so a
  * navigation remounts it with a 180ms fade + 2px rise (`motion-slide-up`).
  * Query-only changes (filters, view mode) keep the same pathname and therefore
  * the same element instance — the list must not animate, scroll or remount every
  * time an operator types in the search box.
+ *
+ * Accessibility (`T17.3`, WCAG 2.2 AA):
+ * - the **first** focusable element is a "Skip to main content" link, visible on focus, pointing at
+ *   `<main id="main-content">`, so keyboard users never have to tab through the header to reach a
+ *   dashboard;
+ * - `<main>` is a focus target (`tabIndex={-1}`) so following the skip link actually moves focus;
+ * - the nav marks the current page with `aria-current="page"`, not just a colour;
+ * - the palette is reachable with `Cmd+K`/`Ctrl+K` and from a real button, so the shortcut is
+ *   discoverable rather than folklore.
  */
 export function Layout() {
   const { baseUrl, logout } = useAuth();
   const { pathname } = useLocation();
+  const [paletteOpen, setPaletteOpen] = useState(false);
+
+  const togglePalette = useCallback(() => setPaletteOpen((open) => !open), []);
+  useCommandPaletteShortcut(togglePalette);
 
   // A new route starts at the top of the page. Assigning `scrollTop` (rather
   // than `scrollTo`/`scrollIntoView`) keeps this a no-op in environments without
@@ -28,6 +52,14 @@ export function Layout() {
 
   return (
     <div className="flex min-h-screen flex-col bg-slate-950 text-slate-100">
+      <a
+        href="#main-content"
+        data-testid="skip-to-content"
+        className="sr-only rounded-lg bg-indigo-600 px-3 py-2 text-sm font-semibold text-white focus:not-sr-only focus:absolute focus:left-4 focus:top-3 focus:z-50"
+      >
+        Skip to main content
+      </a>
+
       <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-950/90 backdrop-blur">
         <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4 sm:px-6">
           <div className="flex items-center gap-6">
@@ -45,22 +77,45 @@ export function Layout() {
               <span>FerrisCD</span>
             </Link>
             <nav aria-label="Primary" className="flex items-center gap-1">
-              <Link
-                to="/"
-                className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-800/80 hover:text-white"
-              >
-                <Layers className="h-4 w-4 text-indigo-400" />
-                Applications
-              </Link>
+              {NAV_ITEMS.map((item) => (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  end={item.end}
+                  className={({ isActive }) =>
+                    `inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
+                      isActive
+                        ? "bg-slate-800 text-white"
+                        : "text-slate-200 hover:bg-slate-800/80 hover:text-white"
+                    }`
+                  }
+                >
+                  <item.icon className="h-4 w-4 text-indigo-300" aria-hidden="true" />
+                  {item.label}
+                </NavLink>
+              ))}
             </nav>
           </div>
 
           <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setPaletteOpen(true)}
+              aria-keyshortcuts="Meta+K Control+K"
+              title={`Search everything (${COMMAND_PALETTE_HINT})`}
+              className="hidden items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 transition-colors hover:border-slate-600 hover:bg-slate-800 sm:inline-flex"
+            >
+              <Search aria-hidden="true" className="h-3.5 w-3.5 text-slate-300" />
+              <span>Search</span>
+              <kbd className="rounded border border-slate-600 bg-slate-950 px-1 py-0.5 font-mono text-[10px] text-slate-200">
+                ⌘K
+              </kbd>
+            </button>
             <span
-              className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-slate-800 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-400 sm:inline-flex"
+              className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-slate-800 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-300 sm:inline-flex"
               title={`Connected FerrisCD API endpoint: ${baseUrl || "same-origin"}`}
             >
-              <Server className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+              <Server className="h-3.5 w-3.5 shrink-0 text-emerald-300" aria-hidden="true" />
               <span className="truncate">{baseUrl || "same-origin"}</span>
             </span>
             <Button
@@ -76,11 +131,17 @@ export function Layout() {
         </div>
       </header>
 
-      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6">
+      <main
+        id="main-content"
+        tabIndex={-1}
+        className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 focus:outline-none sm:px-6"
+      >
         <div key={pathname} className="motion-slide-up">
           <Outlet />
         </div>
       </main>
+
+      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
     </div>
   );
 }

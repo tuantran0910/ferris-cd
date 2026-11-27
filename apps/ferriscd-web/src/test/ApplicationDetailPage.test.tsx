@@ -38,6 +38,27 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
     setStoredToken("test-token");
   });
 
+  it("supports APG arrow/Home/End navigation between detail tabs", async () => {
+    const user = userEvent.setup();
+    renderDetailPage();
+    await screen.findByRole("heading", { name: "payments-api" });
+
+    const resources = screen.getByRole("tab", { name: /Resources/ });
+    expect(resources).toHaveAttribute("aria-controls", "app-tabpanel");
+    expect(resources).toHaveAttribute("tabindex", "0");
+    resources.focus();
+    await user.keyboard("{ArrowRight}");
+    expect(screen.getByRole("tab", { name: "Live Diff" })).toHaveFocus();
+    await user.keyboard("{End}");
+    expect(screen.getByRole("tab", { name: /History/ })).toHaveFocus();
+    await user.keyboard("{Home}");
+    expect(screen.getByRole("tab", { name: /Resources/ })).toHaveFocus();
+    expect(screen.getByRole("tabpanel")).toHaveAttribute(
+      "aria-labelledby",
+      "app-tab-resources",
+    );
+  });
+
   it("displays separate Sync and Health badges, source/destination summary, conditions timeline, and history table", async () => {
     const user = userEvent.setup();
     renderDetailPage();
