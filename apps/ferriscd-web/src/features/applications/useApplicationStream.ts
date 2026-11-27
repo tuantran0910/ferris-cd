@@ -36,7 +36,7 @@ export function isStreamStalled(
   return now - lastFrameAt >= thresholdMs;
 }
 
-export interface ApplicationStreamOptionsConfig {
+export interface UseApplicationStreamOptions {
   /** Liveness threshold; the page uses the 15 s default, tests use a smaller value. */
   stallMs?: number;
 }
@@ -74,13 +74,13 @@ export function shouldFallBackToPolling(attempt: number): boolean {
  */
 export function useApplicationStream(
   enabled = true,
-  options: ApplicationStreamOptionsConfig = {},
+  options: UseApplicationStreamOptions = {},
 ): ApplicationStreamState {
   const { token, baseUrl, logout } = useAuth();
   const queryClient = useQueryClient();
   const [status, setStatus] = useState<ApplicationStreamStatus>("idle");
   const [snapshot, setSnapshot] = useState<ApplicationListView | null>(null);
-  const stallMs = options.stallMs ?? STREAM_STALL_MS;
+  const stallMs = Math.max(50, options.stallMs ?? STREAM_STALL_MS);
 
   useEffect(() => {
     if (!enabled || !token) {
@@ -93,7 +93,7 @@ export function useApplicationStream(
     let watchdog: ReturnType<typeof setInterval> | undefined;
     let controller: AbortController | undefined;
     let attempt = 0;
-    let lastFrameAt = Date.now();
+    let lastFrameAt = 0;
     let stalled = false;
 
     const schedule = (delayMs: number) => {

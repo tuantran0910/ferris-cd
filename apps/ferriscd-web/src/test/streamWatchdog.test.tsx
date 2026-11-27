@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -74,7 +74,9 @@ describe("useApplicationStream liveness watchdog", () => {
 
       unmount();
       const afterUnmount = calls;
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      });
       expect(calls).toBe(afterUnmount);
     } finally {
       globalThis.fetch = nativeFetch;
@@ -106,11 +108,15 @@ describe("useApplicationStream liveness watchdog", () => {
 
     try {
       const { result, unmount } = renderHook(
-        () => useApplicationStream(true, { stallMs: 100 }),
+        () => useApplicationStream(true, { stallMs: 250 }),
         { wrapper },
       );
       await waitFor(() => expect(result.current.status).toBe("live"));
-      await new Promise((resolve) => setTimeout(resolve, 400));
+      // Outlive the stall threshold *and* the first retry backoff, so a spurious abort would
+      // surface as a second fetch instead of staying invisible inside the window.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+      });
       expect(calls).toBe(1);
       expect(result.current.status).toBe("live");
       unmount();
