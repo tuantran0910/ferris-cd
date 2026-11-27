@@ -340,6 +340,14 @@ jobs:
           restore-keys: |
             advisory-db-
 
+      - name: Repair cached advisory database if it is not a git checkout
+        run: |
+          set -euo pipefail
+          if [[ -d "${HOME}/.cargo/advisory-db" && ! -d "${HOME}/.cargo/advisory-db/.git" ]]; then
+            echo "cached advisory DB is not a git checkout; dropping it"
+            rm -rf "${HOME}/.cargo/advisory-db"
+          fi
+
       - name: Install cargo-deny (host binary so the cached advisory DB applies)
         uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
         with:
