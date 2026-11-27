@@ -8,6 +8,7 @@ use std::time::Duration;
 use ferriscd_crd::Application;
 use kube::{Api, Client, ResourceExt};
 
+pub mod audit;
 pub mod cluster_manager;
 pub mod controller;
 pub mod credentials;
@@ -32,6 +33,13 @@ pub mod sync_recovery;
 pub mod telemetry;
 pub mod waves;
 
+pub use audit::{
+    AUDIT_CATEGORIES, AUDIT_OUTCOMES, AUDIT_SCHEMA_VERSION, AUDIT_TRACING_TARGET, AuditActor,
+    AuditCategory, AuditEmitResult, AuditEvent, AuditLogger, AuditOutcome, AuditSink,
+    AuditSinkError, AuditTarget, DEFAULT_AUDIT_CHANNEL_CAPACITY, JsonlFileAuditSink,
+    MAX_AUDIT_REASON_CHARS, RecordingAuditSink, TracingAuditSink, ValidatedAuditWebhookUrl,
+    WebhookAuditSink,
+};
 pub use cluster_manager::{
     ClusterAuth, ClusterChange, ClusterError, ClusterHandle, ClusterHandleBuilder, ClusterManager,
     ClusterName, ClusterOptions, ClusterSecret, ClusterSecretEvent, ClusterSecretSource,
@@ -86,11 +94,13 @@ pub use live_state::{
     LiveStateError, TrackingOwner,
 };
 pub use metrics::{
-    ACTIVE_RECONCILES, APP_HEALTH_STATUS, APP_SYNC_STATUS, CACHE_OUTCOMES, DEFAULT_METRICS_ADDR,
-    GIT_FETCH_DURATION_SECONDS, METRICS_ADDR_ENV, METRICS_PATH, Metrics, MetricsEncodeError,
-    MetricsServeError, MetricsStatusWriter, RBAC_RELOAD_COUNTER, RBAC_RELOAD_OUTCOMES,
-    RBAC_RELOAD_TOTAL, RECONCILE_DURATION_SECONDS, RECONCILE_RESULTS, RECONCILE_TOTAL,
-    RENDER_CACHE_TOTAL, RbacReloadOutcome, ReconcileGuard, ReconcileResult, SYNC_STATUS_VALUES,
+    ACTIVE_RECONCILES, APP_HEALTH_STATUS, APP_SYNC_STATUS, AUDIT_DROPPED_COUNTER,
+    AUDIT_DROPPED_TOTAL, AUDIT_EVENTS_COUNTER, AUDIT_EVENTS_TOTAL, CACHE_OUTCOMES,
+    DEFAULT_METRICS_ADDR, GIT_FETCH_DURATION_SECONDS, METRICS_ADDR_ENV, METRICS_PATH, Metrics,
+    MetricsEncodeError, MetricsServeError, MetricsStatusWriter, RBAC_RELOAD_COUNTER,
+    RBAC_RELOAD_OUTCOMES, RBAC_RELOAD_TOTAL, RECONCILE_DURATION_SECONDS, RECONCILE_RESULTS,
+    RECONCILE_TOTAL, RENDER_CACHE_TOTAL, RbacReloadOutcome, ReconcileGuard, ReconcileResult,
+    SYNC_STATUS_VALUES,
 };
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
 pub use project::{ApiProjectSource, ProjectSource};
@@ -141,7 +151,10 @@ pub fn controller_name() -> &'static str {
 }
 
 /// Runtime options for [`run_with`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Debug` is implemented manually so `audit_webhook_url` never prints embedded credentials or
+/// query-string tokens into logs or panic messages (`T17.2`).
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct RunOptions {
     /// Namespace whose `Application` objects this controller owns.
     ///
@@ -200,6 +213,35 @@ pub struct RunOptions {
     /// [`metrics::METRICS_ADDR_ENV`], defaulting to [`metrics::DEFAULT_METRICS_ADDR`]. The listener
     /// is never the API/webhook port.
     pub metrics_addr: Option<String>,
+
+    /// Optional append-only JSONL audit log file path (`--audit-log-path`, `T17.2`).
+    pub audit_log_path: Option<std::path::PathBuf>,
+
+    /// Optional async batched HTTPS audit webhook URL (`--audit-webhook-url`, `T17.2`).
+    pub audit_webhook_url: Option<String>,
+}
+
+impl std::fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOptions")
+            .field("namespace", &self.namespace)
+            .field("application_namespaces", &self.application_namespaces)
+            .field("allow_local_repos", &self.allow_local_repos)
+            .field("work_root", &self.work_root)
+            .field("allow_insecure_clusters", &self.allow_insecure_clusters)
+            .field("leader_election", &self.leader_election)
+            .field("shard", &self.shard)
+            .field("metrics_addr", &self.metrics_addr)
+            .field("audit_log_path", &self.audit_log_path)
+            .field(
+                "audit_webhook_url",
+                &self
+                    .audit_webhook_url
+                    .as_deref()
+                    .map(audit::redact_audit_url),
+            )
+            .finish()
+    }
 }
 
 /// The `T13.2` knobs [`RunOptions::leader_election`] carries.
@@ -397,8 +439,12 @@ pub struct ControlPlane {
     telemetry: telemetry::TelemetryGuard,
     /// `T17.1`: lock-free startup readiness barrier shared with `/readyz`.
     readiness: ControlPlaneReadiness,
+    /// `T17.2`: external audit sinks whose queued records are flushed on shutdown.
+    audit_file: Option<Arc<audit::JsonlFileAuditSink>>,
+    audit_webhook: Option<Arc<audit::WebhookAuditSink>>,
     cluster_stop: tokio_util::sync::CancellationToken,
     cluster_watch: tokio::task::JoinHandle<()>,
+    audit: audit::AuditLogger,
 }
 
 impl std::fmt::Debug for ControlPlane {
@@ -481,6 +527,13 @@ impl ControlPlane {
         self.readiness.clone()
     }
 
+    /// Shared compliance audit logger (`T17.2`) wired to stdout structured JSON (`ferriscd::audit`)
+    /// plus any configured optional JSONL file or HTTPS webhook sinks.
+    #[must_use]
+    pub fn audit(&self) -> audit::AuditLogger {
+        self.audit.clone()
+    }
+
     /// Runs the controller loop until `SIGINT`/`SIGTERM`, then stops the cluster registry watch.
     ///
     /// # Errors
@@ -551,6 +604,9 @@ impl ControlPlane {
         };
         // The registry is a background watcher: stopping it is enough, nothing is buffered.
         self.cluster_stop.cancel();
+        // `T17.2`: flush queued external-sink audit records with a bounded deadline; anything
+        // past it is a documented loss, never an unbounded shutdown stall.
+        self.flush_audit_sinks().await;
         drop(self.cluster_watch);
         // The controller has drained: stop the listener too (idempotent — a `SIGTERM` already
         // cancelled the token) and report its outcome, so a dead `/metrics` endpoint can never be
@@ -575,6 +631,25 @@ impl ControlPlane {
     ///
     /// The task cancels the shared token if serving fails: a metrics endpoint that died must stop
     /// the process, not leave a reconciling controller that nobody can observe.
+    /// Flushes queued external audit sinks with a bounded deadline (`T17.2`).
+    async fn flush_audit_sinks(&self) {
+        const AUDIT_FLUSH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some(file) = &self.audit_file
+            && tokio::time::timeout(AUDIT_FLUSH_DEADLINE, file.wait_drained())
+                .await
+                .is_err()
+        {
+            tracing::warn!("audit JSONL sink did not drain before the shutdown deadline");
+        }
+        if let Some(webhook) = &self.audit_webhook
+            && tokio::time::timeout(AUDIT_FLUSH_DEADLINE, webhook.wait_drained())
+                .await
+                .is_err()
+        {
+            tracing::warn!("audit webhook sink did not drain before the shutdown deadline");
+        }
+    }
+
     fn spawn_metrics_listener(
         &mut self,
         stop: tokio_util::sync::CancellationToken,
@@ -617,6 +692,37 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     // unusable `--metrics-addr` fails the startup instead of leaving a reconciling process that
     // cannot be scraped. `None` keeps the process metrics-free (hermetic/live tests, library use).
     let metrics = metrics::Metrics::with_fixed_series();
+    // `T17.2`: build the shared compliance audit logger (lossless stdout JSON on `ferriscd::audit`,
+    // plus optional non-blocking JSONL file and HTTPS webhook sinks).
+    let mut audit_sinks: Vec<Arc<dyn audit::AuditSink>> = vec![Arc::new(audit::TracingAuditSink)];
+    let mut audit_file: Option<Arc<audit::JsonlFileAuditSink>> = None;
+    if let Some(path) = options.audit_log_path.clone() {
+        let file_sink = Arc::new(
+            audit::JsonlFileAuditSink::open(
+                path.clone(),
+                audit::DEFAULT_AUDIT_CHANNEL_CAPACITY,
+                metrics.clone(),
+            )
+            .await
+            .with_context(|| format!("failed to initialize --audit-log-path {}", path.display()))?,
+        );
+        audit_sinks.push(file_sink.clone());
+        audit_file = Some(file_sink);
+    }
+    let mut audit_webhook: Option<Arc<audit::WebhookAuditSink>> = None;
+    if let Some(url) = options.audit_webhook_url.as_deref() {
+        let webhook_sink = Arc::new(
+            audit::WebhookAuditSink::spawn(
+                url,
+                audit::DEFAULT_AUDIT_CHANNEL_CAPACITY,
+                metrics.clone(),
+            )
+            .context("failed to initialize --audit-webhook-url")?,
+        );
+        audit_sinks.push(webhook_sink.clone());
+        audit_webhook = Some(webhook_sink);
+    }
+    let audit = audit::AuditLogger::with_sinks(audit_sinks, metrics.clone());
     let (metrics_listener, metrics_addr) = match options.metrics_addr.as_deref() {
         None => (None, None),
         Some(addr) => {
@@ -791,12 +897,15 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         DiscoveryCache::new(client.clone()),
         pool.clone(),
     ));
-    let clusters = Arc::new(ClusterManager::new(
-        in_cluster,
-        config.namespace.clone(),
-        cluster_options,
-        Arc::new(KubeClusterBuilder::new(cluster_options)),
-    ));
+    let clusters = Arc::new(
+        ClusterManager::new(
+            in_cluster,
+            config.namespace.clone(),
+            cluster_options,
+            Arc::new(KubeClusterBuilder::new(cluster_options)),
+        )
+        .with_audit(audit.clone()),
+    );
     let readiness = ControlPlaneReadiness::new();
     // Seed from one initial list before the watch starts: an `Application` that already references
     // a remote cluster must not fail terminally in the window between the watch being spawned and
@@ -858,9 +967,10 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         // `T13.1`: `spec.destination.cluster` is resolved through the registry. Without this every
         // non-`in-cluster` destination is a terminal error, which is the pre-Phase-13 behaviour.
         .with_cluster_source(clusters.clone())
-        // `T15.1`: Git fetch latency and the render-cache hit/miss bridge (`with_metrics` consumes
-        // the pipeline, so it is the last builder call).
-        .with_metrics(metrics.clone()),
+        // `T15.1`: Git fetch latency and the render-cache hit/miss bridge.
+        .with_metrics(metrics.clone())
+        // `T17.2`: compliance audit emission for ServiceAccount impersonation resolutions.
+        .with_audit(audit.clone()),
     );
     // `T15.2`: rate-limited Kubernetes Events on `Application` CRs (deduplicates identical
     // consecutive `Warning` reasons within 5 minutes before calling `Recorder::publish`).
@@ -890,6 +1000,9 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         readiness,
         cluster_stop,
         cluster_watch,
+        audit_file,
+        audit_webhook,
+        audit,
     })
 }
 

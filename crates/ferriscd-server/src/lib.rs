@@ -41,6 +41,7 @@
 //! lockdown switch that refuses every protected request without even calling the API server.
 
 pub mod api;
+pub mod audit;
 pub mod auth;
 pub mod error;
 pub mod kube;
@@ -55,6 +56,12 @@ use std::net::SocketAddr;
 use axum::Router;
 
 pub use api::router;
+pub use audit::{
+    AUDIT_SCHEMA_VERSION, AuditActor, AuditCategory, AuditEmitResult, AuditEvent, AuditLogger,
+    AuditOutcome, AuditSink, AuditSinkError, AuditTarget, DEFAULT_AUDIT_CHANNEL_CAPACITY,
+    JsonlFileAuditSink, REQUEST_ID_HEADER, RecordingAuditSink, RequestId, TokenFingerprint,
+    TracingAuditSink, ValidatedAuditWebhookUrl, WebhookAuditSink,
+};
 pub use auth::{
     AuthPolicy, AuthenticatedIdentity, BearerError, BearerToken, DEFAULT_IDENTITY_CACHE_TTL,
     IdentityCache, TokenAuthenticator, UnconfiguredTokenAuthenticator, UnknownAuthPolicy,

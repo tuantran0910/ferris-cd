@@ -673,6 +673,8 @@ pub struct InventorySyncPipeline {
     /// duration and bridges the render cache's own counters — nothing else in the pipeline is
     /// instrumented, so the metric surface stays small and matching the roadmap's families.
     metrics: Option<crate::metrics::Metrics>,
+    /// `T17.2`: optional compliance audit logger for `controller.impersonation` resolutions.
+    audit: Option<crate::audit::AuditLogger>,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -729,6 +731,7 @@ impl InventorySyncPipeline {
             credentials: None,
             clusters: None,
             metrics: None,
+            audit: None,
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -741,6 +744,13 @@ impl InventorySyncPipeline {
     #[must_use]
     pub fn with_metrics(mut self, metrics: crate::metrics::Metrics) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Wires the compliance audit logger (`T17.2`) for `controller.impersonation` resolutions.
+    #[must_use]
+    pub fn with_audit(mut self, audit: crate::audit::AuditLogger) -> Self {
+        self.audit = Some(audit);
         self
     }
 
@@ -928,23 +938,94 @@ impl InventorySyncPipeline {
         app: &Application,
         target: &ClusterTarget,
     ) -> Result<ClusterAccess, ReconcileError> {
-        let Some(impersonation) = Impersonation::for_application(app)? else {
-            // No `serviceAccountName`: the target cluster's credential (the controller's own
-            // identity in-cluster). Cloning a `ClusterAccess` is four `Arc` clones, so the
-            // non-impersonated path costs what it did before `T12.3`.
-            return Ok(target.access().clone());
+        let app_namespace = app.namespace();
+        let app_name = app.name_any();
+        let project = &app.spec.project;
+        let cluster = &app.spec.destination.cluster;
+        let impersonation = match Impersonation::for_application(app) {
+            Ok(Some(impersonation)) => impersonation,
+            Ok(None) => {
+                // No `serviceAccountName`: the target cluster's credential (the controller's own
+                // identity in-cluster). Cloning a `ClusterAccess` is four `Arc` clones, so the
+                // non-impersonated path costs what it did before `T12.3`.
+                return Ok(target.access().clone());
+            }
+            Err(error) => {
+                if let Some(audit) = &self.audit {
+                    let requested = app
+                        .spec
+                        .service_account_name
+                        .as_deref()
+                        .unwrap_or("<invalid>");
+                    crate::audit::record_impersonation(
+                        audit,
+                        requested,
+                        &[],
+                        app_namespace.as_deref(),
+                        &app_name,
+                        project,
+                        cluster,
+                        crate::audit::AuditOutcome::Denied,
+                        Some(&error.to_string()),
+                    );
+                }
+                return Err(ReconcileError::Impersonation(error));
+            }
         };
         let Some(source) = target.impersonation() else {
-            return Err(ReconcileError::Impersonation(
-                ImpersonationError::NotWired {
-                    service_account: impersonation.user().to_owned(),
-                },
-            ));
+            let error = ImpersonationError::NotWired {
+                service_account: impersonation.user().to_owned(),
+            };
+            if let Some(audit) = &self.audit {
+                crate::audit::record_impersonation(
+                    audit,
+                    impersonation.user(),
+                    impersonation.groups(),
+                    app_namespace.as_deref(),
+                    &app_name,
+                    project,
+                    cluster,
+                    crate::audit::AuditOutcome::Failed,
+                    Some(&error.to_string()),
+                );
+            }
+            return Err(ReconcileError::Impersonation(error));
         };
-        let access = source.access_for(&impersonation)?;
+        let access = match source.access_for(&impersonation) {
+            Ok(access) => access,
+            Err(error) => {
+                if let Some(audit) = &self.audit {
+                    crate::audit::record_impersonation(
+                        audit,
+                        impersonation.user(),
+                        impersonation.groups(),
+                        app_namespace.as_deref(),
+                        &app_name,
+                        project,
+                        cluster,
+                        crate::audit::AuditOutcome::Failed,
+                        Some(&error.to_string()),
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if let Some(audit) = &self.audit {
+            crate::audit::record_impersonation(
+                audit,
+                impersonation.user(),
+                impersonation.groups(),
+                app_namespace.as_deref(),
+                &app_name,
+                project,
+                cluster,
+                crate::audit::AuditOutcome::Allowed,
+                None,
+            );
+        }
         tracing::debug!(
-            app.namespace = %app.namespace().unwrap_or_default(),
-            app.name = %app.name_any(),
+            app.namespace = %app_namespace.as_deref().unwrap_or_default(),
+            app.name = %app_name,
             identity = %access.identity(),
             "reconciling as an impersonated ServiceAccount"
         );
@@ -10334,5 +10415,130 @@ data:
         apply_once_with_events(&app, &fixture.pipeline, &writer, &failing_events)
             .await
             .expect("sync must succeed even when event publishing fails");
+    }
+
+    /// **`T17.2`:** `InventorySyncPipeline::with_audit` emits `controller.impersonation` audit
+    /// events across `Allowed` (valid ServiceAccount), `Denied` (invalid ServiceAccount name),
+    /// `Failed` (`NotWired`), and `Failed` (`ImpersonationSource` error).
+    #[tokio::test]
+    async fn impersonation_resolutions_emit_compliance_audit_events() {
+        struct FailingImpersonationSource;
+        impl ImpersonationSource for FailingImpersonationSource {
+            fn access_for(
+                &self,
+                _impersonation: &Impersonation,
+            ) -> Result<ClusterAccess, ReconcileError> {
+                Err(ReconcileError::Impersonation(
+                    ImpersonationError::UnsupportedConfig {
+                        reason: "synthetic pool failure at \
+                                 https://user:tok3n@git.example.com/r.git?token=qsecret"
+                            .to_owned(),
+                    },
+                ))
+            }
+        }
+
+        // 1. Allowed impersonation
+        let recorder = Arc::new(crate::audit::RecordingAuditSink::new());
+        let audit = crate::audit::AuditLogger::with_sinks(
+            vec![recorder.clone()],
+            crate::metrics::Metrics::with_fixed_series(),
+        );
+        let mut fixture = fixture_with_policy_and_impersonation(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            tenant_scope(&["team-a"]),
+            ImpersonationWiring::Wired,
+        );
+        fixture.pipeline = fixture.pipeline.with_audit(audit.clone());
+        fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let valid_app = tenant_application(&fixture, "team-a", Some("deployer"));
+        fixture
+            .pipeline
+            .apply(&valid_app)
+            .await
+            .expect("valid impersonated apply must succeed");
+
+        // 2. Denied impersonation (invalid ServiceAccount name)
+        let wildcard_project: AppProject = serde_saphyr::from_str(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: payments
+  namespace: ferriscd-system
+spec:
+  sourceRepos: ["*"]
+  sourceNamespaces: ["ferriscd-system", "team-a"]
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  allowedServiceAccounts: ["payments/*"]
+"#,
+        )
+        .expect("project");
+        let mut invalid_fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(wildcard_project),
+            tenant_scope(&["team-a"]),
+        );
+        invalid_fixture.pipeline = invalid_fixture.pipeline.with_audit(audit.clone());
+        invalid_fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let invalid_app = tenant_application(&invalid_fixture, "team-a", Some("Deployer"));
+        assert!(invalid_fixture.pipeline.apply(&invalid_app).await.is_err());
+
+        // 3. Failed impersonation (NotWired)
+        let mut unwired_fixture = fixture_with_policy_and_impersonation(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            tenant_scope(&["team-a"]),
+            ImpersonationWiring::NotWired,
+        );
+        unwired_fixture.pipeline = unwired_fixture.pipeline.with_audit(audit.clone());
+        unwired_fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let unwired_app = tenant_application(&unwired_fixture, "team-a", Some("deployer"));
+        assert!(unwired_fixture.pipeline.apply(&unwired_app).await.is_err());
+
+        // 4. Failed impersonation (ImpersonationSource returns error)
+        let mut err_fixture = fixture_with_policy_and_impersonation(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(tenant_project()),
+            tenant_scope(&["team-a"]),
+            ImpersonationWiring::NotWired,
+        );
+        err_fixture.pipeline = err_fixture
+            .pipeline
+            .with_impersonation_source(Arc::new(FailingImpersonationSource))
+            .with_audit(audit);
+        err_fixture.commit(&[("configmap.yaml", POLICY_CONFIGMAP)]);
+        let err_app = tenant_application(&err_fixture, "team-a", Some("deployer"));
+        assert!(err_fixture.pipeline.apply(&err_app).await.is_err());
+
+        let events = recorder.events();
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().all(|ev| ev.category
+            == crate::audit::AuditCategory::ControllerImpersonation
+            && ev.action == "impersonate"));
+        assert_eq!(events[0].outcome, crate::audit::AuditOutcome::Allowed);
+        assert_eq!(
+            events[0].actor.username.as_deref(),
+            Some("system:serviceaccount:payments:deployer")
+        );
+        assert_eq!(events[0].target.project.as_deref(), Some("payments"));
+        assert_eq!(events[0].target.cluster.as_deref(), Some("in-cluster"));
+
+        assert_eq!(events[1].outcome, crate::audit::AuditOutcome::Denied);
+        assert_eq!(events[2].outcome, crate::audit::AuditOutcome::Failed);
+        assert_eq!(events[3].outcome, crate::audit::AuditOutcome::Failed);
+
+        // The fifth category must redact embedded URL credentials/queries too: the failing
+        // impersonation reason carries `user:tok3n@...?...=qsecret`, and neither secret may be
+        // serialized into the audit trail.
+        let serialized = serde_json::to_string(&events).expect("events serialize");
+        assert!(!serialized.contains("tok3n"), "{serialized}");
+        assert!(!serialized.contains("qsecret"), "{serialized}");
     }
 }

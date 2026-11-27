@@ -90,12 +90,29 @@ spec:
             - --application-namespaces
             - {{ join "," .Values.multiTenant.applicationNamespaces | quote }}
             {{- end }}
+            {{- with .Values.audit }}
+            {{- if .logPath }}
+            - --audit-log-path
+            - {{ .logPath | quote }}
+            {{- end }}
+            {{- if and .webhookUrl (not .webhookUrlSecret.name) }}
+            - --audit-webhook-url
+            - {{ .webhookUrl | quote }}
+            {{- end }}
+            {{- end }}
             {{- range .Values.server.extraArgs }}
             - {{ . | quote }}
             {{- end }}
           env:
             - name: RUST_LOG
               value: {{ .Values.server.logLevel | quote }}
+            {{- if .Values.audit.webhookUrlSecret.name }}
+            - name: FERRISCD_AUDIT_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.audit.webhookUrlSecret.name }}
+                  key: {{ .Values.audit.webhookUrlSecret.key }}
+            {{- end }}
             {{- if .Values.webhooks.existingSecret }}
             - name: FERRISCD_GITHUB_WEBHOOK_SECRET
               valueFrom:

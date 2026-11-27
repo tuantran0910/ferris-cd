@@ -70,6 +70,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
+use crate::audit::{AuditCategory, AuditOutcome};
 use crate::controller::FailureClass;
 use crate::reconcile::{ControllerError, ReconcileError, StatusWriter};
 
@@ -129,6 +130,17 @@ pub const RBAC_WATCH_ERRORS: &str = "ferriscd_rbac_watch_errors";
 
 /// Scraped name of the RBAC watch error counter (`T17.1`).
 pub const RBAC_WATCH_ERRORS_TOTAL: &str = "ferriscd_rbac_watch_errors_total";
+/// Registered name of the compliance audit events counter (`T17.2`).
+pub const AUDIT_EVENTS_COUNTER: &str = "ferriscd_audit_events";
+
+/// Scraped name of the compliance audit events counter (`T17.2`).
+pub const AUDIT_EVENTS_TOTAL: &str = "ferriscd_audit_events_total";
+
+/// Registered name of the dropped compliance audit events counter (`T17.2`).
+pub const AUDIT_DROPPED_COUNTER: &str = "ferriscd_audit_dropped";
+
+/// Scraped name of the dropped compliance audit events counter (`T17.2`).
+pub const AUDIT_DROPPED_TOTAL: &str = "ferriscd_audit_dropped_total";
 
 /// The **complete** `result` label set, in the order it is documented.
 pub const RECONCILE_RESULTS: [&str; 3] = ["success", "retryable", "terminal"];
@@ -325,7 +337,23 @@ struct RenderCacheSeen {
     misses: u64,
 }
 
-/// The process's Prometheus registry and its seven families.
+/// `category`/`outcome` label set for [`AUDIT_EVENTS_TOTAL`] (`T17.2`).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct AuditEventLabels {
+    category: &'static str,
+    outcome: &'static str,
+}
+
+impl AuditEventLabels {
+    fn of(category: AuditCategory, outcome: AuditOutcome) -> Self {
+        Self {
+            category: category.as_str(),
+            outcome: outcome.as_str(),
+        }
+    }
+}
+
+/// The process's Prometheus registry and its ten families.
 ///
 /// Cheap to clone (`Arc` inside), so the reconcile loop, the status writer, the pipeline and the
 /// listener all share one registry. Recording touches only atomics; the registry lock is taken by
@@ -342,6 +370,8 @@ pub struct Metrics {
     active_reconciles: Gauge,
     rbac_reload_total: Family<OutcomeLabels, Counter>,
     rbac_watch_errors: Counter,
+    audit_events_total: Family<AuditEventLabels, Counter>,
+    audit_dropped_total: Counter,
     render_cache_seen: Arc<Mutex<RenderCacheSeen>>,
 }
 
@@ -361,7 +391,7 @@ impl std::fmt::Debug for Metrics {
 /// **Advisory only:** it is hand-maintained documentation of the registry, not the source of truth
 /// — the registration in [`Metrics::new`] and the `T15.1` tests are. A family added there without a
 /// row here does not break anything (and is caught by the tests), it just reads as an omission.
-const FAMILY_DESCRIPTIONS: [(&str, &str); 9] = [
+const FAMILY_DESCRIPTIONS: [(&str, &str); 11] = [
     (RECONCILE_DURATION_SECONDS, "histogram"),
     (RECONCILE_TOTAL, "counter"),
     (APP_SYNC_STATUS, "gauge"),
@@ -371,6 +401,8 @@ const FAMILY_DESCRIPTIONS: [(&str, &str); 9] = [
     (ACTIVE_RECONCILES, "gauge"),
     (RBAC_RELOAD_TOTAL, "counter"),
     (RBAC_WATCH_ERRORS_TOTAL, "counter"),
+    (AUDIT_EVENTS_TOTAL, "counter"),
+    (AUDIT_DROPPED_TOTAL, "counter"),
 ];
 
 /// Builds a latency histogram (same buckets for reconcile and Git fetch).
@@ -396,6 +428,8 @@ impl Metrics {
         let active_reconciles = Gauge::default();
         let rbac_reload_total = Family::<OutcomeLabels, Counter>::default();
         let rbac_watch_errors = Counter::default();
+        let audit_events_total = Family::<AuditEventLabels, Counter>::default();
+        let audit_dropped_total = Counter::default();
 
         let mut registry = Registry::default();
         registry.register(
@@ -443,6 +477,16 @@ impl Metrics {
             "ferriscd-rbac-cm watch errors while retaining the active policy snapshot",
             rbac_watch_errors.clone(),
         );
+        registry.register(
+            AUDIT_EVENTS_COUNTER,
+            "Compliance audit events emitted, by category and outcome",
+            audit_events_total.clone(),
+        );
+        registry.register(
+            AUDIT_DROPPED_COUNTER,
+            "Compliance audit events dropped by non-blocking external sinks",
+            audit_dropped_total.clone(),
+        );
 
         Self {
             registry: Arc::new(Mutex::new(registry)),
@@ -455,6 +499,8 @@ impl Metrics {
             active_reconciles,
             rbac_reload_total,
             rbac_watch_errors,
+            audit_events_total,
+            audit_dropped_total,
             render_cache_seen: Arc::new(Mutex::new(RenderCacheSeen::default())),
         }
     }
@@ -498,6 +544,24 @@ impl Metrics {
                 .rbac_reload_total
                 .get_or_create_owned(&OutcomeLabels::of_rbac_reload(outcome));
         }
+        for category in [
+            AuditCategory::ApiOperation,
+            AuditCategory::ApiAuthzDenied,
+            AuditCategory::WebhookDelivery,
+            AuditCategory::ControllerImpersonation,
+            AuditCategory::ClusterRegistry,
+        ] {
+            for outcome in [
+                AuditOutcome::Allowed,
+                AuditOutcome::Denied,
+                AuditOutcome::Accepted,
+                AuditOutcome::Failed,
+            ] {
+                metrics
+                    .audit_events_total
+                    .get_or_create_owned(&AuditEventLabels::of(category, outcome));
+            }
+        }
         metrics
     }
 
@@ -515,6 +579,23 @@ impl Metrics {
     /// permanently dead watch still has to be visible.
     pub fn record_rbac_watch_error(&self) {
         self.rbac_watch_errors.inc();
+    }
+
+    /// Records one emitted compliance audit event (`T17.2`).
+    pub fn record_audit_event(&self, category: AuditCategory, outcome: AuditOutcome) {
+        self.audit_events_total
+            .get_or_create_owned(&AuditEventLabels::of(category, outcome))
+            .inc();
+    }
+
+    /// Records one compliance audit event dropped by a non-blocking external sink (`T17.2`).
+    pub fn record_audit_dropped(&self) {
+        self.audit_dropped_total.inc();
+    }
+
+    /// Records `count` compliance audit events dropped by a non-blocking external sink (`T17.2`).
+    pub fn record_audit_dropped_by(&self, count: u64) {
+        self.audit_dropped_total.inc_by(count);
     }
 
     /// Marks a reconcile as started and returns the guard that ends it.
@@ -1407,10 +1488,12 @@ mod tests {
         metrics.record_rbac_reload(RbacReloadOutcome::Error);
         metrics.record_rbac_reload(RbacReloadOutcome::Deleted);
         metrics.record_rbac_watch_error();
+        metrics.record_audit_event(AuditCategory::ApiOperation, AuditOutcome::Accepted);
+        metrics.record_audit_dropped();
 
         let (body, samples) = scrape(&metrics);
         let families = exposition::label_names(&samples);
-        let expected: [(&str, &[&str]); 9] = [
+        let expected: [(&str, &[&str]); 11] = [
             (RECONCILE_DURATION_SECONDS, &["result", "le"]),
             (RECONCILE_TOTAL, &["result"]),
             (APP_SYNC_STATUS, &["app_namespace", "app_name", "status"]),
@@ -1420,6 +1503,8 @@ mod tests {
             (ACTIVE_RECONCILES, &[]),
             (RBAC_RELOAD_TOTAL, &["outcome"]),
             (RBAC_WATCH_ERRORS_TOTAL, &[]),
+            (AUDIT_EVENTS_TOTAL, &["category", "outcome"]),
+            (AUDIT_DROPPED_TOTAL, &[]),
         ];
         assert_eq!(
             families.len(),
@@ -1764,6 +1849,8 @@ mod tests {
             ACTIVE_RECONCILES,
             RBAC_RELOAD_TOTAL,
             RBAC_WATCH_ERRORS_TOTAL,
+            AUDIT_EVENTS_TOTAL,
+            AUDIT_DROPPED_TOTAL,
         ]
         .into_iter()
         .collect();

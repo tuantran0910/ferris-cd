@@ -702,11 +702,36 @@ mod tests {
             "--metrics-addr",
             "FERRISCD_METRICS_ADDR",
             "ferriscd_reconcile_total",
+            "--audit-log-path",
+            "FERRISCD_AUDIT_LOG_PATH",
+            "--audit-webhook-url",
+            "FERRISCD_AUDIT_WEBHOOK_URL",
         ] {
             assert!(
                 help.contains(expected),
                 "the flag help must document {expected:?}: {help}"
             );
         }
+    }
+
+    #[test]
+    fn audit_flags_parse_and_redact_userinfo_and_query_in_debug() {
+        let args = parse(&[
+            "ferriscd",
+            "server",
+            "--audit-log-path",
+            "/tmp/audit.jsonl",
+            "--audit-webhook-url",
+            "https://user:s3cr3t-audit-key@siem.example.com/ingest?api_key=q-secret#frag",
+        ]);
+        assert_eq!(
+            args.controller.audit_log_path,
+            Some(PathBuf::from("/tmp/audit.jsonl"))
+        );
+        let rendered = format!("{args:?}");
+        assert!(!rendered.contains("s3cr3t-audit-key"), "{rendered}");
+        assert!(!rendered.contains("q-secret"), "{rendered}");
+        assert!(!rendered.contains("frag"), "{rendered}");
+        assert!(rendered.contains("siem.example.com/ingest"), "{rendered}");
     }
 }

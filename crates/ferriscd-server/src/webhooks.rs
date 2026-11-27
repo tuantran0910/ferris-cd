@@ -37,6 +37,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use axum::Extension;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -49,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
 
+use crate::audit::{AuditOutcome, RequestId, record_webhook_delivery};
 use crate::error::{ApiError, ApiErrorBody};
 use crate::state::{AppState, SeamFuture};
 
@@ -829,10 +831,21 @@ fn identities<'a>(urls: impl Iterator<Item = &'a String>) -> Vec<String> {
 )]
 pub async fn github(
     State(state): State<AppState>,
+    request_id: Option<Extension<RequestId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<WebhookResponse>, ApiError> {
+    let req_id = request_id.as_ref().map(|Extension(id)| id.as_str());
     let Some(secret) = state.webhooks.github_secret.as_ref() else {
+        record_webhook_delivery(
+            &state.audit,
+            req_id,
+            "github",
+            "github.webhook",
+            None,
+            AuditOutcome::Failed,
+            "GitHub webhooks are not configured",
+        );
         return Err(ApiError::unprocessable(
             "GitHub webhooks are not configured on this server: no HMAC secret is set, and an \
              unverified webhook is never accepted",
@@ -842,36 +855,95 @@ pub async fn github(
     if !secret.verify_github(&body, signature) {
         // One message for "missing", "malformed", and "wrong": the caller learns nothing about
         // which part of the check failed.
+        record_webhook_delivery(
+            &state.audit,
+            req_id,
+            "github",
+            "github.webhook",
+            None,
+            AuditOutcome::Denied,
+            "invalid or missing X-Hub-Signature-256 signature",
+        );
         return Err(ApiError::unauthorized(
             "the X-Hub-Signature-256 header is missing or does not match the body",
         ));
     }
 
     let Some(delivery) = header(&headers, GITHUB_DELIVERY_HEADER) else {
+        record_webhook_delivery(
+            &state.audit,
+            req_id,
+            "github",
+            "github.webhook",
+            None,
+            AuditOutcome::Failed,
+            "missing X-GitHub-Delivery header",
+        );
         return Err(ApiError::bad_request(
             "a GitHub delivery must carry X-GitHub-Delivery (it is the only replay protection)",
         ));
     };
     let delivery = delivery.trim();
     if delivery.is_empty() || delivery.chars().count() > MAX_DELIVERY_ID_CHARS {
+        record_webhook_delivery(
+            &state.audit,
+            req_id,
+            "github",
+            "github.webhook",
+            None,
+            AuditOutcome::Failed,
+            "malformed X-GitHub-Delivery header",
+        );
         return Err(ApiError::bad_request(format!(
             "X-GitHub-Delivery must be a non-empty id of at most {MAX_DELIVERY_ID_CHARS} characters"
         )));
     }
     if !state.dedupe.admit(delivery) {
         tracing::info!(delivery = %delivery, "duplicate GitHub delivery ignored");
+        record_webhook_delivery(
+            &state.audit,
+            req_id,
+            "github",
+            "github.push",
+            None,
+            AuditOutcome::Accepted,
+            "duplicate delivery ignored",
+        );
         return Ok(Json(WebhookResponse::duplicate(delivery)));
     }
 
     let event = header(&headers, GITHUB_EVENT_HEADER).unwrap_or_default();
     if !event.eq_ignore_ascii_case("push") {
         tracing::debug!(event = %event, delivery = %delivery, "ignoring a non-push GitHub event");
+        record_webhook_delivery(
+            &state.audit,
+            req_id,
+            "github",
+            "github.non_push",
+            None,
+            AuditOutcome::Accepted,
+            "ignored non-push GitHub event",
+        );
         return Ok(Json(WebhookResponse::ignored(format!(
             "GitHub event {event:?} is not a push; FerrisCD only reacts to pushed refs"
         ))));
     }
 
-    let payload: GitHubPushPayload = parse_payload(&body)?;
+    let payload: GitHubPushPayload = match parse_payload(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            record_webhook_delivery(
+                &state.audit,
+                req_id,
+                "github",
+                "github.push",
+                None,
+                AuditOutcome::Failed,
+                "malformed GitHub push JSON payload",
+            );
+            return Err(error);
+        }
+    };
     let repository = payload
         .repository
         .as_ref()
@@ -890,12 +962,36 @@ pub async fn github(
             .and_then(|repository| repository.default_branch.as_deref()),
     );
 
-    let (response, jobs) = fan_out_push(&state, repository, identities, reference).await?;
+    let (response, jobs) = match fan_out_push(&state, repository, identities, reference).await {
+        Ok(res) => res,
+        Err(error) => {
+            record_webhook_delivery(
+                &state.audit,
+                req_id,
+                "github",
+                "github.push",
+                Some(repository),
+                AuditOutcome::Failed,
+                "GitHub push could not be matched",
+            );
+            return Err(error);
+        }
+    };
+    let matched = response.matched.unwrap_or_default();
+    record_webhook_delivery(
+        &state.audit,
+        req_id,
+        "github",
+        "github.push",
+        Some(repository),
+        AuditOutcome::Accepted,
+        &format!("status={} matched={matched}", response.status),
+    );
     tracing::info!(
         delivery = %delivery,
         repository = %response.repository.as_deref().unwrap_or_default(),
         reference = %response.reference.as_deref().unwrap_or_default(),
-        matched = response.matched.unwrap_or_default(),
+        matched,
         "GitHub push accepted"
     );
     jobs.dispatch(&state);
@@ -926,23 +1022,57 @@ pub async fn github(
 )]
 pub async fn gitlab(
     State(state): State<AppState>,
+    request_id: Option<Extension<RequestId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<WebhookResponse>, ApiError> {
+    let req_id = request_id.as_ref().map(|Extension(id)| id.as_str());
     let Some(secret) = state.webhooks.gitlab_secret.as_ref() else {
+        record_webhook_delivery(
+            &state.audit,
+            req_id,
+            "gitlab",
+            "gitlab.webhook",
+            None,
+            AuditOutcome::Failed,
+            "GitLab webhooks are not configured",
+        );
         return Err(ApiError::unprocessable(
             "GitLab webhooks are not configured on this server: no X-Gitlab-Token secret is set, \
              and an unverified webhook is never accepted",
         ));
     };
     if !secret.verify_gitlab(header(&headers, GITLAB_TOKEN_HEADER)) {
+        record_webhook_delivery(
+            &state.audit,
+            req_id,
+            "gitlab",
+            "gitlab.webhook",
+            None,
+            AuditOutcome::Denied,
+            "invalid or missing X-Gitlab-Token header",
+        );
         return Err(ApiError::unauthorized(
             "the X-Gitlab-Token header is missing or does not match",
         ));
     }
 
     let event = header(&headers, GITLAB_EVENT_HEADER).unwrap_or_default();
-    let payload: GitLabPushPayload = parse_payload(&body)?;
+    let payload: GitLabPushPayload = match parse_payload(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            record_webhook_delivery(
+                &state.audit,
+                req_id,
+                "gitlab",
+                "gitlab.push",
+                None,
+                AuditOutcome::Failed,
+                "malformed GitLab push JSON payload",
+            );
+            return Err(error);
+        }
+    };
     let kind = payload
         .object_kind
         .as_deref()
@@ -951,6 +1081,15 @@ pub async fn gitlab(
         .to_ascii_lowercase();
     if !matches!(kind.as_str(), "push" | "tag_push") {
         tracing::debug!(event = %event, object_kind = %kind, "ignoring a non-push GitLab event");
+        record_webhook_delivery(
+            &state.audit,
+            req_id,
+            "gitlab",
+            "gitlab.non_push",
+            None,
+            AuditOutcome::Accepted,
+            "ignored non-push GitLab event",
+        );
         return Ok(Json(WebhookResponse::ignored(format!(
             "GitLab event {kind:?} is not a push; FerrisCD only reacts to pushed refs"
         ))));
@@ -974,12 +1113,36 @@ pub async fn gitlab(
             .and_then(|project| project.default_branch.as_deref()),
     );
 
-    let (response, jobs) = fan_out_push(&state, repository, identities, reference).await?;
+    let (response, jobs) = match fan_out_push(&state, repository, identities, reference).await {
+        Ok(res) => res,
+        Err(error) => {
+            record_webhook_delivery(
+                &state.audit,
+                req_id,
+                "gitlab",
+                "gitlab.push",
+                Some(repository),
+                AuditOutcome::Failed,
+                "GitLab push could not be matched",
+            );
+            return Err(error);
+        }
+    };
+    let matched = response.matched.unwrap_or_default();
+    record_webhook_delivery(
+        &state.audit,
+        req_id,
+        "gitlab",
+        "gitlab.push",
+        Some(repository),
+        AuditOutcome::Accepted,
+        &format!("status={} matched={matched}", response.status),
+    );
     tracing::info!(
         event = %event,
         repository = %response.repository.as_deref().unwrap_or_default(),
         reference = %response.reference.as_deref().unwrap_or_default(),
-        matched = response.matched.unwrap_or_default(),
+        matched,
         "GitLab push accepted"
     );
     jobs.dispatch(&state);
