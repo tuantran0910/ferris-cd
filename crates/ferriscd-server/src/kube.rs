@@ -1653,8 +1653,10 @@ mod tests {
             page("two", None),
         ])));
         let mut calls = 0;
-        let merged = collect_event_pages(|_token| {
+        let mut tokens = Vec::new();
+        let merged = collect_event_pages(|token| {
             calls += 1;
+            tokens.push(token.clone());
             let pages = Arc::clone(&pages);
             async move {
                 pages
@@ -1668,6 +1670,7 @@ mod tests {
         .expect("both pages merge");
         assert_eq!(calls, 2);
         assert_eq!(merged.len(), 2);
+        assert_eq!(tokens, vec![None, Some("two".to_owned())]);
 
         // Always-continuing pages stop at the budget instead of looping forever.
         let endless = Arc::new(Mutex::new(VecDeque::from(

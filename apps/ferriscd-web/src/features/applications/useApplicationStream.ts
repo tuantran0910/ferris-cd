@@ -36,6 +36,11 @@ export function isStreamStalled(
   return now - lastFrameAt >= thresholdMs;
 }
 
+export interface ApplicationStreamOptionsConfig {
+  /** Liveness threshold; the page uses the 15 s default, tests use a smaller value. */
+  stallMs?: number;
+}
+
 /** Five fast retries (0.5 s, 1 s, 2 s, 4 s, 8 s with jitter) before falling back to polling. */
 export const MAX_FAST_ATTEMPTS = 5;
 export const BASE_RETRY_MS = 500;
@@ -64,13 +69,18 @@ export function shouldFallBackToPolling(attempt: number): boolean {
  * - after the retry budget, fall back to the existing 10 s polling and retry the stream once a
  *   minute (corporate proxies silently drop long-lived connections);
  * - a `401` stops the stream and signs the session out instead of retrying with a dead token;
+ * - a 15 s silence watchdog aborts a half-open socket (proxy black-hole) into the retry path;
  * - the `AbortController` is aborted on unmount, so no reader outlives the page.
  */
-export function useApplicationStream(enabled = true): ApplicationStreamState {
+export function useApplicationStream(
+  enabled = true,
+  options: ApplicationStreamOptionsConfig = {},
+): ApplicationStreamState {
   const { token, baseUrl, logout } = useAuth();
   const queryClient = useQueryClient();
   const [status, setStatus] = useState<ApplicationStreamStatus>("idle");
   const [snapshot, setSnapshot] = useState<ApplicationListView | null>(null);
+  const stallMs = options.stallMs ?? STREAM_STALL_MS;
 
   useEffect(() => {
     if (!enabled || !token) {
@@ -98,23 +108,24 @@ export function useApplicationStream(enabled = true): ApplicationStreamState {
       }
       controller = new AbortController();
       stalled = false;
-      lastFrameAt = Date.now();
+      lastFrameAt = performance.now();
       setStatus("connecting");
       // Server snapshots arrive every ~2 s; silence means a half-open socket that will never
       // reject on its own. Force it into the retry path instead of freezing a "live" dashboard.
+      const active = controller;
       watchdog = setInterval(() => {
-        if (isStreamStalled(lastFrameAt, Date.now())) {
+        if (isStreamStalled(lastFrameAt, performance.now(), stallMs)) {
           stalled = true;
-          controller?.abort();
+          active.abort();
         }
-      }, 1_000);
+      }, Math.min(1_000, stallMs));
       try {
         await openApplicationStream({
           baseUrl,
           token,
           signal: controller.signal,
           onSnapshot: (snapshot) => {
-            lastFrameAt = Date.now();
+            lastFrameAt = performance.now();
             // A slower in-flight poll must not overwrite a newer streamed snapshot.
             void queryClient.cancelQueries(
               { queryKey: queryKeys.applications() },
@@ -172,7 +183,7 @@ export function useApplicationStream(enabled = true): ApplicationStreamState {
         clearInterval(watchdog);
       }
     };
-  }, [enabled, token, baseUrl, queryClient, logout]);
+  }, [enabled, token, baseUrl, queryClient, logout, stallMs]);
 
   return { status, snapshot };
 }
