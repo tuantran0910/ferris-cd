@@ -540,7 +540,9 @@ pub fn redact_audit_url(raw: &str) -> String {
     // Credential pre-pass for SCP-style remotes and non-special schemes that `Url::parse` keeps
     // verbatim (its `set_username`/`set_password` fail for cannot-be-a-base URLs). Restrict the
     // search to the segment before the first path/query/fragment delimiter, then redact between
-    // the first and last `@` inside it, so a password containing `@`, `/`, `?` or `#` cannot leak.
+    // the first and last `@` inside it, so an `@` in the path/query/fragment can neither defeat
+    // the redaction nor leak the userinfo. A raw `/`, `?` or `#` before the `@` means the value is
+    // not credential-shaped and is left to `Url::parse`.
     let head_end = trimmed.find(['/', '?', '#']).unwrap_or(trimmed.len());
     let head = &trimmed[..head_end];
     if let (Some(first_at), Some(last_at)) = (head.find('@'), head.rfind('@'))
@@ -1496,6 +1498,14 @@ mod tests {
             assert!(!redacted.contains("s3cr3t"), "{leaked} -> {redacted}");
             assert!(!redacted.contains("pass@"), "{leaked} -> {redacted}");
         }
+        assert_eq!(
+            redact_audit_url("deploy:s3cr3t@git.example.com:org/repo.git?ref=user@example.com"),
+            "deploy:***@git.example.com:org/repo.git"
+        );
+        assert_eq!(
+            redact_audit_url("deploy:s3cr3t@git.example.com:org/repo.git#frag@x"),
+            "deploy:***@git.example.com:org/repo.git"
+        );
         assert_eq!(
             redact_audit_url("git@github.com:org/repo.git"),
             "git@github.com:org/repo.git",

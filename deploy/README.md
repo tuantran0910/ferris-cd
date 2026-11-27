@@ -463,7 +463,7 @@ Exposed families — and nothing else:
 | `ferriscd_rbac_reload_total` | counter | `outcome` = `ok` \| `error` \| `deleted` |
 | `ferriscd_rbac_watch_errors_total` | counter | *(none)* |
 | `ferriscd_audit_events_total` | counter | `category` = `api.operation` \| `api.authz_denied` \| `webhook.delivery` \| `controller.impersonation` \| `cluster.registry`, `outcome` = `allowed` \| `denied` \| `accepted` \| `failed` |
-| `ferriscd_audit_dropped_total` | counter | *(none)* — one increment per timed-out sink flush (the exact backlog is unknown after the channel closes), plus one per `try_send` drop |
+| `ferriscd_audit_dropped_total` | counter | *(none)* — one per `try_send` drop, one per failed JSONL write/flush, one per event in a rejected/failed webhook batch, and one per timed-out sink flush (the exact backlog is unknown after the channel closes) |
 
 Operational notes:
 
