@@ -403,7 +403,13 @@ pub async fn run() -> anyhow::Result<()> {
 /// Fails when the log format is invalid, the namespace configuration is invalid, the
 /// Kubernetes client cannot be configured, or in-flight reconciles outlive the drain timeout.
 pub async fn run_with(options: RunOptions) -> anyhow::Result<()> {
-    prepare(options).await?.run().await
+    let plane = prepare(options).await?;
+    let audit = plane.audit_sink_handles();
+    let result = plane.run().await;
+    // `T17.2`: the standalone controller has no API drain to wait for; close the external audit
+    // sinks only once the reconcile loop has stopped.
+    audit.flush().await;
+    result
 }
 
 /// Everything one `ferriscd` process builds **once**, shared by the controller loop and the
@@ -604,9 +610,6 @@ impl ControlPlane {
         };
         // The registry is a background watcher: stopping it is enough, nothing is buffered.
         self.cluster_stop.cancel();
-        // `T17.2`: flush queued external-sink audit records with a bounded deadline; anything
-        // past it is a documented loss, never an unbounded shutdown stall.
-        self.flush_audit_sinks().await;
         drop(self.cluster_watch);
         // The controller has drained: stop the listener too (idempotent — a `SIGTERM` already
         // cancelled the token) and report its outcome, so a dead `/metrics` endpoint can never be
@@ -631,22 +634,14 @@ impl ControlPlane {
     ///
     /// The task cancels the shared token if serving fails: a metrics endpoint that died must stop
     /// the process, not leave a reconciling controller that nobody can observe.
-    /// Flushes queued external audit sinks with a bounded deadline (`T17.2`).
-    async fn flush_audit_sinks(&self) {
-        const AUDIT_FLUSH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
-        if let Some(file) = &self.audit_file
-            && tokio::time::timeout(AUDIT_FLUSH_DEADLINE, file.wait_drained())
-                .await
-                .is_err()
-        {
-            tracing::warn!("audit JSONL sink did not drain before the shutdown deadline");
-        }
-        if let Some(webhook) = &self.audit_webhook
-            && tokio::time::timeout(AUDIT_FLUSH_DEADLINE, webhook.wait_drained())
-                .await
-                .is_err()
-        {
-            tracing::warn!("audit webhook sink did not drain before the shutdown deadline");
+    /// Clones the external audit-sink handles so a caller that also runs the API server can flush
+    /// them **after** both the controller and the API have drained (`T17.2`).
+    #[must_use]
+    pub fn audit_sink_handles(&self) -> AuditSinkHandles {
+        AuditSinkHandles {
+            file: self.audit_file.clone(),
+            webhook: self.audit_webhook.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 
@@ -1079,6 +1074,41 @@ where
             TermEnd::Controllers(result)
         }
         result = hold => TermEnd::Hold(result),
+    }
+}
+
+/// External audit sinks cloned out of a [`ControlPlane`] so shutdown can flush them after every
+/// producer (controller and API) has drained (`T17.2`).
+#[derive(Clone)]
+pub struct AuditSinkHandles {
+    file: Option<Arc<audit::JsonlFileAuditSink>>,
+    webhook: Option<Arc<audit::WebhookAuditSink>>,
+    metrics: metrics::Metrics,
+}
+
+impl AuditSinkHandles {
+    /// Closes and drains both external sinks within a bounded deadline (`T17.2`).
+    ///
+    /// Records a dropped-event increment when a sink cannot finish in time instead of stalling
+    /// process shutdown; stdout audit records are unaffected.
+    pub async fn flush(self) {
+        const AUDIT_FLUSH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+        if let Some(file) = &self.file
+            && tokio::time::timeout(AUDIT_FLUSH_DEADLINE, file.wait_drained())
+                .await
+                .is_err()
+        {
+            self.metrics.record_audit_dropped();
+            tracing::warn!("audit JSONL sink did not drain before the shutdown deadline");
+        }
+        if let Some(webhook) = &self.webhook
+            && tokio::time::timeout(AUDIT_FLUSH_DEADLINE, webhook.wait_drained())
+                .await
+                .is_err()
+        {
+            self.metrics.record_audit_dropped();
+            tracing::warn!("audit webhook sink did not drain before the shutdown deadline");
+        }
     }
 }
 

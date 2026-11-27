@@ -353,7 +353,7 @@ impl AuditEventLabels {
     }
 }
 
-/// The process's Prometheus registry and its ten families.
+/// The process's Prometheus registry and its eleven families.
 ///
 /// Cheap to clone (`Arc` inside), so the reconcile loop, the status writer, the pipeline and the
 /// listener all share one registry. Recording touches only atomics; the registry lock is taken by

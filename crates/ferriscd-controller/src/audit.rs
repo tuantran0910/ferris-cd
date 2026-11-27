@@ -301,6 +301,7 @@ impl AuditEvent {
             .actor
             .groups
             .iter()
+            .take(32)
             .filter_map(|group| sanitize_bounded_field(group))
             .collect();
         self.actor.token_fingerprint =
@@ -533,6 +534,17 @@ impl AuditSink for JsonlFileAuditSink {
 #[must_use]
 pub fn redact_audit_url(raw: &str) -> String {
     let trimmed = raw.trim();
+    // Credential pre-pass: `user:password@` without a `/` in the userinfo (SCP-style remotes and
+    // non-special schemes that `Url::parse` would keep verbatim). Query/fragment still stripped.
+    if let Some((userinfo, rest)) = trimmed.split_once('@')
+        && !userinfo.contains('/')
+        && userinfo.contains(':')
+    {
+        let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+        let user = userinfo.split_once(':').map_or("***", |(user, _)| user);
+        let redacted = if user.is_empty() { "***" } else { user };
+        return format!("{redacted}:***@{rest}");
+    }
     if let Ok(mut parsed) = reqwest::Url::parse(trimmed) {
         let _ = parsed.set_username("");
         let _ = parsed.set_password(None);
@@ -1455,6 +1467,34 @@ mod tests {
     }
 
     #[test]
+    fn scp_style_userinfo_without_a_scheme_is_redacted_but_bare_users_survive() {
+        let with_password = redact_audit_url("deploy:hunter2@git.example.com:org/repo.git");
+        assert!(!with_password.contains("hunter2"), "{with_password}");
+        assert_eq!(
+            redact_audit_url("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git",
+            "a plain scp-style user is not a secret"
+        );
+    }
+
+    #[test]
+    fn actor_groups_are_capped_at_a_bounded_arity() {
+        let mut event = AuditEvent::new(
+            AuditCategory::ApiOperation,
+            AuditActor {
+                username: Some("alice".to_owned()),
+                groups: (0..64).map(|index| format!("group-{index}")).collect(),
+                token_fingerprint: None,
+            },
+            AuditTarget::default(),
+            "get",
+            AuditOutcome::Allowed,
+        );
+        event.sanitize();
+        assert_eq!(event.actor.groups.len(), 32);
+    }
+
+    #[test]
     fn sanitize_audit_reason_never_splits_a_multibyte_char_at_the_scheme_boundary() {
         // Regression: `rfind` returns a byte index; adding 1 used to slice inside a multi-byte
         // character and panic from the cluster-registry watch task.
@@ -1655,6 +1695,16 @@ mod tests {
         assert_eq!(sink.emit(&event), AuditEmitResult::Delivered);
 
         // `wait_drained` closes the sender and joins the writer without deadlocking.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path)
+                .expect("audit log metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the audit JSONL file must be owner-only");
+        }
         tokio::time::timeout(Duration::from_secs(2), sink.wait_drained())
             .await
             .expect("wait_drained must not deadlock");

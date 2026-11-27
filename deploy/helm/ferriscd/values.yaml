@@ -126,6 +126,8 @@ telemetry:
 # stdout on the `ferriscd::audit` tracing target for FluentBit/Vector collection.
 audit:
   # Optional append-only JSONL file path inside the writable `/tmp` volume (e.g. `/tmp/audit.jsonl`).
+  # In-cluster this needs a rotation sidecar or `copytruncate` and a `tmpSizeLimit`; prefer
+  # `webhookUrlSecret` for production SIEM delivery.
   logPath: ""
   # Optional async batched HTTPS webhook URL for SIEM ingestion (HTTPS-only, SSRF-guarded).
   # Rendered as a plain pod argument: prefer `webhookUrlSecret` in production.
@@ -400,7 +402,8 @@ affinity: {}
 # When empty and `replicaCount > 1`, a default hostname topologySpreadConstraint is added.
 topologySpreadConstraints: []
 priorityClassName: ""
-terminationGracePeriodSeconds: 30
+# Must cover the controller drain (default 30 s) plus the <= 2 s audit-sink flush.
+terminationGracePeriodSeconds: 40
 
 # Optional FerrisCD Modern Web Dashboard (`apps/ferriscd-web`).
 # Runs under the same `restricted` PodSecurityStandard (`readOnlyRootFilesystem: true`,

@@ -106,7 +106,7 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.server.logLevel | quote }}
-            {{- if .Values.audit.webhookUrlSecret.name }}
+            {{- if and .Values.audit .Values.audit.webhookUrlSecret .Values.audit.webhookUrlSecret.name }}
             - name: FERRISCD_AUDIT_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:
