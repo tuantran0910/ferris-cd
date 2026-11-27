@@ -95,7 +95,7 @@ spec:
             - --audit-log-path
             - {{ .logPath | quote }}
             {{- end }}
-            {{- if and .webhookUrl (not .webhookUrlSecret.name) }}
+            {{- if and .webhookUrl (not (and .webhookUrlSecret .webhookUrlSecret.name)) }}
             - --audit-webhook-url
             - {{ .webhookUrl | quote }}
             {{- end }}

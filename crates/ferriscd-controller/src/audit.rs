@@ -536,7 +536,7 @@ pub fn redact_audit_url(raw: &str) -> String {
     let trimmed = raw.trim();
     // Credential pre-pass: `user:password@` without a `/` in the userinfo (SCP-style remotes and
     // non-special schemes that `Url::parse` would keep verbatim). Query/fragment still stripped.
-    if let Some((userinfo, rest)) = trimmed.split_once('@')
+    if let Some((userinfo, rest)) = trimmed.rsplit_once('@')
         && !userinfo.contains('/')
         && userinfo.contains(':')
     {
@@ -1470,6 +1470,9 @@ mod tests {
     fn scp_style_userinfo_without_a_scheme_is_redacted_but_bare_users_survive() {
         let with_password = redact_audit_url("deploy:hunter2@git.example.com:org/repo.git");
         assert!(!with_password.contains("hunter2"), "{with_password}");
+        let multi_at = redact_audit_url("deploy:pa@ss@git.example.com:org/repo.git");
+        assert!(!multi_at.contains("ss@"), "{multi_at}");
+        assert!(!multi_at.contains("pa@"), "{multi_at}");
         assert_eq!(
             redact_audit_url("git@github.com:org/repo.git"),
             "git@github.com:org/repo.git",
@@ -1695,6 +1698,7 @@ mod tests {
         assert_eq!(sink.emit(&event), AuditEmitResult::Delivered);
 
         // `wait_drained` closes the sender and joins the writer without deadlocking.
+        // The mode is decided at creation; `wait_drained` below is what flushes the queued record.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

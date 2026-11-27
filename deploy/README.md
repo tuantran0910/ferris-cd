@@ -462,6 +462,8 @@ Exposed families — and nothing else:
 | `ferriscd_active_reconciles` | gauge | *(none)* |
 | `ferriscd_rbac_reload_total` | counter | `outcome` = `ok` \| `error` \| `deleted` |
 | `ferriscd_rbac_watch_errors_total` | counter | *(none)* |
+| `ferriscd_audit_events_total` | counter | `category` = `api.operation` \| `api.authz_denied` \| `webhook.delivery` \| `controller.impersonation` \| `cluster.registry`, `outcome` = `allowed` \| `denied` \| `accepted` \| `failed` |
+| `ferriscd_audit_dropped_total` | counter | *(none)* |
 
 Operational notes:
 

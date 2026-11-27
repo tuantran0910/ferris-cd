@@ -572,6 +572,11 @@ impl ControlPlane {
     ///
     /// # Errors
     ///
+    /// **Caller obligation (`T17.2`):** this method no longer closes the external audit sinks.
+    /// After every producer (including an in-process API server sharing the plane) has drained,
+    /// call [`Self::audit_sink_handles`]`().flush().await`, or queued JSONL/webhook audit records
+    /// are lost at exit.
+    ///
     /// See [`run_with`].
     pub async fn run_until(
         mut self,
@@ -610,7 +615,8 @@ impl ControlPlane {
         };
         // The registry is a background watcher: stopping it is enough, nothing is buffered.
         self.cluster_stop.cancel();
-        drop(self.cluster_watch);
+        // Give the registry watcher a bounded chance to observe cancellation before the sinks close.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), self.cluster_watch).await;
         // The controller has drained: stop the listener too (idempotent — a `SIGTERM` already
         // cancelled the token) and report its outcome, so a dead `/metrics` endpoint can never be
         // mistaken for a healthy process.
@@ -630,10 +636,6 @@ impl ControlPlane {
         served.map_err(anyhow::Error::from)
     }
 
-    /// Spawns the internal `/metrics` listener, if one was bound at startup.
-    ///
-    /// The task cancels the shared token if serving fails: a metrics endpoint that died must stop
-    /// the process, not leave a reconciling controller that nobody can observe.
     /// Clones the external audit-sink handles so a caller that also runs the API server can flush
     /// them **after** both the controller and the API have drained (`T17.2`).
     #[must_use]
@@ -645,6 +647,10 @@ impl ControlPlane {
         }
     }
 
+    /// Spawns the internal `/metrics` listener, if one was bound at startup.
+    ///
+    /// The task cancels the shared token if serving fails: a metrics endpoint that died must stop
+    /// the process, not leave a reconciling controller that nobody can observe.
     fn spawn_metrics_listener(
         &mut self,
         stop: tokio_util::sync::CancellationToken,
@@ -1099,7 +1105,10 @@ impl AuditSinkHandles {
                 .is_err()
         {
             self.metrics.record_audit_dropped();
-            tracing::warn!("audit JSONL sink did not drain before the shutdown deadline");
+            tracing::warn!(
+                dropped = "up to the channel capacity",
+                "audit JSONL sink did not drain before the shutdown deadline"
+            );
         }
         if let Some(webhook) = &self.webhook
             && tokio::time::timeout(AUDIT_FLUSH_DEADLINE, webhook.wait_drained())
@@ -1107,7 +1116,10 @@ impl AuditSinkHandles {
                 .is_err()
         {
             self.metrics.record_audit_dropped();
-            tracing::warn!("audit webhook sink did not drain before the shutdown deadline");
+            tracing::warn!(
+                dropped = "up to the channel capacity",
+                "audit webhook sink did not drain before the shutdown deadline"
+            );
         }
     }
 }
@@ -1633,6 +1645,40 @@ mod tests {
                 "{shard_id:?}/{total_shards:?}: {err:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn audit_sink_handles_flush_writes_queued_external_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let metrics = metrics::Metrics::with_fixed_series();
+        let sink = Arc::new(
+            audit::JsonlFileAuditSink::open(path.clone(), 8, metrics.clone())
+                .await
+                .expect("jsonl sink"),
+        );
+        let logger = audit::AuditLogger::with_sinks(vec![sink.clone()], metrics.clone());
+        logger.emit(audit::AuditEvent::new(
+            audit::AuditCategory::ApiOperation,
+            audit::AuditActor {
+                username: Some("tester".to_owned()),
+                groups: Vec::new(),
+                token_fingerprint: None,
+            },
+            audit::AuditTarget::default(),
+            "flush-test",
+            audit::AuditOutcome::Accepted,
+        ));
+
+        let handles = AuditSinkHandles {
+            file: Some(sink),
+            webhook: None,
+            metrics,
+        };
+        handles.flush().await;
+
+        let contents = std::fs::read_to_string(&path).expect("audit file");
+        assert!(contents.contains("flush-test"), "{contents}");
     }
 
     #[tokio::test]
