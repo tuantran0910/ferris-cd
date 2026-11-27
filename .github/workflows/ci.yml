@@ -322,8 +322,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # `rustsec/audit-check` publishes a check run on pull requests.
-      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -360,10 +358,13 @@ jobs:
       - name: Run cargo-deny (licenses, advisories, bans, sources)
         run: cargo deny check --hide-inclusion-graph
 
-      - name: Run cargo-audit (RUSTSEC database)
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+      - name: Install cargo-audit (prebuilt host binary; keeps the gate under 90 s)
+        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit@0.23.0
+
+      - name: Run cargo-audit (RUSTSEC database)
+        run: cargo audit --file Cargo.lock
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
