@@ -1363,6 +1363,18 @@ CSV
   PATH="${test_dir}/mockbin:${PATH}" get_pod_restart_count "ferriscd-controller-gone" >/dev/null 2>&1 || missing_pod_rc=$?
   assert_eq "get_pod_restart_count fails when pod is missing (exit 1)" "1" "$missing_pod_rc"
 
+  # (f) Summary flatness header uses `printf --` so leading `---` never triggers invalid option
+  local hdr_out hdr_rc=0
+  hdr_out="$(printf -- '--- RSS & FD Flatness Report ---\n%s\n' "status=PASS" 2>&1)" || hdr_rc=$?
+  assert_eq "printf -- handles leading dashes in flatness header (exit 0)" "0" "$hdr_rc"
+  if [[ "$hdr_out" == *"--- RSS & FD Flatness Report ---"* ]]; then
+    log_pass "self-test: flatness summary header renders cleanly"
+    passed=$((passed + 1))
+  else
+    log_err "self-test FAILED: unexpected flatness summary header output: ${hdr_out}"
+    failed=$((failed + 1))
+  fi
+
   log_info "Self-test summary: ${passed} passed, ${failed} failed."
   if [[ "$failed" -ne 0 ]]; then
     return 1
@@ -1639,7 +1651,7 @@ run_live_benchmark() {
     "$rec_ok_delta" "$rec_retry_delta" "$rec_term_delta"
   printf 'RenderCache hit rate:   %s (steady-state soak window)\n' "$hit_rate"
   printf 'Controller restarts:    %s\n' "$controller_status_line"
-  printf '--- RSS & FD Flatness Report ---\n%s\n' "$flatness_report"
+  printf -- '--- RSS & FD Flatness Report ---\n%s\n' "$flatness_report"
   printf 'Artifacts saved under:  %s\n' "$out_results"
   printf '===============================================================\n'
 
