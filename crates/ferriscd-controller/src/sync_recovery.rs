@@ -108,11 +108,12 @@ pub fn classify_apply_failure(error: &kube::Error, takeover_field_managers: &[St
     };
 
     if is_immutable_field_error(status) {
+        // Put the actionable `Replace=true` guidance before the server's message so the 200-char
+        // `/status` condition cap (`reconcile::bounded`) never slices off the operator hint.
         return Recovery::Fail {
             message: format!(
-                "{} is immutable and cannot be patched in place; annotate it with \
-                 {REPLACE_HINT} to let FerrisCD delete and recreate it (the object's data is \
-                 preserved in Git)",
+                "immutable field cannot be patched in place; annotate with {REPLACE_HINT} to \
+                 delete and recreate ({})",
                 quoted_server_message(status)
             ),
         };
@@ -1096,6 +1097,15 @@ mod tests {
         assert!(
             message.contains("Replace=true"),
             "the advice must survive the redaction: {message}"
+        );
+        // The `Ready` condition truncates messages at 200 chars (`reconcile::bounded`); putting
+        // the `Replace=true` hint before the server text ensures operators still see the fix.
+        let condition = crate::reconcile::bounded(&format!(
+            "/ConfigMap/ferriscd-crd-and-cr/immutable: {message}"
+        ));
+        assert!(
+            condition.contains("Replace=true"),
+            "the Replace=true hint must survive Ready-condition truncation: {condition}"
         );
     }
 }

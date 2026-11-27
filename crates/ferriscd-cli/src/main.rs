@@ -47,6 +47,11 @@ enum Commands {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    // Every subcommand that builds a Kubernetes client (apply, controller, server, app, ...)
+    // needs a process-level rustls provider: both `ring` (kube) and `aws-lc-rs` (gix) are in
+    // the dependency graph, so rustls refuses to pick one and panics on the first TLS use.
+    ferriscd_controller::impersonation::ensure_crypto_provider();
+
     tracing::debug!(
         api_group = ferriscd_crd::api_group(),
         field_manager = ferriscd_engine::default_field_manager(),

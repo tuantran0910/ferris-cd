@@ -691,24 +691,9 @@ impl<'a> SyncExecutor<'a> {
         namespace: &str,
         report: &mut ExecutionReport,
     ) -> Result<(), ReconcileError> {
-        if self.reader.namespace_exists(namespace).await? {
-            return Ok(());
+        if ensure_namespace_exists(self.applier, self.reader, self.discovery, namespace).await? {
+            report.apply_calls += 1;
         }
-        let resource = namespace_resource(namespace);
-        let target = resolve_desired_target(self.discovery, &resource).await?;
-        report.apply_calls += 1;
-        self.applier
-            .apply(ApplyRequest {
-                resource: &resource,
-                api_resource: &target.api_resource,
-                namespace: None,
-                force: false,
-            })
-            .await?;
-        info!(
-            namespace = %namespace,
-            "created the destination namespace (syncOptions.createNamespace)"
-        );
         Ok(())
     }
 
@@ -886,6 +871,38 @@ fn mark_pending(report: &mut ExecutionReport, plan: &SyncPlan, index: usize) {
             report.pending.insert(remaining.key().clone());
         }
     }
+}
+
+/// Creates `namespace` via Server-Side Apply (unstamped, so never prunable) when it does not yet
+/// exist. Returns `Ok(true)` if the namespace was created, or `Ok(false)` if it already existed.
+///
+/// Shared between [`SyncExecutor::ensure_namespace`] (for `Sync` steps) and orchestrated `PreSync`
+/// hooks so a `PreSync` `Job` in a brand-new destination namespace with `createNamespace: true`
+/// never fails with `404 namespaces "<ns>" not found`.
+pub(crate) async fn ensure_namespace_exists(
+    applier: &dyn Applier,
+    reader: &ClusterStateReader,
+    discovery: &DiscoveryCache,
+    namespace: &str,
+) -> Result<bool, ReconcileError> {
+    if reader.namespace_exists(namespace).await? {
+        return Ok(false);
+    }
+    let resource = namespace_resource(namespace);
+    let target = resolve_desired_target(discovery, &resource).await?;
+    applier
+        .apply(ApplyRequest {
+            resource: &resource,
+            api_resource: &target.api_resource,
+            namespace: None,
+            force: false,
+        })
+        .await?;
+    info!(
+        namespace = %namespace,
+        "created the destination namespace (syncOptions.createNamespace)"
+    );
+    Ok(true)
 }
 
 /// Builds the bare `Namespace` object created by `syncOptions.createNamespace`.

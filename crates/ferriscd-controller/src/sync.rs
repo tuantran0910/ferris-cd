@@ -515,6 +515,8 @@ struct PassRequest<'a> {
 struct PassExecution {
     /// One report per executed plan, in execution order.
     reports: Vec<ExecutionReport>,
+    /// Mutating applies issued outside a `SyncPlan` report (e.g. `createNamespace` before `PreSync`).
+    extra_apply_calls: usize,
     /// Orphans deliberately kept (planner `Skip`s and deletes the pruner declined).
     retained: usize,
     /// The `status.operationState` to persist (`None` = leave it untouched).
@@ -564,7 +566,12 @@ impl PassExecution {
 
     /// How many mutating Server-Side Apply calls the pass issued.
     fn apply_calls(&self) -> usize {
-        self.reports.iter().map(|report| report.apply_calls).sum()
+        self.extra_apply_calls
+            + self
+                .reports
+                .iter()
+                .map(|report| report.apply_calls)
+                .sum::<usize>()
     }
 
     /// The first failure, in execution order.
@@ -1517,6 +1524,7 @@ impl InventorySyncPipeline {
         PassExecution {
             retained: execution.retained + plan.retained_orphans().len(),
             reports: vec![execution],
+            extra_apply_calls: 0,
             operation: None,
             settled,
             requeue: None,
@@ -1575,6 +1583,37 @@ impl InventorySyncPipeline {
         // 2. The hooks of the persisted step. Idempotent by construction: a hook that is already
         //    tracked is observed, never created again (finding H2).
         let step = self.machine.current_step(&state);
+        // When `syncOptions.createNamespace: true` is set and `PreSync` actually has hooks to run,
+        // ensure the destination namespace exists *before* creating `PreSync` hooks: otherwise a
+        // `PreSync` migration `Job` into a brand-new namespace fails with `404 Namespace not found`
+        // before wave 0's `createNamespace` ever runs. Hook-less multi-wave operations skip this so
+        // `SyncPlan::pre_create_namespace` preserves its `declared_in_git` rule in wave 0.
+        let destination_ns = request.app.spec.destination.namespace.trim();
+        if step.phase == SyncPhase::PreSync
+            && request.options.create_namespace
+            && !destination_ns.is_empty()
+            && !hooks::hooks_for_step(&request.bundle.hooks, step).is_empty()
+        {
+            match crate::sync_executor::ensure_namespace_exists(
+                request.access.applier(),
+                request.access.reader(),
+                request.discovery,
+                destination_ns,
+            )
+            .await
+            {
+                Ok(true) => pass.extra_apply_calls += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(mid_operation_error(
+                        request,
+                        &error,
+                        request.prev_inventory,
+                        Some(state),
+                    ));
+                }
+            }
+        }
         // Hooks are created and observed as the pass's identity, like every other workload call.
         let hook_cluster = PassHooks {
             pipeline: self,
@@ -9680,6 +9719,133 @@ spec:
         assert_eq!(
             fixture.cluster.applies(),
             vec!["/ConfigMap/payments/settings".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_namespace_runs_before_a_presync_hook() {
+        // Destination namespace does NOT exist yet; `createNamespace: true` must create it before
+        // the `PreSync` hook Job is submitted so live clusters do not reject the Job with 404.
+        let fixture = fixture(FakeCluster::default());
+        fixture.commit(&[
+            (
+                "hook.yaml",
+                "apiVersion: batch/v1\nkind: Job\nmetadata:\n  generateName: migrate-\n  annotations:\n    ferriscd.io/hook: PreSync\n",
+            ),
+            ("configmap.yaml", CONFIGMAP),
+        ]);
+        let mut app = fixture.app(".");
+        app.spec.sync_policy = Some(SyncPolicy {
+            automated: Some(AutomatedSyncPolicy {
+                prune: false,
+                self_heal: true,
+            }),
+            sync_options: Some(SyncOptions {
+                create_namespace: true,
+                ..SyncOptions::default()
+            }),
+            ..SyncPolicy::default()
+        });
+
+        let first = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("createNamespace must pre-create the namespace before PreSync");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/Namespace//payments".to_owned()],
+            "destination Namespace must be pre-created before wave 0 runs"
+        );
+        assert_eq!(
+            fixture.cluster.creates(),
+            vec!["migrate-abcde".to_owned()],
+            "PreSync hook must be created in the same pass after ensuring the Namespace"
+        );
+        assert_eq!(
+            first.operation_state.as_ref().and_then(|s| s.sync_phase),
+            Some(SyncPhase::PreSync)
+        );
+        assert_eq!(
+            fixture.pipeline.mutating_applies(),
+            1,
+            "the PreSync createNamespace apply must be counted in mutating_applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn hookless_multi_wave_with_git_namespace_does_not_pre_create_bare_namespace() {
+        // Multi-wave bundle with NO PreSync hooks and a Git-declared Namespace in wave -1:
+        // `createNamespace: true` must not pre-create a bare unstamped Namespace during PreSync,
+        // letting wave -1 apply the Git-declared Namespace directly (preserving labels & tracking-id).
+        let fixture = fixture(FakeCluster::default());
+        fixture.commit(&[
+            (
+                "namespace.yaml",
+                "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: payments\n  labels:\n    pod-security.kubernetes.io/enforce: restricted\n  annotations:\n    ferriscd.io/sync-wave: \"-1\"\n",
+            ),
+            (
+                "configmap.yaml",
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\n  annotations:\n    ferriscd.io/sync-wave: \"0\"\ndata:\n  key: val\n",
+            ),
+        ]);
+        let mut app = fixture.app(".");
+        app.spec.sync_policy = Some(SyncPolicy {
+            automated: Some(AutomatedSyncPolicy {
+                prune: false,
+                self_heal: true,
+            }),
+            sync_options: Some(SyncOptions {
+                create_namespace: true,
+                ..SyncOptions::default()
+            }),
+            ..SyncPolicy::default()
+        });
+
+        let first = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("hookless multi-wave must dispatch wave -1 directly");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["/Namespace//payments".to_owned()],
+            "only the Git-declared Namespace in wave -1 must be applied (no bare pre-create)"
+        );
+        assert_eq!(
+            fixture.pipeline.mutating_applies(),
+            1,
+            "exactly one apply for the Git-declared Namespace"
+        );
+        let ns_applied = fixture
+            .cluster
+            .applied_objects
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("Namespace was applied");
+        assert_eq!(
+            ns_applied
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("pod-security.kubernetes.io/enforce"))
+                .map(String::as_str),
+            Some("restricted"),
+            "Git-declared Namespace labels must be applied directly, never bypassed by a bare pre-create"
+        );
+        assert!(
+            ns_applied
+                .metadata
+                .annotations
+                .as_ref()
+                .is_some_and(|anns| anns.contains_key(annotations::TRACKING_ID)),
+            "Git-declared Namespace must carry ferriscd.io/tracking-id"
+        );
+        assert_eq!(
+            first.operation_state.as_ref().and_then(|s| s.sync_phase),
+            Some(SyncPhase::Sync)
         );
     }
 

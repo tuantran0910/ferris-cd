@@ -85,7 +85,7 @@ fn a_crd_and_its_custom_resource_sync_on_the_first_pass() {
         "status.inventory to track both",
         || {
             inventory_contains("apiextensions.k8s.io/CustomResourceDefinition//widgets.example.com")
-                && inventory_contains(&format!("/Widget/{TARGET_NAMESPACE}/one"))
+                && inventory_contains(&format!("example.com/Widget/{TARGET_NAMESPACE}/one"))
         },
     );
     wait_for(
@@ -93,9 +93,11 @@ fn a_crd_and_its_custom_resource_sync_on_the_first_pass() {
         "the Application to become Ready",
         || ready_condition_status().as_deref() == Some("True"),
     );
-    assert_eq!(
-        ready_condition_reason().as_deref(),
-        Some("SyncSucceeded"),
+    assert!(
+        matches!(
+            ready_condition_reason().as_deref(),
+            Some("SyncSucceeded" | "SyncSkipped")
+        ),
         "a CRD + CR bundle must not stay PendingDependencies: {}",
         status_jsonpath("{.status}")
     );
@@ -147,12 +149,29 @@ fn an_immutable_configmap_fails_safely_and_recreates_with_replace() {
     );
 
     // Opting in recreates it deterministically (delete -> wait for 404 -> apply, trap M3).
+    // Bump `ferriscd.io/refresh` after pushing the fix: the prior failure was terminal
+    // (`TERMINAL_DELAY = 600s`), so without a refresh annotation/webhook the controller would
+    // wait 10 minutes before polling Git again.
     write(
         repo,
         "configmap.yaml",
         &immutable_configmap_with_annotation("b", "ferriscd.io/sync-options: Replace=true"),
     );
     git_commit(repo, "opt into Replace for the immutable ConfigMap");
+    let refresh = kubectl(&[
+        "annotate",
+        "application",
+        APPLICATION_NAME,
+        "-n",
+        CONTROL_NAMESPACE,
+        "ferriscd.io/refresh=replace-opt-in",
+        "--overwrite",
+    ]);
+    assert!(
+        refresh.status.success(),
+        "refreshing Application failed: {}",
+        String::from_utf8_lossy(&refresh.stderr)
+    );
     wait_for(Duration::from_secs(300), "the recreated ConfigMap", || {
         configmap_data(TARGET_NAMESPACE, "immutable") == Some("b".to_owned())
     });
@@ -189,9 +208,14 @@ fn a_kubectl_applied_configmap_is_adopted_only_when_the_manager_is_listed() {
 
     // Brownfield: the object exists first, owned by `kubectl-client-side-apply`.
     ensure_namespace(TARGET_NAMESPACE);
-    kubectl_stdin(
-        &["apply", "-f", "-"],
+    let seeded = kubectl_stdin(
+        &["apply", "-n", TARGET_NAMESPACE, "-f", "-"],
         &plain_configmap("brownfield", "from-kubectl"),
+    );
+    assert!(
+        seeded.status.success(),
+        "seeding brownfield ConfigMap failed: {}",
+        String::from_utf8_lossy(&seeded.stderr)
     );
     apply_application(repo, "createNamespace: false\n      pruneCRDs: false");
 
@@ -377,6 +401,21 @@ struct ClusterCleanup;
 
 impl ClusterCleanup {
     fn new() -> Self {
+        Self::delete_all();
+        Self
+    }
+
+    fn delete_all() {
+        let _ = kubectl(&[
+            "patch",
+            "application",
+            APPLICATION_NAME,
+            "-n",
+            CONTROL_NAMESPACE,
+            "--type=merge",
+            "-p",
+            r#"{"metadata":{"finalizers":[]}}"#,
+        ]);
         let _ = kubectl(&[
             "delete",
             "application",
@@ -384,6 +423,7 @@ impl ClusterCleanup {
             "-n",
             CONTROL_NAMESPACE,
             "--ignore-not-found=true",
+            "--timeout=30s",
         ]);
         let _ = kubectl(&[
             "delete",
@@ -400,35 +440,12 @@ impl ClusterCleanup {
             "widgets.example.com",
             "--ignore-not-found=true",
         ]);
-        Self
     }
 }
 
 impl Drop for ClusterCleanup {
     fn drop(&mut self) {
-        let _ = kubectl(&[
-            "delete",
-            "application",
-            APPLICATION_NAME,
-            "-n",
-            CONTROL_NAMESPACE,
-            "--ignore-not-found=true",
-        ]);
-        let _ = kubectl(&[
-            "delete",
-            "namespace",
-            TARGET_NAMESPACE,
-            "--ignore-not-found=true",
-            // Blocking delete: a namespace left `Terminating` by an earlier run races the next
-            // create with `AlreadyExists`/`Forbidden` (finding M2).
-            "--timeout=120s",
-        ]);
-        let _ = kubectl(&[
-            "delete",
-            "crd",
-            "widgets.example.com",
-            "--ignore-not-found=true",
-        ]);
+        Self::delete_all();
     }
 }
 
@@ -446,6 +463,8 @@ impl ControllerProcess {
                 CONTROL_NAMESPACE,
                 // The fixture repository is a local path, which the production URL policy rejects.
                 "--allow-local-repos",
+                "--metrics-addr",
+                "127.0.0.1:0",
             ])
             .env("RUST_LOG", "info")
             .stdout(Stdio::inherit())

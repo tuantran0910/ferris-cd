@@ -231,6 +231,24 @@ struct ClusterCleanup;
 impl ClusterCleanup {
     fn new() -> Self {
         // Start from a clean slate so a previous aborted run cannot mask a failure.
+        Self::delete_all();
+        Self
+    }
+
+    fn delete_all() {
+        // Strip the FerrisCD finalizer first: before `ControllerProcess::start()` (and on `Drop`,
+        // after `_controller_cleanup` has already stopped the controller), no controller is running
+        // to clear `ferriscd.io/finalizer`, so a bare `kubectl delete` would block indefinitely.
+        let _ = kubectl(&[
+            "patch",
+            "application",
+            APPLICATION_NAME,
+            "-n",
+            CONTROL_NAMESPACE,
+            "--type=merge",
+            "-p",
+            r#"{"metadata":{"finalizers":[]}}"#,
+        ]);
         let _ = kubectl(&[
             "delete",
             "application",
@@ -238,6 +256,7 @@ impl ClusterCleanup {
             "-n",
             CONTROL_NAMESPACE,
             "--ignore-not-found=true",
+            "--timeout=30s",
         ]);
         let _ = kubectl(&[
             "delete",
@@ -248,29 +267,12 @@ impl ClusterCleanup {
             // create with `AlreadyExists`/`Forbidden` (finding M2).
             "--timeout=120s",
         ]);
-        Self
     }
 }
 
 impl Drop for ClusterCleanup {
     fn drop(&mut self) {
-        let _ = kubectl(&[
-            "delete",
-            "application",
-            APPLICATION_NAME,
-            "-n",
-            CONTROL_NAMESPACE,
-            "--ignore-not-found=true",
-        ]);
-        let _ = kubectl(&[
-            "delete",
-            "namespace",
-            TARGET_NAMESPACE,
-            "--ignore-not-found=true",
-            // Blocking delete: a namespace left `Terminating` by an earlier run races the next
-            // create with `AlreadyExists`/`Forbidden` (finding M2).
-            "--timeout=120s",
-        ]);
+        Self::delete_all();
     }
 }
 
@@ -289,6 +291,8 @@ impl ControllerProcess {
                 // Explicit opt-in: the fixture repository is a local path, which the production
                 // URL policy rejects on purpose.
                 "--allow-local-repos",
+                "--metrics-addr",
+                "127.0.0.1:0",
             ])
             .env("RUST_LOG", "info")
             .stdout(Stdio::inherit())
@@ -436,6 +440,12 @@ fn ensure_namespace(namespace: &str) {
 /// `automated: { selfHeal: true }` is required since T07.5: the diff gate refuses to apply
 /// anything for `automated: None` (manual-only) and, with `selfHeal: false`, only on a source
 /// change. Pruning stays off so the "removed from Git is kept" leg remains observable.
+///
+/// `takeoverFieldManagers` lists `kubectl-patch` because the drift-injection leg below edits the
+/// ConfigMap through `kubectl patch`. FerrisCD never forces fields owned by another manager
+/// (`serverSideForce` stays false), so without this opt-in self-heal would correctly refuse and
+/// the test would time out — that refusal is the safe default, and this field is the documented
+/// escape hatch exercised here.
 fn apply_application(repo_path: &str) {
     let manifest = format!(
         "apiVersion: ferriscd.io/v1alpha1\n\
@@ -453,6 +463,9 @@ fn apply_application(repo_path: &str) {
          \x20   cluster: in-cluster\n\
          \x20   namespace: {TARGET_NAMESPACE}\n\
          \x20 syncPolicy:\n\
+         \x20   syncOptions:\n\
+         \x20     takeoverFieldManagers:\n\
+         \x20       - kubectl-patch\n\
          \x20   automated:\n\
          \x20     prune: false\n\
          \x20     selfHeal: true\n\

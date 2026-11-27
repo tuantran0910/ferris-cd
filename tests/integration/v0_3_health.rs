@@ -188,6 +188,21 @@ struct ClusterCleanup;
 impl ClusterCleanup {
     fn new() -> Self {
         // Start from a clean slate so a previous aborted run cannot mask a failure.
+        Self::delete_all();
+        Self
+    }
+
+    fn delete_all() {
+        let _ = kubectl(&[
+            "patch",
+            "application",
+            APPLICATION_NAME,
+            "-n",
+            CONTROL_NAMESPACE,
+            "--type=merge",
+            "-p",
+            r#"{"metadata":{"finalizers":[]}}"#,
+        ]);
         let _ = kubectl(&[
             "delete",
             "application",
@@ -195,6 +210,7 @@ impl ClusterCleanup {
             "-n",
             CONTROL_NAMESPACE,
             "--ignore-not-found=true",
+            "--timeout=30s",
         ]);
         let _ = kubectl(&[
             "delete",
@@ -205,29 +221,12 @@ impl ClusterCleanup {
             // create with `AlreadyExists`/`Forbidden` (finding M2).
             "--timeout=120s",
         ]);
-        Self
     }
 }
 
 impl Drop for ClusterCleanup {
     fn drop(&mut self) {
-        let _ = kubectl(&[
-            "delete",
-            "application",
-            APPLICATION_NAME,
-            "-n",
-            CONTROL_NAMESPACE,
-            "--ignore-not-found=true",
-        ]);
-        let _ = kubectl(&[
-            "delete",
-            "namespace",
-            TARGET_NAMESPACE,
-            "--ignore-not-found=true",
-            // Blocking delete: a namespace left `Terminating` by an earlier run races the next
-            // create with `AlreadyExists`/`Forbidden` (finding M2).
-            "--timeout=120s",
-        ]);
+        Self::delete_all();
     }
 }
 
@@ -246,6 +245,8 @@ impl ControllerProcess {
                 // Explicit opt-in: the fixture repository is a local path, which the production
                 // URL policy rejects on purpose.
                 "--allow-local-repos",
+                "--metrics-addr",
+                "127.0.0.1:0",
             ])
             .env("RUST_LOG", "info")
             .stdout(Stdio::inherit())

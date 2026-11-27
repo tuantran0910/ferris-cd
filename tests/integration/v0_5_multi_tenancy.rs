@@ -90,9 +90,9 @@ async fn a_tenant_application_is_refused_without_a_service_account_and_impersona
     ensure_namespace(CONTROL_NAMESPACE);
     ensure_namespace(TENANT_NAMESPACE);
     ensure_namespace(DESTINATION_NAMESPACE);
+    let _cleanup = ClusterCleanup::new();
     apply_manifest(&tenant_project_manifest());
     apply_manifest(&tenant_rbac_manifest());
-    let _cleanup = ClusterCleanup::new();
 
     let fixture = Fixture::new().await;
 
@@ -311,8 +311,18 @@ impl Fixture {
     fn apply_application(&self, service_account: Option<&str>) {
         let manifest =
             tenant_application_manifest(&self.repo.display().to_string(), service_account);
-        // Re-creating the object keeps the test independent of whatever a previous run left
-        // behind (a finalizer would otherwise keep it `Terminating`).
+        // Strip the finalizer first because this in-process test does not run a background watch
+        // loop to clear `ferriscd.io/finalizer` during `kubectl delete`.
+        let _ = kubectl(&[
+            "-n",
+            TENANT_NAMESPACE,
+            "patch",
+            "application",
+            APPLICATION_NAME,
+            "--type=merge",
+            "-p",
+            r#"{"metadata":{"finalizers":[]}}"#,
+        ]);
         let _ = kubectl(&[
             "-n",
             TENANT_NAMESPACE,
@@ -320,17 +330,23 @@ impl Fixture {
             "application",
             APPLICATION_NAME,
             "--ignore-not-found=true",
-            "--timeout=120s",
+            "--timeout=30s",
         ]);
         apply_manifest(&manifest);
     }
 
-    /// Runs one reconcile exactly as the controller's finalizer gate would.
+    /// Runs reconcile through the controller's finalizer gate: when the `Application` does not yet
+    /// carry `ferriscd.io/finalizer`, the first `reconcile_instance` call only attaches it, so a
+    /// second call runs `Apply` against the persisted object.
     async fn reconcile(&self) -> Result<(), ferriscd_controller::reconcile::ControllerError> {
         let app = self.read_application().await;
-        reconcile_instance(Arc::new(app), self.ctx.clone())
-            .await
-            .map(|_action| ())
+        let had_finalizer = has_finalizer(&app);
+        reconcile_instance(Arc::new(app), self.ctx.clone()).await?;
+        if !had_finalizer {
+            let app = self.read_application().await;
+            reconcile_instance(Arc::new(app), self.ctx.clone()).await?;
+        }
+        Ok(())
     }
 
     async fn read_application(&self) -> Application {
@@ -477,11 +493,21 @@ impl ClusterCleanup {
         let _ = kubectl(&[
             "-n",
             TENANT_NAMESPACE,
+            "patch",
+            "application",
+            APPLICATION_NAME,
+            "--type=merge",
+            "-p",
+            r#"{"metadata":{"finalizers":[]}}"#,
+        ]);
+        let _ = kubectl(&[
+            "-n",
+            TENANT_NAMESPACE,
             "delete",
             "application",
             APPLICATION_NAME,
             "--ignore-not-found=true",
-            "--timeout=120s",
+            "--timeout=30s",
         ]);
         let _ = kubectl(&[
             "delete",
