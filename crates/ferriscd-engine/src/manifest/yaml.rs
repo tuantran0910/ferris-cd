@@ -711,6 +711,22 @@ data:
     }
 
     #[test]
+    fn parse_document_reports_budget_breach_before_deserialization() {
+        // `parse_document` must surface the whole-stream budget verdict (not a generic parse
+        // error): exceed the 1_024-document stream budget with well-formed documents.
+        let mut stream = String::new();
+        for _ in 0..1_025 {
+            stream.push_str("---\na: 1\n");
+        }
+        let err = parse_document::<serde_json::Value>(&stream)
+            .expect_err("the document budget must reject the stream");
+        assert!(
+            matches!(err, YamlGuardError::Budget { .. }),
+            "expected a budget-specific guard error, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn whole_stream_budget_breach_is_reported_as_yaml_budget() {
         // 1_025 documents exceed the library default per-stream document budget (1_024).
         let mut stream = String::new();

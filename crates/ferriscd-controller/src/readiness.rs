@@ -1,9 +1,11 @@
 //! Control-plane readiness barrier (`T17.1`).
 //!
-//! Tracks the three startup `InitDone` gates that must complete before `GET /readyz` returns
+//! Tracks the startup `InitDone` gates that must complete before `GET /readyz` returns
 //! `200 OK`:
 //!
-//! 1. **Application watches** (`ApplicationControllers::wait_until_ready()`),
+//! 1. **Application watches** (`ApplicationControllers::wait_until_ready()`) — or, on an HA
+//!    standby that has actually observed a healthy foreign leader, the `standby_serving` gate
+//!    instead (a standby never runs the controller set, so it can never satisfy `wait_until_ready`),
 //! 2. **Cluster registry seed** (`ClusterManager` initial `Secret` list / `InitDone`),
 //! 3. **RBAC policy load** (initial `ferriscd-rbac-cm` load / watch `InitDone`).
 //!
@@ -32,6 +34,7 @@ pub struct ControlPlaneReadiness {
 #[derive(Debug, Default)]
 struct ReadinessInner {
     controllers_ready: AtomicBool,
+    standby_serving: AtomicBool,
     clusters_seeded: AtomicBool,
     rbac_loaded: AtomicBool,
 }
@@ -51,10 +54,29 @@ impl ControlPlaneReadiness {
         }
     }
 
-    /// Signals that every `Application` watch store has completed its initial list (`InitDone`),
-    /// or that an HA standby replica has entered leader-election candidacy.
+    /// Signals that every `Application` watch store has completed its initial list (`InitDone`).
+    ///
+    /// Only the replica that actually runs the controller set marks this. An HA standby uses
+    /// [`Self::mark_standby_serving`] instead.
     pub fn mark_controllers_ready(&self) {
         self.inner.controllers_ready.store(true, Ordering::Release);
+    }
+
+    /// Signals that this replica is an HA standby that has observed a **healthy foreign leader**
+    /// holding the `Lease`.
+    ///
+    /// A standby serves stateless API requests and therefore must report ready once the cluster
+    /// registry and RBAC snapshot are seeded, even though it never runs the controller set.
+    pub fn mark_standby_serving(&self) {
+        self.inner.standby_serving.store(true, Ordering::Release);
+    }
+
+    /// Clears the standby gate once this replica acquires the `Lease` and becomes the leader.
+    ///
+    /// The new leader must then wait for its own `ApplicationControllers::wait_until_ready()`
+    /// before reporting ready, exactly like the non-HA path.
+    pub fn clear_standby_serving(&self) {
+        self.inner.standby_serving.store(false, Ordering::Release);
     }
 
     /// Signals that the `ClusterManager` initial `Secret` seed (or watch `InitDone`) completed.
@@ -73,6 +95,12 @@ impl ControlPlaneReadiness {
         self.inner.controllers_ready.load(Ordering::Acquire)
     }
 
+    /// Whether this replica is serving as an HA standby against a healthy foreign leader.
+    #[must_use]
+    pub fn standby_serving(&self) -> bool {
+        self.inner.standby_serving.load(Ordering::Acquire)
+    }
+
     /// Whether the `ClusterManager` seed gate has signalled `InitDone`.
     #[must_use]
     pub fn clusters_seeded(&self) -> bool {
@@ -85,12 +113,15 @@ impl ControlPlaneReadiness {
         self.inner.rbac_loaded.load(Ordering::Acquire)
     }
 
-    /// Returns `true` strictly once all three startup gates have completed `InitDone`.
+    /// Returns `true` strictly once the application gate (controller watches or a standby that
+    /// observed a healthy leader) and both data gates have completed `InitDone`.
     ///
     /// Performs zero heap allocations and takes no locks.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.controllers_ready() && self.clusters_seeded() && self.rbac_loaded()
+        (self.controllers_ready() || self.standby_serving())
+            && self.clusters_seeded()
+            && self.rbac_loaded()
     }
 
     /// Secret-free explanation of which gates are still pending, or `None` once ready.
@@ -99,15 +130,16 @@ impl ControlPlaneReadiness {
     #[must_use]
     pub fn reason(&self) -> Option<String> {
         let controllers = self.controllers_ready();
+        let standby = self.standby_serving();
         let clusters = self.clusters_seeded();
         let rbac = self.rbac_loaded();
-        if controllers && clusters && rbac {
+        if (controllers || standby) && clusters && rbac {
             return None;
         }
         let mut pending: [&'static str; 3] = [""; 3];
         let mut len = 0_usize;
-        if !controllers {
-            pending[len] = "application watches";
+        if !controllers && !standby {
+            pending[len] = "application watches (or a healthy active leader)";
             len += 1;
         }
         if !clusters {
@@ -150,7 +182,7 @@ mod tests {
         let after_rbac = readiness.reason().expect("still missing controllers");
         assert_eq!(
             after_rbac,
-            "waiting for initial control-plane readiness: application watches"
+            "waiting for initial control-plane readiness: application watches (or a healthy active leader)"
         );
 
         // Clones share the exact same underlying atomic state.
@@ -158,6 +190,37 @@ mod tests {
         handle.mark_controllers_ready();
         assert!(readiness.is_ready());
         assert_eq!(readiness.reason(), None);
+    }
+
+    #[test]
+    fn standby_is_ready_only_after_observing_a_healthy_leader_and_both_data_gates() {
+        let readiness = ControlPlaneReadiness::new();
+        readiness.mark_standby_serving();
+        assert!(!readiness.is_ready());
+        assert!(
+            readiness
+                .reason()
+                .expect("missing data gates")
+                .contains("cluster registry seed")
+        );
+
+        readiness.mark_clusters_seeded();
+        readiness.mark_rbac_loaded();
+        assert!(readiness.is_ready());
+
+        // Acquiring the lease clears the standby shortcut: the new leader must complete its own
+        // controller watches before it may serve traffic.
+        readiness.clear_standby_serving();
+        assert!(!readiness.is_ready());
+        assert!(
+            readiness
+                .reason()
+                .expect("leader is cold")
+                .contains("application watches")
+        );
+
+        readiness.mark_controllers_ready();
+        assert!(readiness.is_ready());
     }
 
     #[test]

@@ -989,7 +989,9 @@ async fn run_as_leader(
     // Leader-election config validated: in active/standby HA mode, standby replicas serve
     // stateless API requests behind the shared Service while campaigning on the Lease, so gating
     // `/readyz` on winning the Lease would deadlock `helm upgrade --wait` for `replicaCount > 1`.
-    readiness.mark_controllers_ready();
+    // The standby gate is marked only after a live foreign leader is observed; the leader clears
+    // it and must then complete its own controller watches before it reports ready.
+    let standby_readiness = readiness.clone();
     // `stop` is owned by the caller (`ControlPlane::run` wires it to `SIGINT`/`SIGTERM`): releasing
     // the lease (and cancelling the leader token) is `Leadership::hold`'s job, so the release happens
     // in one place, and a CLI that stops the API server stops the lease too.
@@ -1004,12 +1006,13 @@ async fn run_as_leader(
 
     loop {
         let Some(term) = election
-            .campaign(&stop)
+            .campaign_with(&stop, || standby_readiness.mark_standby_serving())
             .await
             .context("leader election failed")?
         else {
             break;
         };
+        readiness.clear_standby_serving();
         let token = term.token();
         // Boxed so one `select!` can poll both halves without moving either: the controller set has
         // to be awaited *after* the term ends, so in-flight passes drain like a `SIGTERM`.

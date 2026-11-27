@@ -960,10 +960,18 @@ pub async fn watch_rbac_policy(
     metrics: Metrics,
     stop: CancellationToken,
 ) {
-    let api: Api<ConfigMap> = Api::namespaced(client, &namespace);
+    let api = rbac_configmap_api(client, &namespace);
     let config = watcher::Config::default().fields(&format!("metadata.name={RBAC_CONFIGMAP_NAME}"));
     let stream = watcher::watcher(api, config).default_backoff();
     drive_rbac_watch(stream, &namespace, store, readiness, metrics, stop).await;
+}
+
+/// Builds the **strictly namespaced** `ConfigMap` API used by the live RBAC watcher.
+///
+/// The control-plane namespace comes from `--namespace`; this must never be a cluster-wide `Api`
+/// (`T17.1` Trap Guard).
+fn rbac_configmap_api(client: Client, namespace: &str) -> Api<ConfigMap> {
+    Api::namespaced(client, namespace)
 }
 
 /// Drives the live RBAC policy state machine over any Kubernetes `ConfigMap` watch stream.
@@ -1071,6 +1079,7 @@ pub async fn drive_rbac_watch<S, E>(
                     error = %error,
                     "RBAC ConfigMap watch error; retrying with backoff while retaining active policy"
                 );
+                metrics.record_rbac_reload(RbacReloadOutcome::Error);
             }
         }
     }
@@ -1115,6 +1124,29 @@ mod tests {
             },
             ..Pod::default()
         }
+    }
+
+    #[tokio::test]
+    async fn rbac_configmap_watch_is_namespaced_and_never_cluster_wide()
+    -> Result<(), Box<dyn std::error::Error>> {
+        ferriscd_controller::impersonation::ensure_crypto_provider();
+        let config = kube::Config::new("https://127.0.0.1:1".parse()?);
+        let client = Client::try_from(config)?;
+
+        let default = rbac_configmap_api(client.clone(), "ferriscd-system");
+        assert_eq!(
+            default.namespace(),
+            Some("ferriscd-system"),
+            "the RBAC watch must be scoped to the control-plane namespace"
+        );
+
+        let custom = rbac_configmap_api(client, "custom-plane");
+        assert_eq!(
+            custom.namespace(),
+            Some("custom-plane"),
+            "the RBAC watch must follow --namespace"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1581,7 +1613,11 @@ rules:
             "last known-good policy must remain active after malformed updates and watch errors"
         );
         assert_eq!(rbac_reload_count(&metrics, "ok"), 0);
-        assert_eq!(rbac_reload_count(&metrics, "error"), 2);
+        assert_eq!(
+            rbac_reload_count(&metrics, "error"),
+            3,
+            "two malformed updates plus the watch error must surface as three error outcomes"
+        );
         assert_eq!(rbac_reload_count(&metrics, "deleted"), 0);
     }
 

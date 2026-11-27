@@ -576,7 +576,8 @@ pub async fn readyz(State(state): State<AppState>) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
     if state.readiness.is_ready() {
-        // Steady-state `200 OK` path allocates zero heap memory (`T17.1` non-functional requirement).
+        // The probe evaluation itself (`is_ready`/`reason`) allocates zero heap memory; this branch
+        // only wraps a static body (`T17.1` non-functional requirement).
         (
             StatusCode::OK,
             [(

@@ -68,9 +68,10 @@ fn readyz_and_live_rbac_reload_work_end_to_end() {
     assert!(!token.trim().is_empty(), "kubectl must mint a token");
 
     let address = free_address();
-    let mut server = ServerProcess::start(address);
+    let metrics_address = free_address();
+    let mut server = ServerProcess::start(address, metrics_address);
 
-    // --- 1. /readyz flips to 200 {"status":"ready"} once all three startup gates complete -------
+    // --- 1. /readyz flips 503 -> 200 once all three startup gates complete ----------------------
     let ready_body = wait_for_ready(address);
     assert!(
         ready_body.contains(r#""status":"ready""#),
@@ -118,9 +119,21 @@ fn readyz_and_live_rbac_reload_work_end_to_end() {
 
     // --- 3. Malformed RBAC update retains last known-good policy --------------------------------
     apply_rbac_policy("rules: [unterminated");
-    // Give the watch stream a brief moment to receive and reject the malformed update, then prove
-    // the previous grant still authorizes GET.
-    sleep(Duration::from_millis(300));
+    // Wait for the watch to *observe and reject* the malformed update (outcome="error" metric)
+    // instead of sleeping: only then does the retained grant prove the fail-safe path ran.
+    let rejection_deadline = Instant::now() + Duration::from_secs(10);
+    let mut rejection_observed = false;
+    while Instant::now() < rejection_deadline {
+        if rbac_reload_errors(metrics_address) >= 1 {
+            rejection_observed = true;
+            break;
+        }
+        sleep(Duration::from_millis(50));
+    }
+    assert!(
+        rejection_observed,
+        "the malformed update was never rejected (ferriscd_rbac_reload_total{{outcome=\"error\"}} stayed 0)"
+    );
     let (retained_status, _) = http_request(address, "GET", &app_path, Some(token.trim()), None)
         .expect("GET after malformed update must complete");
     assert_eq!(
@@ -156,7 +169,7 @@ struct ServerProcess {
 }
 
 impl ServerProcess {
-    fn start(address: SocketAddr) -> Self {
+    fn start(address: SocketAddr, metrics_address: SocketAddr) -> Self {
         let binary = env!("CARGO_BIN_EXE_ferriscd");
         let child = Command::new(binary)
             .args([
@@ -164,7 +177,7 @@ impl ServerProcess {
                 "--api-addr",
                 &address.to_string(),
                 "--metrics-addr",
-                "127.0.0.1:0",
+                &metrics_address.to_string(),
                 "--namespace",
                 NAMESPACE,
                 "--auth-policy",
@@ -202,13 +215,37 @@ fn free_address() -> SocketAddr {
 
 fn wait_for_ready(address: SocketAddr) -> String {
     let deadline = Instant::now() + STARTUP_BUDGET;
+    let mut first_response = true;
     while Instant::now() < deadline {
-        if let Some((200, body)) = http_request(address, "GET", "/readyz", None, None) {
-            return body;
+        if let Some((status, body)) = http_request(address, "GET", "/readyz", None, None) {
+            // The spec requires proof of the `503` phase, not only the final `200`.
+            if first_response {
+                assert_eq!(
+                    status, 503,
+                    "the first /readyz response must be 503 before InitDone, got {status}: {body}"
+                );
+                first_response = false;
+            }
+            if status == 200 {
+                return body;
+            }
         }
         sleep(Duration::from_millis(100));
     }
     panic!("the API server did not reach /readyz == 200 within {STARTUP_BUDGET:?}");
+}
+
+/// Sums `ferriscd_rbac_reload_total{outcome="error"}` from the metrics endpoint (`0` when the
+/// listener is not up yet).
+fn rbac_reload_errors(metrics_address: SocketAddr) -> u64 {
+    let Some((200, body)) = http_request(metrics_address, "GET", "/metrics", None, None) else {
+        return 0;
+    };
+    body.lines()
+        .filter(|line| line.starts_with("ferriscd_rbac_reload_total{"))
+        .filter(|line| line.contains("outcome=\"error\""))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
 }
 
 fn http_request(

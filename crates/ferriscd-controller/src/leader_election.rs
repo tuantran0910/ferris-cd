@@ -1058,6 +1058,20 @@ impl LeaderElection {
         &self,
         stop: &CancellationToken,
     ) -> Result<Option<Leadership>, LeaderElectionError> {
+        self.campaign_with(stop, || {}).await
+    }
+
+    /// [`Self::campaign`] with a callback invoked every time a **healthy foreign leader** is
+    /// observed holding the lease.
+    ///
+    /// The HA active/standby loop uses this to mark the `standby_serving` readiness gate: a
+    /// standby must report ready to serve stateless API traffic, but only once it has seen a live
+    /// leader (candidacy alone must not flip `/readyz`).
+    pub async fn campaign_with(
+        &self,
+        stop: &CancellationToken,
+        on_standby: impl Fn(),
+    ) -> Result<Option<Leadership>, LeaderElectionError> {
         let mut attempt = 0_u32;
         loop {
             if stop.is_cancelled() {
@@ -1077,6 +1091,7 @@ impl LeaderElection {
                     }));
                 }
                 Ok(AcquireOutcome::Held { holder }) => {
+                    on_standby();
                     tracing::debug!(
                         lease = %self.elector.config.lease_name,
                         holder = %holder,
@@ -1654,6 +1669,59 @@ mod tests {
             "losing the lease must cancel reconciliation immediately"
         );
         stop.cancel();
+    }
+
+    /// **`T17.1`:** the HA readiness shortcut is signalled only after a *healthy foreign leader* is
+    /// observed, and never while this replica itself holds the lease.
+    #[tokio::test]
+    async fn a_standby_observer_fires_only_while_a_healthy_foreign_leader_holds_the_lease() {
+        let api = Arc::new(FakeLeaseApi::default());
+        api.seed("pod-0", Duration::from_secs(0), 30);
+        let election = Arc::new(LeaderElection::new(Arc::new(
+            LeaseElector::new(api.clone(), fast_config("pod-1")).expect("config"),
+        )));
+        let stop = CancellationToken::new();
+        let observed = Arc::new(AtomicUsize::new(0));
+
+        let campaign = {
+            let election = election.clone();
+            let stop = stop.clone();
+            let observed = observed.clone();
+            tokio::spawn(async move {
+                election
+                    .campaign_with(&stop, move || {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .await
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while observed.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            observed.load(Ordering::SeqCst) >= 1,
+            "the standby must observe the healthy foreign leader"
+        );
+
+        // The leader's lease expires: this replica acquires it and must not keep the standby
+        // shortcut armed while its own controller watches are cold.
+        api.seed("pod-0", Duration::from_secs(30), 30);
+        let leadership = tokio::time::timeout(Duration::from_secs(5), campaign)
+            .await
+            .expect("campaign must finish once the lease is available")
+            .expect("campaign task must not panic")
+            .expect("campaign must not fail")
+            .expect("this replica must acquire the lease");
+        stop.cancel();
+        drop(leadership);
+
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            1,
+            "the standby observer must not fire for this replica's own leadership"
+        );
     }
 
     #[tokio::test]

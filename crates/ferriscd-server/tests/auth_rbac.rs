@@ -1259,6 +1259,37 @@ async fn list_clusters_hides_cross_tenant_clusters() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["items"].as_array().expect("items").len(), 0);
 
+    // Wildcard destinations (`cluster: "*"`) expose every registered cluster.
+    let mut wildcard_state = state.clone();
+    wildcard_state.projects = Arc::new(ScopedProjects(vec![project_with_clusters(
+        "wildcard",
+        &["*"],
+    )]));
+    let (status, body) = get_as(wildcard_state, "/api/v1/clusters", Some("admin-token")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["items"].as_array().expect("items").len(),
+        3,
+        "a wildcard destination must see every cluster"
+    );
+
+    // A visible project with an empty `destinations` list exposes no clusters.
+    let mut empty_destinations_state = state.clone();
+    empty_destinations_state.projects =
+        Arc::new(ScopedProjects(vec![project_with_clusters("empty", &[])]));
+    let (status, body) = get_as(
+        empty_destinations_state,
+        "/api/v1/clusters",
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["items"].as_array().expect("items").len(),
+        0,
+        "an empty destinations list must not fall back to every cluster"
+    );
+
     // Unrestricted `PassThrough` sees the full registry.
     let pass_through = state.with_auth(AuthPolicy::PassThrough);
     let (status, body) = get_as(pass_through, "/api/v1/clusters", None).await;
