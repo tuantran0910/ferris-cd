@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 description = "Pure GitOps reconciliation engine, manifest renderer, diff, and sync planner for FerrisCD"
 
 [lints]

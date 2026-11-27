@@ -1,7 +1,7 @@
 # FerrisCD Knowledge Base — Curriculum Index
 
 > **FerrisCD** is built with two equal deliverables: a memory-safe, SSA-first Kubernetes GitOps
-> platform written in Rust (`v0.1` -> `v1.0`), and this **16-lesson hands-on Knowledge Base**
+> platform written in Rust (`v0.1` -> `v1.1+`), and this **hands-on Knowledge Base**
 > paired with Architecture Decision Records (ADRs) and reproducible `kind` Kubernetes experiments.
 
 * **Master Architecture & Specs:** [MASTER_PLAN.md](../MASTER_PLAN.md) · [ROADMAP.md](../ROADMAP.md) · [REVIEW_LOG.md](../REVIEW_LOG.md)
@@ -70,3 +70,9 @@ Read these three foundational ADRs first — every lesson builds on the boundari
 | **`v1.0`** | [Lesson 14: Control-Plane API, Webhooks, TokenReview & Project RBAC](14-control-plane-api-webhooks-and-rbac.md) | In-process `axum` + `utoipa` OpenAPI 3.1 server sharing engine caches, hardened GitHub HMAC + `X-GitHub-Delivery` dedupe vs. GitLab token webhooks with 1 MiB body cap & fan-out debounce, `TokenReview` AuthN (30s positive cache), default-deny `ferriscd-rbac-cm` with `404` non-existence masking, full `ferriscd` CLI | `crates/ferriscd-server/`, `crates/ferriscd-cli/src/commands/{server,login,app,platform}.rs` |
 | **`v1.0`** | [Lesson 15: Observability, Scale Benchmarking & Chaos Engineering](15-observability-benchmarking-and-chaos-engineering.md) | Compile-time low-cardinality Prometheus metrics (`:9090/metrics`), async Tokio `.instrument(span)` OTLP tracing, 5-minute deduplicated Kubernetes Events, 50-app / 500-resource 30m soak benchmark, dual-tier chaos suite (`SIGKILL`, Git outage with zero prunes, K8s `429`/`503` backoff) | `crates/ferriscd-controller/src/{metrics,telemetry,events}.rs`, `benchmarks/scale_harness.sh`, `tests/integration/chaos_suite.rs` |
 | **`v1.0`** | [Lesson 16: Packaging, Hardening, OpenAPI Codegen & Production GitOps](16-packaging-hardening-and-production-gitops.md) | End-to-end Rust `utoipa` -> `openapi-typescript`/`openapi-fetch` React 19 + React Flow dashboard, non-root `readOnlyRootFilesystem: true` containers with `openssh-client` + UID `65532` (Finding C6) + SHA-256 pinned `helm`/`kustomize`, `NetworkPolicy` IMDS egress hardening, least-privilege Helm/Kustomize packaging, Day-2 operations & release pipeline | `apps/ferriscd-web/`, `Dockerfile`, `deploy/helm/ferriscd/`, `deploy/manifests/`, `docs/operations/RUNBOOK.md`, `.github/workflows/release.yml` |
+
+### Track E — Enterprise Evolution & Production Hardening ([Track E Spec](../roadmap/track-e-enterprise-evolution.md))
+
+| Milestone | Lesson | Learning Objectives | Key Codebase Artifacts |
+|---|---|---|---|
+| **`v1.1`** | [Lesson 17: Production Hardening, Live Governance & Software Supply-Chain Security](17-production-hardening-live-governance-and-supply-chain.md) | Watch-backed lock-free `/readyz` barrier, live `ferriscd-rbac-cm` hot-reload (fail-safe retention / fail-closed deletion), tenant-scoped cluster discovery, versioned `ferriscd.io/audit/v1` compliance audit trail with SSRF-guarded non-blocking sinks, `deny.toml` governance, 40-char SHA-pinned CI workflows, CycloneDX SBOMs, keyless Cosign digest signing & SLSA Level 3 provenance | `deny.toml`, `.cargo/audit.toml`, `.github/workflows/{ci,security-audit,release}.yml`, `SECURITY.md` |

@@ -21,7 +21,7 @@ jobs:
     name: YAML & Repo Hygiene
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Validate YAML files
         run: |
@@ -48,7 +48,7 @@ jobs:
           done
 
       - name: Setup Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
 
       - name: Lint and validate Helm chart & Kustomize overlay
         run: |
@@ -250,7 +250,7 @@ jobs:
     name: Format, Clippy & Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Detect Rust workspace
         id: workspace
@@ -261,12 +261,12 @@ jobs:
             echo "has_cargo=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         if: steps.workspace.outputs.has_cargo == 'true'
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: steps.workspace.outputs.has_cargo == 'true'
 
       - name: Check formatting
@@ -292,9 +292,9 @@ jobs:
       run:
         working-directory: apps/ferriscd-web
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -316,3 +316,64 @@ jobs:
 
       - name: Build production bundle
         run: npm run build
+
+  security:
+    name: Supply-Chain Security (cargo-deny, cargo-audit, npm audit, SHA pinning)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Enforce supply-chain policy (SHA pins, cosign digests, advisory expiry)
+        run: ruby .github/scripts/check-supply-chain.rb
+
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+
+      - name: Restore cached RustSec advisory database
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: |
+            ~/.cargo/advisory-db
+            ~/.cargo/advisory-db-deny
+          key: advisory-db-${{ github.run_id }}
+          restore-keys: |
+            advisory-db-
+
+      - name: Repair cached advisory database if it is not a git checkout
+        run: |
+          set -euo pipefail
+          for db in "${HOME}/.cargo/advisory-db" "${HOME}/.cargo/advisory-db-deny"; do
+            if [[ -d "${db}" && ! -d "${db}/.git" ]]; then
+              echo "cached advisory DB ${db} is not a git checkout; dropping it"
+              rm -rf "${db}"
+            fi
+          done
+
+      - name: Install cargo-deny (host binary so the cached advisory DB applies)
+        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Run cargo-deny (licenses, advisories, bans, sources)
+        run: cargo deny check --hide-inclusion-graph
+
+      - name: Install cargo-audit (prebuilt host binary; keeps the gate under 90 s)
+        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
+        with:
+          tool: cargo-audit@0.23.0
+
+      - name: Run cargo-audit (RUSTSEC database)
+        run: cargo audit --file Cargo.lock
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/ferriscd-web/package-lock.json
+
+      # Production dependencies are the blocking gate; devDependency advisories are tracked in
+      # issue #51 (vitest 5 upgrade) and reported by the weekly `security-audit.yml` job.
+      - name: Audit production Web UI dependencies
+        working-directory: apps/ferriscd-web
+        run: npm audit --omit=dev --audit-level=high

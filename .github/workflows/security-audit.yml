@@ -1,0 +1,95 @@
+name: Security Audit
+
+on:
+  schedule:
+    # Weekly supply-chain audit (Monday 06:00 UTC) so new RUSTSEC/npm advisories surface promptly.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-supply-chain:
+    name: Rust Dependency & License Governance (cargo-deny + cargo-audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # `rustsec/audit-check` files/updates a GitHub issue on scheduled runs.
+      issues: write
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+
+      - name: Restore cached RustSec advisory database
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: |
+            ~/.cargo/advisory-db
+            ~/.cargo/advisory-db-deny
+          key: advisory-db-${{ github.run_id }}
+          restore-keys: |
+            advisory-db-
+
+      - name: Repair cached advisory database if it is not a git checkout
+        run: |
+          set -euo pipefail
+          for db in "${HOME}/.cargo/advisory-db" "${HOME}/.cargo/advisory-db-deny"; do
+            if [[ -d "${db}" && ! -d "${db}/.git" ]]; then
+              echo "cached advisory DB ${db} is not a git checkout; dropping it"
+              rm -rf "${db}"
+            fi
+          done
+
+      - name: Install cargo-deny (host binary so the cached advisory DB applies)
+        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Run cargo-deny (advisories, licenses, bans, sources)
+        run: cargo deny check --hide-inclusion-graph
+
+      - name: Run cargo-audit (RUSTSEC database)
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  web-supply-chain:
+    name: Web UI Dependency Audit (npm audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/ferriscd-web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/ferriscd-web/package-lock.json
+
+      - name: Audit production Web UI dependencies (high/critical gate)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Report full Web UI dependency audit (including devDependencies)
+        run: npm audit --audit-level=high || echo "::warning::Dev-only npm advisories detected; review package-lock.json"
+
+  workflow-sha-pinning:
+    name: Supply-Chain Policy (SHA pins, cosign digests, advisory expiry)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Enforce supply-chain policy
+        run: ruby .github/scripts/check-supply-chain.rb
+

@@ -4,10 +4,11 @@
 
 | Version | Supported |
 |---|---|
-| `1.0.x` (`v1.0`) | Supported (security fixes applied to `main` and tagged patch releases) |
-| `< 1.0.0` (pre-release) | Unsupported — upgrade to `v1.0` |
+| `1.1.x` (`v1.1`) | Supported (security fixes applied to `main` and tagged patch releases) |
+| `1.0.x` (`v1.0`) | Supported (critical security backports) |
+| `< 1.0.0` (pre-release) | Unsupported — upgrade to `v1.1` |
 
-## Reporting a Vulnerability
+## Reporting a Vulnerability & CVE Triage SLAs
 
 **Please do not report security vulnerabilities through public GitHub issues or pull requests.**
 
@@ -17,7 +18,90 @@ Use GitHub's **Private Vulnerability Reporting** ("Report a vulnerability" under
 - Minimal reproduction steps or proof-of-concept manifest/request
 - Affected crate, container image, Helm value, or renderer configuration
 
-We aim to acknowledge reports within **72 hours** and share a remediation plan and coordinated disclosure timeline after triage.
+### Remediation & Triage Targets (`T17.5`)
+
+| Severity (CVSS v3.1 / RUSTSEC) | Initial Acknowledgement | Remediation / Patch Release Target |
+|---|---|---|
+| **Critical** (`9.0–10.0`) | `<= 24 hours` | `<= 48 hours` |
+| **High** (`7.0–8.9`) | `<= 48 hours` | `<= 7 days` |
+| **Medium / Low** (`< 7.0`) | `<= 72 hours` | Next scheduled minor/patch release (`<= 30 days`) |
+
+The PR gate audits only **production** Web UI dependencies (`npm audit --omit=dev --audit-level=high`)
+because the current dev toolchain (`vitest`/`tinypool`) carries open advisories that require a
+breaking major upgrade (tracked in issue #51); the weekly `security-audit.yml` job reports the
+full dependency tree, dev included, as a warning.
+
+Temporary dependency advisory exceptions in [`deny.toml`](deny.toml) and [`.cargo/audit.toml`](.cargo/audit.toml) are permitted **only** when the vulnerable code path is demonstrably unreachable (e.g., disabled Cargo feature), and MUST carry a written technical justification, an explicit expiry date, and a tracking reference.
+
+---
+
+## Supply-Chain Verification & Artifact Provenance (`T17.5`)
+
+Every tagged release (`vX.Y.Z`) published by [`.github/workflows/release.yml`](.github/workflows/release.yml) provides:
+
+1. **Keyless Sigstore Cosign signatures** bound to the immutable `sha256:` image digest (never a mutable tag) using GitHub Actions OIDC identity.
+2. **CycloneDX SBOMs** for both the Rust workspace (`ferriscd-<version>-workspace.cdx.json`) and both multi-arch OCI images (`ferriscd-<version>-image.cdx.json`, `ferriscd-web-<version>-image.cdx.json`), attested onto the image digests via `cosign attest`.
+3. **SLSA Level 3 build provenance** attestations via `actions/attest-build-provenance` for release binary tarballs, Helm chart `.tgz` archives, and container image digests.
+4. **Immutable CI supply chain:** Every third-party GitHub Action in `.github/workflows/` is pinned to a full 40-character commit SHA and enforced automatically on every PR.
+
+### Verifying Container Image Signatures & SBOM Attestations
+
+Always resolve and verify against the **immutable `sha256:` digest**, never a mutable tag.
+The commands below require [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/),
+the GitHub CLI (`gh attestation verify`), and [`crane`](https://github.com/google/go-containerregistry)
+(or `docker buildx imagetools inspect`) to resolve the digest:
+
+```bash
+IMAGE="ghcr.io/tuantran0910/ferris-cd"
+DIGEST="$(crane digest "${IMAGE}:1.1.0")"
+
+# 1. Verify keyless Sigstore Cosign signature (GitHub Actions OIDC identity)
+cosign verify \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  --certificate-identity-regexp "^https://github\.com/tuantran0910/ferris-cd/\.github/workflows/release\.yml@refs/tags/v" \
+  "${IMAGE}@${DIGEST}"
+
+# 2. Verify attached CycloneDX SBOM attestation
+cosign verify-attestation \
+  --type cyclonedx \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  --certificate-identity-regexp "^https://github\.com/tuantran0910/ferris-cd/\.github/workflows/release\.yml@refs/tags/v" \
+  "${IMAGE}@${DIGEST}"
+```
+
+To exercise this path **without cutting a release**, dispatch the workflow with
+`sign_dry_run=true`; it pushes `<version>-dryrun` images and runs the same `cosign verify` /
+`cosign verify-attestation` checks inside the job:
+
+```bash
+gh workflow run release.yml -f dry_run_version=0.0.0-dryrun -f sign_dry_run=true
+```
+
+### Verifying SLSA Level 3 Provenance (Binaries, Helm Charts & Images)
+
+```bash
+# Verify a release binary archive or Helm chart `.tgz`
+gh attestation verify ferriscd-1.1.0-x86_64-unknown-linux-gnu.tar.gz --repo tuantran0910/ferris-cd
+gh attestation verify ferriscd-1.1.0.tgz --repo tuantran0910/ferris-cd
+
+# Verify an OCI container image digest
+gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo tuantran0910/ferris-cd
+```
+
+### Pinning Immutable Digests in Helm Production Deployments
+
+In production, pin immutable digests instead of mutable tags in your Helm values override:
+
+```yaml
+image:
+  repository: ghcr.io/tuantran0910/ferris-cd
+  tag: "1.1.0@sha256:<verified-control-plane-digest>"
+
+web:
+  image:
+    repository: ghcr.io/tuantran0910/ferris-cd-web
+    tag: "1.1.0@sha256:<verified-web-digest>"
+```
 
 ---
 
