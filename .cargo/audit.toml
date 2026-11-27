@@ -6,7 +6,8 @@
 [advisories]
 ignore = [
     # Affects kube-client `openssl-tls` connector only; FerrisCD builds kube 5.1 with `rustls-tls`
-    # exclusively (`openssl-tls` is not enabled). Review/remove on kube >= 5.2 upgrade.
-    # Expires: 2027-02-28 | Tracking: docs/ROADMAP.md (T17.5)
+    # exclusively (`openssl-tls` is not enabled). Removal tracked in
+    # https://github.com/tuantran0910/ferris-cd/issues/50.
+    # Expires: 2027-02-28
     "RUSTSEC-2026-0600",
 ]

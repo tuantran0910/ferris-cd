@@ -7,10 +7,15 @@ on:
   workflow_dispatch:
     inputs:
       dry_run_version:
-        description: "Version string used for dry-run artifacts (no images pushed or GitHub Release published)"
+        description: "Version string used for dry-run artifacts (no GitHub Release published)"
         required: false
         default: "0.0.0-dryrun"
         type: string
+      sign_dry_run:
+        description: "Dry-run only: push <version>-dryrun images to GHCR and sign/attest them so cosign verify is exercised end to end"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -28,6 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       is_tag: ${{ steps.meta.outputs.is_tag }}
+      should_push: ${{ steps.meta.outputs.should_push }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
@@ -37,6 +43,7 @@ jobs:
         id: meta
         env:
           DRY_RUN_VERSION: ${{ inputs.dry_run_version }}
+          SIGN_DRY_RUN: ${{ inputs.sign_dry_run }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
@@ -50,6 +57,14 @@ jobs:
             VERSION="${DRY_RUN_VERSION:-0.0.0-dryrun}"
             VERSION="${VERSION#v}"
             TAG="v${VERSION}"
+          fi
+
+          # Images are pushed on a tag, or on a dry run that opts in to exercising the
+          # sign/attest/verify path against a throwaway `-dryrun` tag in the same registry.
+          if [[ "${IS_TAG}" == "true" || "${SIGN_DRY_RUN:-false}" == "true" ]]; then
+            SHOULD_PUSH="true"
+          else
+            SHOULD_PUSH="false"
           fi
 
           if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -67,6 +82,7 @@ jobs:
 
           {
             echo "is_tag=${IS_TAG}"
+            echo "should_push=${SHOULD_PUSH}"
             echo "is_prerelease=${IS_PRERELEASE}"
             echo "tag=${TAG}"
             echo "version=${VERSION}"
@@ -93,8 +109,15 @@ jobs:
           set -euo pipefail
           cargo install --locked cargo-cyclonedx --version 0.5.7
           mkdir -p dist/sbom
-          cargo cyclonedx --format json --spec-version 1.5 --top-level
-          cp ferriscd-cli.cdx.json "dist/sbom/ferriscd-${VERSION}-workspace.cdx.json"
+          # 0.5.x has no workspace-aggregation mode: `--top-level` means "direct dependencies
+          # only" (17 of 366 components here), and each BOM is written next to its Cargo.toml.
+          # Generate the full graph for every crate and merge them into one workspace BOM.
+          cargo cyclonedx --format json --spec-version 1.5
+          test "$(find crates -name '*.cdx.json' | wc -l)" -eq 5
+          ruby .github/scripts/merge-cyclonedx.rb \
+            "dist/sbom/ferriscd-${VERSION}-workspace.cdx.json" \
+            crates/*/*.cdx.json
+          ls -l dist/sbom
 
       - name: Upload workspace SBOM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -251,7 +274,7 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -269,6 +292,7 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ needs.metadata.outputs.is_tag == 'true' && needs.metadata.outputs.is_prerelease == 'false' }}
             type=raw,value=${{ needs.metadata.outputs.version }},enable=${{ needs.metadata.outputs.is_tag != 'true' }}
+            type=raw,value=${{ needs.metadata.outputs.version }}-dryrun,enable=${{ inputs.sign_dry_run == true }}
 
       - name: Build and push multi-arch control-plane image
         id: build
@@ -277,26 +301,28 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ needs.metadata.outputs.is_tag == 'true' }}
+          push: ${{ needs.metadata.outputs.should_push == 'true' }}
           tags: ${{ steps.docker-meta.outputs.tags }}
           labels: ${{ steps.docker-meta.outputs.labels }}
           cache-from: type=gha,scope=control-plane
           cache-to: type=gha,mode=max,scope=control-plane
 
       - name: Generate CycloneDX SBOM for control-plane container image (Syft)
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           image: ghcr.io/${{ needs.metadata.outputs.repo_lower }}@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
           output-file: ferriscd-${{ needs.metadata.outputs.version }}-image.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
 
       - name: Install Cosign for keyless OIDC image signing
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Keyless sign & attest control-plane image strictly by immutable digest
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         env:
           IMAGE_REF: ghcr.io/${{ needs.metadata.outputs.repo_lower }}@${{ steps.build.outputs.digest }}
           SBOM_FILE: ferriscd-${{ needs.metadata.outputs.version }}-image.cdx.json
@@ -309,8 +335,24 @@ jobs:
           cosign sign --yes "${IMAGE_REF}"
           cosign attest --yes --type cyclonedx --predicate "${SBOM_FILE}" "${IMAGE_REF}"
 
+      - name: Verify keyless signature & SBOM attestation (dry-run)
+        if: needs.metadata.outputs.is_tag != 'true' && inputs.sign_dry_run == true
+        env:
+          IMAGE_REF: ghcr.io/${{ needs.metadata.outputs.repo_lower }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/heads/" \
+            "${IMAGE_REF}"
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/heads/" \
+            "${IMAGE_REF}"
+
       - name: Generate SLSA Level 3 build provenance attestation for control-plane image digest
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ghcr.io/${{ needs.metadata.outputs.repo_lower }}
@@ -318,7 +360,7 @@ jobs:
           push-to-registry: true
 
       - name: Upload control-plane image SBOM artifact
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom-image-control-plane
@@ -344,7 +386,7 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -362,6 +404,7 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ needs.metadata.outputs.is_tag == 'true' && needs.metadata.outputs.is_prerelease == 'false' }}
             type=raw,value=${{ needs.metadata.outputs.version }},enable=${{ needs.metadata.outputs.is_tag != 'true' }}
+            type=raw,value=${{ needs.metadata.outputs.version }}-dryrun,enable=${{ inputs.sign_dry_run == true }}
 
       - name: Build and push multi-arch web UI image
         id: build
@@ -370,26 +413,28 @@ jobs:
           context: apps/ferriscd-web
           file: apps/ferriscd-web/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ needs.metadata.outputs.is_tag == 'true' }}
+          push: ${{ needs.metadata.outputs.should_push == 'true' }}
           tags: ${{ steps.docker-meta.outputs.tags }}
           labels: ${{ steps.docker-meta.outputs.labels }}
           cache-from: type=gha,scope=web-ui
           cache-to: type=gha,mode=max,scope=web-ui
 
       - name: Generate CycloneDX SBOM for Web UI container image (Syft)
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           image: ghcr.io/${{ needs.metadata.outputs.repo_lower }}-web@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
           output-file: ferriscd-web-${{ needs.metadata.outputs.version }}-image.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
 
       - name: Install Cosign for keyless OIDC image signing
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: Keyless sign & attest Web UI image strictly by immutable digest
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         env:
           IMAGE_REF: ghcr.io/${{ needs.metadata.outputs.repo_lower }}-web@${{ steps.build.outputs.digest }}
           SBOM_FILE: ferriscd-web-${{ needs.metadata.outputs.version }}-image.cdx.json
@@ -402,8 +447,24 @@ jobs:
           cosign sign --yes "${IMAGE_REF}"
           cosign attest --yes --type cyclonedx --predicate "${SBOM_FILE}" "${IMAGE_REF}"
 
+      - name: Verify keyless signature & SBOM attestation (dry-run)
+        if: needs.metadata.outputs.is_tag != 'true' && inputs.sign_dry_run == true
+        env:
+          IMAGE_REF: ghcr.io/${{ needs.metadata.outputs.repo_lower }}-web@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/heads/" \
+            "${IMAGE_REF}"
+          cosign verify-attestation \
+            --type cyclonedx \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPOSITORY}/\\.github/workflows/release\\.yml@refs/heads/" \
+            "${IMAGE_REF}"
+
       - name: Generate SLSA Level 3 build provenance attestation for Web UI image digest
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ghcr.io/${{ needs.metadata.outputs.repo_lower }}-web
@@ -411,7 +472,7 @@ jobs:
           push-to-registry: true
 
       - name: Upload Web UI image SBOM artifact
-        if: needs.metadata.outputs.is_tag == 'true'
+        if: needs.metadata.outputs.should_push == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom-image-web

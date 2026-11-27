@@ -26,6 +26,11 @@ Use GitHub's **Private Vulnerability Reporting** ("Report a vulnerability" under
 | **High** (`7.0–8.9`) | `<= 48 hours` | `<= 7 days` |
 | **Medium / Low** (`< 7.0`) | `<= 72 hours` | Next scheduled minor/patch release (`<= 30 days`) |
 
+The PR gate audits only **production** Web UI dependencies (`npm audit --omit=dev --audit-level=high`)
+because the current dev toolchain (`vitest`/`tinypool`) carries open advisories that require a
+breaking major upgrade (tracked in issue #51); the weekly `security-audit.yml` job reports the
+full dependency tree, dev included, as a warning.
+
 Temporary dependency advisory exceptions in [`deny.toml`](deny.toml) and [`.cargo/audit.toml`](.cargo/audit.toml) are permitted **only** when the vulnerable code path is demonstrably unreachable (e.g., disabled Cargo feature), and MUST carry a written technical justification, an explicit expiry date, and a tracking reference.
 
 ---
@@ -41,7 +46,10 @@ Every tagged release (`vX.Y.Z`) published by [`.github/workflows/release.yml`](.
 
 ### Verifying Container Image Signatures & SBOM Attestations
 
-Always resolve and verify against the **immutable `sha256:` digest**, never a mutable tag:
+Always resolve and verify against the **immutable `sha256:` digest**, never a mutable tag.
+The commands below require [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/),
+the GitHub CLI (`gh attestation verify`), and [`crane`](https://github.com/google/go-containerregistry)
+(or `docker buildx imagetools inspect`) to resolve the digest:
 
 ```bash
 IMAGE="ghcr.io/tuantran0910/ferris-cd"
@@ -59,6 +67,14 @@ cosign verify-attestation \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   --certificate-identity-regexp "^https://github\.com/tuantran0910/ferris-cd/\.github/workflows/release\.yml@refs/tags/v" \
   "${IMAGE}@${DIGEST}"
+```
+
+To exercise this path **without cutting a release**, dispatch the workflow with
+`sign_dry_run=true`; it pushes `<version>-dryrun` images and runs the same `cosign verify` /
+`cosign verify-attestation` checks inside the job:
+
+```bash
+gh workflow run release.yml -f dry_run_version=0.0.0-dryrun -f sign_dry_run=true
 ```
 
 ### Verifying SLSA Level 3 Provenance (Binaries, Helm Charts & Images)

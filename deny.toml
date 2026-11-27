@@ -10,9 +10,10 @@
 targets = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
     "aarch64-apple-darwin",
 ]
-all-features = false
+all-features = true
 no-default-features = false
 
 [output]
@@ -23,8 +24,10 @@ version = 2
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
+# Every exception is validated by `.github/scripts/check-supply-chain.rb`: a missing reason,
+# a missing expiry, or a lapsed expiry fails CI.
 ignore = [
-    { id = "RUSTSEC-2026-0600", reason = "Affects kube-client openssl-tls connector only; FerrisCD compiles kube 5.1 with rustls-tls exclusively (openssl-tls is disabled). Review/remove upon coordinated kube >= 5.2 upgrade; expires: 2027-02-28; tracking: docs/ROADMAP.md (T17.5)." },
+    { id = "RUSTSEC-2026-0600", reason = "Affects kube-client openssl-tls connector only; FerrisCD compiles kube 5.1 with rustls-tls exclusively (openssl-tls is disabled). Removal tracked in #50; expires: 2027-02-28." },
 ]
 
 [licenses]
@@ -32,6 +35,7 @@ version = 2
 # Enterprise-compatible permissive + weak-copyleft allowlist (`T17.5`).
 allow = [
     "Apache-2.0",
+    # LLVM exception: rustix/linux-raw-sys/ar_archive_writer/wasi.
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
     "BSD-2-Clause",
@@ -40,6 +44,7 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "Unicode-3.0",
+    # Boost (ryu), CC0 (dunce), Unlicense/public-domain (aho-corasick, jiff, ...).
     "BSL-1.0",
     "CC0-1.0",
     "Unlicense",

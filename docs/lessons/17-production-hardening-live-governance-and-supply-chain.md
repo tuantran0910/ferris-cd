@@ -79,19 +79,15 @@ cargo deny check --hide-inclusion-graph
 # 2. Verify production Web UI dependencies have zero High/Critical advisories
 npm --prefix apps/ferriscd-web audit --omit=dev --audit-level=high
 
-# 3. Verify zero unpinned third-party GitHub Actions exist across .github/workflows/
-ruby -e '
-  Dir.glob(".github/workflows/*.{yml,yaml}").sort.each do |file|
-    File.readlines(file).each_with_index do |line, idx|
-      next unless line =~ /^\s*-?\s*uses:\s*([^\s#]+)/
-      ref = Regexp.last_match(1).gsub(/\A["\x27]|["\x27]\z/, "")
-      next if ref.start_with?("./", "docker://")
-      abort("#{file}:#{idx + 1}: unpinned #{ref}") unless ref =~ /@[0-9a-f]{40}\z/
-    end
-  end
-  puts "PASS: all GitHub Actions pinned to immutable 40-char SHAs"
-'
+# 3. Verify the shared supply-chain policy (SHA pins, digest-only cosign, advisory expiry).
+#    The exact script CI runs, so the documented check cannot drift from the enforced one.
+ruby .github/scripts/check-supply-chain.rb
 ```
+
+CycloneDX note: `cargo-cyclonedx 0.5.x` writes one BOM per crate next to its `Cargo.toml` and has no
+workspace-aggregation mode — `--top-level` means "direct dependencies only" (17 of 366 components
+here). The release job therefore generates the full graph for all five crates and merges them with
+`.github/scripts/merge-cyclonedx.rb`.
 
 ### Part B — Live `kind` Experiment: `/readyz`, Live RBAC Reload & Audit Trail
 
@@ -99,7 +95,11 @@ ruby -e '
 # 1. Run the kind-guarded live readiness + live RBAC hot-reload E2E test (`<= 2 s` reload SLA)
 cargo test -p ferriscd-cli --test v1_1_readiness_rbac -- --ignored --test-threads=1
 
-# 2. Verify a released artifact's Sigstore signature & SLSA provenance (replace <VERSION> and <DIGEST>)
+# 2. Exercise the whole release supply-chain path without a tag: pushes <version>-dryrun images,
+#    generates both image SBOMs, signs/attests by digest, then runs cosign verify in the job.
+gh workflow run release.yml -f dry_run_version=0.0.0-dryrun -f sign_dry_run=true
+
+# 3. Verify a released artifact's Sigstore signature & SLSA provenance (replace <VERSION> and <DIGEST>)
 cosign verify \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   --certificate-identity-regexp "^https://github\.com/tuantran0910/ferris-cd/\.github/workflows/release\.yml@refs/tags/v" \

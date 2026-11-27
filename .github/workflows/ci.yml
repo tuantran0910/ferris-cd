@@ -323,25 +323,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Enforce 40-char commit SHA pinning across workflows
-        run: |
-          ruby -e '
-            errors = []
-            Dir.glob(".github/workflows/*.{yml,yaml}").sort.each do |file|
-              File.readlines(file).each_with_index do |line, idx|
-                next unless line =~ /^\s*-?\s*uses:\s*([^\s#]+)/
-                ref = Regexp.last_match(1).gsub(/\A["\x27]|["\x27]\z/, "")
-                next if ref.start_with?("./", "docker://")
-                unless ref =~ /\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}\z/
-                  errors << "#{file}:#{idx + 1}: unpinned action reference `#{ref}` (must pin 40-char commit SHA)"
-                end
-              end
-            end
-            abort(errors.join("\n")) unless errors.empty?
-            puts "OK: all third-party GitHub Actions are pinned to immutable 40-char commit SHAs."
-          '
+      - name: Enforce supply-chain policy (SHA pins, cosign digests, advisory expiry)
+        run: ruby .github/scripts/check-supply-chain.rb
 
       - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+
+      - name: Restore cached RustSec advisory database
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4
+        with:
+          path: ~/.cargo/advisory-db
+          key: advisory-db-${{ github.run_id }}
+          restore-keys: |
+            advisory-db-
 
       - name: Run cargo-deny (licenses, advisories, bans, sources)
         uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2
@@ -359,6 +352,9 @@ jobs:
           cache: npm
           cache-dependency-path: apps/ferriscd-web/package-lock.json
 
+      # Production dependencies are the blocking gate; devDependency advisories are tracked in
+      # issue #51 (vitest 5 upgrade) and reported by the weekly `security-audit.yml` job.
       - name: Audit production Web UI dependencies
         working-directory: apps/ferriscd-web
         run: npm audit --omit=dev --audit-level=high
+
