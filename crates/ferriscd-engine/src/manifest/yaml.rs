@@ -109,12 +109,7 @@ where
         });
     }
     serde_saphyr::from_str_with_options(document, parse_options()).map_err(|err| {
-        // Alias-replay limits are enforced during deserialization. The parser wraps the typed
-        // variants, so match the guard's own fixed phrases ("alias replay ...", "alias expansion
-        // ...") — never a bare user-controlled token such as `replay`, which could come from an
-        // unknown-field error and misreport a typo as a budget breach.
-        let message = err.to_string();
-        if message.contains("alias replay") || message.contains("alias expansion") {
+        if is_alias_limit_breach(&err) {
             YamlGuardError::Budget {
                 limit: "alias-replay".to_owned(),
             }
@@ -122,6 +117,24 @@ where
             YamlGuardError::Parse
         }
     })
+}
+
+/// Whether `err` (possibly wrapped in `AliasError`/`WithSnippet`) is one of the parser's
+/// alias-replay guards. Matching the typed variants — never rendered text — keeps a user key such
+/// as `unknown field \`alias replay\`` classified as an ordinary parse error.
+fn is_alias_limit_breach(err: &serde_saphyr::Error) -> bool {
+    let mut current = err;
+    loop {
+        current = match current {
+            serde_saphyr::Error::AliasError { error, .. }
+            | serde_saphyr::Error::WithSnippet { error, .. } => error,
+            serde_saphyr::Error::AliasReplayCounterOverflow { .. }
+            | serde_saphyr::Error::AliasReplayLimitExceeded { .. }
+            | serde_saphyr::Error::AliasExpansionLimitExceeded { .. }
+            | serde_saphyr::Error::AliasReplayStackDepthExceeded { .. } => return true,
+            _ => return false,
+        };
+    }
 }
 
 /// Parses a single manifest file into zero or more validated [`DesiredResource`]s.
@@ -748,13 +761,25 @@ rules: *e
     fn parse_document_classifies_per_anchor_expansion_breaches_as_budget() {
         // One anchor expanded more than `max_alias_expansions_per_anchor`: a typed
         // `AliasExpansionLimitExceeded`, which must also surface as a budget breach.
-        let aliases = " *a,".repeat(101);
-        let bomb = format!("a: &a [1]\nb: [{aliases}]\n");
+        // 12 anchors keep the whole-stream alias/anchor ratio heuristic quiet (101 <= 10 * 12),
+        // so the failure comes from the deserializer's per-anchor expansion limit itself.
+        let mut bomb = String::from("a: &a [1]\n");
+        for index in 0..11 {
+            bomb.push_str(&format!("extra{index}: &e{index} [1]\n"));
+        }
+        bomb.push_str("b: [");
+        for _ in 0..101 {
+            bomb.push_str(" *a,");
+        }
+        bomb.push_str("]\n");
         let err = parse_document::<serde_json::Value>(&bomb)
             .expect_err("the per-anchor expansion guard must reject the bomb");
-        assert!(
-            matches!(err, YamlGuardError::Budget { .. }),
-            "expected a budget-specific guard error, got: {err:?}"
+        assert_eq!(
+            err,
+            YamlGuardError::Budget {
+                limit: "alias-replay".to_owned()
+            },
+            "the deserializer branch must be reached and classified as alias-replay"
         );
     }
 

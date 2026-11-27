@@ -1644,6 +1644,33 @@ rules:
         assert_eq!(rbac_reload_count(&metrics, "deleted"), 0);
     }
 
+    /// **`T17.1`:** the "fault ended the stream" suppression is per fault: a successful event
+    /// between two failures resets it, so the trailing clean end still counts.
+    #[tokio::test]
+    async fn watch_error_accounting_resets_after_a_successful_event() {
+        let events: Vec<Result<WatcherEvent<ConfigMap>, &'static str>> = vec![
+            Ok(WatcherEvent::Init),
+            Err("first disconnect"),
+            Ok(WatcherEvent::InitDone),
+        ];
+        let metrics = Metrics::with_fixed_series();
+        drive_rbac_watch(
+            futures::stream::iter(events),
+            "ferriscd-system",
+            RbacPolicyStore::empty(),
+            ControlPlaneReadiness::new(),
+            metrics.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            rbac_watch_error_count(&metrics),
+            2,
+            "one Err plus the trailing clean stream end must each be counted"
+        );
+    }
+
     /// **`T17.1`:** deleting `ferriscd-rbac-cm` directly (`Delete`) or omitting it from a completed
     /// reconnect re-list (`Init` -> `InitDone` without `InitApply`) must fail closed to
     /// `RbacPolicy::empty()` and increment `outcome="deleted"` once per transition.
