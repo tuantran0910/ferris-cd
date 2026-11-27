@@ -1,0 +1,12 @@
+# Cargo Audit configuration for FerrisCD (`T17.5`).
+#
+# Kept strictly in sync with `deny.toml`. Every ignored advisory MUST carry a documented
+# technical justification and expiry date.
+
+[advisories]
+ignore = [
+    # Affects kube-client `openssl-tls` connector only; FerrisCD builds kube 5.1 with `rustls-tls`
+    # exclusively (`openssl-tls` is not enabled). Review/remove on kube >= 5.2 upgrade.
+    # Expires: 2027-02-28 | Tracking: docs/ROADMAP.md (T17.5)
+    "RUSTSEC-2026-0600",
+]

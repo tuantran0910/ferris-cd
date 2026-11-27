@@ -73,10 +73,44 @@ jobs:
             echo "repo_lower=${REPO_LOWER}"
           } >> "${GITHUB_OUTPUT}"
 
+  sbom-workspace:
+    name: Generate Rust Workspace CycloneDX SBOM
+    needs: metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: sbom-workspace
+
+      - name: Generate CycloneDX SBOM for Rust workspace
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-cyclonedx --version 0.5.7
+          mkdir -p dist/sbom
+          cargo cyclonedx --format json --spec-version 1.5 --top-level
+          cp ferriscd-cli.cdx.json "dist/sbom/ferriscd-${VERSION}-workspace.cdx.json"
+
+      - name: Upload workspace SBOM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-workspace
+          path: dist/sbom/ferriscd-*-workspace.cdx.json
+          if-no-files-found: error
+
   build-binaries:
     name: Build CLI/Server Binary (${{ matrix.target }})
     needs: metadata
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -88,13 +122,13 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
 
@@ -136,8 +170,14 @@ jobs:
             cat "${ARCHIVE}.sha256"
           )
 
+      - name: Generate SLSA Level 3 build provenance attestation for binary archive
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/ferriscd-${{ needs.metadata.outputs.version }}-${{ matrix.target }}.tar.gz
+
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: binary-${{ matrix.target }}
           path: |
@@ -149,11 +189,15 @@ jobs:
     name: Package Helm Chart
     needs: metadata
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
 
       - name: Lint and package Helm chart
         env:
@@ -173,8 +217,14 @@ jobs:
             cat "ferriscd-${VERSION}.tgz.sha256"
           )
 
+      - name: Generate SLSA Level 3 build provenance attestation for Helm chart
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/helm/ferriscd-${{ needs.metadata.outputs.version }}.tgz
+
       - name: Upload Helm chart artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: helm-chart
           path: |
@@ -183,24 +233,26 @@ jobs:
           if-no-files-found: error
 
   container-control-plane:
-    name: Build Multi-Arch Control Plane Image
+    name: Build, Sign & Attest Multi-Arch Control Plane Image
     needs: metadata
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry
         if: needs.metadata.outputs.is_tag == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -208,7 +260,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: docker-meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ needs.metadata.outputs.repo_lower }}
           tags: |
@@ -219,7 +271,8 @@ jobs:
             type=raw,value=${{ needs.metadata.outputs.version }},enable=${{ needs.metadata.outputs.is_tag != 'true' }}
 
       - name: Build and push multi-arch control-plane image
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile
@@ -230,25 +283,69 @@ jobs:
           cache-from: type=gha,scope=control-plane
           cache-to: type=gha,mode=max,scope=control-plane
 
+      - name: Generate CycloneDX SBOM for control-plane container image (Syft)
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ghcr.io/${{ needs.metadata.outputs.repo_lower }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: ferriscd-${{ needs.metadata.outputs.version }}-image.cdx.json
+
+      - name: Install Cosign for keyless OIDC image signing
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Keyless sign & attest control-plane image strictly by immutable digest
+        if: needs.metadata.outputs.is_tag == 'true'
+        env:
+          IMAGE_REF: ghcr.io/${{ needs.metadata.outputs.repo_lower }}@${{ steps.build.outputs.digest }}
+          SBOM_FILE: ferriscd-${{ needs.metadata.outputs.version }}-image.cdx.json
+        run: |
+          set -euo pipefail
+          if [[ "${IMAGE_REF}" != *@sha256:* ]]; then
+            echo "ERROR: refusing to sign mutable tag; expected immutable @sha256: digest (${IMAGE_REF})" >&2
+            exit 1
+          fi
+          cosign sign --yes "${IMAGE_REF}"
+          cosign attest --yes --type cyclonedx --predicate "${SBOM_FILE}" "${IMAGE_REF}"
+
+      - name: Generate SLSA Level 3 build provenance attestation for control-plane image digest
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ghcr.io/${{ needs.metadata.outputs.repo_lower }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Upload control-plane image SBOM artifact
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-image-control-plane
+          path: ferriscd-${{ needs.metadata.outputs.version }}-image.cdx.json
+          if-no-files-found: error
+
   container-web:
-    name: Build Multi-Arch Web UI Image
+    name: Build, Sign & Attest Multi-Arch Web UI Image
     needs: metadata
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GitHub Container Registry
         if: needs.metadata.outputs.is_tag == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -256,7 +353,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: docker-meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ needs.metadata.outputs.repo_lower }}-web
           tags: |
@@ -267,7 +364,8 @@ jobs:
             type=raw,value=${{ needs.metadata.outputs.version }},enable=${{ needs.metadata.outputs.is_tag != 'true' }}
 
       - name: Build and push multi-arch web UI image
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: apps/ferriscd-web
           file: apps/ferriscd-web/Dockerfile
@@ -278,10 +376,53 @@ jobs:
           cache-from: type=gha,scope=web-ui
           cache-to: type=gha,mode=max,scope=web-ui
 
+      - name: Generate CycloneDX SBOM for Web UI container image (Syft)
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ghcr.io/${{ needs.metadata.outputs.repo_lower }}-web@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: ferriscd-web-${{ needs.metadata.outputs.version }}-image.cdx.json
+
+      - name: Install Cosign for keyless OIDC image signing
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Keyless sign & attest Web UI image strictly by immutable digest
+        if: needs.metadata.outputs.is_tag == 'true'
+        env:
+          IMAGE_REF: ghcr.io/${{ needs.metadata.outputs.repo_lower }}-web@${{ steps.build.outputs.digest }}
+          SBOM_FILE: ferriscd-web-${{ needs.metadata.outputs.version }}-image.cdx.json
+        run: |
+          set -euo pipefail
+          if [[ "${IMAGE_REF}" != *@sha256:* ]]; then
+            echo "ERROR: refusing to sign mutable tag; expected immutable @sha256: digest (${IMAGE_REF})" >&2
+            exit 1
+          fi
+          cosign sign --yes "${IMAGE_REF}"
+          cosign attest --yes --type cyclonedx --predicate "${SBOM_FILE}" "${IMAGE_REF}"
+
+      - name: Generate SLSA Level 3 build provenance attestation for Web UI image digest
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ghcr.io/${{ needs.metadata.outputs.repo_lower }}-web
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Upload Web UI image SBOM artifact
+        if: needs.metadata.outputs.is_tag == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-image-web
+          path: ferriscd-web-${{ needs.metadata.outputs.version }}-image.cdx.json
+          if-no-files-found: error
+
   publish-release:
-    name: Assemble Checksums & Publish GitHub Release
+    name: Assemble Checksums, SBOMs & Publish GitHub Release
     needs:
       - metadata
+      - sbom-workspace
       - build-binaries
       - package-helm
       - container-control-plane
@@ -291,7 +432,7 @@ jobs:
       contents: write
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-artifacts
           merge-multiple: true
@@ -301,23 +442,30 @@ jobs:
           set -euo pipefail
           cd release-artifacts
           rm -f *.sha256
-          LC_ALL=C sha256sum ferriscd-*.tar.gz ferriscd-*.tgz | sort -k2 > SHA256SUMS.txt
+          shopt -s nullglob
+          FILES=(ferriscd-*.tar.gz ferriscd-*.tgz ferriscd-*.cdx.json)
+          if [[ ${#FILES[@]} -eq 0 ]]; then
+            echo "ERROR: no release artifacts found" >&2
+            exit 1
+          fi
+          LC_ALL=C sha256sum "${FILES[@]}" | sort -k2 > SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Upload dry-run release bundle
         if: needs.metadata.outputs.is_tag != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-dryrun-${{ needs.metadata.outputs.version }}
           path: |
             release-artifacts/ferriscd-*.tar.gz
             release-artifacts/ferriscd-*.tgz
+            release-artifacts/ferriscd-*.cdx.json
             release-artifacts/SHA256SUMS.txt
 
       - name: Publish GitHub Release
         if: needs.metadata.outputs.is_tag == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.metadata.outputs.tag }}
           name: FerrisCD ${{ needs.metadata.outputs.tag }}
@@ -326,4 +474,5 @@ jobs:
           files: |
             release-artifacts/ferriscd-*.tar.gz
             release-artifacts/ferriscd-*.tgz
+            release-artifacts/ferriscd-*.cdx.json
             release-artifacts/SHA256SUMS.txt

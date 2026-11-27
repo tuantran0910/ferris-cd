@@ -1,0 +1,66 @@
+# Supply-chain & dependency governance policy for FerrisCD (`T17.5`).
+#
+# Validated in CI on every PR (`.github/workflows/ci.yml`) and weekly via
+# `.github/workflows/security-audit.yml` using `cargo deny check`.
+#
+# Governance rule: every advisory `ignore` entry MUST carry an explicit rationale, an expiry date,
+# and a tracking reference — never leave open-ended exceptions.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2026-0600", reason = "Affects kube-client openssl-tls connector only; FerrisCD compiles kube 5.1 with rustls-tls exclusively (openssl-tls is disabled). Review/remove upon coordinated kube >= 5.2 upgrade; expires: 2027-02-28; tracking: docs/ROADMAP.md (T17.5)." },
+]
+
+[licenses]
+version = 2
+# Enterprise-compatible permissive + weak-copyleft allowlist (`T17.5`).
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

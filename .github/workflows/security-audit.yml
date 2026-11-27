@@ -1,0 +1,81 @@
+name: Security Audit
+
+on:
+  schedule:
+    # Weekly supply-chain audit (Monday 06:00 UTC) so new RUSTSEC/npm advisories surface promptly.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-supply-chain:
+    name: Rust Dependency & License Governance (cargo-deny + cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+
+      - name: Run cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2
+        with:
+          arguments: --hide-inclusion-graph
+
+      - name: Run cargo-audit (RUSTSEC database)
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  web-supply-chain:
+    name: Web UI Dependency Audit (npm audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/ferriscd-web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/ferriscd-web/package-lock.json
+
+      - name: Audit production Web UI dependencies (high/critical gate)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Report full Web UI dependency audit (including devDependencies)
+        run: npm audit --audit-level=high || echo "::warning::Dev-only npm advisories detected; review package-lock.json"
+
+  workflow-sha-pinning:
+    name: Verify Immutable SHA Pinning Across Workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Enforce 40-char commit SHA pinning on all third-party GitHub Actions
+        run: |
+          ruby -e '
+            errors = []
+            Dir.glob(".github/workflows/*.{yml,yaml}").sort.each do |file|
+              File.readlines(file).each_with_index do |line, idx|
+                next unless line =~ /^\s*-?\s*uses:\s*([^\s#]+)/
+                ref = Regexp.last_match(1).gsub(/\A["\x27]|["\x27]\z/, "")
+                next if ref.start_with?("./", "docker://")
+                unless ref =~ /\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}\z/
+                  errors << "#{file}:#{idx + 1}: unpinned action reference `#{ref}` (must pin 40-char commit SHA)"
+                end
+              end
+            end
+            abort(errors.join("\n")) unless errors.empty?
+            puts "OK: every third-party GitHub Action in .github/workflows/ is pinned to a 40-char commit SHA."
+          '

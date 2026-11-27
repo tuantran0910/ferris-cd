@@ -21,7 +21,7 @@ jobs:
     name: YAML & Repo Hygiene
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Validate YAML files
         run: |
@@ -48,7 +48,7 @@ jobs:
           done
 
       - name: Setup Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
 
       - name: Lint and validate Helm chart & Kustomize overlay
         run: |
@@ -250,7 +250,7 @@ jobs:
     name: Format, Clippy & Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Detect Rust workspace
         id: workspace
@@ -261,12 +261,12 @@ jobs:
             echo "has_cargo=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         if: steps.workspace.outputs.has_cargo == 'true'
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: steps.workspace.outputs.has_cargo == 'true'
 
       - name: Check formatting
@@ -292,9 +292,9 @@ jobs:
       run:
         working-directory: apps/ferriscd-web
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
           cache: npm
@@ -316,3 +316,49 @@ jobs:
 
       - name: Build production bundle
         run: npm run build
+
+  security:
+    name: Supply-Chain Security (cargo-deny, cargo-audit, npm audit, SHA pinning)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Enforce 40-char commit SHA pinning across workflows
+        run: |
+          ruby -e '
+            errors = []
+            Dir.glob(".github/workflows/*.{yml,yaml}").sort.each do |file|
+              File.readlines(file).each_with_index do |line, idx|
+                next unless line =~ /^\s*-?\s*uses:\s*([^\s#]+)/
+                ref = Regexp.last_match(1).gsub(/\A["\x27]|["\x27]\z/, "")
+                next if ref.start_with?("./", "docker://")
+                unless ref =~ /\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}\z/
+                  errors << "#{file}:#{idx + 1}: unpinned action reference `#{ref}` (must pin 40-char commit SHA)"
+                end
+              end
+            end
+            abort(errors.join("\n")) unless errors.empty?
+            puts "OK: all third-party GitHub Actions are pinned to immutable 40-char commit SHAs."
+          '
+
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+
+      - name: Run cargo-deny (licenses, advisories, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2
+        with:
+          arguments: --hide-inclusion-graph
+
+      - name: Run cargo-audit (RUSTSEC database)
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/ferriscd-web/package-lock.json
+
+      - name: Audit production Web UI dependencies
+        working-directory: apps/ferriscd-web
+        run: npm audit --omit=dev --audit-level=high
