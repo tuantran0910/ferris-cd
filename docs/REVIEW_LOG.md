@@ -219,6 +219,132 @@ Executed all **26/26** ignored live Kubernetes integration & chaos suites agains
 
 ---
 
+## Phase 19 implementation review (`T19.4` — Event-Driven Notifications Engine)
+
+Scoped to `crates/ferriscd-controller/src/notifications/` (`observer.rs`, `ssrf.rs`, `adapters.rs`,
+`template.rs`, `worker.rs`, `mod.rs`), the `ferriscd_notifications_total{service,outcome}` series in
+`crates/ferriscd-controller/src/metrics.rs`, the `--notifications-*` flags and wiring in
+`crates/ferriscd-cli/src/commands/controller.rs` + `ferriscd-controller/src/lib.rs`, and the live `v0.5`
+acceptance suite `tests/integration/v0_5_notifications.rs`. Finding IDs are namespaced `P19-*` so they
+never collide with the plan-level trap matrix or the `P07-*`/`P13-*`/`P14-*` rounds above.
+
+**Two ID spaces appear in the code this section reviews.** The findings below are `P19-*`. The
+implementation review that preceded this round used bare `C…`/`H…`/`M…`/`N…` numbers, which collided
+with `P19-M2`–`P19-M5` (different findings, same number), so those comments are now prefixed:
+
+- **`R1-*`** — the earlier implementation-review round on the notification subsystem: `R1-H2`
+  (transport configuration is assertable), `R1-M2` (a panicking delivery is logged and survived),
+  `R1-M3` (bounded per-delivery concurrency), `R1-M4` (hand-written redacted `Debug` on
+  `Delivery`/`DeliveryRequest`), `R1-M5` (the `select!` is biased towards cancellation), `R1-M6` (the
+  tenant allowlist is the tenancy boundary), `R1-M7` (a malformed subscription annotation is reported
+  once per `Application`) and `R1-N1`–`R1-N7` (retry-count/backoff semantics, jitter, metric
+  cardinality, non-routable ranges, shutdown drops, validated-URL posting, bounded dedup revisions).
+- **`P19-*`** — this round. Where an earlier-round comment was re-examined here, the code cites this
+  round's ID (`P19-H1` for the CA-file/trust path and its live acceptance, `P19-M1` for the token
+  refund and edge rollback, `P19-M2` for the default-open allowlist warning, `P19-M3` for the live
+  scratch root). A pre-existing bare `M1` in `crates/ferriscd-cli/src/commands/controller.rs` (the
+  Phase 12 RBAC-help finding, outside this diff) is cited as `T12-M1`.
+
+So a bare `M3` no longer appears in code: `grep -rn 'P19-M3'` finds the live scratch-root work and
+`grep -rn 'R1-M3'` finds the delivery-concurrency work, each with exactly one meaning.
+
+- **`P19-H1` / the live acceptance proves the *trust* path, and its scope is narrowed in writing:** the
+  roadmap asks for an **in-cluster receiver pod**; the shipped suite runs the receiver **on the host's
+  non-loopback LAN address** instead (`TlsReceiver`, rustls over a blocking `TcpListener`), and the
+  controller under test is the real `ferriscd` binary running as a **host process** with
+  `--notifications-ca-file <pem>` and `--notifications-allow-private-cidrs <lan>/32`. Rationale: the
+  property the roadmap's sentence is really after is that an operator-supplied PEM CA is *added to* the
+  client's roots (a trust extension, not a verification bypass) and that reachability to a private
+  address is a **separate** decision — both are client-side facts that a host-side receiver observes
+  completely, without also having to reproduce a pod image, a `Service` and an in-cluster `Secret`
+  mount. What is therefore **not** covered by the live suite: the in-cluster network path (a
+  `Service`/`EndpointSlice`-routed `https://…svc/hook` destination) and a receiver pod's own identity.
+  The narrowing is stated in the file's module docs and in the lesson (§6.1).
+- **`P19-H1a` / the negative control makes "required" a measured claim, not a code reading:**
+  `notifications_require_the_ca_file_and_the_private_cidr_allowlist` runs the same receiver, the same
+  `Application` and the same flags **minus exactly one prerequisite** per phase, and each phase asserts
+  three things the other phase cannot satisfy: (1) the process's own
+  `ferriscd_notifications_total{service="webhook",outcome="failed"}` is `>= 1` (scraped over a
+  `TcpStream` from the address parsed out of the controller's own "metrics listener ready" line, so
+  "nothing happened" cannot pass); (2) `outcome="delivered"` stays `0` and the receiver records **zero**
+  deliveries; (3) the *reason* is distinguished — without the CA file the receiver must have **accepted
+  a TCP connection** (the handshake is what fails) and the log must contain
+  `the notification delivery failed` but not `refused by the SSRF egress guard`; without the CIDR
+  allowlist the receiver must have accepted **no** new connection at all and the log must contain the
+  egress-guard refusal but not the transport failure.
+- **`P19-M1` / the token bucket reserves, and gives the token back:** the per-`Application` bucket is
+  consumed *before* `try_send`, so a full queue (`try_send` → `Err`, capacity 512) **refunds** the
+  token (`refund_token`) and counts `outcome="dropped"`. Without the refund, one burst of 512 dropped
+  alerts would empty a tenant's bucket and then rate-limit (`suppressed`) the single real page that
+  follows — the exact alert the budget exists to protect. The same pass also **rolls back the edge
+  state** when nothing was enqueued (deduplicated, rate limited or dropped), so "we already saw
+  `Ready=False`" can never be committed for an alert that was never sent; the `on-out-of-sync` debounce
+  timer is deliberately *not* rolled back (it is a clock, not an edge — resetting it would re-arm a 60 s
+  wait every 180 s and never fire). The documented limit: a write that fires several triggers where
+  only some are enqueued advances the whole observation.
+- **`P19-M2` / the default-open tenant allowlist is announced at startup:**
+  `--notifications-allowed-namespaces` unset means "any reconciled namespace may page any channel
+  `Secret` in the control-plane namespace". That stays the default (no existing `Application` stops
+  alerting when the flag is introduced), but the one dangerous combination — notifications enabled
+  **and** an `Application` scope wider than the control plane **and** no allowlist — emits one
+  `tracing::warn!` before the first reconcile. The predicate
+  (`open_tenant_allowlist_warning`) is pure, so the wiring is asserted without capturing logs, and an
+  explicit allowlist or a control-plane-only scope produces no warning.
+- **`P19-M3` / the live suites cannot leave a scratch directory behind:** every controller child is
+  started with its own `TMPDIR` **and** an explicit `--work-root` inside it, and both live tests assert
+  that `--work-root`'s `ferriscd-repos` exists *and* that `<TMPDIR>/ferriscd-repos` (the default the
+  flag replaces) does not — the phase-scoped assertion lives in the negative control too, so a
+  regression shows up in both.
+- **`P19-M4` / template context narrowed (recorded deviation):** the roadmap's bullet says the redacted
+  context exposes `sync`, `health`, **`conditions` and `history`**. `NotificationContext` exposes
+  neither: it carries `app.{name,namespace,project,repoUrl,revision,syncStatus,healthStatus,message}`,
+  `observedGeneration`, `trigger`, `service` and `recipient` — twelve closed keys, allow-listed at
+  `ConfigMap` load time. `conditions` duplicate `Ready`/message (which is already the `app.message`
+  field) and `history` is unbounded operator-visible history that would only grow payloads; both are
+  omissions rather than oversights, and the closed struct is what makes "a template cannot reach a
+  `Secret`, a diff or a rendered manifest" a type-level statement instead of a review statement.
+- **`P19-M5` / the CA prerequisite is a documented, portable CLI requirement:** the live CA is generated
+  with `openssl req -x509 -config <cnf>` + a `[v3_ca]` section, **not** `-addext` (OpenSSL 1.1.1+ only,
+  absent from the stock macOS LibreSSL), and the leaf keeps its **IP SAN** for the host's LAN address so
+  hostname/IP verification is still exercised. The controller side treats a missing, empty or non-PEM
+  `--notifications-ca-file` as a **startup** error (`--enable-notifications` off does not skip the read
+  of a *configured* path), because the alternative — coming up and failing TLS on the first real page —
+  is the worst failure mode for an alerting path.
+- **The live suite is serial by construction, and its address premise is asserted:** the two live
+  tests share the control-plane namespace, so each takes a **process-global** `static LIVE_SUITE:
+  Mutex<()>` as its first statement (`live_suite()`, poison-recovering). "Run serially" is therefore
+  no longer a note asking the operator for `--test-threads=1`: `make test-integration` runs
+  `cargo test --workspace -- --ignored` at the default thread count, and a `--test-threads=2`
+  invocation was executed to confirm the second test waits for the first. The egress-guard premise
+  of the negative control's phase 2 — "no allowlist ⇒ refused" — is now *checked* instead of assumed:
+  `non_loopback_ipv4()` asserts that the discovered LAN address is classified
+  `BlockReason::PrivateNetwork` by the guard itself (`10/8`, `172.16/12`, `192.168/16`, RFC 6598
+  `100.64/10`; a public address fails with that list in the message and the prerequisite is written
+  out in the file's `# Prerequisites`), because a public address would be reachable without the flag.
+- **Trap guards asserted hermetically:** `notifications.ferriscd.io/*` is not a control annotation
+  (`composite_hash` unchanged), redirects are never followed (client policy **and** a hard `3xx`
+  refusal in the worker), the **canonical** address is classified (IPv4-mapped IPv6 and NAT64 judged by
+  their embedded IPv4), the validated address is pinned at connect (`GuardedResolver`), a `/0` allowlist
+  is refused at parse time, loopback/metadata stay blocked even when a CIDR covers them, the signing key
+  never reaches a payload or a log (asserted on the receiver's raw bytes and on the controller's
+  complete log), and the `reqwest` errors are logged through `without_url()`. The live receiver's own
+  log assertions cover the destination URL's **query string** too (the channel URL carries a
+  `?token=…` sentinel that must appear in the request line and never in the controller log), its
+  request-head buffer is capped (`MAX_HEADER_BYTES`), and a metrics-address timeout reports the
+  child's log tail instead of only "timed out".
+- **Verification:** `make gate` green; the live suite
+  (`cargo test -p ferriscd-cli --test v0_5_notifications -- --ignored`, no `--test-threads`) executed
+  **three** times against `kind-ferriscd-dev` — once concurrently (`--test-threads=2`, both tests still
+  serialised by `LIVE_SUITE`) and twice back-to-back serially — with both tests passing on every run,
+  after which no `Application`, channel `Secret` or namespace is left in the cluster and no
+  `${TMPDIR}/ferriscd-repos` is created.
+- **Follow-ups (non-blocking):** the in-cluster receiver path from the roadmap (see `P19-H1`) remains
+  uncovered; `conditions`/`history` in the template context are intentionally not exposed (`P19-M4`);
+  the observer's edge/dedup tables are in-memory, so a restart re-delivers at most one notification per
+  subscribed trigger (documented, and collapsed server-side by PagerDuty's `dedup_key`).
+
+---
+
 ## `T19.2` Web UI PKCE SSO & `ferriscd login --oidc` — Review Round (open follow-ups)
 
 First review pass found one Critical (`C1`), two High (`H1`, `H2`), three Medium and a set of nits; all

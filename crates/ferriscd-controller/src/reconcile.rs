@@ -2320,6 +2320,9 @@ mod tests {
             crate::metrics::RBAC_WATCH_ERRORS_TOTAL,
             crate::metrics::AUDIT_EVENTS_TOTAL,
             crate::metrics::AUDIT_DROPPED_TOTAL,
+            // `T19.4`: the notification families are pre-created too (a replica that has delivered
+            // nothing still exposes them, as zeros).
+            crate::metrics::NOTIFICATIONS_TOTAL,
         ]
         .into_iter()
         .collect();

@@ -26,6 +26,11 @@
 //! | `ferriscd_git_fetch_duration_seconds` | histogram | — | 1 |
 //! | `ferriscd_render_cache_total` | counter | `outcome` | 2 |
 //! | `ferriscd_active_reconciles` | gauge | — | 1 |
+//! | `ferriscd_rbac_reload_total` | counter | `outcome` | 3 |
+//! | `ferriscd_rbac_watch_errors_total` | counter | — | 1 |
+//! | `ferriscd_audit_events_total` | counter | `category`, `outcome` | 5 × 4 |
+//! | `ferriscd_audit_dropped_total` | counter | — | 1 |
+//! | `ferriscd_notifications_total` | counter | `service`, `outcome` | 4 × 4 |
 //!
 //! # The listener is separate from the API
 //!
@@ -72,6 +77,7 @@ use prometheus_client::registry::Registry;
 
 use crate::audit::{AuditCategory, AuditOutcome};
 use crate::controller::FailureClass;
+use crate::notifications::NotificationService;
 use crate::reconcile::{ControllerError, ReconcileError, StatusWriter};
 
 /// Default bind address of the internal metrics listener (`--metrics-addr`).
@@ -142,6 +148,12 @@ pub const AUDIT_DROPPED_COUNTER: &str = "ferriscd_audit_dropped";
 /// Scraped name of the dropped compliance audit events counter (`T17.2`).
 pub const AUDIT_DROPPED_TOTAL: &str = "ferriscd_audit_dropped_total";
 
+/// Registered name of the notification delivery counter (`T19.4`).
+pub const NOTIFICATIONS_COUNTER: &str = "ferriscd_notifications";
+
+/// Scraped name of the notification delivery counter (`T19.4`).
+pub const NOTIFICATIONS_TOTAL: &str = "ferriscd_notifications_total";
+
 /// The **complete** `result` label set, in the order it is documented.
 pub const RECONCILE_RESULTS: [&str; 3] = ["success", "retryable", "terminal"];
 
@@ -163,6 +175,19 @@ pub const CACHE_OUTCOMES: [&str; 2] = ["hit", "miss"];
 
 /// The **complete** `outcome` label set of [`RBAC_RELOAD_TOTAL`] (`T17.1`).
 pub const RBAC_RELOAD_OUTCOMES: [&str; 3] = ["ok", "error", "deleted"];
+
+/// The **complete** `service` label set of [`NOTIFICATIONS_TOTAL`] (`T19.4`).
+pub const NOTIFICATION_SERVICES: [&str; 4] = ["slack", "teams", "pagerduty", "webhook"];
+
+/// The **complete** `outcome` label set of [`NOTIFICATIONS_TOTAL`] (`T19.4`).
+///
+/// `suppressed` **is** recorded in production: the observer's deduplication and rate-limit gates
+/// emit it (`notifications::observer`) and it is the label that answers "how much am I being rate
+/// limited / deduplicated?" after an alert storm. `dropped` covers an unresolvable channel, a
+/// service mismatch and a full queue. Keeping the set fixed here means a future outcome cannot
+/// become a cardinality surprise (finding **R1-N3**: the previous comment claimed `suppressed` was
+/// unused, which was wrong).
+pub const NOTIFICATION_OUTCOMES: [&str; 4] = ["delivered", "failed", "dropped", "suppressed"];
 
 /// First bucket of the latency histograms (5 ms).
 const BUCKET_START_SECONDS: f64 = 0.005;
@@ -337,6 +362,55 @@ struct RenderCacheSeen {
     misses: u64,
 }
 
+/// How one notification delivery ended (`T19.4`).
+///
+/// The variants are the `outcome` label set ([`NOTIFICATION_OUTCOMES`]): a receiver's status code or
+/// error message never reaches a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationOutcome {
+    /// The receiver answered 2xx.
+    Delivered,
+    /// Every attempt failed (or the destination was refused by the egress guard).
+    Failed,
+    /// The notification was never attempted (unknown channel, service mismatch) or the bounded queue
+    /// was full.
+    Dropped,
+    /// A gate (deduplication / rate limit) suppressed the delivery.
+    Suppressed,
+}
+
+impl NotificationOutcome {
+    /// The label value. Always one of [`NOTIFICATION_OUTCOMES`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => NOTIFICATION_OUTCOMES[0],
+            Self::Failed => NOTIFICATION_OUTCOMES[1],
+            Self::Dropped => NOTIFICATION_OUTCOMES[2],
+            Self::Suppressed => NOTIFICATION_OUTCOMES[3],
+        }
+    }
+}
+
+/// `service`/`outcome` label set for [`NOTIFICATIONS_TOTAL`] (`T19.4`).
+///
+/// Both labels are `&'static str` drawn from the fixed sets above, so the series count is at most
+/// `4 × 4` regardless of how many `Application`s notify.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct NotificationLabels {
+    service: &'static str,
+    outcome: &'static str,
+}
+
+impl NotificationLabels {
+    fn of(service: &'static str, outcome: NotificationOutcome) -> Self {
+        Self {
+            service,
+            outcome: outcome.as_str(),
+        }
+    }
+}
+
 /// `category`/`outcome` label set for [`AUDIT_EVENTS_TOTAL`] (`T17.2`).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct AuditEventLabels {
@@ -353,7 +427,7 @@ impl AuditEventLabels {
     }
 }
 
-/// The process's Prometheus registry and its eleven families.
+/// The process's Prometheus registry and its twelve families.
 ///
 /// Cheap to clone (`Arc` inside), so the reconcile loop, the status writer, the pipeline and the
 /// listener all share one registry. Recording touches only atomics; the registry lock is taken by
@@ -372,6 +446,7 @@ pub struct Metrics {
     rbac_watch_errors: Counter,
     audit_events_total: Family<AuditEventLabels, Counter>,
     audit_dropped_total: Counter,
+    notifications_total: Family<NotificationLabels, Counter>,
     render_cache_seen: Arc<Mutex<RenderCacheSeen>>,
 }
 
@@ -391,7 +466,7 @@ impl std::fmt::Debug for Metrics {
 /// **Advisory only:** it is hand-maintained documentation of the registry, not the source of truth
 /// — the registration in [`Metrics::new`] and the `T15.1` tests are. A family added there without a
 /// row here does not break anything (and is caught by the tests), it just reads as an omission.
-const FAMILY_DESCRIPTIONS: [(&str, &str); 11] = [
+const FAMILY_DESCRIPTIONS: [(&str, &str); 12] = [
     (RECONCILE_DURATION_SECONDS, "histogram"),
     (RECONCILE_TOTAL, "counter"),
     (APP_SYNC_STATUS, "gauge"),
@@ -403,6 +478,7 @@ const FAMILY_DESCRIPTIONS: [(&str, &str); 11] = [
     (RBAC_WATCH_ERRORS_TOTAL, "counter"),
     (AUDIT_EVENTS_TOTAL, "counter"),
     (AUDIT_DROPPED_TOTAL, "counter"),
+    (NOTIFICATIONS_TOTAL, "counter"),
 ];
 
 /// Builds a latency histogram (same buckets for reconcile and Git fetch).
@@ -430,6 +506,7 @@ impl Metrics {
         let rbac_watch_errors = Counter::default();
         let audit_events_total = Family::<AuditEventLabels, Counter>::default();
         let audit_dropped_total = Counter::default();
+        let notifications_total = Family::<NotificationLabels, Counter>::default();
 
         let mut registry = Registry::default();
         registry.register(
@@ -487,6 +564,11 @@ impl Metrics {
             "Compliance audit events dropped by non-blocking external sinks",
             audit_dropped_total.clone(),
         );
+        registry.register(
+            NOTIFICATIONS_COUNTER,
+            "Notifications delivered to external services, by service and outcome",
+            notifications_total.clone(),
+        );
 
         Self {
             registry: Arc::new(Mutex::new(registry)),
@@ -501,6 +583,7 @@ impl Metrics {
             rbac_watch_errors,
             audit_events_total,
             audit_dropped_total,
+            notifications_total,
             render_cache_seen: Arc::new(Mutex::new(RenderCacheSeen::default())),
         }
     }
@@ -562,6 +645,20 @@ impl Metrics {
                     .get_or_create_owned(&AuditEventLabels::of(category, outcome));
             }
         }
+        // `T19.4`: the notification families are pre-created too, so `rate(failures)` exists (as a
+        // zero) on a replica that has not delivered anything yet.
+        for service in NOTIFICATION_SERVICES {
+            for outcome in [
+                NotificationOutcome::Delivered,
+                NotificationOutcome::Failed,
+                NotificationOutcome::Dropped,
+                NotificationOutcome::Suppressed,
+            ] {
+                metrics
+                    .notifications_total
+                    .get_or_create_owned(&NotificationLabels::of(service, outcome));
+            }
+        }
         metrics
     }
 
@@ -579,6 +676,16 @@ impl Metrics {
     /// permanently dead watch still has to be visible.
     pub fn record_rbac_watch_error(&self) {
         self.rbac_watch_errors.inc();
+    }
+
+    /// Records one notification delivery attempt (`T19.4`).
+    ///
+    /// The `service` label is derived from the typed enum, so a runtime string (a channel name, a
+    /// URL) can never become a label and the set stays at [`NOTIFICATION_SERVICES`].
+    pub fn record_notification(&self, service: NotificationService, outcome: NotificationOutcome) {
+        self.notifications_total
+            .get_or_create_owned(&NotificationLabels::of(service.as_str(), outcome))
+            .inc();
     }
 
     /// Records one emitted compliance audit event (`T17.2`).
@@ -1413,6 +1520,22 @@ mod tests {
             entries: 1,
             capacity: 1,
         });
+        // `T19.4`: every (service, outcome) pair, so the union below is the documented set.
+        for service in [
+            crate::notifications::NotificationService::Slack,
+            crate::notifications::NotificationService::Teams,
+            crate::notifications::NotificationService::PagerDuty,
+            crate::notifications::NotificationService::Webhook,
+        ] {
+            for outcome in [
+                NotificationOutcome::Delivered,
+                NotificationOutcome::Failed,
+                NotificationOutcome::Dropped,
+                NotificationOutcome::Suppressed,
+            ] {
+                metrics.record_notification(service, outcome);
+            }
+        }
 
         let (body, samples) = scrape(&metrics);
         assert_eq!(
@@ -1439,6 +1562,21 @@ mod tests {
         assert_eq!(
             exposition::label_values(&samples, RENDER_CACHE_TOTAL, "outcome"),
             CACHE_OUTCOMES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+        );
+
+        assert_eq!(
+            exposition::label_values(&samples, NOTIFICATIONS_TOTAL, "service"),
+            NOTIFICATION_SERVICES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+        );
+        assert_eq!(
+            exposition::label_values(&samples, NOTIFICATIONS_TOTAL, "outcome"),
+            NOTIFICATION_OUTCOMES
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect()
@@ -1490,10 +1628,25 @@ mod tests {
         metrics.record_rbac_watch_error();
         metrics.record_audit_event(AuditCategory::ApiOperation, AuditOutcome::Accepted);
         metrics.record_audit_dropped();
+        for service in [
+            crate::notifications::NotificationService::Slack,
+            crate::notifications::NotificationService::Teams,
+            crate::notifications::NotificationService::PagerDuty,
+            crate::notifications::NotificationService::Webhook,
+        ] {
+            for outcome in [
+                NotificationOutcome::Delivered,
+                NotificationOutcome::Failed,
+                NotificationOutcome::Dropped,
+                NotificationOutcome::Suppressed,
+            ] {
+                metrics.record_notification(service, outcome);
+            }
+        }
 
         let (body, samples) = scrape(&metrics);
         let families = exposition::label_names(&samples);
-        let expected: [(&str, &[&str]); 11] = [
+        let expected: [(&str, &[&str]); 12] = [
             (RECONCILE_DURATION_SECONDS, &["result", "le"]),
             (RECONCILE_TOTAL, &["result"]),
             (APP_SYNC_STATUS, &["app_namespace", "app_name", "status"]),
@@ -1505,6 +1658,7 @@ mod tests {
             (RBAC_WATCH_ERRORS_TOTAL, &[]),
             (AUDIT_EVENTS_TOTAL, &["category", "outcome"]),
             (AUDIT_DROPPED_TOTAL, &[]),
+            (NOTIFICATIONS_TOTAL, &["service", "outcome"]),
         ];
         assert_eq!(
             families.len(),
@@ -1851,6 +2005,7 @@ mod tests {
             RBAC_WATCH_ERRORS_TOTAL,
             AUDIT_EVENTS_TOTAL,
             AUDIT_DROPPED_TOTAL,
+            NOTIFICATIONS_TOTAL,
         ]
         .into_iter()
         .collect();
