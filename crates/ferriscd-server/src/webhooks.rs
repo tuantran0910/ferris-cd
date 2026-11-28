@@ -634,13 +634,18 @@ pub fn repository_identity(url: &str) -> Option<String> {
 ///    is" and matching every branch would wake every manifest-only app on every feature branch.
 #[must_use]
 pub fn application_matches(app: &Application, event: &PushEvent) -> bool {
-    let Some(identity) = repository_identity(&app.spec.source.git.repo_url) else {
+    // `T18.3`: only a Git source can be woken by a push. An OCI-backed `Application` has no Git
+    // identity to match, so a push event never refreshes it.
+    let Some(git) = app.spec.source.git_source() else {
+        return false;
+    };
+    let Some(identity) = repository_identity(&git.repo_url) else {
         return false;
     };
     if !event.identities.iter().any(|pushed| pushed == &identity) {
         return false;
     }
-    revision_matches(&app.spec.source.git.target_revision, &event.reference)
+    revision_matches(&git.target_revision, &event.reference)
 }
 
 /// Whether a `targetRevision` tracks the pushed ref.

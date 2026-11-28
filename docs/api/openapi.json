@@ -759,6 +759,183 @@
         ]
       }
     },
+    "/api/v1/auth/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`GET /api/v1/auth/callback` — completes the BFF flow (`T19.2`).",
+        "description": "Validates that `state` is **this browser's** (the [`STATE_COOKIE_NAME`] cookie must equal the query\nparameter, compared in constant time), consumes the one-shot transaction, exchanges the code with\nthe stored verifier, seals a session cookie plus the CSRF cookie, and answers `303` to the\nconfigured post-login path. The state cookie is expired on the response whatever the outcome.",
+        "operationId": "callback",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "description": "The authorization code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The state this server issued",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "Session established; redirect to the post-login path"
+          },
+          "400": {
+            "description": "The state is missing, unknown, expired or not this browser's",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The session cookie could not be sealed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The BFF flow is not enabled on this server"
+          },
+          "502": {
+            "description": "The identity provider could not be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/config": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Publishes how a caller can authenticate, so the Web UI and the CLI can pick a sign-in flow\n(`T19.1`; `T19.2` consumes it with PKCE).",
+        "description": "How to authenticate against this server: the auth mode (token-review, oidc, token-review-or-oidc, ...), plus the OIDC issuer, public client id and scopes when OIDC is enabled. Public by design — a client needs it before it has a credential.",
+        "operationId": "auth_config",
+        "responses": {
+          "200": {
+            "description": "The authentication configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthConfigView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/login": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`GET /api/v1/auth/login` — starts the BFF flow (`T19.2`).",
+        "description": "Answers `302` to the IdP's authorization endpoint with a fresh `state`, `nonce` and `S256`\nchallenge — plus the short-lived [`STATE_COOKIE_NAME`] cookie that binds that `state` to this\nbrowser — or `404` when the server was started without `--oidc-bff-enabled`.\n\n`429` is the per-client sign-in budget ([`MAX_LOGINS_PER_CLIENT`] per [`LOGIN_WINDOW`]).",
+        "operationId": "login",
+        "parameters": [
+          {
+            "name": "redirect_uri",
+            "in": "query",
+            "description": "The registered redirect URI; must match exactly",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to the identity provider's authorization endpoint"
+          },
+          "400": {
+            "description": "redirect_uri is not the registered one",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The BFF flow is not enabled on this server"
+          },
+          "429": {
+            "description": "Too many sign-ins were started from this address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The identity provider's discovery document is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /api/v1/auth/logout` — clears the BFF session (`T19.2`).",
+        "description": "Requires the double-submit CSRF header (see [`csrf`]) for a *usable* session: a cross-site page\nmust not be able to sign an operator out. A request the browser labels cross-site is refused\noutright, even with no session cookie at all — otherwise any page could force the `Max-Age=0`\ncookies to be stored. A cookie that no longer opens (expired, tampered, sealed under a rotated\nkey) is treated as absent here, because the caller's only remaining goal is to get rid of it —\nrefusing that would leave the browser stuck behind a `401` it cannot clear.\n\nThe session is stateless, so this cannot revoke a cookie that was copied before the sign-out: that\ncopy keeps working until the token (or the cookie) expires; only the IdP can revoke it earlier.",
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "Session cookies cleared"
+          },
+          "403": {
+            "description": "The CSRF header is missing or does not match, or the sign-out was initiated from another site",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The BFF flow is not enabled on this server"
+          }
+        }
+      }
+    },
     "/api/v1/clusters": {
       "get": {
         "tags": [
@@ -1122,7 +1299,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "Stable code (`NotFound`, `BadRequest`, `Conflict`, `Unprocessable`, `Unauthorized`,\n`Forbidden`, `BackendUnavailable`, `PayloadTooLarge`)."
+            "description": "Stable code (`NotFound`, `BadRequest`, `Conflict`, `Unprocessable`, `Unauthorized`,\n`Forbidden`, `BackendUnavailable`, `PayloadTooLarge`, `TooManyRequests`)."
           },
           "message": {
             "type": "string",
@@ -1156,6 +1333,17 @@
               {
                 "$ref": "#/components/schemas/OperationView",
                 "description": "The running operation, when one is recorded."
+              }
+            ]
+          },
+          "syncWindow": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SyncWindowGateView",
+                "description": "The `AppProject` sync-window verdict for this `Application` right now (`T17.4`).\n\nAbsent when the project configures no window: a project without governance windows adds\nnothing to the payload. (`ApplicationDetailView` has no `rename_all`, so the wire name is\nspelled out here to stay camelCase like the rest of the API.)"
               }
             ]
           }
@@ -1430,6 +1618,40 @@
                 "description": "`status.sync` (absent before the first reconcile)."
               }
             ]
+          }
+        }
+      },
+      "AuthConfigView": {
+        "type": "object",
+        "description": "`GET /api/v1/auth/config` body (`T19.1`).\n\nServed from the **public** group: the SPA and `ferriscd login --oidc` must learn how to\nauthenticate before they have a token, so this carries only what a stranger may know — the auth\nmode, the issuer, the public client id and the scopes (`T19.2` consumes it).",
+        "required": [
+          "authMode",
+          "scopes",
+          "bffEnabled"
+        ],
+        "properties": {
+          "authMode": {
+            "type": "string",
+            "description": "`token-review`, `oidc`, `token-review-or-oidc`, `pass-through` or `deny-all`."
+          },
+          "bffEnabled": {
+            "type": "boolean",
+            "description": "Whether the optional server-side (BFF cookie) session mode is enabled (`T19.2`)."
+          },
+          "clientId": {
+            "type": "string",
+            "description": "The configured OAuth client id. **Absent** when OIDC is disabled; never `null`."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The configured OIDC issuer. **Absent** when OIDC is disabled; never `null`."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The scopes the client should request from the IdP. Always present (`[]` when OIDC is off)."
           }
         }
       },
@@ -1868,6 +2090,93 @@
           }
         }
       },
+      "ProjectSyncWindowView": {
+        "type": "object",
+        "description": "One `spec.syncWindows[]` entry with its state at the moment of the response (`T17.4`).",
+        "required": [
+          "kind",
+          "schedule",
+          "duration",
+          "timeZone",
+          "manualSync",
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Whether the window is open right now."
+          },
+          "applications": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Glob patterns for `Application.metadata.name` (empty = every application)."
+          },
+          "clusters": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Glob patterns for `spec.destination.cluster` (empty = every cluster)."
+          },
+          "duration": {
+            "type": "string",
+            "description": "The duration, verbatim (`30m`, `2h`, `7d`)."
+          },
+          "endsAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the currently open occurrence ends (RFC 3339)."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why this entry cannot be evaluated. The project is deny-all while it is set (fail closed)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`allow` or `deny` (deny wins over allow)."
+          },
+          "manualSync": {
+            "type": "boolean",
+            "description": "Whether a manual sync may override this window."
+          },
+          "namespaces": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Glob patterns for `Application.metadata.namespace` (empty = every namespace)."
+          },
+          "nextStart": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The next occurrence that starts after now (RFC 3339), within a year."
+          },
+          "schedule": {
+            "type": "string",
+            "description": "The 5-field cron expression, verbatim."
+          },
+          "startsAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the currently open occurrence started (RFC 3339)."
+          },
+          "timeZone": {
+            "type": "string",
+            "description": "The effective IANA time zone (`UTC` when `spec.syncWindows[].timeZone` is absent)."
+          }
+        }
+      },
       "ProjectView": {
         "type": "object",
         "description": "One `AppProject`, reduced to its boundary facts.",
@@ -1900,6 +2209,13 @@
             "type": "string",
             "description": "`metadata.name`."
           },
+          "nextSyncWindowTransition": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the next window starts or stops (RFC 3339), across every configured window."
+          },
           "sourceNamespaces": {
             "type": "array",
             "items": {
@@ -1913,6 +2229,13 @@
               "type": "string"
             },
             "description": "`spec.sourceRepos`."
+          },
+          "syncWindows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProjectSyncWindowView"
+            },
+            "description": "`spec.syncWindows`, each with its state at the moment of the response (`T17.4`).\n\nEmpty (and omitted) for a project that configures no window, so the pre-`T17.4` payload is\nbyte-identical for every such project."
           }
         }
       },
@@ -2148,6 +2471,43 @@
           }
         }
       },
+      "SyncWindowGateView": {
+        "type": "object",
+        "description": "The sync-window verdict for one `Application` right now (`T17.4`).\n\nThe UI needs this to explain a blocked `POST .../sync` *before* the operator clicks: a window is\na time-based refusal, and \"nothing happened\" is indistinguishable from a controller stall\notherwise. `manualOverride` says whether a manual sync would be honoured anyway\n(`manualSync: true` on every blocking window).\n\nA blocked manual sync is **deferred, not rejected**: the controller pauses the requested\noperation and runs it when the window lifts, without asking again (finding N-c), so the modal\ntells the operator *when* it will happen rather than to come back and click twice.",
+        "required": [
+          "blocked",
+          "message",
+          "manualOverride"
+        ],
+        "properties": {
+          "blocked": {
+            "type": "boolean",
+            "description": "Whether a manual sync would be skipped right now."
+          },
+          "manualOverride": {
+            "type": "boolean",
+            "description": "Whether `manualSync: true` makes a manual sync still executable."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable explanation, including the next window transition."
+          },
+          "nextTransition": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the verdict could change (RFC 3339)."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`denyWindowActive`, `outsideAllowWindow`, or `invalidWindow`; absent when not blocked."
+          }
+        }
+      },
       "WebhookResponse": {
         "type": "object",
         "description": "The `ferriscd.io/refresh` request a webhook reports back.",
@@ -2202,6 +2562,10 @@
     {
       "name": "health",
       "description": "Liveness and readiness probes"
+    },
+    {
+      "name": "auth",
+      "description": "Sign-in discovery: how a client authenticates (public)"
     },
     {
       "name": "applications",

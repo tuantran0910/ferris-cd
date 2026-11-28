@@ -42,6 +42,7 @@ use kube::runtime::{PredicateConfig, WatchStreamExt, watcher};
 use kube::{Api, Client, ResourceExt};
 use tokio_util::sync::CancellationToken;
 
+use crate::drift_watcher::{DriftTriggerChannels, DriftWatcherConfig};
 use crate::reconcile::{ControllerError, ReconcileContext, reconcile_instance};
 use crate::sharding::{Sharding, shard_predicate};
 use crate::{lock_recover, predicate};
@@ -116,6 +117,13 @@ pub struct ControllerConfig {
     /// pre-Phase-13 behaviour, unchanged. The filter runs on the watch stream, before the
     /// controller schedules work — see [`build_controllers`].
     pub shard: Option<Sharding>,
+    /// Opt-in drift watcher (`T18.2`).
+    ///
+    /// Disabled by default. When enabled, every scope's `Controller` additionally reconciles on a
+    /// bounded drift-trigger channel ([`crate::drift_watcher`]); the triggers themselves come from
+    /// label-scoped `PartialObjectMetadata` watches started by the supervisor in
+    /// [`run_until_with_readiness`].
+    pub drift_watcher: DriftWatcherConfig,
 }
 
 impl Default for ControllerConfig {
@@ -126,6 +134,7 @@ impl Default for ControllerConfig {
             concurrency: DEFAULT_CONCURRENCY,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             shard: None,
+            drift_watcher: DriftWatcherConfig::disabled(),
         }
     }
 }
@@ -169,6 +178,13 @@ impl ControllerConfig {
     #[must_use]
     pub fn with_shard(mut self, shard: Sharding) -> Self {
         self.shard = Some(shard);
+        self
+    }
+
+    /// Opts into the drift watcher (`T18.2`, builder style).
+    #[must_use]
+    pub fn with_drift_watcher(mut self, drift_watcher: DriftWatcherConfig) -> Self {
+        self.drift_watcher = drift_watcher;
         self
     }
 
@@ -388,6 +404,9 @@ pub enum ReadinessError {
 /// while the watchers must not be able to corrupt each other's view of the cluster.
 pub struct ApplicationControllers {
     controllers: Vec<NamespacedController>,
+    /// `T18.2`: the bounded drift-trigger channel of every scope. `None` unless the opt-in drift
+    /// watcher is enabled, so a `v1.0` deployment allocates nothing.
+    drift: Option<DriftTriggerChannels>,
 }
 
 impl std::fmt::Debug for ApplicationControllers {
@@ -395,6 +414,10 @@ impl std::fmt::Debug for ApplicationControllers {
         f.debug_struct("ApplicationControllers")
             .field("scopes", &self.labels())
             .field("objects", &self.store_lengths())
+            .field(
+                "drift_scopes",
+                &self.drift.as_ref().map(DriftTriggerChannels::len),
+            )
             .finish()
     }
 }
@@ -438,6 +461,24 @@ impl ApplicationControllers {
             .iter()
             .map(|controller| controller.store().len())
             .collect()
+    }
+
+    /// Every scope's private store, in [`Self::labels`] order (`T18.2`).
+    ///
+    /// The drift watcher derives its watch set and its `app-hash` index from exactly these stores,
+    /// so it never issues an `Application` list of its own (no cluster-wide informer).
+    #[must_use]
+    pub fn stores(&self) -> Vec<Store<Application>> {
+        self.controllers
+            .iter()
+            .map(NamespacedController::store)
+            .collect()
+    }
+
+    /// The per-scope drift-trigger channels, or `None` when the drift watcher is disabled.
+    #[must_use]
+    pub fn drift_triggers(&self) -> Option<&DriftTriggerChannels> {
+        self.drift.as_ref()
     }
 
     /// Waits until **every** scope's store has completed its first list.
@@ -502,6 +543,34 @@ type ControllerRunItem = Result<
     kube::runtime::controller::Error<ControllerError, watcher::Error>,
 >;
 
+/// Whether a run-stream item is "this object is no longer in the local store" (finding N-1).
+///
+/// A drift trigger (`T18.2`) names an `Application` by `ObjectRef`, so it can outlive the object:
+/// the `Application` was deleted (or moved out of this scope) between the metadata event and the
+/// dequeue. kube's `ObjectNotFound` is a **no-op** — nothing was scheduled, nothing failed, and the
+/// drift that mattered is the one a still-present `Application` gets — so it is logged at `debug`
+/// and never at `warn`. Warning on it turns an ordinary delete into a scary log line per trigger.
+fn is_object_not_found(
+    error: &kube::runtime::controller::Error<ControllerError, watcher::Error>,
+) -> bool {
+    matches!(error, kube::runtime::controller::Error::ObjectNotFound(_))
+}
+
+/// Reports one run-stream item, at the level it deserves (finding N-1).
+///
+/// Extracted from the drive loop so the `debug`-vs-`warn` split is assertable: an
+/// `ObjectNotFound` is a no-op (debug), every other stream error is a real problem (warn).
+fn log_run_stream_error(error: &kube::runtime::controller::Error<ControllerError, watcher::Error>) {
+    if is_object_not_found(error) {
+        tracing::debug!(
+            error = %error,
+            "controller stream: the object is no longer in the store; nothing to reconcile"
+        );
+    } else {
+        tracing::warn!(error = %error, "controller stream error");
+    }
+}
+
 /// The `Application` API for one scope: namespaced, or cluster-wide for `*`.
 fn scope_api(client: &Client, namespace: Option<&str>) -> Api<Application> {
     match namespace {
@@ -558,6 +627,20 @@ where
     (stream, reader)
 }
 
+/// Wraps a drift-trigger receiver as the stream [`Controller::reconcile_on`] accepts.
+///
+/// Spelled with `futures::stream::unfold` rather than `tokio_stream::wrappers::ReceiverStream` so
+/// the workspace does not take a new dependency for six lines of adapter: the item type,
+/// back-pressure and cancellation semantics are identical.
+fn drift_trigger_stream(
+    receiver: tokio::sync::mpsc::Receiver<reflector::ObjectRef<Application>>,
+) -> impl Stream<Item = reflector::ObjectRef<Application>> + Send + 'static {
+    futures::stream::unfold(receiver, |mut receiver| async move {
+        let next = receiver.recv().await?;
+        Some((next, receiver))
+    })
+}
+
 /// Builds **one `Controller` per watched namespace** for the configured scope (finding C1).
 ///
 /// The returned controllers are not yet running: [`run`] drives their `run` streams and waits for
@@ -566,6 +649,12 @@ where
 /// `config.shard` (`T13.3`) reaches every scope: an `Application` is filtered by its own
 /// `(namespace, name)`, so the shard boundary is independent of which namespace scope the watch
 /// covers — including the cluster-wide `*` scope.
+///
+/// `config.drift_watcher` (`T18.2`) additionally wires one bounded
+/// `mpsc::channel::<ObjectRef<Application>>` per scope into `Controller::reconcile_on`, so a
+/// metadata-watch hit schedules exactly the `Application` it concerns — through the same store,
+/// queue, concurrency limit and backoff as every other trigger. Disabled (the default), no channel
+/// is created and the controller set is byte-for-byte the pre-`v1.2` wiring.
 #[must_use]
 pub fn build_controllers(client: Client, config: &ControllerConfig) -> ApplicationControllers {
     let scopes: Vec<Option<String>> = match config.watched_namespaces() {
@@ -574,22 +663,37 @@ pub fn build_controllers(client: Client, config: &ControllerConfig) -> Applicati
         // what makes this safe: scope alone never authorizes a tenant `Application`.
         None => vec![None],
     };
+    let mut drift_scopes = Vec::new();
     let controllers = scopes
         .into_iter()
         .map(|namespace| {
             let api = scope_api(&client, namespace.as_deref());
             let (stream, store) =
                 scoped_store(watcher(api, watcher::Config::default()), config.shard);
-            let controller = Controller::for_stream(stream, store).with_config(
+            let mut controller = Controller::for_stream(stream, store).with_config(
                 kube::runtime::controller::Config::default().concurrency(config.concurrency),
             );
+            if config.drift_watcher.enabled {
+                // Clamped to at least 1: `mpsc::channel(0)` panics, and a misconfigured capacity
+                // must never take the controller down at startup.
+                let (sender, receiver) =
+                    tokio::sync::mpsc::channel(config.drift_watcher.trigger_capacity.max(1));
+                drift_scopes.push((namespace.clone(), sender));
+                controller = controller.reconcile_on(drift_trigger_stream(receiver));
+            }
             NamespacedController {
                 namespace,
                 controller,
             }
         })
         .collect();
-    ApplicationControllers { controllers }
+    let drift = match drift_scopes.is_empty() {
+        true => None,
+        // Metrics are attached by the caller that owns the recorder (`run_until_with_readiness`):
+        // `ControllerConfig` is a plain `Eq` value and must not carry a registry.
+        false => Some(DriftTriggerChannels::new(drift_scopes, None)),
+    };
+    ApplicationControllers { controllers, drift }
 }
 
 /// Listens for `SIGINT`/`SIGTERM` and cancels `stop`, logging the signal exactly once.
@@ -621,7 +725,7 @@ pub async fn run(
 ) -> Result<(), crate::ShutdownError> {
     let stop = CancellationToken::new();
     spawn_shutdown_listener(stop.clone());
-    run_until_with_readiness(client, config, ctx, stop, None).await
+    run_until_with_readiness(client, config, ctx, stop, None, None).await
 }
 
 /// Runs the controller set for **one leader term** (`T13.2`).
@@ -639,7 +743,7 @@ pub async fn run_as_leader(
     ctx: Arc<ReconcileContext>,
     token: CancellationToken,
 ) -> Result<(), crate::ShutdownError> {
-    run_until_with_readiness(client, config, ctx, token, None).await
+    run_until_with_readiness(client, config, ctx, token, None, None).await
 }
 
 /// Same as [`run_as_leader`], additionally signalling [`ControlPlaneReadiness::mark_controllers_ready`](crate::ControlPlaneReadiness::mark_controllers_ready)
@@ -656,7 +760,28 @@ pub async fn run_as_leader_with_readiness(
     token: CancellationToken,
     readiness: crate::ControlPlaneReadiness,
 ) -> Result<(), crate::ShutdownError> {
-    run_until_with_readiness(client, config, ctx, token, Some(readiness)).await
+    run_until_with_readiness(client, config, ctx, token, Some(readiness), None).await
+}
+
+/// Same as [`run_as_leader_with_readiness`], additionally starting the opt-in drift watcher
+/// (`T18.2`) for the duration of the term.
+///
+/// `drift` carries the collaborators the watcher needs but the controller set does not own (the
+/// cluster registry, the self-echo cache and the metric registry). It is `None` for a caller that
+/// did not opt in: the watcher is never started, and the controller set is unchanged.
+///
+/// # Errors
+///
+/// See [`run_as_leader_with_readiness`].
+pub async fn run_as_leader_with_readiness_and_drift(
+    client: Client,
+    config: ControllerConfig,
+    ctx: Arc<ReconcileContext>,
+    token: CancellationToken,
+    readiness: crate::ControlPlaneReadiness,
+    drift: Option<crate::drift_watcher::DriftRuntime>,
+) -> Result<(), crate::ShutdownError> {
+    run_until_with_readiness(client, config, ctx, token, Some(readiness), drift).await
 }
 
 /// Drives the controller set until `stop` is cancelled, then drains in-flight reconciles.
@@ -671,6 +796,7 @@ async fn run_until_with_readiness(
     ctx: Arc<ReconcileContext>,
     stop: CancellationToken,
     readiness_gate: Option<crate::ControlPlaneReadiness>,
+    drift: Option<crate::drift_watcher::DriftRuntime>,
 ) -> Result<(), crate::ShutdownError> {
     let drain_timeout = config.drain_timeout;
     let controllers = build_controllers(client, &config);
@@ -680,6 +806,56 @@ async fn run_until_with_readiness(
         .map(|l| (*l).to_owned())
         .collect();
     let readiness = controllers.wait_until_ready();
+    // `T18.2`: start the opt-in supervisor before the reconcile pumps run, so the first metadata
+    // event can be delivered as soon as an `Application` has completed its list. It is spawned with
+    // the same `stop` token, so a lost lease or a `SIGTERM` stops the watches with everything else.
+    let drift_task = match (config.drift_watcher.enabled, drift) {
+        (true, Some(runtime)) => match controllers.drift_triggers() {
+            Some(triggers) => {
+                let channels = Arc::new(triggers.clone().with_metrics(runtime.metrics.clone()));
+                let watcher = crate::drift_watcher::DriftWatcher::new(
+                    config.drift_watcher.clone(),
+                    runtime.clusters,
+                    controllers.stores(),
+                    channels,
+                    runtime.echo,
+                    config.shard,
+                    runtime.metrics,
+                );
+                Some(tokio::spawn(watcher.run(stop.clone())))
+            }
+            // Enabled but unwired: a construction bug, never a silent downgrade.
+            None => {
+                tracing::warn!(
+                    "the drift watcher is enabled but no scope was wired for drift triggers; \
+                     continuing with periodic polling only"
+                );
+                None
+            }
+        },
+        // Enabled but no runtime: `prepare` builds the two together, so this can only be a wiring
+        // bug. Say so instead of quietly running Model 1 only.
+        (true, None) => {
+            tracing::warn!(
+                "the drift watcher is enabled but no runtime was supplied for this term; \
+                 continuing with periodic polling only"
+            );
+            None
+        }
+        // Finding M5: the *symmetric* case. A runtime was built (the flag was on when `prepare`
+        // ran) but the term's config says disabled, which can only be a wiring bug. Saying so is
+        // what makes the pair of warnings complete: neither half of the switch can silently
+        // disagree with the other.
+        (false, Some(runtime)) => {
+            tracing::warn!(
+                clusters = ?runtime.clusters.names(),
+                "a drift watcher runtime was built but `--enable-drift-watcher` is off for this \
+                 term; no metadata watch is started and only Model 1 periodic polling runs"
+            );
+            None
+        }
+        (false, None) => None,
+    };
 
     tracing::info!(
         namespace = %config.namespace,
@@ -707,7 +883,12 @@ async fn run_until_with_readiness(
                 }
                 Err(err) => {
                     // Stream errors do not terminate the controller; surface and continue.
-                    tracing::warn!(error = %err, "controller stream error");
+                    //
+                    // Finding N-1: an `ObjectNotFound` is not an error at all — the run stream (or a
+                    // `T18.2` drift trigger) named an `Application` that has since left the store.
+                    // It is the normal shape of "the object was deleted while the reconcile was
+                    // queued", so it is logged at `debug` (see [`log_run_stream_error`]).
+                    log_run_stream_error(&err);
                 }
             }
         }
@@ -737,8 +918,19 @@ async fn run_until_with_readiness(
     // Readiness and the reconcile pump run together: the stores only become ready because the
     // streams are polled. The pump is what ends the work, exactly as before (a graceful shutdown
     // stops every controller, so every stream ends).
+    //
+    // `T18.2`: the drift supervisor joins them. It ends when `stop` is cancelled (it is the same
+    // token), so it can never hold shutdown open, and a panicking supervisor is reported instead of
+    // aborting the drain.
     let work = async move {
-        let ((), ()) = tokio::join!(drive, readiness);
+        let drift = async move {
+            if let Some(task) = drift_task
+                && let Err(err) = task.await
+            {
+                tracing::warn!(error = %err, "the drift watcher task ended abnormally");
+            }
+        };
+        let ((), (), ()) = tokio::join!(drive, readiness, drift);
     };
     let shutdown = async move {
         stop.cancelled().await;
@@ -749,6 +941,7 @@ async fn run_until_with_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drift_watcher::DriftWatcherConfig;
 
     #[test]
     fn defaults_watch_the_control_plane_namespace_with_bounded_concurrency() {
@@ -966,11 +1159,12 @@ mod tests {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
             source: ferriscd_crd::SourceSpec {
-                git: ferriscd_crd::GitSourceSpec {
+                git: Some(ferriscd_crd::GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "main".to_owned(),
                     path: String::new(),
-                },
+                }),
+                oci: None,
                 renderer: ferriscd_crd::RendererSpec::default(),
             },
             destination: ferriscd_crd::DestinationSpec {
@@ -1271,6 +1465,107 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // T18.2: the drift-trigger wiring
+    // ---------------------------------------------------------------------
+
+    /// Disabled (the default) wires nothing: no channel, no `reconcile_on`, no allocation.
+    ///
+    /// `#[tokio::test]` because building a `kube::Client` over a tower service needs a reactor (the
+    /// same reason the finding-C1 tests are async).
+    #[tokio::test]
+    async fn the_drift_watcher_is_unwired_unless_it_is_enabled() {
+        let client = offline_client();
+        let disabled = build_controllers(client.clone(), &ControllerConfig::default());
+        assert!(
+            disabled.drift_triggers().is_none(),
+            "`--enable-drift-watcher=false` must leave the controller set untouched"
+        );
+
+        let enabled = build_controllers(
+            client,
+            &ControllerConfig::default().with_drift_watcher(DriftWatcherConfig::from_flag(true)),
+        );
+        let triggers = enabled
+            .drift_triggers()
+            .expect("an enabled watcher wires one channel per scope");
+        assert_eq!(
+            triggers.len(),
+            enabled.len(),
+            "one bounded trigger channel per watched scope, never one shared queue"
+        );
+    }
+
+    /// **T18.2 wiring (behavioural):** a reference pushed into a scope's drift channel reconciles
+    /// exactly that `Application`, through the controller's own store and queue.
+    ///
+    /// The reconciler never returns `await_change` for the first pass here: it counts. The first
+    /// reconcile comes from the initial list; the second can only come from the drift trigger, so the
+    /// assertion proves the trigger reached the work queue (not just that a channel exists).
+    #[tokio::test]
+    async fn a_drift_trigger_reconciles_the_application_it_names() {
+        let namespace = "ferriscd-system";
+        let (mut sender, receiver) = futures::channel::mpsc::unbounded();
+        send(&mut sender, watcher::Event::Init);
+        send(
+            &mut sender,
+            watcher::Event::InitApply(scripted_application(namespace, "payments", 1)),
+        );
+        send(&mut sender, watcher::Event::InitDone);
+        let (stream, store) = scoped_store(receiver, None);
+
+        // The production wiring, verbatim: one bounded channel per scope, `reconcile_on` with the
+        // receiver stream.
+        let (drift_tx, drift_rx) =
+            tokio::sync::mpsc::channel::<reflector::ObjectRef<Application>>(8);
+        let reconciled = Arc::new(Mutex::new(Vec::new()));
+        let record = {
+            let reconciled = reconciled.clone();
+            move |app: Arc<Application>, _ctx: Arc<()>| {
+                let reconciled = reconciled.clone();
+                async move {
+                    lock_recover(&reconciled).push(object_key(&app));
+                    Ok::<Action, std::io::Error>(Action::await_change())
+                }
+            }
+        };
+        let on_error =
+            |_app: Arc<Application>, _err: &std::io::Error, _ctx: Arc<()>| Action::await_change();
+        let mut run = Box::pin(
+            Controller::for_stream(stream, store)
+                .reconcile_on(drift_trigger_stream(drift_rx))
+                .run(record, on_error, Arc::new(()))
+                .boxed(),
+        );
+
+        // First: the list itself is reconciled.
+        let first = tokio::time::timeout(Duration::from_secs(10), run.next())
+            .await
+            .expect("the listed Application must be reconciled")
+            .expect("the controller stream must not end");
+        first.expect("a scripted reconcile must succeed");
+        assert_eq!(
+            lock_recover(&reconciled).clone(),
+            vec![format!("{namespace}/payments")]
+        );
+
+        // Then: a drift trigger for the same object schedules another pass, and the trigger carries
+        // the `ObjectRef` identity (namespace + name), which is what `Sharding::owns` filtered on.
+        drift_tx
+            .try_send(reflector::ObjectRef::new("payments").within(namespace))
+            .expect("the drift channel accepts the trigger");
+        let second = tokio::time::timeout(Duration::from_secs(10), run.next())
+            .await
+            .expect("the drift trigger must schedule a reconcile")
+            .expect("the controller stream must not end");
+        second.expect("a scripted reconcile must succeed");
+        assert_eq!(
+            lock_recover(&reconciled).len(),
+            2,
+            "the trigger scheduled exactly one additional pass"
+        );
+    }
+
     /// A `/status` writer that records nothing: the shutdown contract is what this test pins.
     struct DiscardingStatus;
 
@@ -1335,6 +1630,7 @@ mod tests {
         ));
         let controllers = ApplicationControllers {
             controllers: scopes,
+            drift: None,
         };
         let stop = CancellationToken::new();
         let mut runs = futures::stream::select_all(controllers.into_run_streams(ctx, stop.clone()));
@@ -1364,5 +1660,156 @@ mod tests {
             "every scope's run stream must end when the leader token is cancelled: a \
              `notify_one` would leave the other namespaces reconciling without authority"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // T18.2 (finding N-1): a trigger that outlives its Application
+    // ---------------------------------------------------------------------
+
+    /// A `Box<ObjectRef<DynamicObject>>`, the payload kube puts in `Error::ObjectNotFound`.
+    ///
+    /// `ObjectRef::<DynamicObject>::new` requires `DynamicType: Default`, which `ApiResource` does
+    /// not implement, so the dynamic type is supplied explicitly.
+    fn not_found_ref() -> Box<reflector::ObjectRef<kube::api::DynamicObject>> {
+        let api_resource = kube::api::ApiResource::from_gvk(&kube::core::GroupVersionKind::gvk(
+            "",
+            "v1",
+            "ConfigMap",
+        ));
+        Box::new(reflector::ObjectRef::new_with("payments", api_resource).within("team-a"))
+    }
+
+    /// Every constructible variant of the controller's run-stream error.
+    fn run_stream_errors() -> Vec<kube::runtime::controller::Error<ControllerError, watcher::Error>>
+    {
+        vec![
+            kube::runtime::controller::Error::ObjectNotFound(not_found_ref()),
+            kube::runtime::controller::Error::ReconcilerFailed(
+                ControllerError::from_reconcile(crate::reconcile::ReconcileError::Invalid {
+                    message: "the reconciler gave up".to_owned(),
+                }),
+                not_found_ref(),
+            ),
+            kube::runtime::controller::Error::QueueError(watcher::Error::NoResourceVersion),
+        ]
+    }
+
+    /// **Finding N-1:** only `ObjectNotFound` is "nothing to reconcile". It is the normal result of
+    /// a `T18.2` drift trigger naming an `Application` that has since been deleted, so it must not be
+    /// classified as a failure — every other run-stream variant is one.
+    #[test]
+    fn only_object_not_found_is_a_no_op_run_stream_error() {
+        use kube::runtime::controller::Error as ControllerRunError;
+
+        let errors = run_stream_errors();
+        assert!(
+            errors.len() >= 3,
+            "the classifier must be exercised against more than one variant"
+        );
+        for error in &errors {
+            let expected = matches!(error, ControllerRunError::ObjectNotFound(_));
+            assert_eq!(
+                is_object_not_found(error),
+                expected,
+                "misclassified {error:?}"
+            );
+        }
+        assert!(
+            is_object_not_found(&errors[0]),
+            "the trigger's object leaving the store is the no-op case"
+        );
+        assert!(
+            !is_object_not_found(&errors[1]) && !is_object_not_found(&errors[2]),
+            "a failed reconcile and a broken queue are real problems"
+        );
+    }
+
+    /// **Finding N-1 (the level, not just the predicate):** an `ObjectNotFound` is logged at
+    /// `debug`, while every other run-stream error is logged at `warn`.
+    ///
+    /// Pins the split that [`log_run_stream_error`] performs: reverting the branch to `warn!` (the
+    /// original bug) makes this test fail, whereas asserting only the predicate would not.
+    #[test]
+    fn an_object_not_found_is_logged_at_debug_and_every_other_error_at_warn() {
+        let logs = captured_logs(|| {
+            for error in run_stream_errors() {
+                log_run_stream_error(&error);
+            }
+        });
+        assert!(
+            logs.contains("DEBUG"),
+            "an ObjectNotFound must be logged (at debug), got: {logs}"
+        );
+        assert!(
+            logs.contains("no longer in the store"),
+            "the debug line must say the object is gone, got: {logs}"
+        );
+        assert!(
+            logs.contains("WARN") && logs.contains("controller stream error"),
+            "a real stream error must be logged at warn, got: {logs}"
+        );
+        let not_found = captured_logs(|| {
+            log_run_stream_error(&kube::runtime::controller::Error::ObjectNotFound(
+                not_found_ref(),
+            ))
+        });
+        assert!(
+            !not_found.contains("WARN"),
+            "an ObjectNotFound must never be a warning, got: {not_found}"
+        );
+        let failed = captured_logs(|| {
+            log_run_stream_error(&kube::runtime::controller::Error::QueueError(
+                watcher::Error::NoResourceVersion,
+            ));
+        });
+        assert!(
+            failed.contains("WARN") && !failed.contains("DEBUG"),
+            "a queue error must be a warning and nothing else, got: {failed}"
+        );
+    }
+
+    /// A `tracing` writer that collects the formatted log lines of one test.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let bytes = lock_recover(&self.0);
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock_recover(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Runs `body` under a thread-local subscriber and returns the formatted log lines it produced.
+    ///
+    /// Thread-local (not global) on purpose: the test suite runs in parallel, and installing a
+    /// global subscriber would both race other tests and capture their lines.
+    fn captured_logs(body: impl FnOnce()) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        logs.contents()
     }
 }

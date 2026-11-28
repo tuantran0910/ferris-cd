@@ -11,6 +11,9 @@ description = "Kubernetes Custom Resource Definitions and status schemas for Fer
 workspace = true
 
 [dependencies]
+# `T17.4`: IANA time zones for `AppProject.spec.syncWindows` (the workspace dependency enables the
+# bundled tzdb; `k8s-openapi` re-exports the same `jiff`, but with no database configured).
+jiff.workspace = true
 # NOTE: never enable a `k8s-openapi` version feature here; the binary crate decides.
 k8s-openapi.workspace = true
 kube.workspace = true

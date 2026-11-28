@@ -10,6 +10,7 @@ import { LiveRegion } from "../../ui/LiveRegion";
 import { Skeleton } from "../../ui/Skeleton";
 import { normalizeSyncStatus } from "../../ui/StatusBadges";
 import { useApplications } from "../applications/hooks";
+import { SyncWindowsPanel } from "../sync/SyncWindows";
 import { useProjects } from "./hooks";
 
 /**
@@ -66,6 +67,12 @@ export function ProjectsPage() {
         ...(project.sourceNamespaces ?? []),
         ...(project.destinations ?? []),
         ...(project.allowedServiceAccounts ?? []),
+        ...(project.syncWindows ?? []).flatMap((window) => [
+          window.kind,
+          window.schedule,
+          window.timeZone,
+          window.duration,
+        ]),
       ]
         .join(" ")
         .toLowerCase()
@@ -84,7 +91,8 @@ export function ProjectsPage() {
             ? "1 AppProject visible to your identity"
             : `${projects.length} AppProjects visible to your identity`}
           {" — "}
-          repository, namespace, destination and ServiceAccount allow-lists.
+          repository, namespace, destination and ServiceAccount allow-lists, and any
+          deployment-governance windows.
         </p>
       </div>
 
@@ -107,7 +115,7 @@ export function ProjectsPage() {
           aria-label="Search projects"
           value={search}
           onChange={(event) => setSearch(event.target.value)}
-          placeholder="Search by project, repo, namespace, cluster, or ServiceAccount..."
+          placeholder="Search by project, repo, namespace, cluster, ServiceAccount, or schedule..."
           className="w-full rounded-lg border border-slate-700 bg-slate-950 py-2 pl-9 pr-3 text-xs text-slate-100 transition-colors placeholder-slate-400 focus:border-indigo-400 focus:outline-none"
         />
       </div>
@@ -208,6 +216,13 @@ function ProjectCard({
           title="Allowed ServiceAccounts"
           values={project.allowedServiceAccounts ?? []}
           testId={`project-service-accounts-${project.name}`}
+        />
+        {/* `T17.4`: *when* this project may deploy. The server evaluated each window at request
+            time, so "Open now" here is the same verdict the controller's gate uses. */}
+        <SyncWindowsPanel
+          windows={project.syncWindows}
+          nextTransition={project.nextSyncWindowTransition}
+          testId={`project-sync-windows-${project.name}`}
         />
       </dl>
 

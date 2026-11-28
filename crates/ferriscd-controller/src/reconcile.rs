@@ -79,6 +79,23 @@ pub const REASON_PENDING: &str = "PendingDependencies";
 /// so a skipped-but-drifting `Application` is visible as `OutOfSync` without being an error.
 pub const REASON_SYNC_SKIPPED: &str = "SyncSkipped";
 
+/// Condition reason recorded when a deployed sync window blocks automation (`T17.4`).
+///
+/// Deliberately `Ready=True`: a governance window is not a failure. A blocked pass still reads Git,
+/// diffs the cluster, reports `OutOfSync`, and requeues for the window boundary — so it must never
+/// flip `Ready=False`, which would also fire a `Warning SyncFailed`-style notification (`T19.4`)
+/// for a change freeze an operator asked for. The `message` carries the blocking window and the
+/// next transition instant.
+///
+/// **A manual `POST .../sync` refused by a window is deferred, not dropped** (finding N-c). The
+/// request is recorded as a running operation, [`crate::sync`]'s pass pauses it at the existing
+/// phase/step (moving `startedAt`/`phaseStartedAt` to `now`, so a freeze never counts against the
+/// wave/operation timeouts) and requeues for the window boundary; when the window lifts, the
+/// operation resumes and executes **without a second confirmation**. That is what an operator asking
+/// for a manual sync has already given: the window decides *when*, not *whether*. A window with
+/// `manualSync: true` still executes immediately instead.
+pub const REASON_SYNC_WINDOW_ACTIVE: &str = "SyncWindowActive";
+
 /// Condition reason recorded when a managed object belongs to another `Application`.
 ///
 /// Terminal (trap T10): no apply FerrisCD could issue would resolve the conflict, so the
@@ -1574,11 +1591,12 @@ mod tests {
             project: DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
             source: SourceSpec {
-                git: GitSourceSpec {
+                git: Some(GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "HEAD".to_owned(),
                     path: String::new(),
-                },
+                }),
+                oci: None,
                 renderer: RendererSpec::default(),
             },
             destination: DestinationSpec {
@@ -2302,6 +2320,15 @@ mod tests {
             crate::metrics::RBAC_WATCH_ERRORS_TOTAL,
             crate::metrics::AUDIT_EVENTS_TOTAL,
             crate::metrics::AUDIT_DROPPED_TOTAL,
+            // `T18.2`: the drift watcher's families are registered (and zero-instantiated) on every
+            // replica, whether or not the opt-in watch is running.
+            crate::metrics::DRIFT_FALLBACK_TOTAL,
+            crate::metrics::DRIFT_EVENTS_TOTAL,
+            crate::metrics::DRIFT_TRIGGERS_TOTAL,
+            crate::metrics::DRIFT_ACTIVE_WATCHES,
+            // `T19.4`: the notification families are pre-created too (a replica that has delivered
+            // nothing still exposes them, as zeros).
+            crate::metrics::NOTIFICATIONS_TOTAL,
         ]
         .into_iter()
         .collect();

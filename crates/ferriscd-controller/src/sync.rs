@@ -88,8 +88,8 @@ use ferriscd_crd::status::{
 };
 use ferriscd_crd::{Application, SyncOptions, annotations};
 use ferriscd_engine::diff::{
-    DiffStatus, DiffSummary, IgnoreRuleSet, ResourceDiff, SyncDecision, SyncTrigger, should_sync,
-    source_spec_hash,
+    DiffStatus, DiffSummary, IgnoreRuleSet, ResourceDiff, SkipReason, SyncDecision, SyncTrigger,
+    SyncWindowGate, should_sync, source_spec_hash,
 };
 use ferriscd_engine::graph::sort_keys_prune_order;
 use ferriscd_engine::health::{
@@ -100,7 +100,10 @@ use ferriscd_engine::manifest::{
     self, DesiredResource, ManifestLoaderConfig, RenderContext, RenderPipeline, RendererBinaries,
     ResourceKey,
 };
-use ferriscd_engine::policy::{AppProjectPolicy, ApplicationScope, PolicyError};
+use ferriscd_engine::policy::{
+    AppProjectPolicy, ApplicationScope, PolicyError, SyncWindowSet, SyncWindowTarget,
+    SyncWindowVerdict,
+};
 use ferriscd_engine::repo::{GitSource, RepoCache, RepoCredentials, RepoUrlPolicy};
 use ferriscd_engine::sync::{
     DEFAULT_REQUEUE_AFTER, OrphanCandidate, OrphanOwnership, PlanRequest, RollbackDecision,
@@ -125,11 +128,11 @@ use crate::impersonation::{
 use crate::live_state::{
     ClusterStateReader, LiveObjectSource, LiveState, LiveStateMap, TrackingOwner, plan_fetch,
 };
-use crate::project::ProjectSource;
+use crate::project::{ProjectSource, ProjectStatusSink, sync_window_condition};
 use crate::prune::{OwnershipVerifiedPruner, PruneResult};
 use crate::reconcile::{
     ApplyOutcome, CleanupMode, CleanupOutcome, DiffPreview, REASON_PENDING, REASON_SYNC_SKIPPED,
-    ReconcileError, SyncPipeline, now,
+    REASON_SYNC_WINDOW_ACTIVE, ReconcileError, SyncPipeline, now,
 };
 use crate::scope::{self, InBundleCrd};
 use crate::sync_executor::{
@@ -505,6 +508,9 @@ struct PassRequest<'a> {
     orphans: &'a [OrphanCandidate],
     options: &'a SyncOptions,
     decision: SyncDecision,
+    /// The sync-window verdict behind `decision` (`T17.4`): a `Skip` pass applies and prunes
+    /// nothing, and a paused operation requeues for the window boundary.
+    window: &'a SyncWindowVerdict,
     prune_enabled: bool,
     prev_inventory: &'a Inventory,
     now: &'a Time,
@@ -618,6 +624,9 @@ struct PreparedPass {
     summary: DiffSummary,
     spec_hash: String,
     decision: SyncDecision,
+    /// The `AppProject` sync-window verdict this pass was decided with (`T17.4`), evaluated at
+    /// `pass_started` — the same instant the gate and the requeue hint use, so they cannot disagree.
+    window: SyncWindowVerdict,
     statuses: BTreeMap<ResourceKey, DiffStatus>,
     orphans: Vec<OrphanCandidate>,
     deferred: BTreeSet<ResourceKey>,
@@ -653,6 +662,16 @@ pub struct InventorySyncPipeline {
     /// `T12.1`: reads the `AppProject` an `Application` references. `None` is a wiring bug and
     /// refuses every sync (fail closed) — policy is never silently skipped.
     project_source: Option<Arc<dyn ProjectSource>>,
+    /// `T17.4`: reports an unusable `spec.syncWindows` entry on the `AppProject` `/status`.
+    project_status: Option<Arc<dyn ProjectStatusSink>>,
+    /// Projects that have already produced the "`spec.syncWindows` cannot be evaluated" warning
+    /// (finding M3). A permanently broken project fails closed on every single pass, so without
+    /// this the same line would be repeated by every reconcile forever and bury everything else;
+    /// the first occurrence stays a `warn!` (it is actionable) and the rest is `debug!`.
+    ///
+    /// Only project names are stored: a broken project that is fixed and broken again warns again,
+    /// because the entry is removed as soon as the windows evaluate.
+    invalid_window_warned: std::sync::Mutex<BTreeSet<String>>,
     /// `T12.2`: which namespaces may host `Application` objects; the safe default is the
     /// control-plane namespace only.
     application_scope: ApplicationScope,
@@ -680,6 +699,10 @@ pub struct InventorySyncPipeline {
     /// `--enable-drift-watcher` adds the `ferriscd.io/managed-by` / `ferriscd.io/app-hash` label
     /// pair a label-scoped `DriftWatcher` selects on (`T18.2`).
     stamp: ferriscd_engine::inventory::StampOptions,
+    /// `T18.2`: where every confirmed apply/prune records its `metadata.resourceVersion`, so the
+    /// opt-in drift watcher can suppress the watch event FerrisCD's own write produces. `None`
+    /// (the default) records nothing, which is exactly the pre-`v1.2` behaviour.
+    self_echo: Option<Arc<crate::drift_watcher::SelfEchoCache>>,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -731,6 +754,8 @@ impl InventorySyncPipeline {
             execution_policy: ExecutionPolicy::default(),
             machine: SyncMachine::default(),
             project_source: None,
+            project_status: None,
+            invalid_window_warned: std::sync::Mutex::new(BTreeSet::new()),
             application_scope: ApplicationScope::default(),
             impersonation: None,
             credentials: None,
@@ -738,6 +763,7 @@ impl InventorySyncPipeline {
             metrics: None,
             audit: None,
             stamp: ferriscd_engine::inventory::StampOptions::tracking_id_only(),
+            self_echo: None,
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -778,6 +804,24 @@ impl InventorySyncPipeline {
         self.stamp
     }
 
+    /// Wires the `T18.2` self-echo cache: every confirmed apply/prune records the write it made, so
+    /// the opt-in drift watcher can drop the watch event that write produces (without it, a
+    /// generation-less `ConfigMap`/`Secret` would loop apply → watch → apply forever).
+    ///
+    /// Not wired by default, matching `--enable-drift-watcher=false`: a deployment that did not opt
+    /// in pays nothing.
+    #[must_use]
+    pub fn with_self_echo(mut self, echo: Arc<crate::drift_watcher::SelfEchoCache>) -> Self {
+        self.self_echo = Some(echo);
+        self
+    }
+
+    /// The wired self-echo cache, if any (`T18.2`).
+    #[must_use]
+    pub fn self_echo(&self) -> Option<&Arc<crate::drift_watcher::SelfEchoCache>> {
+        self.self_echo.as_ref()
+    }
+
     /// Number of mutating Server-Side Apply calls this pipeline has issued so far.
     ///
     /// A metric/test seam, not part of the stable API. Every in-place mutation goes through
@@ -797,6 +841,17 @@ impl InventorySyncPipeline {
     #[must_use]
     pub fn with_url_policy(mut self, policy: RepoUrlPolicy) -> Self {
         self.url_policy = policy;
+        self
+    }
+
+    /// Wires the `AppProject` `/status` writer (`T17.4`).
+    ///
+    /// Without one, a project with an unparseable `spec.syncWindows` is still deny-all (the runtime
+    /// guard does not depend on the reporter) — the operator just has to read the sync-pipeline log
+    /// instead of `kubectl describe appproject`.
+    #[must_use]
+    pub fn with_project_status(mut self, sink: Arc<dyn ProjectStatusSink>) -> Self {
+        self.project_status = Some(sink);
         self
     }
 
@@ -1164,6 +1219,7 @@ impl InventorySyncPipeline {
             orphans: &prepared.orphans,
             options: &prepared.options,
             decision: prepared.decision,
+            window: &prepared.window,
             prune_enabled: prepared.prune_enabled,
             prev_inventory: &prepared.prev_inventory,
             now: &prepared.pass_started,
@@ -1303,7 +1359,11 @@ impl InventorySyncPipeline {
         );
         let outcome = build_outcome(
             app,
-            prepared.decision,
+            GateVerdict {
+                decision: prepared.decision,
+                window: &prepared.window,
+                now: &prepared.pass_started,
+            },
             &prepared.summary,
             &prepared.spec_hash,
             counts,
@@ -1376,6 +1436,12 @@ impl InventorySyncPipeline {
         let prev_inventory = status_inventory(app)?;
         let previous_status = app.status.clone().unwrap_or_default();
         let pass_started = now();
+        // `T17.4`: the deployment-governance verdict, evaluated at `pass_started` against the
+        // project that was just fetched. The engine takes the instant as an argument (it never reads
+        // a clock), so a blocked pass is reproducible in a unit test.
+        let window = self
+            .evaluate_sync_windows(&policy, app, &pass_started, mode)
+            .await;
 
         // --- Phase 10: the rollback request decides *which commit* this pass sees ---------
         // Parsed before the diff gate and before `spec.source` is resolved: a rollback that first
@@ -1432,8 +1498,8 @@ impl InventorySyncPipeline {
 
         let desired_inventory = bundle.hooks.permanent_inventory();
         // Safety rail: an empty desired set over a non-empty inventory is far more likely to be
-        // a wrong `spec.source.git.path` than an intentional "delete everything". Require an
-        // explicit opt-in before a pass that would prune the whole inventory.
+        // a wrong source path than an intentional "delete everything". Require an explicit opt-in
+        // before a pass that would prune the whole inventory.
         if desired_inventory.is_empty() && !prev_inventory.is_empty() && !empty_desired_allowed() {
             return Err(ReconcileError::Invalid {
                 message: format!(
@@ -1444,8 +1510,8 @@ impl InventorySyncPipeline {
                     // Finding M4: this message reaches `Application.status`, so the repository URL
                     // is quoted through the shared redaction helper — a Git remote routinely
                     // carries a personal access token.
-                    manifest::redact_repo_url(&app.spec.source.git.repo_url),
-                    app.spec.source.git.path,
+                    manifest::redact_repo_url(app.spec.source.repo_url()),
+                    app.spec.source.source_path(),
                     prev_inventory.len()
                 ),
             });
@@ -1512,7 +1578,14 @@ impl InventorySyncPipeline {
         let spec_hash = source_spec_hash(&app.spec).map_err(|err| ReconcileError::Invalid {
             message: err.to_string(),
         })?;
-        let decision = should_sync(app, &revision, &spec_hash, &summary, manual_operation(app));
+        let decision = should_sync(
+            app,
+            &revision,
+            &spec_hash,
+            &summary,
+            manual_operation(app),
+            SyncWindowGate::from_verdict(&window),
+        );
         let statuses = status_by_key(&diffs);
 
         let orphans: Vec<OrphanCandidate> = orphan_keys
@@ -1552,6 +1625,7 @@ impl InventorySyncPipeline {
             summary,
             spec_hash,
             decision,
+            window,
             statuses,
             orphans,
             deferred,
@@ -1601,6 +1675,7 @@ impl InventorySyncPipeline {
         let (plan, execution) = self
             .execute_plan(
                 &request.access,
+                request.app.spec.destination.cluster.as_str(),
                 request.discovery,
                 request.bundle.hooks.permanent(),
                 request.decision,
@@ -1656,6 +1731,37 @@ impl InventorySyncPipeline {
             .status
             .as_ref()
             .and_then(|status| status.operation_state.clone());
+
+        // 0. `T17.4`: a blocking sync window pauses the operation.
+        //
+        // The guard runs *before* the state machine is stepped, so a pass the window blocks can
+        // neither apply a wave nor reach the prune step (the trap guard: never prune while blocked).
+        // The persisted phase/step is left exactly where it was, and the two clocks
+        // (`startedAt`/`phaseStartedAt`) are moved to `now`: a change freeze is not a stuck rollout,
+        // so it must not accrue against the ten-minute wave/operation timeouts. The requeue hint is
+        // the window boundary, so the operation resumes by itself when the window closes.
+        if request.decision == SyncDecision::Skip(SkipReason::SyncWindowDenied)
+            && let Some(state) = persisted.as_ref()
+            && state.phase == OperationPhase::Running
+        {
+            let mut paused = state.clone();
+            paused.phase_started_at = Some(request.now.clone());
+            paused.started_at = request.now.clone();
+            tracing::debug!(
+                app.namespace = %request.owner.namespace,
+                app.name = %request.owner.name,
+                phase = ?paused.sync_phase,
+                wave = paused.current_wave,
+                %request.decision,
+                "sync window blocked this pass; the running operation is paused instead of applied"
+            );
+            pass.operation = Some(paused);
+            pass.requeue = request.window.requeue_hint(
+                request.now.0,
+                Duration::from_secs(u64::from(request.app.spec.requeue_after_seconds)),
+            );
+            return Ok(pass);
+        }
 
         // 1. Start a new operation, or resume the persisted one.
         let mut state = match persisted.as_ref() {
@@ -1813,6 +1919,7 @@ impl InventorySyncPipeline {
             let (plan, execution) = self
                 .execute_plan(
                     &request.access,
+                    request.app.spec.destination.cluster.as_str(),
                     request.discovery,
                     &wave.resources,
                     forced_execute(request.decision),
@@ -1865,6 +1972,7 @@ impl InventorySyncPipeline {
             let (plan, execution) = self
                 .execute_plan(
                     &request.access,
+                    request.app.spec.destination.cluster.as_str(),
                     request.discovery,
                     &[],
                     SyncDecision::Execute(SyncTrigger::PruneRequired),
@@ -1895,6 +2003,7 @@ impl InventorySyncPipeline {
     async fn execute_plan(
         &self,
         access: &ClusterAccess,
+        cluster: &str,
         discovery: &DiscoveryCache,
         desired: &[DesiredResource],
         decision: SyncDecision,
@@ -1933,6 +2042,11 @@ impl InventorySyncPipeline {
             owner,
             &policy,
         )
+        // `T18.2`: record every confirmed write so the opt-in drift watcher can tell FerrisCD's own
+        // echo from an out-of-band edit. `None` when the watcher is off. The destination cluster is
+        // part of the record's identity (finding M-1), so a write in one cluster never suppresses an
+        // event from another.
+        .with_self_echo_option(self.self_echo.clone(), cluster)
         .execute(&plan, desired, prev_inventory)
         .await;
         (plan, execution)
@@ -2143,6 +2257,118 @@ impl InventorySyncPipeline {
         Ok(AppProjectPolicy::from_project(&project))
     }
 
+    /// Compiles and evaluates the project's `spec.syncWindows` for this `Application` (`T17.4`).
+    ///
+    /// Three things happen here, in this order:
+    ///
+    /// 1. every window is compiled once (an unparseable entry is kept as a deny-all reason — the
+    ///    evaluation never silently drops a broken change freeze);
+    /// 2. the verdict is computed for `(application name, namespace, destination cluster)` at the
+    ///    pass's own `now`;
+    /// 3. for a project that declares windows — or whose `/status` still records the condition
+    ///    (finding H-A: an operator who deleted *every* window must still get the stale report
+    ///    removed) — the `AppProject` `/status` is synchronised with that verdict: an unparseable
+    ///    entry sets a `Ready=False` (`reason=SyncWindowInvalid`) condition naming the offending
+    ///    list entry, and a project whose windows all evaluate **clears** it again (finding H2) —
+    ///    otherwise `kubectl describe appproject` would keep announcing a change freeze the operator
+    ///    already fixed.
+    ///
+    /// Reporting is best effort: the sync is denied either way, so a failure to *describe* the
+    /// problem must not be escalated into a retryable reconcile error.
+    ///
+    /// **Nothing is written in [`PassMode::Preview`]** (finding M2). The control-plane API's
+    /// `GET .../diff` runs this very code in-process; a read-only request must not patch another
+    /// object's `/status`, and the verdict it needs is in the returned [`SyncWindowVerdict`]
+    /// anyway.
+    async fn evaluate_sync_windows(
+        &self,
+        policy: &AppProjectPolicy,
+        app: &Application,
+        now: &Time,
+        mode: PassMode,
+    ) -> SyncWindowVerdict {
+        let windows = SyncWindowSet::from_spec(policy.spec());
+        let namespace = app.namespace().unwrap_or_default();
+        let name = app.name_any();
+        let project = policy.project_name();
+        let target = SyncWindowTarget::new(&name, &namespace, &app.spec.destination.cluster);
+        let verdict = windows.evaluate(now.0, &target);
+
+        if windows.invalid().is_empty() {
+            // The windows evaluate again: the recorded condition (if any) is stale, and the
+            // warning was about a state that no longer holds.
+            self.clear_invalid_window_report(project);
+        } else {
+            let message = verdict.message(now.0);
+            let first = self.note_invalid_window_report(project);
+            if first {
+                warn!(
+                    app.namespace = %namespace,
+                    app.name = %name,
+                    project = %project,
+                    %message,
+                    "AppProject spec.syncWindows cannot be evaluated; every sync of this project is \
+                     denied (fail closed)"
+                );
+            } else {
+                // Finding M3: a project that stays broken denies every pass, so the same warning
+                // would be logged by every reconcile forever. The first one is the actionable line;
+                // the repeats are debug so they do not bury everything else.
+                tracing::debug!(
+                    app.namespace = %namespace,
+                    app.name = %name,
+                    project = %project,
+                    %message,
+                    "AppProject spec.syncWindows still cannot be evaluated (already reported)"
+                );
+            }
+        }
+
+        if mode == PassMode::Apply
+            // Finding H-A: the gate is "declares windows **or** still carries the condition". An
+            // operator who deletes every window leaves nothing in the spec that asks for a report,
+            // so the recorded condition is the only evidence that the stale one has to be removed —
+            // and a project that never declared windows records no condition, so it still costs no
+            // `/status` read or write at all (the zero-write guarantee).
+            && (policy.spec().has_sync_windows() || policy.records_sync_window_invalid())
+            && let Some(sink) = self.project_status.as_deref()
+        {
+            // `None` clears: the sink derives its own generation from the project it reads, so
+            // this pipeline never supplies one (finding H1). `sync_window_condition` answers `None`
+            // for an empty `invalid` list, which is the same "evaluates again" case (finding M-1).
+            let condition = sync_window_condition(windows.invalid(), now.clone());
+            if let Err(err) = sink.report(project, condition).await {
+                warn!(
+                    project = %project,
+                    error = %err,
+                    "failed to record the AppProject syncWindows condition"
+                );
+            }
+        }
+        verdict
+    }
+
+    /// Records that `project`'s unusable `spec.syncWindows` is being logged, answering whether
+    /// this is the **first** time (`true`) or a repeat (`false`) — finding M3.
+    fn note_invalid_window_report(&self, project: &str) -> bool {
+        // A poisoned lock only means another pass panicked while taking it; the answer is a log
+        // rate limit, so recovering the guard is strictly better than failing the reconcile.
+        let mut warned = match self.invalid_window_warned.lock() {
+            Ok(warned) => warned,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        warned.insert(project.to_owned())
+    }
+
+    /// Forgets a previous "cannot be evaluated" report for `project`, which now evaluates.
+    fn clear_invalid_window_report(&self, project: &str) {
+        let mut warned = match self.invalid_window_warned.lock() {
+            Ok(warned) => warned,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        warned.remove(project);
+    }
+
     /// Resolves the revision and renders the desired manifest set.
     ///
     /// Rendering goes through the Phase 11 pipeline (`T11.1`): the renderer is selected by
@@ -2160,12 +2386,27 @@ impl InventorySyncPipeline {
         pinned: Option<&str>,
         discovery: &DiscoveryCache,
     ) -> Result<(String, Vec<DesiredResource>), ReconcileError> {
+        // `T18.3` accepts `spec.source.oci` at the API boundary (schema + offline validation),
+        // but the registry client that would turn it into a checkout is wired in `T18.4`. Until
+        // then an OCI source is a terminal, honest refusal — never a silent empty render and never
+        // a Git fetch of an empty URL.
+        let git = app
+            .spec
+            .source
+            .git_source()
+            .ok_or_else(|| ReconcileError::Invalid {
+                message:
+                    "spec.source.oci is not served by this controller build yet: this release \
+                          can only render a Git source (spec.source.git). No artifact was fetched \
+                          and nothing in the cluster was changed."
+                        .to_owned(),
+            })?;
         let source = GitSource::new(
-            app.spec.source.git.repo_url.clone(),
+            git.repo_url.clone(),
             pinned
                 .map(str::to_owned)
-                .unwrap_or_else(|| app.spec.source.git.target_revision.clone()),
-            app.spec.source.git.path.clone(),
+                .unwrap_or_else(|| git.target_revision.clone()),
+            git.path.clone(),
         );
         // Explicit, configurable local-repository policy: `Production` rejects `file://` and
         // bare local paths, so a misconfigured `Application` cannot read the pod's filesystem.
@@ -2220,7 +2461,7 @@ impl InventorySyncPipeline {
         let render_span = tracing::info_span!(
             "manifest_render",
             commit_sha = %resolved.commit_sha,
-            path = %app.spec.source.git.path,
+            path = %source.path,
         );
         let rendered = self.render.render(&context).instrument(render_span).await;
         // `T15.1`: the render cache owns the `hits`/`misses` counters; the recorder turns the
@@ -2901,6 +3142,20 @@ fn orphan_ownership(live: &BTreeMap<ResourceKey, LiveState>, key: &ResourceKey) 
     }
 }
 
+/// The decision gate's verdict for one pass, plus the instant it was decided (`T17.4`).
+///
+/// The three belong together: the window verdict was evaluated at `now`, and the outcome message and
+/// requeue hint must quote that same instant. Bundling them also keeps [`build_outcome`] at the
+/// argument count it already had.
+struct GateVerdict<'a> {
+    /// What the gate decided (`Execute`/`Skip`).
+    decision: SyncDecision,
+    /// The `AppProject` sync-window verdict that decision was taken with.
+    window: &'a SyncWindowVerdict,
+    /// The instant the pass started.
+    now: &'a Time,
+}
+
 /// Builds the successful [`ApplyOutcome`], including the crash-safe inventory and sync state.
 ///
 /// `status.sync.status` is derived from the diff summary, **not** from "did an apply succeed":
@@ -2913,13 +3168,18 @@ fn orphan_ownership(live: &BTreeMap<ResourceKey, LiveState>, key: &ResourceKey) 
 /// warning that only exists in a log line is invisible (findings H1/H2).
 fn build_outcome(
     app: &Application,
-    decision: SyncDecision,
+    gate: GateVerdict<'_>,
     summary: &DiffSummary,
     spec_hash: &str,
     counts: SyncCounts,
     revision: String,
     inventory: Inventory,
 ) -> ApplyOutcome {
+    let GateVerdict {
+        decision,
+        window,
+        now,
+    } = gate;
     let SyncCounts {
         desired,
         applied,
@@ -2960,7 +3220,7 @@ fn build_outcome(
         // previous values when a pass reports `None` here.
         last_synced_revision: synced.then(|| revision.clone()),
         last_synced_spec_hash: synced.then(|| spec_hash.to_owned()),
-        last_synced_at: synced.then(now),
+        last_synced_at: synced.then(|| now.clone()),
     };
 
     // A stuck orphan is otherwise invisible: `prune: true` that deletes nothing looks exactly
@@ -2991,6 +3251,28 @@ fn build_outcome(
         )
     } else {
         match decision {
+            // `T17.4`: a blocked window keeps `Ready=True` (it is governance, not a failure) but
+            // says *why* — the blocking window, when it lifts, and the drift it deliberately leaves
+            // untouched. `status.sync.status` still reports `OutOfSync` from the same summary.
+            //
+            // The two facts that must survive the `/status` message cap come **first** (finding
+            // H3): the next-transition instant (a whole RFC 3339 timestamp, which the roadmap
+            // requires, and which is what tells the operator when the pass will run) and the trap
+            // guard ("nothing was applied or pruned, drift is reported"). The window explanation
+            // alone is long enough to exhaust
+            // [`MAX_STATUS_MESSAGE_CHARS`](ferriscd_crd::status::MAX_STATUS_MESSAGE_CHARS), so an
+            // explanation-first order truncated exactly those two facts away.
+            SyncDecision::Skip(SkipReason::SyncWindowDenied) => (
+                REASON_SYNC_WINDOW_ACTIVE,
+                format!(
+                    "sync window blocked, next transition {}, nothing was applied or pruned, \
+                     drift is reported: {}",
+                    window
+                        .next_transition()
+                        .map_or_else(|| "never".to_owned(), |instant| instant.to_string()),
+                    window.message(now.0)
+                ),
+            ),
             SyncDecision::Skip(skip) => (
                 REASON_SYNC_SKIPPED,
                 format!(
@@ -3018,7 +3300,24 @@ fn build_outcome(
         }
     };
 
-    let requeue = plan_requeue(decision.is_execute(), pending, health, app, requeue_hint);
+    let requeue = plan_requeue(
+        decision.is_execute(),
+        pending,
+        health,
+        app,
+        requeue_hint,
+        // `T17.4`: a blocked pass wakes at the window boundary instead of waiting for its next
+        // periodic poll — no worker ever sleeps on the window.
+        decision
+            .is_skip()
+            .then(|| {
+                window.requeue_hint(
+                    now.0,
+                    Duration::from_secs(u64::from(app.spec.requeue_after_seconds)),
+                )
+            })
+            .flatten(),
+    );
 
     ApplyOutcome::ready(reason, message)
         .with_inventory(inventory)
@@ -3142,21 +3441,28 @@ fn plan_requeue(
     health: HealthStatus,
     app: &Application,
     hint: Option<Duration>,
+    window: Option<Duration>,
 ) -> Duration {
+    let configured = Duration::from_secs(u64::from(app.spec.requeue_after_seconds));
+    // A blocked window is the tightest bound there is: a pass blocked now must be re-evaluated at
+    // the instant the window closes, and never later.
+    let bound = |delay: Duration| match window {
+        Some(window) => delay.min(window),
+        None => delay,
+    };
     // An in-flight wave/hook operation owns its own pacing (`T10.1`: `Action::requeue(5s)`): it is
     // waiting for a rollout, not for a timer, and `spec.requeueAfterSeconds` (default 180 s) would
     // make a three-wave sync take nine minutes for no reason.
     if let Some(hint) = hint {
-        return hint;
+        return bound(hint);
     }
-    let configured = Duration::from_secs(u64::from(app.spec.requeue_after_seconds));
     if execute && pending > 0 {
         return PENDING_REQUEUE;
     }
     if health == HealthStatus::Progressing {
-        return PROGRESSING_REQUEUE.min(configured);
+        return bound(PROGRESSING_REQUEUE.min(configured));
     }
-    configured
+    bound(configured)
 }
 
 /// First 7 characters of a commit SHA (the full SHA lives in `status.sync.revision`).
@@ -3920,11 +4226,12 @@ mod tests {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
             source: SourceSpec {
-                git: GitSourceSpec {
+                git: Some(GitSourceSpec {
                     repo_url: repo_url.to_owned(),
                     target_revision: "main".to_owned(),
                     path: path.to_owned(),
-                },
+                }),
+                oci: None,
                 renderer: RendererSpec::default(),
             },
             destination: DestinationSpec {
@@ -4046,6 +4353,34 @@ mod tests {
     }
 
     /// A hermetic pipeline: fake Git, fake discovery, fake live cluster, fake applier.
+    /// `T17.4`: pre-window tests build an outcome with the gate's window dimension neutral, which
+    /// is exactly `SyncWindowVerdict::allowed()` (and the pass instant is irrelevant to them).
+    fn build_outcome(
+        app: &Application,
+        decision: SyncDecision,
+        summary: &DiffSummary,
+        spec_hash: &str,
+        counts: SyncCounts,
+        revision: String,
+        inventory: Inventory,
+    ) -> ApplyOutcome {
+        let window = SyncWindowVerdict::allowed();
+        let now = crate::reconcile::now();
+        super::build_outcome(
+            app,
+            super::GateVerdict {
+                decision,
+                window: &window,
+                now: &now,
+            },
+            summary,
+            spec_hash,
+            counts,
+            revision,
+            inventory,
+        )
+    }
+
     struct Fixture {
         git: Arc<FakeGitClient>,
         cluster: Arc<FakeCluster>,
@@ -4117,6 +4452,13 @@ spec:
             self
         }
 
+        /// Replaces a stored project (`T17.4`): what a live `kubectl apply` of an `AppProject` does
+        /// between two passes, and what a test uses to open a change freeze *mid-rollout*.
+        fn set_project(&self, project: AppProject) {
+            let name = project.name_any();
+            self.projects.lock().unwrap().insert(name, project);
+        }
+
         fn reads(&self) -> Vec<String> {
             self.reads.lock().unwrap().clone()
         }
@@ -4130,6 +4472,69 @@ spec:
             self.reads.lock().unwrap().push(name.to_owned());
             let project = self.projects.lock().unwrap().get(name).cloned();
             Box::pin(async move { Ok(project) })
+        }
+    }
+
+    /// Scripted `AppProject` `/status` writer (`T17.4`): records what the pipeline reported.
+    ///
+    /// A report of `None` is the *clearing* write (finding H2) and is recorded as such, so a test
+    /// can tell "the pipeline asked for the condition to be removed" from "the pipeline said
+    /// nothing at all".
+    #[derive(Default)]
+    struct FakeProjectStatusSink {
+        reports: StdMutex<Vec<(String, Option<ferriscd_crd::Condition>)>>,
+        /// When set, every report fails with this message.
+        failure: Option<&'static str>,
+    }
+
+    impl FakeProjectStatusSink {
+        fn failing(reason: &'static str) -> Self {
+            Self {
+                failure: Some(reason),
+                ..Self::default()
+            }
+        }
+
+        fn reports(&self) -> Vec<(String, Option<ferriscd_crd::Condition>)> {
+            self.reports.lock().unwrap().clone()
+        }
+
+        /// The conditions that were written (the clearing writes are skipped).
+        fn conditions(&self) -> Vec<(String, ferriscd_crd::Condition)> {
+            self.reports()
+                .into_iter()
+                .filter_map(|(name, condition)| condition.map(|condition| (name, condition)))
+                .collect()
+        }
+
+        /// How many clearing writes (`report(name, None)`) were requested.
+        fn clears(&self) -> usize {
+            self.reports()
+                .iter()
+                .filter(|(_, condition)| condition.is_none())
+                .count()
+        }
+    }
+
+    impl ProjectStatusSink for FakeProjectStatusSink {
+        fn report<'a>(
+            &'a self,
+            name: &'a str,
+            condition: Option<ferriscd_crd::Condition>,
+        ) -> BoxFuture<'a, Result<(), ReconcileError>> {
+            self.reports
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), condition));
+            let failure = self.failure;
+            Box::pin(async move {
+                match failure {
+                    Some(reason) => Err(ReconcileError::Invalid {
+                        message: reason.to_owned(),
+                    }),
+                    None => Ok(()),
+                }
+            })
         }
     }
 
@@ -4395,9 +4800,13 @@ spec:
     }
 
     fn default_project_source() -> FakeProjectSource {
-        let project: AppProject =
-            serde_saphyr::from_str(DEFAULT_PROJECT_MANIFEST).expect("default project must parse");
-        FakeProjectSource::default().with_project(project)
+        FakeProjectSource::default().with_project(default_project())
+    }
+
+    /// The shipped `default` project as a value (`T17.4`: lets a test swap a project — and so its
+    /// `spec.syncWindows` — between two passes of the same `Application`).
+    fn default_project() -> AppProject {
+        serde_saphyr::from_str(DEFAULT_PROJECT_MANIFEST).expect("default project must parse")
     }
 
     /// A parseable `metav1.Time` fixture.
@@ -4657,6 +5066,86 @@ spec:
         fn app(&self, path: &str) -> Application {
             application(&self.repo_url, path, "payments")
         }
+
+        /// An `Application` bound to the `payments` project the window tests wire (`T17.4`).
+        fn governed_app(&self, path: &str) -> Application {
+            let mut app = self.app(path);
+            app.spec.project = "payments".to_owned();
+            app
+        }
+
+        /// Returns `fixture` with the `T17.4` `AppProject` `/status` writer wired in.
+        fn with_project_status(mut self, sink: Arc<FakeProjectStatusSink>) -> Self {
+            self.pipeline = self
+                .pipeline
+                .with_project_status(sink as Arc<dyn ProjectStatusSink>);
+            self
+        }
+    }
+
+    /// A project with the given `spec.syncWindows` YAML block (already indented for `spec:`).
+    fn project_with_windows(name: &str, windows: &str) -> AppProject {
+        serde_saphyr::from_str(&format!(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: {name}
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - "*"
+  sourceNamespaces:
+    - ferriscd-system
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  syncWindows:{windows}
+"#
+        ))
+        .expect("test project with sync windows must parse")
+    }
+
+    /// The same project with **no** windows at all — what an operator leaves behind when they delete
+    /// `spec.syncWindows` instead of fixing the typo (`T17.4`, finding H-A).
+    fn project_without_windows(name: &str) -> AppProject {
+        let mut project = project_with_windows(
+            name,
+            r#"
+    - kind: deny
+      schedule: "0 9 * * MON-FRI"
+      duration: 2h
+"#,
+        );
+        project.spec.sync_windows.clear();
+        project
+    }
+
+    /// [`project_without_windows`] **plus** the `Ready=False/SyncWindowInvalid` condition a previous
+    /// pass wrote to its `/status` (finding H-A).
+    ///
+    /// The fake `ProjectSource` and the fake `ProjectStatusSink` are separate seams, so a test has to
+    /// put the condition on the project itself to model the API server's next read.
+    fn with_recorded_invalid_window(name: &str) -> AppProject {
+        let mut project = project_without_windows(name);
+        project.status = Some(ferriscd_crd::AppProjectStatus {
+            observed_generation: Some(2),
+            conditions: vec![
+                crate::project::sync_window_condition(
+                    &[ferriscd_engine::policy::InvalidSyncWindow {
+                        index: 0,
+                        schedule: "every weekday at nine".to_owned(),
+                        message: "not a cron expression".to_owned(),
+                    }],
+                    at("2026-01-07T12:00:00Z"),
+                )
+                .expect("a recorded condition implies a broken window"),
+            ],
+        });
+        project
     }
 
     /// A fake `kustomize`/`helm` binary: a POSIX shell script that records its invocations and
@@ -5559,6 +6048,1030 @@ spec:
             .await
             .expect("apply must succeed");
         assert!(fixture.cluster.deletes().is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Sync windows & deployment governance (`T17.4`)
+    // ---------------------------------------------------------------------
+
+    /// A window that is open at *every* instant: it fires every minute and lasts an hour.
+    ///
+    /// The controller evaluates windows at its own injected `now()` (the engine takes the instant as
+    /// an argument, so it needs no clock), which means a test cannot pick a fixed calendar instant.
+    /// "Every minute for an hour" is therefore the only deterministic way to say *always active*
+    /// without touching the system clock.
+    const ALWAYS_OPEN_DENY: &str = r#"
+    - kind: deny
+      schedule: "* * * * *"
+      duration: 1h
+"#;
+
+    /// An `allow` window that never fires (`31 February`), so a project that lists it is always
+    /// outside its allow window.
+    const NEVER_OPEN_ALLOW: &str = r#"
+    - kind: allow
+      schedule: "0 0 31 2 *"
+      duration: 1h
+"#;
+
+    /// A deny window with `manualSync: true`: a manual sync may break the glass.
+    const ALWAYS_OPEN_OVERRIDABLE_DENY: &str = r#"
+    - kind: deny
+      schedule: "* * * * *"
+      duration: 1h
+      manualSync: true
+"#;
+
+    fn manifest_window_project(windows: &str) -> FakeProjectSource {
+        FakeProjectSource::default().with_project(project_with_windows("payments", windows))
+    }
+
+    /// An `Application` that has a previous successful sync recorded (so "the pass cleared
+    /// `lastSyncedRevision`" is observable) plus drift in the cluster.
+    fn drifted_app(fixture: &Fixture) -> Application {
+        let mut app = fixture.governed_app(".");
+        app.spec.sync_policy = Some(self_heal_policy());
+        app.status = Some(ApplicationStatus {
+            inventory: vec![ferriscd_crd::InventoryEntry::new(CONFIGMAP_KEY, "v1")],
+            sync: Some({
+                let mut sync = SyncState::new(
+                    ferriscd_crd::status::SyncStatus::OutOfSync,
+                    Some("0000000000000000000000000000000000000000".to_owned()),
+                );
+                sync.last_synced_revision =
+                    Some("1111111111111111111111111111111111111111".to_owned());
+                sync.last_synced_spec_hash = Some(HASH.to_owned());
+                sync
+            }),
+            ..ApplicationStatus::default()
+        });
+        app
+    }
+
+    /// **`T17.4` trap guard:** a blocked pass reports drift but applies nothing, prunes nothing,
+    /// keeps `Ready=True` (`reason=SyncWindowActive`), and never clears `lastSyncedRevision`.
+    #[tokio::test]
+    async fn an_active_deny_window_blocks_automated_sync_while_drift_stays_reported() {
+        // The live object carries `data: {key: value}` that Git does not declare: an out-of-band
+        // mutation the pass must report as drift even while it is blocked.
+        let live = config_map(
+            "settings",
+            Some("ferriscd-system/payments:/ConfigMap:payments/settings"),
+        );
+        let orphan = config_map(
+            "removed",
+            Some("ferriscd-system/payments:/ConfigMap:payments/removed"),
+        );
+        let fixture = fixture_with_policy(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(live)
+                .with_object(orphan),
+            manifest_window_project(ALWAYS_OPEN_DENY),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let app = drifted_app(&fixture);
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a blocked window is not an error");
+
+        // 1. Nothing was applied and nothing was pruned, even though `prune: true`.
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "a blocked pass must not apply: {:?}",
+            fixture.cluster.applies()
+        );
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "a blocked pass must never prune"
+        );
+
+        // 2. Drift is still reported, and the sync markers are untouched.
+        let sync = outcome.sync.clone().expect("sync state");
+        assert_eq!(
+            sync.status,
+            ferriscd_crd::status::SyncStatus::OutOfSync,
+            "drift must stay visible while the window blocks"
+        );
+        // The outcome reports `None` for both markers, which is what `merge_sync_state` preserves
+        // instead of overwriting: applying the outcome to the previous status must leave them.
+        assert_eq!(
+            sync.last_synced_revision, None,
+            "a blocked pass must not advance lastSyncedRevision"
+        );
+        assert_eq!(
+            sync.last_synced_spec_hash, None,
+            "a blocked pass must not advance lastSyncedSpecHash"
+        );
+        let mut merged = app.status.clone().expect("previous status");
+        crate::reconcile::apply_outcome_status(&mut merged, &outcome);
+        let merged_sync = merged.sync.clone().expect("sync state");
+        assert_eq!(
+            merged_sync.last_synced_revision.as_deref(),
+            Some("1111111111111111111111111111111111111111"),
+            "a blocked pass must never clear lastSyncedRevision"
+        );
+        assert_eq!(merged_sync.last_synced_spec_hash.as_deref(), Some(HASH));
+        assert_eq!(
+            merged_sync.status,
+            ferriscd_crd::status::SyncStatus::OutOfSync,
+            "the persisted status keeps reporting drift"
+        );
+
+        // 3. `Ready=True` with the governance reason, naming the window and the next transition.
+        assert_eq!(outcome.reason, REASON_SYNC_WINDOW_ACTIVE);
+        assert!(
+            outcome.message.contains("deny sync window is active"),
+            "{}",
+            outcome.message
+        );
+        assert!(
+            outcome.message.contains("the next window transition is"),
+            "the message must say when the window lifts: {}",
+            outcome.message
+        );
+        assert!(
+            outcome.message.contains("nothing was applied or pruned"),
+            "{}",
+            outcome.message
+        );
+
+        // 4. The pass requeues for the boundary (never sleeps): the window fires every minute, so
+        // the requeue is at most a minute even though `requeueAfterSeconds` is 180.
+        let requeue = outcome
+            .requeue
+            .expect("a blocked pass must requeue for the window boundary");
+        assert!(
+            requeue <= Duration::from_secs(60) && requeue >= Duration::from_secs(1),
+            "unexpected requeue {requeue:?}"
+        );
+
+        // 5. And the diff preview still computes live drift (`T17.4` verification: `GET .../diff`
+        // is unaffected by a window).
+        let preview = fixture.pipeline.diff(&app).await.expect("diff preview");
+        assert!(
+            preview.summary.out_of_sync + preview.summary.missing > 0,
+            "the read-only diff must still report drift: {:?}",
+            preview.summary
+        );
+    }
+
+    /// An `allow`-only project blocks everything outside its window, and a source change does not
+    /// get through either (this is a *time* gate, not a `selfHeal` gate).
+    #[tokio::test]
+    async fn an_allow_only_project_blocks_outside_its_window() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            manifest_window_project(NEVER_OPEN_ALLOW),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let app = fixture.governed_app(".");
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("outside an allow window is not an error");
+        assert_eq!(outcome.reason, REASON_SYNC_WINDOW_ACTIVE);
+        assert!(
+            outcome.message.contains("outside every allow sync window"),
+            "{}",
+            outcome.message
+        );
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "the first sync of a project outside its allow window must not run"
+        );
+        // There is no next transition (the schedule can never fire), so the pass falls back to its
+        // configured interval instead of inventing a boundary.
+        assert_eq!(outcome.requeue, Some(Duration::from_secs(180)));
+
+        // The same pass with a project that has no windows applies normally: the gate is the only
+        // difference.
+        let open = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            default_project_source(),
+            ApplicationScope::default(),
+        );
+        open.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let applied = open
+            .pipeline
+            .apply(&open.app("."))
+            .await
+            .expect("an ungoverned project syncs");
+        assert_eq!(applied.reason, ferriscd_crd::status::REASON_SYNC_SUCCEEDED);
+        assert_eq!(open.cluster.applies().len(), 1);
+    }
+
+    /// **`T17.4` trap guard, mid-rollout:** a freeze that opens while an operation is `Running`
+    /// *pauses* it instead of stepping the state machine — no wave is applied, nothing is pruned,
+    /// the persisted `(phase, step, activeHooks)` survives, and both operation clocks move to `now`
+    /// so a change freeze never accrues against the ten-minute wave timeout. Removing the freeze
+    /// resumes the very same operation.
+    #[tokio::test]
+    async fn a_window_opening_mid_rollout_pauses_the_running_operation() {
+        // A `PreSync` hook makes the bundle an operation (single-pass syncs cannot be paused).
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            default_project_source(),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("hook.yaml", PRE_SYNC_HOOK), ("configmap.yaml", CONFIGMAP)]);
+        let app = fixture.app(".");
+
+        // Pass 1 (no window): the hook is created and tracked, the operation is `Running`.
+        let first = fixture.pipeline.apply(&app).await.expect("the hook pass");
+        let mut state = first.operation_state.clone().expect("operation state");
+        assert_eq!(state.phase, OperationPhase::Running);
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "a `Progressing` PreSync hook keeps the waves closed: {:?}",
+            fixture.cluster.applies()
+        );
+
+        // A freeze that opened ten minutes ago would already be counting against the wave timeout,
+        // so seed a clock that is obviously stale: the pause has to move it to `now`.
+        let stale = at("2020-01-01T00:00:00Z");
+        state.started_at = stale.clone();
+        state.phase_started_at = Some(stale.clone());
+
+        // The operator applies a change freeze *mid-migration*, and the hook then finishes: without
+        // the window, this pass would dispatch wave 0.
+        fixture
+            .projects
+            .set_project(project_with_windows("default", ALWAYS_OPEN_DENY));
+        fixture.cluster.complete_job("migrate-abcde");
+
+        let mut blocked = app.clone();
+        blocked.status = Some(ApplicationStatus {
+            operation_state: Some(state.clone()),
+            ..ApplicationStatus::default()
+        });
+        let paused = fixture
+            .pipeline
+            .apply(&blocked)
+            .await
+            .expect("a paused operation is not an error");
+
+        assert_eq!(paused.reason, REASON_SYNC_WINDOW_ACTIVE);
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "a paused operation applies no wave: {:?}",
+            fixture.cluster.applies()
+        );
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "a paused operation never reaches the prune step"
+        );
+        let paused_state = paused
+            .operation_state
+            .clone()
+            .expect("the paused pass must carry the operation state");
+        assert_eq!(
+            paused_state.phase,
+            OperationPhase::Running,
+            "the state machine was not stepped"
+        );
+        assert_eq!(paused_state.sync_phase, state.sync_phase);
+        assert_eq!(paused_state.current_wave, state.current_wave);
+        assert_eq!(
+            paused_state.active_hooks, state.active_hooks,
+            "the hook records are the crash-safe progress: a pause must not drop them"
+        );
+        assert!(
+            paused_state.started_at.0 > stale.0,
+            "a change freeze must not accrue against the operation timeout (startedAt was {})",
+            paused_state.started_at.0
+        );
+        assert!(
+            paused_state
+                .phase_started_at
+                .as_ref()
+                .is_some_and(|started| started.0 > stale.0),
+            "a change freeze must not accrue against the wave timeout"
+        );
+        assert!(
+            paused
+                .requeue
+                .is_some_and(|requeue| requeue <= Duration::from_secs(60)),
+            "a paused operation wakes at the window boundary: {:?}",
+            paused.requeue
+        );
+
+        // The freeze is lifted: the *same* operation resumes and wave 0 is applied.
+        fixture.projects.set_project(default_project());
+        let mut resumed = app.clone();
+        resumed.status = Some(ApplicationStatus {
+            operation_state: Some(paused_state),
+            ..ApplicationStatus::default()
+        });
+        let outcome = fixture
+            .pipeline
+            .apply(&resumed)
+            .await
+            .expect("the resumed pass");
+        assert_ne!(outcome.reason, REASON_SYNC_WINDOW_ACTIVE);
+        assert!(
+            fixture
+                .cluster
+                .applies()
+                .iter()
+                .any(|key| key.contains(CONFIGMAP_KEY)),
+            "removing the window must resume the operation: {:?}",
+            fixture.cluster.applies()
+        );
+    }
+
+    /// `manualSync: true` lets a **manual** sync through a deny window; the automated trigger stays
+    /// blocked (`T17.4`: manual override applies only to the Manual trigger).
+    #[tokio::test]
+    async fn a_manual_sync_override_breaks_the_glass_but_automation_stays_blocked() {
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            manifest_window_project(ALWAYS_OPEN_OVERRIDABLE_DENY),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+
+        // Automated: blocked, and the message says the override exists but is human-only.
+        let automated = {
+            let mut app = fixture.governed_app(".");
+            app.spec.sync_policy = Some(self_heal_policy());
+            app
+        };
+        let blocked = fixture
+            .pipeline
+            .apply(&automated)
+            .await
+            .expect("blocked is not an error");
+        assert_eq!(blocked.reason, REASON_SYNC_WINDOW_ACTIVE);
+        assert!(
+            blocked.message.contains("a manual sync may override"),
+            "{}",
+            blocked.message
+        );
+        assert!(fixture.cluster.applies().is_empty());
+
+        // Manual: honoured, because the window opted in.
+        let mut manual = automated.clone();
+        manual.annotations_mut().insert(
+            ferriscd_crd::annotations::OPERATION.to_owned(),
+            r#"{"sync":{}}"#.to_owned(),
+        );
+        let executed = fixture
+            .pipeline
+            .apply(&manual)
+            .await
+            .expect("a manual override syncs");
+        assert_eq!(executed.reason, ferriscd_crd::status::REASON_SYNC_SUCCEEDED);
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            1,
+            "the manual override must actually apply"
+        );
+
+        // And a strict deny window refuses the manual sync too.
+        let strict = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            manifest_window_project(ALWAYS_OPEN_DENY),
+            ApplicationScope::default(),
+        );
+        strict.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut manual = strict.governed_app(".");
+        manual.annotations_mut().insert(
+            ferriscd_crd::annotations::OPERATION.to_owned(),
+            r#"{"sync":{}}"#.to_owned(),
+        );
+        let refused = strict
+            .pipeline
+            .apply(&manual)
+            .await
+            .expect("a refused manual sync is not an error");
+        assert_eq!(refused.reason, REASON_SYNC_WINDOW_ACTIVE);
+        assert!(
+            refused.message.contains("manual sync does not override"),
+            "{}",
+            refused.message
+        );
+        assert!(strict.cluster.applies().is_empty());
+    }
+
+    /// **Fail closed:** an unparseable window denies every sync *and* records the reason on the
+    /// `AppProject` `/status` — the operator must not have to correlate logs.
+    #[tokio::test]
+    async fn an_unparseable_window_denies_everything_and_reports_the_project_condition() {
+        let project = project_with_windows(
+            "payments",
+            r#"
+    - kind: deny
+      schedule: "every weekday at nine"
+      duration: 2h
+"#,
+        );
+        let sink = Arc::new(FakeProjectStatusSink::default());
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(project),
+            ApplicationScope::default(),
+        )
+        .with_project_status(sink.clone());
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let mut app = fixture.governed_app(".");
+        app.spec.sync_policy = Some(self_heal_policy());
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a broken window is a denial, not an error");
+        assert_eq!(outcome.reason, REASON_SYNC_WINDOW_ACTIVE);
+        assert!(
+            outcome.message.contains("unusable sync window"),
+            "{}",
+            outcome.message
+        );
+        assert!(
+            outcome.message.contains("spec.syncWindows[0]"),
+            "{}",
+            outcome.message
+        );
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "a typo must never silently disable a change freeze"
+        );
+
+        // The condition lands on the *project*, not the Application.
+        let reports = sink.conditions();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].0, "payments");
+        let condition = &reports[0].1;
+        assert_eq!(condition.type_, "Ready");
+        assert_eq!(condition.status, ferriscd_crd::ConditionStatus::False);
+        assert_eq!(condition.reason, crate::project::REASON_SYNC_WINDOW_INVALID);
+        assert!(
+            condition.message.contains("spec.syncWindows[0]"),
+            "{}",
+            condition.message
+        );
+        // **Finding H1:** the pipeline no longer supplies a generation. The one recorded on the
+        // project belongs to the *project* object, so only `ApiProjectStatusSink::report` (which
+        // reads that object) may stamp it.
+        assert_eq!(
+            condition.observed_generation, None,
+            "a caller must not claim a generation for an object it does not own"
+        );
+        assert_eq!(sink.clears(), 0, "a broken project has nothing to clear");
+
+        // A failing reporter does not turn the denial into a retryable error.
+        let failing = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(project_with_windows(
+                "payments",
+                r#"
+    - kind: deny
+      schedule: "every weekday at nine"
+      duration: 2h
+"#,
+            )),
+            ApplicationScope::default(),
+        )
+        .with_project_status(Arc::new(FakeProjectStatusSink::failing(
+            "status write boom",
+        )));
+        failing.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let outcome = failing
+            .pipeline
+            .apply(&failing.governed_app("."))
+            .await
+            .expect("a failed status report must not fail the sync");
+        assert_eq!(outcome.reason, REASON_SYNC_WINDOW_ACTIVE);
+    }
+
+    /// **`T17.4` trap guard, at the `/status` cap.** The blocked message reaches the `Ready`
+    /// condition through `bounded()`, which truncates to `MAX_STATUS_MESSAGE_CHARS` (200). The
+    /// window explanation alone is long enough to exhaust that budget, so the two facts an operator
+    /// needs — "nothing was applied or pruned" and *when the window lifts* — are written **first**.
+    /// Without that ordering they are silently truncated away and a change freeze looks like a
+    /// controller that quietly did nothing.
+    #[test]
+    fn the_blocked_ready_message_survives_the_status_cap() {
+        // A change freeze that is open at `now`: every weekday 09:00-17:00 UTC for eight hours.
+        // 2026-01-07 is a Wednesday, so the message quotes the 17:00 transition.
+        let now = at("2026-01-07T12:00:00Z");
+        let window = ferriscd_crd::SyncWindow {
+            kind: ferriscd_crd::SyncWindowKind::Deny,
+            schedule: "0 9 * * MON-FRI".to_owned(),
+            duration: "8h".to_owned(),
+            time_zone: None,
+            applications: Vec::new(),
+            namespaces: Vec::new(),
+            clusters: Vec::new(),
+            manual_sync: false,
+        };
+        let verdict = SyncWindowSet::compile(std::slice::from_ref(&window)).evaluate(
+            now.0,
+            &SyncWindowTarget::new("payments-api", "ferriscd-system", "in-cluster"),
+        );
+        let denial = verdict.denial().expect("the freeze is open at 12:00");
+        assert_eq!(
+            denial.reason,
+            ferriscd_engine::policy::SyncWindowDenialReason::DenyWindowActive
+        );
+
+        let summary = DiffSummary {
+            total: 2,
+            out_of_sync: 1,
+            orphaned: 1,
+            ..DiffSummary::default()
+        };
+        let outcome = super::build_outcome(
+            &application("https://example.com/repo.git", ".", "payments"),
+            super::GateVerdict {
+                decision: SyncDecision::Skip(SkipReason::SyncWindowDenied),
+                window: &verdict,
+                now: &now,
+            },
+            &summary,
+            HASH,
+            SyncCounts::default(),
+            // Only the *shape* of the revision matters here (`short_sha` is what the old message
+            // quoted); the message under test never mentions it any more.
+            "1111111111111111111111111111111111111111".to_owned(),
+            Inventory::new(),
+        );
+        assert_eq!(outcome.reason, REASON_SYNC_WINDOW_ACTIVE);
+        // What actually lands on the cluster is the bounded form (`+1` for the `…` marker the
+        // truncation appends).
+        let written = crate::reconcile::bounded(&outcome.message);
+        assert!(
+            written.chars().count() <= ferriscd_crd::status::MAX_STATUS_MESSAGE_CHARS + 1,
+            "the message must stay inside the status cap: {} chars",
+            written.chars().count()
+        );
+        assert!(
+            written.contains("nothing was applied or pruned"),
+            "the blocked pass must say it mutated nothing, even after truncation: {written}"
+        );
+        assert!(
+            written.contains("drift is reported"),
+            "the blocked pass must say drift is still visible: {written}"
+        );
+        assert!(
+            written.contains("next transition 2026-01-07T17:00:00Z"),
+            "the next window transition instant must survive truncation: {written}"
+        );
+        // The explanation itself is still on the full message (only the *status* copy is capped):
+        // the log line and the API keep the reason the operator needs.
+        assert!(
+            outcome.message.contains("deny sync window is active"),
+            "the operator must see which window blocks: {}",
+            outcome.message
+        );
+    }
+
+    /// **Finding H3:** the transition instant survives the cap even when the explanation is at its
+    /// longest — two blocking `allow` windows in a DST-observing zone, which is the case the
+    /// explanation-first ordering truncated away entirely.
+    #[test]
+    fn the_blocked_ready_message_keeps_the_transition_with_two_allow_windows() {
+        // 2026-01-07 12:00Z is 04:00 PST: both Pacific-time allow windows are closed, and the next
+        // one to open is 09:00 PST = 17:00Z.
+        let now = at("2026-01-07T12:00:00Z");
+        let window = |schedule: &str, duration: &str| ferriscd_crd::SyncWindow {
+            kind: ferriscd_crd::SyncWindowKind::Allow,
+            schedule: schedule.to_owned(),
+            duration: duration.to_owned(),
+            time_zone: Some("America/Los_Angeles".to_owned()),
+            applications: Vec::new(),
+            namespaces: Vec::new(),
+            clusters: Vec::new(),
+            manual_sync: false,
+        };
+        let windows = [
+            window("0 9 * * MON-FRI", "8h"),
+            window("0 18 * * MON-FRI", "2h"),
+        ];
+        let verdict = SyncWindowSet::compile(&windows).evaluate(
+            now.0,
+            &SyncWindowTarget::new("payments-api", "ferriscd-system", "in-cluster"),
+        );
+        assert_eq!(
+            verdict
+                .denial()
+                .expect("both allow windows are closed")
+                .reason,
+            ferriscd_engine::policy::SyncWindowDenialReason::OutsideAllowWindow
+        );
+        assert_eq!(
+            verdict.next_transition().map(|instant| instant.to_string()),
+            Some("2026-01-07T17:00:00Z".to_owned()),
+            "09:00 PST is 17:00Z"
+        );
+
+        let outcome = super::build_outcome(
+            &application("https://example.com/repo.git", ".", "payments"),
+            super::GateVerdict {
+                decision: SyncDecision::Skip(SkipReason::SyncWindowDenied),
+                window: &verdict,
+                now: &now,
+            },
+            &DiffSummary::default(),
+            HASH,
+            SyncCounts::default(),
+            "1111111111111111111111111111111111111111".to_owned(),
+            Inventory::new(),
+        );
+        assert_eq!(outcome.reason, REASON_SYNC_WINDOW_ACTIVE);
+        let written = crate::reconcile::bounded(&outcome.message);
+        assert!(
+            written.contains("next transition 2026-01-07T17:00:00Z,"),
+            "the whole timestamp must survive, untruncated: {written}"
+        );
+        assert!(
+            written.contains("nothing was applied or pruned"),
+            "the trap guard must survive: {written}"
+        );
+        assert!(
+            written.contains("drift is reported"),
+            "the drift note must survive: {written}"
+        );
+        assert!(
+            written.chars().count() <= ferriscd_crd::status::MAX_STATUS_MESSAGE_CHARS + 1,
+            "the message must stay inside the status cap: {} chars",
+            written.chars().count()
+        );
+        // Both windows are named in the full message, so the operator knows which policy to edit.
+        assert!(
+            outcome.message.contains("0 18 * * MON-FRI"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    /// **Finding H2:** the project condition is *cleared* once the windows evaluate again.
+    ///
+    /// Fail-closed means a broken project is denied on every pass. Without the clearing write the
+    /// `Ready=False/SyncWindowInvalid` condition would stay on the project forever, so the operator
+    /// who fixed the typo would still read "every sync of this project is denied" in
+    /// `kubectl describe appproject`.
+    #[tokio::test]
+    async fn the_project_condition_is_cleared_when_the_windows_evaluate_again() {
+        let sink = Arc::new(FakeProjectStatusSink::default());
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(project_with_windows(
+                "payments",
+                r#"
+    - kind: deny
+      schedule: "every weekday at nine"
+      duration: 2h
+"#,
+            )),
+            ApplicationScope::default(),
+        )
+        .with_project_status(sink.clone());
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let app = fixture.governed_app(".");
+
+        // Pass 1: broken schedule -> the condition is written.
+        let blocked = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a broken window is a denial, not an error");
+        assert_eq!(blocked.reason, REASON_SYNC_WINDOW_ACTIVE);
+        let conditions = sink.conditions();
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].0, "payments");
+        assert_eq!(
+            conditions[0].1.reason,
+            crate::project::REASON_SYNC_WINDOW_INVALID
+        );
+        assert_eq!(sink.clears(), 0);
+        // The same pass also recorded the "cannot be evaluated" warning dedupe, so the clearing
+        // assertion after pass 2 below is about the *clear*, not about a dedupe never written.
+        assert!(
+            !fixture.pipeline.note_invalid_window_report("payments"),
+            "pass 1 reports the broken project (its dedupe entry now exists)"
+        );
+
+        // The operator fixes the cron expression: the same project now evaluates, so pass 2 asks
+        // for the condition to be removed instead of writing it again.
+        fixture.projects.set_project(project_with_windows(
+            "payments",
+            r#"
+    - kind: deny
+      schedule: "0 9 * * MON-FRI"
+      duration: 2h
+"#,
+        ));
+        let allowed = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a valid window is a governance verdict, not an error");
+        assert_ne!(
+            allowed.reason, REASON_SYNC_WINDOW_ACTIVE,
+            "a window that is not open blocks nothing: {}",
+            allowed.message
+        );
+        assert_eq!(
+            sink.conditions().len(),
+            1,
+            "no second condition is appended for the fixed project"
+        );
+        assert_eq!(
+            sink.clears(),
+            1,
+            "the stale SyncWindowInvalid condition must be cleared"
+        );
+        // Finding M-2: the clear is *wired*, not incidental. Clearing the condition also forgets the
+        // "cannot be evaluated" warning dedupe, so the next report of this project warns again — the
+        // dedupe was removed by pass 2, which is only true if pass 2 took the clearing path.
+        assert!(
+            fixture.pipeline.note_invalid_window_report("payments"),
+            "pass 2 must have cleared the warning dedupe along with the condition"
+        );
+
+        // A project that never declared windows is never written to at all: clearing costs a GET,
+        // and the gate keeps a healthy v1.0 project off the `/status` path entirely.
+        let plain_sink = Arc::new(FakeProjectStatusSink::default());
+        let plain = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            default_project_source(),
+            ApplicationScope::default(),
+        )
+        .with_project_status(plain_sink.clone());
+        plain.commit(&[("configmap.yaml", CONFIGMAP)]);
+        plain
+            .pipeline
+            .apply(&plain.app("."))
+            .await
+            .expect("an ungoverned project syncs");
+        assert!(
+            plain_sink.reports().is_empty(),
+            "a project without syncWindows must not cost a /status read or write: {:?}",
+            plain_sink.reports().len()
+        );
+    }
+
+    /// **Finding H-A:** the clearing write is *not* skipped when the operator deletes every window.
+    ///
+    /// The gate used to be `has_sync_windows()` alone, so the one edit that most obviously fixes a
+    /// broken change freeze — removing `spec.syncWindows` altogether — was the one edit that never
+    /// cleared the `Ready=False/SyncWindowInvalid` condition: nothing in the spec asked for a report
+    /// any more, so the pipeline never reached the sink and `kubectl describe appproject` kept
+    /// announcing a freeze that no longer existed. The project's own `/status` is therefore part of
+    /// the decision, and it is cleared exactly once.
+    #[tokio::test]
+    async fn the_project_condition_is_cleared_when_every_window_is_deleted() {
+        let sink = Arc::new(FakeProjectStatusSink::default());
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(project_with_windows(
+                "payments",
+                r#"
+    - kind: deny
+      schedule: "every weekday at nine"
+      duration: 2h
+"#,
+            )),
+            ApplicationScope::default(),
+        )
+        .with_project_status(sink.clone());
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let app = fixture.governed_app(".");
+
+        // Pass 1: the unparseable window is reported, so the project now carries the condition.
+        fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a broken window is a denial, not an error");
+        assert_eq!(sink.conditions().len(), 1);
+        assert_eq!(sink.clears(), 0);
+
+        // The operator does not fix the typo, they delete the list: the spec now declares no windows
+        // at all, and `spec.syncWindows` is the only thing the old gate looked at.
+        fixture
+            .projects
+            .set_project(with_recorded_invalid_window("payments"));
+
+        // Pass 2: `has_sync_windows()` is false, but the recorded condition is what keeps the sink in
+        // the loop — and the verdict is now "no window, so nothing blocks".
+        let allowed = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a project with no windows is not an error");
+        assert_ne!(
+            allowed.reason, REASON_SYNC_WINDOW_ACTIVE,
+            "no window is open, so nothing blocks: {}",
+            allowed.message
+        );
+        assert_eq!(
+            sink.clears(),
+            1,
+            "the stale condition must be cleared even though the project declares no windows"
+        );
+
+        // Pass 3: the clearing write landed, so the project records nothing and costs no write. This
+        // is the "exactly once" half: the sink stays silent from now on.
+        fixture
+            .projects
+            .set_project(project_without_windows("payments"));
+        fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a project without windows syncs");
+        assert_eq!(sink.clears(), 1, "the condition is cleared exactly once");
+        assert_eq!(
+            sink.reports().len(),
+            2,
+            "one write and one clear: {:?}",
+            sink.reports().len()
+        );
+    }
+
+    /// **Finding M2:** a preview never writes to the `AppProject` `/status`.
+    ///
+    /// `GET /api/v1/applications/{ns}/{name}/diff` runs this very code through
+    /// [`PassMode::Preview`]. A read-only request must not patch a *different* object's `/status`
+    /// — and there is nothing to gain from it: the verdict it needs is returned to the caller.
+    #[tokio::test]
+    async fn a_preview_never_writes_the_project_condition() {
+        let sink = Arc::new(FakeProjectStatusSink::default());
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(project_with_windows(
+                "payments",
+                r#"
+    - kind: deny
+      schedule: "every weekday at nine"
+      duration: 2h
+"#,
+            )),
+            ApplicationScope::default(),
+        )
+        .with_project_status(sink.clone());
+        fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let app = fixture.governed_app(".");
+
+        // The preview still evaluates the windows (the drift it reports is the same the reconcile
+        // would see) …
+        fixture
+            .pipeline
+            .diff(&app)
+            .await
+            .expect("a broken window is a denial, not a preview error");
+        // … but it writes nothing at all.
+        assert!(
+            sink.reports().is_empty(),
+            "a preview must not write the project /status: {:?}",
+            sink.reports().len()
+        );
+
+        // The same fixture through `apply` does report, so the gate — not a broken sink — is what
+        // kept the preview quiet.
+        fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("the apply pass denies without erroring");
+        assert_eq!(sink.conditions().len(), 1);
+    }
+
+    /// **Finding M-B:** the "cannot be evaluated" warning is deduplicated per project, and the
+    /// dedupe is *forgotten* once the project evaluates again.
+    ///
+    /// Without the third assertion a project that breaks, is fixed, and breaks again would only ever
+    /// log its first warning, so the second incident would be invisible.
+    #[test]
+    fn the_invalid_window_warning_is_deduplicated_and_reset_by_a_clear() {
+        let fixture = fixture(FakeCluster::default());
+        assert!(
+            fixture.pipeline.note_invalid_window_report("payments"),
+            "the first pass of a broken project reports"
+        );
+        assert!(
+            !fixture.pipeline.note_invalid_window_report("payments"),
+            "every repeat is debug-only"
+        );
+        fixture.pipeline.clear_invalid_window_report("payments");
+        assert!(
+            fixture.pipeline.note_invalid_window_report("payments"),
+            "a project that breaks again must warn again"
+        );
+    }
+
+    /// **Finding M-C:** a `metadata.generation` bump rewrites the condition even when the message
+    /// reads identically.
+    ///
+    /// `observedGeneration` is what says *which revision* of the project the condition describes; a
+    /// project edited twice into the same failure would otherwise keep the generation of the first
+    /// edit forever, and `kubectl get appproject -o yaml` would claim the operator's last change was
+    /// already accounted for.
+    #[test]
+    fn a_generation_bump_rewrites_the_project_condition() {
+        let invalid = [ferriscd_engine::policy::InvalidSyncWindow {
+            index: 0,
+            schedule: "nope".to_owned(),
+            message: "not a cron expression".to_owned(),
+        }];
+        let condition = crate::project::sync_window_condition(&invalid, at("2026-01-07T12:00:00Z"))
+            .expect("a broken window reports");
+        let recorded = ferriscd_crd::AppProjectStatus {
+            observed_generation: Some(7),
+            conditions: vec![condition.clone().with_observed_generation(Some(7))],
+        };
+        assert_eq!(
+            crate::project::status_patch(
+                &recorded,
+                Some(&condition.clone().with_observed_generation(Some(7)))
+            ),
+            None,
+            "the same condition at the same generation must not cost a write"
+        );
+        assert!(
+            crate::project::status_patch(
+                &recorded,
+                Some(&condition.with_observed_generation(Some(8)))
+            )
+            .is_some(),
+            "a generation bump must rewrite the condition"
+        );
+    }
+
+    /// A malformed window is reported **once**, not on every reconcile: the sink is only asked when
+    /// the verdict is a denial, and `status_patch` skips an unchanged condition.
+    #[test]
+    fn the_project_condition_is_reported_only_when_it_changes() {
+        let now = at("2026-01-07T12:00:00Z");
+        let invalid = [ferriscd_engine::policy::InvalidSyncWindow {
+            index: 0,
+            schedule: "nope".to_owned(),
+            message: "not a cron expression".to_owned(),
+        }];
+        let condition = crate::project::sync_window_condition(&invalid, now.clone())
+            .expect("a broken window reports");
+        assert_eq!(condition.status, ferriscd_crd::ConditionStatus::False);
+        assert_eq!(
+            condition.observed_generation, None,
+            "the generation belongs to the project object, so only the sink stamps it (finding H1)"
+        );
+
+        // Nothing recorded yet -> patch. The same condition again -> no write at all.
+        let empty = ferriscd_crd::AppProjectStatus::default();
+        let conditions =
+            crate::project::status_patch(&empty, Some(&condition)).expect("first report writes");
+        assert_eq!(conditions.len(), 1);
+        let recorded = ferriscd_crd::AppProjectStatus {
+            conditions: conditions.clone(),
+            observed_generation: Some(7),
+        };
+        assert_eq!(
+            crate::project::status_patch(&recorded, Some(&condition)),
+            None,
+            "an unchanged condition must not cost an API write"
+        );
+
+        // A different failure replaces the `Ready` entry instead of appending a second one.
+        let other = [ferriscd_engine::policy::InvalidSyncWindow {
+            index: 1,
+            schedule: "0 0 * * *".to_owned(),
+            message: "duration \"8 days\": unsupported unit".to_owned(),
+        }];
+        let changed =
+            crate::project::sync_window_condition(&other, now).expect("a broken window reports");
+        assert!(changed.message.contains("spec.syncWindows[1]"));
+        let conditions =
+            crate::project::status_patch(&recorded, Some(&changed)).expect("a change writes");
+        assert_eq!(conditions.len(), 1, "the list is a set keyed on `type`");
+        assert!(conditions[0].message.contains("spec.syncWindows[1]"));
+
+        // Several broken entries: the first is named in full and the rest is counted (bounded).
+        let several = [
+            ferriscd_engine::policy::InvalidSyncWindow {
+                index: 0,
+                schedule: "a".to_owned(),
+                message: "b".to_owned(),
+            },
+            ferriscd_engine::policy::InvalidSyncWindow {
+                index: 1,
+                schedule: "c".to_owned(),
+                message: "d".to_owned(),
+            },
+        ];
+        let message = crate::project::sync_window_condition(&several, at("2026-01-07T12:00:00Z"))
+            .expect("a broken window reports")
+            .message;
+        assert!(message.contains("(and 1 more)"), "{message}");
     }
 
     // ---------------------------------------------------------------------
@@ -8260,7 +9773,7 @@ spec:
             .expect("the first pass persists the spec hash");
 
         // The operator points the Application at a different directory in the *same* commit.
-        app.spec.source.git.path = "config".to_owned();
+        app.spec.source.git.as_mut().expect("git source").path = "config".to_owned();
         let new_hash = source_spec_hash(&app.spec).expect("spec hash");
         assert_ne!(old_hash, new_hash, "a path edit must change the hash");
 
@@ -9099,16 +10612,16 @@ spec:
         let mut app = application("https://example.com/repo.git", ".", "payments");
         app.spec.requeue_after_seconds = 180;
         assert_eq!(
-            plan_requeue(true, 2, HealthStatus::Healthy, &app, None),
+            plan_requeue(true, 2, HealthStatus::Healthy, &app, None, None),
             PENDING_REQUEUE,
             "a deferred CRD/namespace is retried quickly regardless of health"
         );
         assert_eq!(
-            plan_requeue(true, 0, HealthStatus::Progressing, &app, None),
+            plan_requeue(true, 0, HealthStatus::Progressing, &app, None, None),
             PROGRESSING_REQUEUE
         );
         assert_eq!(
-            plan_requeue(false, 0, HealthStatus::Progressing, &app, None),
+            plan_requeue(false, 0, HealthStatus::Progressing, &app, None, None),
             PROGRESSING_REQUEUE,
             "a skipped pass still polls fast while a rollout converges"
         );
@@ -9120,7 +10633,7 @@ spec:
             HealthStatus::Unknown,
         ] {
             assert_eq!(
-                plan_requeue(true, 0, settled, &app, None),
+                plan_requeue(true, 0, settled, &app, None, None),
                 Duration::from_secs(180),
                 "{settled:?} is settled"
             );
@@ -9129,14 +10642,73 @@ spec:
         // The progressing interval never *lengthens* an operator's explicit faster interval.
         app.spec.requeue_after_seconds = 3;
         assert_eq!(
-            plan_requeue(true, 0, HealthStatus::Progressing, &app, None),
+            plan_requeue(true, 0, HealthStatus::Progressing, &app, None, None),
             Duration::from_secs(3)
         );
         assert_eq!(
-            plan_requeue(true, 1, HealthStatus::Progressing, &app, None),
+            plan_requeue(true, 1, HealthStatus::Progressing, &app, None, None),
             PENDING_REQUEUE,
             "a pending dependency outranks the health interval"
         );
+
+        // `T17.4`: a blocking sync window is the tightest bound, whatever the other inputs say.
+        app.spec.requeue_after_seconds = 180;
+        let boundary = Some(Duration::from_secs(45));
+        assert_eq!(
+            plan_requeue(false, 0, HealthStatus::Healthy, &app, None, boundary),
+            Duration::from_secs(45),
+            "a blocked pass wakes at the window boundary, not on its periodic interval"
+        );
+        // While converging, the shorter of the two wins: a 10 s health poll is still a 10 s poll
+        // when the window closes in 45 s, and a 10 s window boundary shortens the health poll.
+        assert_eq!(
+            plan_requeue(false, 0, HealthStatus::Progressing, &app, None, boundary),
+            PROGRESSING_REQUEUE,
+            "the boundary never lengthens the converging interval"
+        );
+        assert_eq!(
+            plan_requeue(
+                false,
+                0,
+                HealthStatus::Progressing,
+                &app,
+                None,
+                Some(Duration::from_secs(4))
+            ),
+            Duration::from_secs(4),
+            "a boundary inside the converging interval shortens it"
+        );
+        assert_eq!(
+            plan_requeue(true, 0, HealthStatus::Healthy, &app, None, boundary),
+            Duration::from_secs(45),
+            "the next window transition is also a wake-up point: automation must re-evaluate a \
+             settled pass exactly when a deny window is about to open"
+        );
+        assert_eq!(
+            plan_requeue(
+                false,
+                0,
+                HealthStatus::Healthy,
+                &app,
+                Some(Duration::from_secs(90)),
+                boundary
+            ),
+            Duration::from_secs(45),
+            "an operation hint never sleeps past the boundary either"
+        );
+        assert_eq!(
+            plan_requeue(
+                false,
+                0,
+                HealthStatus::Healthy,
+                &app,
+                Some(Duration::from_secs(5)),
+                boundary
+            ),
+            Duration::from_secs(5),
+            "a shorter hint still wins (min, not override)"
+        );
+        app.spec.requeue_after_seconds = 3;
     }
 
     #[test]
@@ -9550,6 +11122,42 @@ spec:
         );
         assert!(err.to_string().contains("default"), "{err}");
         assert_eq!(fixture.projects.reads(), vec!["default".to_owned()]);
+        // Nothing was read from Git, diffed, or applied.
+        assert_eq!(fixture.git.resolve_calls(), 0);
+        assert!(fixture.dry_run.calls().is_empty());
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    /// **Trap guard (`T18.3`).** `spec.source.oci` is accepted by the API (schema + offline
+    /// validation) but the registry client is `T18.4`'s work: this build must refuse it *terminally
+    /// and before any fetch*, never fall through to a Git clone of an empty URL and never render an
+    /// empty bundle.
+    #[tokio::test]
+    async fn an_oci_source_is_refused_terminally_before_any_fetch() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let mut app = fixture.app(".");
+        app.spec.source.git = None;
+        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+            url: "oci://ghcr.io/example/payments".to_owned(),
+            tag: Some("1.4.2".to_owned()),
+            digest: None,
+            path: String::new(),
+        });
+        assert!(
+            app.spec.validate().is_ok(),
+            "the spec itself must be valid: the refusal is about this build's pipeline"
+        );
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("an OCI source must be refused, not silently rendered");
+        assert!(matches!(err, ReconcileError::Invalid { .. }), "{err:?}");
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        let message = err.to_string();
+        assert!(message.contains("spec.source.oci"), "{message}");
+        assert!(message.contains("No artifact was fetched"), "{message}");
         // Nothing was read from Git, diffed, or applied.
         assert_eq!(fixture.git.resolve_calls(), 0);
         assert!(fixture.dry_run.calls().is_empty());

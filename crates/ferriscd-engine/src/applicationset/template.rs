@@ -567,8 +567,15 @@ syncPolicy:
             rendered.application.spec.destination.cluster, "prod",
             "placeholders must reach nested spec fields"
         );
+        let git = rendered
+            .application
+            .spec
+            .source
+            .git
+            .as_ref()
+            .expect("a rendered Application keeps the Git source the template carries");
         assert_eq!(
-            rendered.application.spec.source.git.path, "apps/prod",
+            git.path, "apps/prod",
             "placeholders must reach the repository path"
         );
         let labels = rendered.application.labels();
@@ -754,11 +761,12 @@ syncPolicy:
             usize::try_from(MAX_GENERATED_APPLICATIONS).expect("positive")
         );
         let _: SourceSpec = SourceSpec {
-            git: GitSourceSpec {
+            git: Some(GitSourceSpec {
                 repo_url: "https://github.com/example/x.git".to_owned(),
                 target_revision: "HEAD".to_owned(),
                 path: String::new(),
-            },
+            }),
+            oci: None,
             renderer: ferriscd_crd::RendererSpec::default(),
         };
     }

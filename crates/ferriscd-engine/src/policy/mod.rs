@@ -15,8 +15,15 @@
 
 pub mod app_project;
 pub mod namespace_scope;
+// `T17.4`: deployment-governance windows — a pure evaluation of `AppProject.spec.syncWindows`
+// against an **injected** `jiff::Timestamp` (never a wall-clock read inside the engine).
+pub mod sync_windows;
 
 pub use app_project::{AppProjectPolicy, PolicyError, wildcard_matches};
 pub use namespace_scope::{
     ALL_NAMESPACES, ApplicationNamespaces, ApplicationScope, ApplicationScopeError,
+};
+pub use sync_windows::{
+    InvalidSyncWindow, SyncWindowDenial, SyncWindowDenialReason, SyncWindowSet, SyncWindowStatus,
+    SyncWindowTarget, SyncWindowVerdict,
 };

@@ -7,12 +7,13 @@ pub mod applicationset;
 pub mod generate;
 pub mod project;
 pub mod status;
+pub mod sync_window;
 
 pub use application::{
     Application, ApplicationSpec, AutoRenderer, AutomatedSyncPolicy, DestinationSpec,
-    GitSourceSpec, HelmRenderer, IgnoreDifference, KustomizeRenderer, PlainYamlRenderer,
-    RendererSpec, RetryBackoff, RetryPolicy, SourceSpec, SpecValidationError, SyncOptions,
-    SyncPolicy,
+    GitSourceSpec, HelmRenderer, IgnoreDifference, KustomizeRenderer, MAX_OCI_TAG_LEN,
+    OCI_DIGEST_HEX_LEN, OCI_DIGEST_PREFIX, OciSourceSpec, PlainYamlRenderer, RendererSpec,
+    RetryBackoff, RetryPolicy, SourceSpec, SpecValidationError, SyncOptions, SyncPolicy,
 };
 pub use applicationset::{
     APPLICATIONSET_FINALIZER, APPLICATIONSET_LABEL, ApplicationSet, ApplicationSetGenerator,
@@ -21,11 +22,18 @@ pub use applicationset::{
     GitDirectoryPattern, GitFilePattern, GitGenerator, ListGenerator, MAX_GENERATED_APPLICATIONS,
     MatrixChildGenerator, MatrixGenerator,
 };
-pub use project::{AppProject, AppProjectSpec, AppProjectStatus, GroupKind, ProjectDestination};
+pub use project::{
+    AppProject, AppProjectSpec, AppProjectStatus, GroupKind, ProjectDestination,
+    ProjectValidationError, REASON_SYNC_WINDOW_INVALID, SyncWindowSpecError,
+};
 pub use status::{
     ActiveHook, ApplicationStatus, Condition, ConditionStatus, HealthState, HealthStatus,
     InventoryEntry, OperationPhase, OperationState, ResourceStatus, RevisionHistoryEntry,
     SourceSummary, SyncPhase, SyncState, SyncStatus,
+};
+pub use sync_window::{
+    CompiledSchedule, CronSchedule, MAX_SEARCH_DAYS, MAX_SYNC_WINDOW_SECONDS, SyncWindow,
+    SyncWindowKind, SyncWindowParseError,
 };
 
 /// Canonical API group of every FerrisCD custom resource.

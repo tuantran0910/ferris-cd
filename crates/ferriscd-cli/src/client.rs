@@ -199,17 +199,32 @@ impl Connection {
     /// `server`/`token` are the command's own flags (`--server-url`, `--token`); `None` means "not
     /// given here", which is when `FERRISCD_SERVER`/`FERRISCD_TOKEN` and finally
     /// `config.json` are consulted.
+    /// Every `ferriscd` command runs inside the async runtime, so the `config.json` read happens on
+    /// the blocking pool rather than on an executor thread (the `docs/REVIEW_LOG.md` §`v1.0`
+    /// follow-up, closed by `T19.2`).
     ///
     /// # Errors
     ///
     /// [`ClientError::NotLoggedIn`] when nothing is stored, [`ClientError::Config`] when the stored
     /// file is unusable, [`ClientError::InvalidUrl`] for a URL that is not absolute http(s).
-    pub fn resolve(server: Option<&str>, token: Option<&str>) -> Result<Self, ClientError> {
+    pub async fn resolve_async(
+        server: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<Self, ClientError> {
         let stored = if server.is_none() || token.is_none() {
-            StoredConfig::load_if_present()?
+            StoredConfig::load_if_present_async().await?
         } else {
             None
         };
+        Self::resolve_from(server, token, stored)
+    }
+
+    /// The shared resolution order, over an already-read (or absent) stored configuration.
+    fn resolve_from(
+        server: Option<&str>,
+        token: Option<&str>,
+        stored: Option<StoredConfig>,
+    ) -> Result<Self, ClientError> {
         let server_url = server
             .map(ToOwned::to_owned)
             .or_else(|| std::env::var(SERVER_ENV).ok().filter(|url| !url.is_empty()))
@@ -329,14 +344,27 @@ impl StoredConfig {
         Ok(stored)
     }
 
-    /// Reads the configuration at the resolved path, or `Ok(None)` when it does not exist.
+    /// Reads the configuration at the resolved path on the blocking pool, or `Ok(None)` when it does
+    /// not exist.
     ///
     /// # Errors
     ///
-    /// [`ClientError::Config`] when the file exists but is unusable.
-    pub fn load_if_present() -> Result<Option<Self>, ClientError> {
+    /// [`ClientError::Config`] when the file exists but is unusable, or when the blocking read panics.
+    pub async fn load_if_present_async() -> Result<Option<Self>, ClientError> {
         let path = config_path()?;
-        match Self::load_from(&path) {
+        let report = path.clone();
+        match tokio::task::spawn_blocking(move || Self::read_or_absent(&path)).await {
+            Ok(result) => result,
+            Err(_) => Err(ClientError::Config {
+                path: report,
+                reason: "the configuration read panicked".to_owned(),
+            }),
+        }
+    }
+
+    /// [`Self::load_from`] over a known path, mapping "no such file" to `Ok(None)`.
+    fn read_or_absent(path: &Path) -> Result<Option<Self>, ClientError> {
+        match Self::load_from(path) {
             Ok(stored) => Ok(Some(stored)),
             Err(ClientError::NotLoggedIn { .. }) => Ok(None),
             Err(error) => Err(error),
@@ -502,11 +530,22 @@ impl Client {
 
     /// Builds a client from the command's flags, the environment, or the stored configuration.
     ///
+    /// The stored-credential read happens on the blocking pool (`T19.2`), so this is safe to call from
+    /// any subcommand's async body.
+    ///
     /// # Errors
     ///
-    /// See [`Connection::resolve`] and [`Self::new`].
-    pub fn connect(server: Option<&str>, token: Option<&str>) -> Result<Self, ClientError> {
-        let connection = Connection::resolve(server, token)?;
+    /// See [`Connection::resolve_async`] and [`Self::new`].
+    pub async fn connect_async(
+        server: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        let connection = Connection::resolve_async(server, token).await?;
+        Self::from_connection(connection)
+    }
+
+    /// Builds the client from a resolved [`Connection`] (with the plain-HTTP warning).
+    fn from_connection(connection: Connection) -> Result<Self, ClientError> {
         if connection.server_url.starts_with("http://") && !is_loopback(&connection.server_url) {
             eprintln!(
                 "warning: {} is plain HTTP, so the bearer token is sent in clear text; use https:// \
@@ -665,6 +704,89 @@ impl Client {
     }
 }
 
+/// The largest `GET /api/v1/auth/config` body the CLI reads.
+///
+/// The document is a handful of short strings, so anything larger is a broken or hostile endpoint:
+/// the same reasoning (and the same ceiling) as `ferriscd_server::auth_bff::MAX_HTTP_BODY_BYTES`.
+pub const MAX_AUTH_CONFIG_BODY_BYTES: usize = 64 * 1024;
+
+/// `GET /api/v1/auth/config` with **no credential** (`T19.1`, consumed by `T19.2`).
+///
+/// The document is public by design — it is how a client learns which sign-in method the server
+/// wants — so this deliberately does not build a [`Client`] (which demands a token).
+///
+/// It is also the first call `ferriscd login --oidc` makes, so it carries a total and a connect
+/// timeout, follows no redirects and reads at most [`MAX_AUTH_CONFIG_BODY_BYTES`]: a login must not
+/// hang on a wedged server, nor be made to buffer an unbounded body before it has authenticated
+/// anything.
+///
+/// # Errors
+///
+/// [`ClientError::InvalidUrl`] for an unusable server URL and the usual transport/status errors.
+pub async fn fetch_auth_config(
+    server_url: &str,
+) -> Result<ferriscd_server::api::AuthConfigView, ClientError> {
+    fetch_auth_config_with(server_url, AUTH_CONFIG_TIMEOUT).await
+}
+
+/// The total timeout for [`fetch_auth_config`].
+pub const AUTH_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The connect timeout for [`fetch_auth_config`].
+pub const AUTH_CONFIG_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`fetch_auth_config`] with an explicit total timeout (the seam a test uses to prove it is
+/// enforced).
+///
+/// # Errors
+///
+/// As [`fetch_auth_config`].
+pub async fn fetch_auth_config_with(
+    server_url: &str,
+    timeout: std::time::Duration,
+) -> Result<ferriscd_server::api::AuthConfigView, ClientError> {
+    ferriscd_controller::impersonation::ensure_crypto_provider();
+    let normalized = normalize_server_url(server_url)?;
+    let url = format!("{normalized}/api/v1/auth/config");
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("ferriscd/", env!("CARGO_PKG_VERSION")))
+        .timeout(timeout)
+        .connect_timeout(AUTH_CONFIG_CONNECT_TIMEOUT.min(timeout))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| ClientError::Transport {
+            method: "CLIENT".to_owned(),
+            url: url.clone(),
+            message: error.to_string(),
+        })?;
+    let response = http
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|error| transport("GET", &url, &error))?;
+    decode_bounded("GET", &url, response, Some(MAX_AUTH_CONFIG_BODY_BYTES)).await
+}
+
+/// Reads `response` into memory, refusing more than `limit` bytes.
+async fn read_bounded(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    if let Some(declared) = response.content_length()
+        && declared > limit as u64
+    {
+        return Err(format!(
+            "the reply announced {declared} bytes, more than the {limit} byte limit"
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(format!("the reply is larger than the {limit} byte limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Whether `url` points at loopback (`127.0.0.0/8`, `::1`, `localhost`).
 fn is_loopback(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
@@ -717,12 +839,27 @@ async fn decode<T: DeserializeOwned>(
     url: &str,
     response: reqwest::Response,
 ) -> Result<T, ClientError> {
+    decode_bounded(method, url, response, None).await
+}
+
+/// [`decode`] with an optional body ceiling, checked against the declared length *and* while the body
+/// streams in (a hostile endpoint can omit `Content-Length`).
+async fn decode_bounded<T: DeserializeOwned>(
+    method: &str,
+    url: &str,
+    mut response: reqwest::Response,
+    limit: Option<usize>,
+) -> Result<T, ClientError> {
     let status = response.status();
-    let bytes = response.bytes().await.map_err(|err| ClientError::Decode {
-        method: method.to_owned(),
-        url: url.to_owned(),
-        message: err.to_string(),
-    })?;
+    // One code path: an absent limit is `usize::MAX`, which the streaming reader treats as "no
+    // ceiling worth mentioning".
+    let bytes = read_bounded(&mut response, limit.unwrap_or(usize::MAX))
+        .await
+        .map_err(|message| ClientError::Decode {
+            method: method.to_owned(),
+            url: url.to_owned(),
+            message,
+        })?;
     if !status.is_success() {
         // The API's own error body is bounded and secret-free (`ApiError::message`), and a client
         // cannot do better than repeat it. Anything else is summarised by its status code only.
@@ -952,14 +1089,15 @@ mod tests {
         assert!(!is_loopback("https://ferriscd.example.com"));
     }
 
-    /// `Connection::resolve` prefers the explicit values over everything else, and reports "not
+    /// `Connection::resolve_async` prefers the explicit values over everything else, and reports "not
     /// logged in" (never a panic) when nothing is available.
-    #[test]
-    fn an_explicit_connection_never_needs_a_stored_file() {
-        let connection = Connection::resolve(
+    #[tokio::test]
+    async fn an_explicit_connection_never_needs_a_stored_file() {
+        let connection = Connection::resolve_async(
             Some("https://ferriscd.example.com/"),
             Some("token-from-flag"),
         )
+        .await
         .expect("explicit values are enough");
         assert_eq!(connection.server_url, "https://ferriscd.example.com");
         assert_eq!(connection.token, "token-from-flag");
@@ -967,7 +1105,7 @@ mod tests {
         // Only a token, no URL: no stored file in this (empty) environment means "not logged in".
         // `FERRISCD_SERVER` may be set by the caller's shell, so the assertion accepts either the
         // stored/env path or the documented error — but never a panic or a half-built connection.
-        match Connection::resolve(None, Some("token")) {
+        match Connection::resolve_async(None, Some("token")).await {
             Ok(connection) => assert!(!connection.server_url.is_empty()),
             Err(error) => assert!(
                 matches!(error, ClientError::NotLoggedIn { .. }),

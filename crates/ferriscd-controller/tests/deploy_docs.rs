@@ -620,3 +620,89 @@ fn the_applicationset_controller_grants_and_caveats_are_documented() {
          `applicationsets` (the finalizer is a merge patch, so `patch` — not `update`)"
     );
 }
+
+/// **`T18.2`:** the opt-in drift watcher's operator surface — the kind allow-list, the `403`
+/// fallback contract, the metadata-only/label-scoped wire shape and the four metric families — must
+/// be documented where an operator turns it on and grants its RBAC.
+///
+/// The RBAC half is pinned structurally as well: a `ClusterRole` sample must grant `get`,
+/// `list` and `watch` on the `apps`, `batch` and `networking.k8s.io` kinds the watcher reads, and
+/// no sample may buy that by granting `secrets`.
+#[test]
+fn the_opt_in_drift_watcher_and_its_fallback_are_documented() {
+    for expected in [
+        "--drift-watcher-kinds",
+        "FERRISCD_DRIFT_WATCHER_KINDS",
+        "application/json;as=PartialObjectMetadata",
+        "as=PartialObjectMetadataList",
+        "labelSelector=ferriscd.io/managed-by=ferriscd",
+        "MAX_DRIFT_WATCHES = 64",
+        "ferriscd_drift_watcher_fallback_total",
+        "ferriscd_drift_watcher_triggers_total",
+        "ferriscd_drift_watcher_active_watches",
+        "ferriscd_drift_watcher_events_total",
+        // The fallback contract: permanent codes park the watch, Model 1 keeps detecting drift.
+        "403",
+        "404",
+        "405",
+        "15m",
+        "Ready=False",
+        "Model 1",
+        // A typo must stop the controller, not silently watch everything.
+        "startup error",
+    ] {
+        assert!(
+            README.contains(expected),
+            "deploy/README.md must document {expected:?} for the opt-in drift watcher"
+        );
+    }
+
+    // The allow-list is validated at startup **unconditionally**, so a malformed value is fatal
+    // even when the watcher is disabled: only a well-formed list is ignored with a warning. The
+    // docs must not promise a leniency the parser does not have.
+    for expected in [
+        "startup unconditionally",
+        "even when `--enable-drift-watcher=false`",
+        "ignored with a",
+    ] {
+        assert!(
+            README.contains(expected),
+            "deploy/README.md must state that a malformed `--drift-watcher-kinds` is a startup \
+             error even when the watcher is off (missing {expected:?})"
+        );
+    }
+
+    // The documented ClusterRole must grant read verbs on the groups the watcher reads. Without
+    // this, every watch of those kinds parks on a `403` and the feature silently degrades to
+    // Model 1 polling for anyone who follows the docs.
+    let documents = rbac_documents();
+    let cluster_role = documents
+        .iter()
+        .find(|(kind, _, rules)| {
+            kind == "ClusterRole"
+                && rules.iter().any(|rule| {
+                    contains(rule, "apiGroups", "apps")
+                        && contains(rule, "verbs", "list")
+                        && contains(rule, "verbs", "watch")
+                })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the README's ClusterRole sample must grant list/watch on `apps` (the drift \
+                 watcher reads `deployments`/`statefulsets`): {README}"
+            )
+        });
+    for (group, resource) in [
+        ("apps", "deployments"),
+        ("batch", "cronjobs"),
+        ("networking.k8s.io", "ingresses"),
+    ] {
+        assert!(
+            cluster_role.2.iter().any(|rule| {
+                contains(rule, "apiGroups", group) && contains(rule, "resources", resource)
+            }),
+            "the ClusterRole sample must grant read access to {group}/{resource} for the drift \
+             watcher"
+        );
+    }
+}

@@ -11,7 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
-use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
+    CustomResourceDefinition, JSONSchemaProps, ValidationRule,
+};
 use kube::CustomResourceExt;
 
 use crate::application::Application;
@@ -29,6 +31,33 @@ pub const APPPROJECT_CRD_FILE_NAME: &str = "appprojects.ferriscd.io.yaml";
 
 /// File name of the generated `ApplicationSet` CRD.
 pub const APPLICATIONSET_CRD_FILE_NAME: &str = "applicationsets.ferriscd.io.yaml";
+
+/// CEL rule (`T18.3`): exactly one of `spec.source.git` / `spec.source.oci`.
+///
+/// The rule is written in the same shape as [`crate::SpecValidationError::MissingSource`] /
+/// [`crate::SpecValidationError::AmbiguousSource`], so the API server's `422` and the offline
+/// `ApplicationSpec::validate` verdict can never disagree.
+///
+/// `has(self.x)` alone is *not* that shape: it is true for an explicitly null property
+/// (`spec: {source: {git: null}}`), while `validate()` sees `None` — the server would accept a
+/// source-less `Application` that the controller then refuses. `has(self.x) && self.x != null` is
+/// exactly "the property is set to a value", which is what `Option` means after deserialization.
+pub const SOURCE_EXCLUSIVE_RULE: &str = "(has(self.git) && self.git != null && !(has(self.oci) && self.oci != null)) || (!(has(self.git) && self.git != null) && has(self.oci) && self.oci != null)";
+
+/// Message reported when [`SOURCE_EXCLUSIVE_RULE`] fails.
+pub const SOURCE_EXCLUSIVE_MESSAGE: &str =
+    "exactly one of spec.source.git or spec.source.oci must be specified";
+
+/// CEL rule (`T18.3`): an OCI reference must be immutable (`tag` or `digest`).
+///
+/// Null-aware for the same reason as [`SOURCE_EXCLUSIVE_RULE`]: `oci: {tag: null}` is "no tag" to
+/// `OciSourceSpec::validate`, so it must be "no tag" here too.
+pub const OCI_REFERENCE_RULE: &str =
+    "(has(self.tag) && self.tag != null) || (has(self.digest) && self.digest != null)";
+
+/// Message reported when [`OCI_REFERENCE_RULE`] fails.
+pub const OCI_REFERENCE_MESSAGE: &str =
+    "at least one of spec.source.oci.tag or spec.source.oci.digest must be specified";
 
 /// One generated manifest, ready to be written to `<dir>/<file_name>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,9 +101,55 @@ pub enum CrdGenerationError {
 }
 
 /// Returns the generated `Application` CRD object.
+///
+/// The `CustomResource` derive cannot express `x-kubernetes-validations`, so the two `T18.3` CEL
+/// rules are injected here — on the **typed** CRD rather than on the rendered YAML, so anything
+/// that applies [`application_crd`] (installers, live tests) gets the same rules the committed
+/// manifest carries.
 #[must_use]
 pub fn application_crd() -> CustomResourceDefinition {
-    Application::crd()
+    let mut crd = Application::crd();
+    inject_source_validation_rules(&mut crd);
+    crd
+}
+
+/// Injects the `T18.3` CEL rules into the `spec.source` / `spec.source.oci` schemas.
+///
+/// Idempotent: the rules are *set*, not appended, so regenerating an already-injected CRD cannot
+/// duplicate them (the drift check compares rendered bytes, and a duplicated rule would show up as
+/// permanent drift).
+fn inject_source_validation_rules(crd: &mut CustomResourceDefinition) {
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version
+            .schema
+            .as_mut()
+            .and_then(|schema| schema.open_api_v3_schema.as_mut())
+        else {
+            continue;
+        };
+        let Some(source) = field_mut(schema, "spec").and_then(|spec| field_mut(spec, "source"))
+        else {
+            continue;
+        };
+        set_rules(source, SOURCE_EXCLUSIVE_RULE, SOURCE_EXCLUSIVE_MESSAGE);
+        if let Some(oci) = field_mut(source, "oci") {
+            set_rules(oci, OCI_REFERENCE_RULE, OCI_REFERENCE_MESSAGE);
+        }
+    }
+}
+
+/// Returns the mutable `name` property of `schema`.
+fn field_mut<'a>(schema: &'a mut JSONSchemaProps, name: &str) -> Option<&'a mut JSONSchemaProps> {
+    schema.properties.as_mut()?.get_mut(name)
+}
+
+/// Sets the single CEL rule of `schema` to `rule`.
+fn set_rules(schema: &mut JSONSchemaProps, rule: &str, message: &str) {
+    schema.x_kubernetes_validations = Some(vec![ValidationRule {
+        rule: rule.to_owned(),
+        message: Some(message.to_owned()),
+        ..ValidationRule::default()
+    }]);
 }
 
 /// Returns the generated `AppProject` CRD object.
@@ -261,6 +336,79 @@ mod tests {
         }
     }
 
+    /// **Acceptance criterion (`T18.3`).** The rendered `Application` CRD carries both CEL rules,
+    /// exactly once each, with the Kubernetes spellings — and the `required` list no longer pins
+    /// `source.git`, which is what makes the schema evolution non-breaking for stored objects.
+    #[test]
+    fn application_crd_carries_the_source_cel_rules() {
+        let value = serde_json::to_value(application_crd()).expect("crd must serialize");
+        let source = &value["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["source"];
+
+        let rules = source["x-kubernetes-validations"]
+            .as_array()
+            .expect("spec.source must carry x-kubernetes-validations");
+        assert_eq!(rules.len(), 1, "exactly one rule: {rules:?}");
+        assert_eq!(rules[0]["rule"], serde_json::json!(SOURCE_EXCLUSIVE_RULE));
+        assert_eq!(
+            rules[0]["message"],
+            serde_json::json!(SOURCE_EXCLUSIVE_MESSAGE)
+        );
+
+        let oci_rules = source["properties"]["oci"]["x-kubernetes-validations"]
+            .as_array()
+            .expect("spec.source.oci must carry x-kubernetes-validations");
+        assert_eq!(oci_rules.len(), 1, "exactly one rule: {oci_rules:?}");
+        assert_eq!(oci_rules[0]["rule"], serde_json::json!(OCI_REFERENCE_RULE));
+        assert_eq!(
+            oci_rules[0]["message"],
+            serde_json::json!(OCI_REFERENCE_MESSAGE)
+        );
+
+        // Both source arms are optional now; only the source block itself is required by
+        // `ApplicationSpec`.
+        let properties = source["properties"]
+            .as_object()
+            .expect("source properties")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(properties.contains(&"git".to_owned()), "{properties:?}");
+        assert!(properties.contains(&"oci".to_owned()), "{properties:?}");
+        let source_required = source
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            source_required.is_empty(),
+            "spec.source must not require either arm any more: {source_required:?}"
+        );
+
+        // The rules survive a YAML render and re-parse (the committed manifest is the contract),
+        // and injecting twice does not duplicate them.
+        let manifest =
+            render_crd(APPLICATION_CRD_FILE_NAME, &application_crd()).expect("render must succeed");
+        let reparsed: Value = serde_saphyr::from_str(&manifest).expect("manifest must parse");
+        let yaml_rules = reparsed["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["source"]["x-kubernetes-validations"]
+            .as_array()
+            .expect("rendered YAML must carry the rule");
+        assert_eq!(yaml_rules.len(), 1);
+        assert_eq!(
+            yaml_rules[0]["rule"],
+            serde_json::json!(SOURCE_EXCLUSIVE_RULE)
+        );
+
+        let mut twice = application_crd();
+        inject_source_validation_rules(&mut twice);
+        assert_eq!(
+            render_crd(APPLICATION_CRD_FILE_NAME, &twice).expect("render must succeed"),
+            manifest,
+            "injecting the rules twice must be a no-op"
+        );
+    }
+
     #[test]
     fn appproject_crd_is_structurally_complete() {
         let manifest = render_crd(APPPROJECT_CRD_FILE_NAME, &appproject_crd())
@@ -406,6 +554,42 @@ mod tests {
                 "committed manifest '{}' drifted from the generated schema; run `ferriscd crd generate`",
                 path.display()
             );
+        }
+    }
+
+    /// The committed CRDs are vendored a second and third time (the Helm chart and the plain
+    /// manifests tree), but `ferriscd crd generate` only writes [`CRD_DIRECTORY`]. Those copies are
+    /// therefore updated by hand, and a stale one ships whatever the schema said the last time
+    /// someone remembered: a cluster installed from the chart would carry the *old* CEL rules while
+    /// `deploy/crds` carries the new ones.
+    #[test]
+    fn vendored_crd_copies_match_the_committed_manifests() {
+        let root = repository_root();
+        let canonical_dir = root.join(CRD_DIRECTORY);
+        for document in crd_documents().expect("generation must succeed") {
+            let canonical = document.path_in(&canonical_dir);
+            let expected = std::fs::read_to_string(&canonical).unwrap_or_else(|error| {
+                panic!(
+                    "failed to read committed CRD manifest '{}': {error}",
+                    canonical.display()
+                )
+            });
+            for copy_dir in ["deploy/helm/ferriscd/crds", "deploy/manifests/crds"] {
+                let path = root.join(copy_dir).join(document.file_name);
+                let actual = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                    panic!(
+                        "failed to read the vendored CRD copy '{}': {error}",
+                        path.display()
+                    )
+                });
+                assert_eq!(
+                    actual,
+                    expected,
+                    "vendored copy '{}' drifted from '{}'; copy it after `ferriscd crd generate`",
+                    path.display(),
+                    canonical.display()
+                );
+            }
         }
     }
 }

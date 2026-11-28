@@ -26,6 +26,15 @@
 //! | `ferriscd_git_fetch_duration_seconds` | histogram | — | 1 |
 //! | `ferriscd_render_cache_total` | counter | `outcome` | 2 |
 //! | `ferriscd_active_reconciles` | gauge | — | 1 |
+//! | `ferriscd_drift_watcher_fallback_total` | counter | `reason` | 3 |
+//! | `ferriscd_drift_watcher_events_total` | counter | `outcome` | 5 |
+//! | `ferriscd_drift_watcher_triggers_total` | counter | — | 1 |
+//! | `ferriscd_drift_watcher_active_watches` | gauge | — | 1 |
+//! | `ferriscd_rbac_reload_total` | counter | `outcome` | 3 |
+//! | `ferriscd_rbac_watch_errors_total` | counter | — | 1 |
+//! | `ferriscd_audit_events_total` | counter | `category`, `outcome` | 5 × 4 |
+//! | `ferriscd_audit_dropped_total` | counter | — | 1 |
+//! | `ferriscd_notifications_total` | counter | `service`, `outcome` | 4 × 4 |
 //!
 //! # The listener is separate from the API
 //!
@@ -72,6 +81,7 @@ use prometheus_client::registry::Registry;
 
 use crate::audit::{AuditCategory, AuditOutcome};
 use crate::controller::FailureClass;
+use crate::notifications::NotificationService;
 use crate::reconcile::{ControllerError, ReconcileError, StatusWriter};
 
 /// Default bind address of the internal metrics listener (`--metrics-addr`).
@@ -142,6 +152,33 @@ pub const AUDIT_DROPPED_COUNTER: &str = "ferriscd_audit_dropped";
 /// Scraped name of the dropped compliance audit events counter (`T17.2`).
 pub const AUDIT_DROPPED_TOTAL: &str = "ferriscd_audit_dropped_total";
 
+/// Registered name of the `T18.2` drift-watcher fallback counter.
+pub const DRIFT_FALLBACK_COUNTER: &str = "ferriscd_drift_watcher_fallback";
+
+/// Scraped name of the `T18.2` drift-watcher fallback counter.
+pub const DRIFT_FALLBACK_TOTAL: &str = "ferriscd_drift_watcher_fallback_total";
+
+/// Registered name of the `T18.2` drift-watcher event counter.
+pub const DRIFT_EVENTS_COUNTER: &str = "ferriscd_drift_watcher_events";
+
+/// Scraped name of the `T18.2` drift-watcher event counter.
+pub const DRIFT_EVENTS_TOTAL: &str = "ferriscd_drift_watcher_events_total";
+
+/// Registered name of the `T18.2` drift-trigger counter (one per enqueued reconcile).
+pub const DRIFT_TRIGGERS_COUNTER: &str = "ferriscd_drift_watcher_triggers";
+
+/// Scraped name of the `T18.2` drift-trigger counter.
+pub const DRIFT_TRIGGERS_TOTAL: &str = "ferriscd_drift_watcher_triggers_total";
+
+/// Scraped name of the `T18.2` active-metadata-watch gauge.
+pub const DRIFT_ACTIVE_WATCHES: &str = "ferriscd_drift_watcher_active_watches";
+
+/// Registered name of the notification delivery counter (`T19.4`).
+pub const NOTIFICATIONS_COUNTER: &str = "ferriscd_notifications";
+
+/// Scraped name of the notification delivery counter (`T19.4`).
+pub const NOTIFICATIONS_TOTAL: &str = "ferriscd_notifications_total";
+
 /// The **complete** `result` label set, in the order it is documented.
 pub const RECONCILE_RESULTS: [&str; 3] = ["success", "retryable", "terminal"];
 
@@ -163,6 +200,41 @@ pub const CACHE_OUTCOMES: [&str; 2] = ["hit", "miss"];
 
 /// The **complete** `outcome` label set of [`RBAC_RELOAD_TOTAL`] (`T17.1`).
 pub const RBAC_RELOAD_OUTCOMES: [&str; 3] = ["ok", "error", "deleted"];
+
+/// The **complete** `reason` label set of [`DRIFT_FALLBACK_TOTAL`] (`T18.2`).
+///
+/// These are exactly the three answers that mean "this watch will never succeed": the controller
+/// cannot list/watch that kind in that scope. Every other error (a `429`, a `500`, a dropped
+/// connection) is transient and must not park a watcher for fifteen minutes.
+pub const DRIFT_FALLBACK_REASONS: [&str; 3] = ["forbidden", "not_found", "method_not_allowed"];
+
+/// The **complete** `outcome` label set of [`DRIFT_EVENTS_TOTAL`] (`T18.2`).
+///
+/// Six fixed values: the five classifications of one watch event plus `dropped`, which counts a
+/// trigger the bounded controller queue refused. A drop is a latency event (Model 1 still converges
+/// the `Application`), and it is deliberately *not* folded into `ignored` so an operator can tell a
+/// saturated queue from a useless event.
+pub const DRIFT_EVENT_OUTCOMES: [&str; 6] = [
+    "suppressed",
+    "unmapped",
+    "filtered",
+    "debounced",
+    "ignored",
+    "dropped",
+];
+
+/// The **complete** `service` label set of [`NOTIFICATIONS_TOTAL`] (`T19.4`).
+pub const NOTIFICATION_SERVICES: [&str; 4] = ["slack", "teams", "pagerduty", "webhook"];
+
+/// The **complete** `outcome` label set of [`NOTIFICATIONS_TOTAL`] (`T19.4`).
+///
+/// `suppressed` **is** recorded in production: the observer's deduplication and rate-limit gates
+/// emit it (`notifications::observer`) and it is the label that answers "how much am I being rate
+/// limited / deduplicated?" after an alert storm. `dropped` covers an unresolvable channel, a
+/// service mismatch and a full queue. Keeping the set fixed here means a future outcome cannot
+/// become a cardinality surprise (finding **R1-N3**: the previous comment claimed `suppressed` was
+/// unused, which was wrong).
+pub const NOTIFICATION_OUTCOMES: [&str; 4] = ["delivered", "failed", "dropped", "suppressed"];
 
 /// First bucket of the latency histograms (5 ms).
 const BUCKET_START_SECONDS: f64 = 0.005;
@@ -295,6 +367,100 @@ impl OutcomeLabels {
             outcome: outcome.as_str(),
         }
     }
+
+    fn of_drift(outcome: DriftWatchOutcome) -> Self {
+        Self {
+            outcome: outcome.as_str(),
+        }
+    }
+}
+
+/// `reason` label set (private, `&'static str` only).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ReasonLabels {
+    reason: &'static str,
+}
+
+impl ReasonLabels {
+    fn of(reason: DriftFallbackReason) -> Self {
+        Self {
+            reason: reason.as_str(),
+        }
+    }
+}
+
+/// Why a `T18.2` metadata watch gave up and parked on the `15m` cooldown.
+///
+/// The variants are exactly the `reason` label set ([`DRIFT_FALLBACK_REASONS`]): a fixed
+/// three-value set, so the family's cardinality cannot grow with the fleet or with the error
+/// message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftFallbackReason {
+    /// `403 Forbidden` — RBAC denies this kind (the usual cause: only `Application` verbs are
+    /// granted, or the label-scoped watch is refused by a restrictive `Role`).
+    Forbidden,
+    /// `404 Not Found` — the kind is no longer served (a CRD was removed mid-watch).
+    NotFound,
+    /// `405 Method Not Allowed` — the endpoint does not serve `watch`.
+    MethodNotAllowed,
+}
+
+impl DriftFallbackReason {
+    /// The label value. Always one of [`DRIFT_FALLBACK_REASONS`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forbidden => DRIFT_FALLBACK_REASONS[0],
+            Self::NotFound => DRIFT_FALLBACK_REASONS[1],
+            Self::MethodNotAllowed => DRIFT_FALLBACK_REASONS[2],
+        }
+    }
+
+    /// Classifies an HTTP status code, or `None` when the failure is not a permanent one.
+    #[must_use]
+    pub const fn of_code(code: u16) -> Option<Self> {
+        match code {
+            403 => Some(Self::Forbidden),
+            404 => Some(Self::NotFound),
+            405 => Some(Self::MethodNotAllowed),
+            _ => None,
+        }
+    }
+}
+
+/// How one `T18.2` metadata watch event was handled.
+///
+/// The variants are exactly the `outcome` label set ([`DRIFT_EVENT_OUTCOMES`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftWatchOutcome {
+    /// The object did not change since FerrisCD wrote it (or only `/status` moved): no trigger.
+    Suppressed,
+    /// No `Application` in this replica's stores owns the object's `ferriscd.io/app-hash`.
+    Unmapped,
+    /// Every `Application` the hash maps to is outside this replica's shard or namespace scope.
+    Filtered,
+    /// The event armed (or refreshed) a per-`Application` trailing-debounce entry.
+    Debounced,
+    /// The event carried nothing usable (no `resourceVersion`).
+    Ignored,
+    /// A trigger could not be enqueued (the bounded controller queue was full, closed, or no scope
+    /// watched the `Application`'s namespace).
+    Dropped,
+}
+
+impl DriftWatchOutcome {
+    /// The label value. Always one of [`DRIFT_EVENT_OUTCOMES`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Suppressed => DRIFT_EVENT_OUTCOMES[0],
+            Self::Unmapped => DRIFT_EVENT_OUTCOMES[1],
+            Self::Filtered => DRIFT_EVENT_OUTCOMES[2],
+            Self::Debounced => DRIFT_EVENT_OUTCOMES[3],
+            Self::Ignored => DRIFT_EVENT_OUTCOMES[4],
+            Self::Dropped => DRIFT_EVENT_OUTCOMES[5],
+        }
+    }
 }
 
 /// `app_namespace`/`app_name`/`status` label set.
@@ -337,6 +503,55 @@ struct RenderCacheSeen {
     misses: u64,
 }
 
+/// How one notification delivery ended (`T19.4`).
+///
+/// The variants are the `outcome` label set ([`NOTIFICATION_OUTCOMES`]): a receiver's status code or
+/// error message never reaches a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationOutcome {
+    /// The receiver answered 2xx.
+    Delivered,
+    /// Every attempt failed (or the destination was refused by the egress guard).
+    Failed,
+    /// The notification was never attempted (unknown channel, service mismatch) or the bounded queue
+    /// was full.
+    Dropped,
+    /// A gate (deduplication / rate limit) suppressed the delivery.
+    Suppressed,
+}
+
+impl NotificationOutcome {
+    /// The label value. Always one of [`NOTIFICATION_OUTCOMES`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => NOTIFICATION_OUTCOMES[0],
+            Self::Failed => NOTIFICATION_OUTCOMES[1],
+            Self::Dropped => NOTIFICATION_OUTCOMES[2],
+            Self::Suppressed => NOTIFICATION_OUTCOMES[3],
+        }
+    }
+}
+
+/// `service`/`outcome` label set for [`NOTIFICATIONS_TOTAL`] (`T19.4`).
+///
+/// Both labels are `&'static str` drawn from the fixed sets above, so the series count is at most
+/// `4 × 4` regardless of how many `Application`s notify.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct NotificationLabels {
+    service: &'static str,
+    outcome: &'static str,
+}
+
+impl NotificationLabels {
+    fn of(service: &'static str, outcome: NotificationOutcome) -> Self {
+        Self {
+            service,
+            outcome: outcome.as_str(),
+        }
+    }
+}
+
 /// `category`/`outcome` label set for [`AUDIT_EVENTS_TOTAL`] (`T17.2`).
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct AuditEventLabels {
@@ -353,7 +568,7 @@ impl AuditEventLabels {
     }
 }
 
-/// The process's Prometheus registry and its eleven families.
+/// The process's Prometheus registry and its sixteen families.
 ///
 /// Cheap to clone (`Arc` inside), so the reconcile loop, the status writer, the pipeline and the
 /// listener all share one registry. Recording touches only atomics; the registry lock is taken by
@@ -372,6 +587,11 @@ pub struct Metrics {
     rbac_watch_errors: Counter,
     audit_events_total: Family<AuditEventLabels, Counter>,
     audit_dropped_total: Counter,
+    drift_fallback_total: Family<ReasonLabels, Counter>,
+    drift_events_total: Family<OutcomeLabels, Counter>,
+    drift_triggers_total: Counter,
+    drift_active_watches: Gauge,
+    notifications_total: Family<NotificationLabels, Counter>,
     render_cache_seen: Arc<Mutex<RenderCacheSeen>>,
 }
 
@@ -391,7 +611,7 @@ impl std::fmt::Debug for Metrics {
 /// **Advisory only:** it is hand-maintained documentation of the registry, not the source of truth
 /// — the registration in [`Metrics::new`] and the `T15.1` tests are. A family added there without a
 /// row here does not break anything (and is caught by the tests), it just reads as an omission.
-const FAMILY_DESCRIPTIONS: [(&str, &str); 11] = [
+const FAMILY_DESCRIPTIONS: [(&str, &str); 16] = [
     (RECONCILE_DURATION_SECONDS, "histogram"),
     (RECONCILE_TOTAL, "counter"),
     (APP_SYNC_STATUS, "gauge"),
@@ -403,6 +623,11 @@ const FAMILY_DESCRIPTIONS: [(&str, &str); 11] = [
     (RBAC_WATCH_ERRORS_TOTAL, "counter"),
     (AUDIT_EVENTS_TOTAL, "counter"),
     (AUDIT_DROPPED_TOTAL, "counter"),
+    (DRIFT_FALLBACK_TOTAL, "counter"),
+    (DRIFT_EVENTS_TOTAL, "counter"),
+    (DRIFT_TRIGGERS_TOTAL, "counter"),
+    (DRIFT_ACTIVE_WATCHES, "gauge"),
+    (NOTIFICATIONS_TOTAL, "counter"),
 ];
 
 /// Builds a latency histogram (same buckets for reconcile and Git fetch).
@@ -430,7 +655,11 @@ impl Metrics {
         let rbac_watch_errors = Counter::default();
         let audit_events_total = Family::<AuditEventLabels, Counter>::default();
         let audit_dropped_total = Counter::default();
-
+        let drift_fallback_total = Family::<ReasonLabels, Counter>::default();
+        let drift_events_total = Family::<OutcomeLabels, Counter>::default();
+        let drift_triggers_total = Counter::default();
+        let drift_active_watches = Gauge::default();
+        let notifications_total = Family::<NotificationLabels, Counter>::default();
         let mut registry = Registry::default();
         registry.register(
             RECONCILE_DURATION_SECONDS,
@@ -487,6 +716,31 @@ impl Metrics {
             "Compliance audit events dropped by non-blocking external sinks",
             audit_dropped_total.clone(),
         );
+        registry.register(
+            DRIFT_FALLBACK_COUNTER,
+            "Opt-in drift-watcher watches that parked on the cooldown after a permanent API error",
+            drift_fallback_total.clone(),
+        );
+        registry.register(
+            DRIFT_EVENTS_COUNTER,
+            "Metadata-watch events observed by the opt-in drift watcher, by outcome",
+            drift_events_total.clone(),
+        );
+        registry.register(
+            DRIFT_TRIGGERS_COUNTER,
+            "Drift-triggered reconciles enqueued on an Application controller",
+            drift_triggers_total.clone(),
+        );
+        registry.register(
+            DRIFT_ACTIVE_WATCHES,
+            "Active PartialObjectMetadata watches held by the opt-in drift watcher",
+            drift_active_watches.clone(),
+        );
+        registry.register(
+            NOTIFICATIONS_COUNTER,
+            "Notifications delivered to external services, by service and outcome",
+            notifications_total.clone(),
+        );
 
         Self {
             registry: Arc::new(Mutex::new(registry)),
@@ -501,6 +755,11 @@ impl Metrics {
             rbac_watch_errors,
             audit_events_total,
             audit_dropped_total,
+            drift_fallback_total,
+            drift_events_total,
+            drift_triggers_total,
+            drift_active_watches,
+            notifications_total,
             render_cache_seen: Arc::new(Mutex::new(RenderCacheSeen::default())),
         }
     }
@@ -562,7 +821,70 @@ impl Metrics {
                     .get_or_create_owned(&AuditEventLabels::of(category, outcome));
             }
         }
+        // `T18.2`: the drift watcher's two fixed sets are zero-instantiated, so a replica that
+        // opted in but has not received a watch event yet still exposes a `0` series (a missing
+        // series and a zero series alert differently). `drift_triggers_total` is a plain counter
+        // and `drift_active_watches` a plain gauge: both encode without a series.
+        for reason in [
+            DriftFallbackReason::Forbidden,
+            DriftFallbackReason::NotFound,
+            DriftFallbackReason::MethodNotAllowed,
+        ] {
+            metrics
+                .drift_fallback_total
+                .get_or_create_owned(&ReasonLabels::of(reason));
+        }
+        for outcome in [
+            DriftWatchOutcome::Suppressed,
+            DriftWatchOutcome::Unmapped,
+            DriftWatchOutcome::Filtered,
+            DriftWatchOutcome::Debounced,
+            DriftWatchOutcome::Ignored,
+            DriftWatchOutcome::Dropped,
+        ] {
+            metrics
+                .drift_events_total
+                .get_or_create_owned(&OutcomeLabels::of_drift(outcome));
+        }
+        // `T19.4`: the notification families are pre-created too, so `rate(failures)` exists (as a
+        // zero) on a replica that has not delivered anything yet.
+        for service in NOTIFICATION_SERVICES {
+            for outcome in [
+                NotificationOutcome::Delivered,
+                NotificationOutcome::Failed,
+                NotificationOutcome::Dropped,
+                NotificationOutcome::Suppressed,
+            ] {
+                metrics
+                    .notifications_total
+                    .get_or_create_owned(&NotificationLabels::of(service, outcome));
+            }
+        }
         metrics
+    }
+
+    /// Records one handled metadata-watch event of the opt-in drift watcher (`T18.2`).
+    pub fn record_drift_event(&self, outcome: DriftWatchOutcome) {
+        self.drift_events_total
+            .get_or_create_owned(&OutcomeLabels::of_drift(outcome))
+            .inc();
+    }
+
+    /// Records one watch that parked on the `T18.2` fallback cooldown.
+    pub fn record_drift_fallback(&self, reason: DriftFallbackReason) {
+        self.drift_fallback_total
+            .get_or_create_owned(&ReasonLabels::of(reason))
+            .inc();
+    }
+
+    /// Records one drift-triggered reconcile enqueued on a controller.
+    pub fn record_drift_trigger(&self) {
+        self.drift_triggers_total.inc();
+    }
+
+    /// Sets how many `PartialObjectMetadata` watches are active right now (`T18.2`).
+    pub fn set_drift_active_watches(&self, watches: usize) {
+        self.drift_active_watches.set(watches as i64);
     }
 
     /// Records one live `ferriscd-rbac-cm` policy reload outcome (`T17.1`).
@@ -579,6 +901,16 @@ impl Metrics {
     /// permanently dead watch still has to be visible.
     pub fn record_rbac_watch_error(&self) {
         self.rbac_watch_errors.inc();
+    }
+
+    /// Records one notification delivery attempt (`T19.4`).
+    ///
+    /// The `service` label is derived from the typed enum, so a runtime string (a channel name, a
+    /// URL) can never become a label and the set stays at [`NOTIFICATION_SERVICES`].
+    pub fn record_notification(&self, service: NotificationService, outcome: NotificationOutcome) {
+        self.notifications_total
+            .get_or_create_owned(&NotificationLabels::of(service.as_str(), outcome))
+            .inc();
     }
 
     /// Records one emitted compliance audit event (`T17.2`).
@@ -1193,6 +1525,10 @@ mod tests {
             (ACTIVE_RECONCILES, "gauge"),
             (RBAC_RELOAD_TOTAL, "counter"),
             (RBAC_WATCH_ERRORS_TOTAL, "counter"),
+            // `T18.2`: zero-instantiated, so a replica that opted in exposes the family (with a
+            // `0` series per reason) before its first watch event.
+            (DRIFT_FALLBACK_TOTAL, "counter"),
+            (DRIFT_EVENTS_TOTAL, "counter"),
         ] {
             assert!(
                 response.body.contains(&format!("# HELP {family} ")),
@@ -1413,6 +1749,22 @@ mod tests {
             entries: 1,
             capacity: 1,
         });
+        // `T19.4`: every (service, outcome) pair, so the union below is the documented set.
+        for service in [
+            crate::notifications::NotificationService::Slack,
+            crate::notifications::NotificationService::Teams,
+            crate::notifications::NotificationService::PagerDuty,
+            crate::notifications::NotificationService::Webhook,
+        ] {
+            for outcome in [
+                NotificationOutcome::Delivered,
+                NotificationOutcome::Failed,
+                NotificationOutcome::Dropped,
+                NotificationOutcome::Suppressed,
+            ] {
+                metrics.record_notification(service, outcome);
+            }
+        }
 
         let (body, samples) = scrape(&metrics);
         assert_eq!(
@@ -1439,6 +1791,21 @@ mod tests {
         assert_eq!(
             exposition::label_values(&samples, RENDER_CACHE_TOTAL, "outcome"),
             CACHE_OUTCOMES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+        );
+
+        assert_eq!(
+            exposition::label_values(&samples, NOTIFICATIONS_TOTAL, "service"),
+            NOTIFICATION_SERVICES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+        );
+        assert_eq!(
+            exposition::label_values(&samples, NOTIFICATIONS_TOTAL, "outcome"),
+            NOTIFICATION_OUTCOMES
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect()
@@ -1490,10 +1857,30 @@ mod tests {
         metrics.record_rbac_watch_error();
         metrics.record_audit_event(AuditCategory::ApiOperation, AuditOutcome::Accepted);
         metrics.record_audit_dropped();
+        metrics.record_drift_event(DriftWatchOutcome::Debounced);
+        metrics.record_drift_event(DriftWatchOutcome::Dropped);
+        metrics.record_drift_fallback(DriftFallbackReason::Forbidden);
+        metrics.record_drift_trigger();
+        metrics.set_drift_active_watches(3);
+        for service in [
+            crate::notifications::NotificationService::Slack,
+            crate::notifications::NotificationService::Teams,
+            crate::notifications::NotificationService::PagerDuty,
+            crate::notifications::NotificationService::Webhook,
+        ] {
+            for outcome in [
+                NotificationOutcome::Delivered,
+                NotificationOutcome::Failed,
+                NotificationOutcome::Dropped,
+                NotificationOutcome::Suppressed,
+            ] {
+                metrics.record_notification(service, outcome);
+            }
+        }
 
         let (body, samples) = scrape(&metrics);
         let families = exposition::label_names(&samples);
-        let expected: [(&str, &[&str]); 11] = [
+        let expected: [(&str, &[&str]); 16] = [
             (RECONCILE_DURATION_SECONDS, &["result", "le"]),
             (RECONCILE_TOTAL, &["result"]),
             (APP_SYNC_STATUS, &["app_namespace", "app_name", "status"]),
@@ -1505,6 +1892,14 @@ mod tests {
             (RBAC_WATCH_ERRORS_TOTAL, &[]),
             (AUDIT_EVENTS_TOTAL, &["category", "outcome"]),
             (AUDIT_DROPPED_TOTAL, &[]),
+            // `T18.2`: the drift watcher's surface is `reason`/`outcome` plus two unlabelled
+            // series — never a cluster name, a GVK, an object name or an error message.
+            (DRIFT_FALLBACK_TOTAL, &["reason"]),
+            (DRIFT_EVENTS_TOTAL, &["outcome"]),
+            (DRIFT_TRIGGERS_TOTAL, &[]),
+            (DRIFT_ACTIVE_WATCHES, &[]),
+            // `T19.4`: the notification counter is bounded to the `service` × `outcome` sets.
+            (NOTIFICATIONS_TOTAL, &["service", "outcome"]),
         ];
         assert_eq!(
             families.len(),
@@ -1851,6 +2246,13 @@ mod tests {
             RBAC_WATCH_ERRORS_TOTAL,
             AUDIT_EVENTS_TOTAL,
             AUDIT_DROPPED_TOTAL,
+            // `T18.2`: the drift watcher's two fixed label sets are instantiated up front too, so an
+            // opted-in replica exposes `0` series (rather than no series) before its first event.
+            DRIFT_FALLBACK_TOTAL,
+            DRIFT_EVENTS_TOTAL,
+            DRIFT_TRIGGERS_TOTAL,
+            DRIFT_ACTIVE_WATCHES,
+            NOTIFICATIONS_TOTAL,
         ]
         .into_iter()
         .collect();

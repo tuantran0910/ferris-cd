@@ -7,7 +7,13 @@ import { ApiClientError, type FerrisApiClient } from "../api/client";
 import { AuthProvider } from "../auth/AuthContext";
 import { resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
 import { ApplicationDetailPage } from "../features/applications/ApplicationDetailPage";
-import { createMockApiClient, sampleAppDetail, sampleApps } from "./fixtures";
+import {
+  blockedSyncWindow,
+  createMockApiClient,
+  overridableSyncWindow,
+  sampleAppDetail,
+  sampleApps,
+} from "./fixtures";
 
 function renderDetailPage(overrides: Partial<FerrisApiClient> = {}) {
   const queryClient = new QueryClient({
@@ -101,6 +107,47 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
     expect(
       await screen.findByText("***REDACTED(sha256:9f86d081)***"),
     ).toBeInTheDocument();
+  });
+
+  it("explains a blocking sync window before the dialog submits (T17.4)", async () => {
+    const user = userEvent.setup();
+    renderDetailPage({
+      getApplication: async () => ({ ...sampleAppDetail, syncWindow: blockedSyncWindow }),
+    });
+
+    // The header badge says "blocked" without opening anything…
+    expect(await screen.findByTestId("sync-window-badge")).toHaveTextContent(
+      "Sync window blocked",
+    );
+    // …the page repeats the reason next to the operation banner…
+    expect(screen.getByTestId("detail-sync-window-notice")).toHaveTextContent(
+      "deny sync window is active",
+    );
+    // …and the dialog explains it and refuses to submit a pass the controller would skip.
+    await user.click(screen.getByRole("button", { name: /^Sync$/i }));
+    expect(
+      await screen.findByTestId("sync-window-blocked"),
+    ).toHaveTextContent("Drift is still detected and reported");
+    expect(screen.getByRole("button", { name: /Confirm Sync/i })).toBeDisabled();
+  });
+
+  it("lets the operator break the glass when the window sets manualSync (T17.4)", async () => {
+    const user = userEvent.setup();
+    renderDetailPage({
+      getApplication: async () => ({
+        ...sampleAppDetail,
+        syncWindow: overridableSyncWindow,
+      }),
+    });
+
+    expect(await screen.findByTestId("sync-window-badge")).toHaveTextContent(
+      "Sync window (override)",
+    );
+    await user.click(screen.getByRole("button", { name: /^Sync$/i }));
+    expect(await screen.findByTestId("sync-window-override")).toHaveTextContent(
+      "Manual override applies",
+    );
+    expect(screen.getByRole("button", { name: /Confirm Sync/i })).toBeEnabled();
   });
 
   it("disables Sync action and displays read-only notice when server responds 403 Forbidden", async () => {

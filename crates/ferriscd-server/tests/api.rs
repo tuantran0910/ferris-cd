@@ -248,7 +248,7 @@ impl DiffSource for Diffs {
         self.asked.lock().expect("test state").push((
             app.metadata.namespace.clone().unwrap_or_default(),
             app.metadata.name.clone().unwrap_or_default(),
-            app.spec.source.git.repo_url.clone(),
+            app.spec.source.repo_url().to_owned(),
         ));
         let preview = self.preview.clone();
         let error = self.error.clone();
@@ -437,7 +437,7 @@ async fn the_readiness_probe_reports_the_seam() {
 #[tokio::test]
 async fn applications_are_listed_with_a_redacted_repository_url() {
     let mut app = application("ferriscd-system", "payment-api");
-    app.spec.source.git.repo_url =
+    app.spec.source.git.as_mut().expect("git source").repo_url =
         "https://oauth2:ghp_averysecrettoken@github.com/example/payment-service.git".to_owned();
     let (status, body) = get(state(vec![app]), "/api/v1/applications").await;
     assert_eq!(status, StatusCode::OK);
@@ -1326,6 +1326,258 @@ async fn projects_and_clusters_are_listed() {
     assert_eq!(body["items"][1]["inCluster"], false);
 }
 
+/// **`T17.4`:** `GET /api/v1/projects` publishes each window **with its live state**, and
+/// `GET /api/v1/applications/{ns}/{name}` publishes the verdict the sync dialog has to explain.
+///
+/// Two windows make the assertions time-independent: `* * * * *` with a one-hour duration is open at
+/// every instant, and `0 0 31 2 *` (31 February) never fires, so the project is always "outside its
+/// allow window" from the point of view of a manual sync.
+#[tokio::test]
+async fn sync_windows_are_published_with_their_live_state_and_verdict() {
+    let project: AppProject = serde_json::from_value(json!({
+        "apiVersion": "ferriscd.io/v1alpha1",
+        "kind": "AppProject",
+        "metadata": {"name": "payments", "namespace": "ferriscd-system"},
+        "spec": {
+            "sourceRepos": ["*"],
+            "destinations": [{"cluster": "in-cluster", "namespace": "payments"}],
+            "syncWindows": [
+                {
+                    "kind": "deny",
+                    "schedule": "0 9-17 * * MON-FRI",
+                    "duration": "8h",
+                    "timeZone": "America/New_York",
+                    "applications": ["payments-*"],
+                    "manualSync": true,
+                },
+                {"kind": "deny", "schedule": "not a schedule", "duration": "2h"},
+            ],
+        },
+    }))
+    .expect("a valid AppProject");
+    // The application must reference the governed project, or there is no verdict to publish.
+    let mut app = application("ferriscd-system", "payment-api");
+    app.spec.project = "payments".to_owned();
+    let state = AppState::new(
+        Arc::new(Apps(vec![app])),
+        Arc::new(Projects(vec![project])),
+        Arc::new(Clusters(vec![ClusterEntry {
+            name: "in-cluster".to_owned(),
+            in_cluster: true,
+        }])),
+        Arc::new(Operations::default()),
+        Arc::new(InventoryReaderFake(Vec::new())),
+        Arc::new(Graph::default()),
+        Arc::new(Diffs::default()),
+        Arc::new(Ready(true)),
+    )
+    .with_refresh_sink(Arc::new(Sink::default()))
+    .with_auth(AuthPolicy::PassThrough);
+
+    let (status, body) = get(state.clone(), "/api/v1/projects").await;
+    assert_eq!(status, StatusCode::OK);
+    let windows = body["items"][0]["syncWindows"]
+        .as_array()
+        .expect("the windows list");
+    assert_eq!(windows.len(), 2, "{body}");
+    assert_eq!(windows[0]["kind"], "deny");
+    assert_eq!(windows[0]["schedule"], "0 9-17 * * MON-FRI");
+    assert_eq!(windows[0]["duration"], "8h");
+    assert_eq!(windows[0]["timeZone"], "America/New_York");
+    assert_eq!(windows[0]["applications"][0], "payments-*");
+    assert_eq!(windows[0]["manualSync"], true);
+    assert!(windows[0]["active"].is_boolean());
+    // The unparseable entry is reported, not dropped: the project is deny-all while it is broken.
+    assert!(
+        !windows[1]["error"].as_str().unwrap_or_default().is_empty(),
+        "{body}"
+    );
+    assert!(body["items"][0].get("nextSyncWindowTransition").is_some());
+
+    // The application detail carries the fail-closed verdict for a *manual* sync.
+    let (status, body) = get(state, "/api/v1/applications/ferriscd-system/payment-api").await;
+    assert_eq!(status, StatusCode::OK);
+    let gate = &body["syncWindow"];
+    assert_eq!(gate["blocked"], true, "{body}");
+    assert_eq!(gate["reason"], "invalidWindow");
+    assert_eq!(
+        gate["manualOverride"], false,
+        "a typo must never open a manual-override backdoor"
+    );
+    assert!(
+        gate["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unusable sync window"),
+        "{body}"
+    );
+}
+
+/// A project without `syncWindows` answers exactly the pre-`T17.4` payload: neither field appears.
+#[tokio::test]
+async fn a_project_without_sync_windows_keeps_the_previous_payload() {
+    let project: AppProject = serde_json::from_value(json!({
+        "apiVersion": "ferriscd.io/v1alpha1",
+        "kind": "AppProject",
+        "metadata": {"name": "payments", "namespace": "ferriscd-system"},
+        "spec": {
+            "sourceRepos": ["*"],
+            "destinations": [{"cluster": "in-cluster", "namespace": "payments"}],
+        },
+    }))
+    .expect("a valid AppProject");
+    let state = AppState::new(
+        Arc::new(Apps(vec![application("ferriscd-system", "payment-api")])),
+        Arc::new(Projects(vec![project])),
+        Arc::new(Clusters(Vec::new())),
+        Arc::new(Operations::default()),
+        Arc::new(InventoryReaderFake(Vec::new())),
+        Arc::new(Graph::default()),
+        Arc::new(Diffs::default()),
+        Arc::new(Ready(true)),
+    )
+    .with_refresh_sink(Arc::new(Sink::default()))
+    .with_auth(AuthPolicy::PassThrough);
+
+    let (_, body) = get(state.clone(), "/api/v1/projects").await;
+    assert!(
+        body["items"][0].get("syncWindows").is_none(),
+        "an empty window list must stay omitted: {body}"
+    );
+    assert!(body["items"][0].get("nextSyncWindowTransition").is_none());
+
+    let (_, detail) = get(state, "/api/v1/applications/ferriscd-system/payment-api").await;
+    assert!(
+        detail.get("syncWindow").is_none(),
+        "a project with no windows has no verdict to explain: {detail}"
+    );
+}
+
+/// **Finding M-A:** a caller that can read the `Application` but not the `AppProject` behind it gets
+/// **no** `syncWindow` — the field is omitted, never guessed.
+///
+/// The verdict is derived from a *different object* than the `Application`: `spec.syncWindows` lives
+/// on the `AppProject`, and the caller's grant on the `Application` is not a grant on the project
+/// (finding M4). So the project has to be resolved *for this request* — visible to the actor and
+/// present in the catalogue — and when it is not, the honest answer is silence. Inventing
+/// `{"blocked": false}` here would tell a tenant "your change freeze does not exist", which is the
+/// one answer that could get a governed project deployed during a freeze.
+///
+/// The visibility half of that filter rests on the same grant `authorize` has already checked for the
+/// `Application`, so the case a request can actually reach is "the project is not one this request may
+/// resolve" — exercised here by a catalogue that holds a windowed project for a *different* tenant.
+///
+/// The test is named for **resolvability**, not visibility (finding M-3): the catalogue lists every
+/// `AppProject` and the handler then filters on `actor.can_see(..)`, so what the assertion proves is
+/// that an unresolvable project yields no verdict — the RBAC premise above is why a request can never
+/// observe a visible-but-unresolvable project, not something this test can trigger.
+#[tokio::test]
+async fn a_sync_window_verdict_is_omitted_when_the_project_is_not_resolvable() {
+    // A windowed project that exists — for someone else. `* * * * *`/`1h` is open at every instant,
+    // so if the verdict were derived from it, `syncWindow` would be present and `active`.
+    let other_tenant: AppProject = serde_json::from_value(json!({
+        "apiVersion": "ferriscd.io/v1alpha1",
+        "kind": "AppProject",
+        "metadata": {"name": "tenant-b", "namespace": "ferriscd-system"},
+        "spec": {
+            "sourceRepos": ["*"],
+            "destinations": [{"cluster": "in-cluster", "namespace": "tenant-b"}],
+            "syncWindows": [
+                {"kind": "deny", "schedule": "* * * * *", "duration": "1h"},
+            ],
+        },
+    }))
+    .expect("a valid AppProject");
+    // The Application itself is readable (pass-through grants every project), and it references
+    // `payments`, which this request cannot resolve.
+    let mut app = application("ferriscd-system", "payment-api");
+    app.spec.project = "payments".to_owned();
+    let state = AppState::new(
+        Arc::new(Apps(vec![app])),
+        Arc::new(Projects(vec![other_tenant])),
+        Arc::new(Clusters(Vec::new())),
+        Arc::new(Operations::default()),
+        Arc::new(InventoryReaderFake(Vec::new())),
+        Arc::new(Graph::default()),
+        Arc::new(Diffs::default()),
+        Arc::new(Ready(true)),
+    )
+    .with_refresh_sink(Arc::new(Sink::default()))
+    .with_auth(AuthPolicy::PassThrough);
+
+    let (status, body) = get(state, "/api/v1/applications/ferriscd-system/payment-api").await;
+    assert_eq!(status, StatusCode::OK, "the Application itself is readable");
+    assert_eq!(body["application"]["name"], "payment-api", "{body}");
+    assert_eq!(body["application"]["project"], "payments", "{body}");
+    assert!(
+        body.get("syncWindow").is_none(),
+        "an unresolvable project must omit the verdict instead of answering `blocked: false`: {body}"
+    );
+}
+
+/// **Finding M-4:** the application-detail path resolves its **one** project by name.
+///
+/// The catalogue below answers `get` and **fails** `list` on purpose: a handler that listed the
+/// catalogue (to find the project in it) would take the error path and omit the verdict, while one
+/// that reads the named object gets it. `syncWindow` being present therefore proves the request
+/// issued one scoped `get` instead of a catalogue listing — the cost the finding is about.
+struct NamedOnlyProjects(AppProject);
+
+impl ProjectCatalog for NamedOnlyProjects {
+    fn list(&self) -> SeamFuture<'_, Vec<AppProject>> {
+        Box::pin(async {
+            Err(ApiError::backend(
+                "the application-detail path must not list the catalogue",
+            ))
+        })
+    }
+
+    fn get(&self, name: &str) -> SeamFuture<'_, Option<AppProject>> {
+        let matches = self.0.metadata.name.as_deref() == Some(name);
+        Box::pin(async move { Ok(matches.then(|| self.0.clone())) })
+    }
+}
+
+#[tokio::test]
+async fn the_application_detail_resolves_its_project_by_name() {
+    // `* * * * *`/`1h` is open at every instant, so the verdict is deterministic.
+    let project: AppProject = serde_json::from_value(json!({
+        "apiVersion": "ferriscd.io/v1alpha1",
+        "kind": "AppProject",
+        "metadata": {"name": "payments", "namespace": "ferriscd-system"},
+        "spec": {
+            "sourceRepos": ["*"],
+            "destinations": [{"cluster": "in-cluster", "namespace": "payments"}],
+            "syncWindows": [
+                {"kind": "deny", "schedule": "* * * * *", "duration": "1h"},
+            ],
+        },
+    }))
+    .expect("a valid AppProject");
+    let mut app = application("ferriscd-system", "payment-api");
+    app.spec.project = "payments".to_owned();
+    let state = AppState::new(
+        Arc::new(Apps(vec![app])),
+        Arc::new(NamedOnlyProjects(project)),
+        Arc::new(Clusters(Vec::new())),
+        Arc::new(Operations::default()),
+        Arc::new(InventoryReaderFake(Vec::new())),
+        Arc::new(Graph::default()),
+        Arc::new(Diffs::default()),
+        Arc::new(Ready(true)),
+    )
+    .with_refresh_sink(Arc::new(Sink::default()))
+    .with_auth(AuthPolicy::PassThrough);
+
+    let (status, body) = get(state, "/api/v1/applications/ferriscd-system/payment-api").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["syncWindow"]["blocked"], true,
+        "the named project's open deny window is still reported: {body}"
+    );
+    assert_eq!(body["syncWindow"]["reason"], "denyWindowActive", "{body}");
+}
+
 // ---------------------------------------------------------------------------
 // OpenAPI
 // ---------------------------------------------------------------------------
@@ -1817,12 +2069,19 @@ async fn a_monorepo_push_fans_out_once_per_application() {
     let mut apps = Vec::new();
     for name in ["api", "worker", "cron"] {
         let mut app = application("ferriscd-system", name);
-        app.spec.source.git.repo_url = "git@github.com:example/payment-service.git".to_owned();
+        app.spec.source.git.as_mut().expect("git source").repo_url =
+            "git@github.com:example/payment-service.git".to_owned();
         apps.push(app);
     }
     // An application tracking a different branch must not be woken.
     let mut other = application("ferriscd-system", "release-only");
-    other.spec.source.git.target_revision = "release/1.2".to_owned();
+    other
+        .spec
+        .source
+        .git
+        .as_mut()
+        .expect("git source")
+        .target_revision = "release/1.2".to_owned();
     apps.push(other);
 
     let state = webhook_state(apps, sink.clone());
