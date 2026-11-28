@@ -20,6 +20,9 @@ test-utils = []
 base64.workspace = true
 dashmap.workspace = true
 ferriscd-crd.workspace = true
+# `T18.3`: gzip decompression of OCI artifact layers. Only this crate (and only `repo::oci`)
+# decompresses an untrusted archive, and it does so behind a bounded streaming counter.
+flate2.workspace = true
 gix.workspace = true
 # `T17.4`: the injected-clock sync-window evaluator takes a `jiff::Timestamp` (`k8s-openapi`
 # re-exports the same crate, but without a tzdb; the workspace dependency enables it).
@@ -30,6 +33,8 @@ kube.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde-saphyr.workspace = true
+# `T18.3`: verifies the `sha256:<64-hex>` digest of an OCI manifest/layer before extraction.
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

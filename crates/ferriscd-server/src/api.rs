@@ -2086,10 +2086,11 @@ fn application_summary(app: &Application) -> ApplicationSummary {
         name: app.name_any(),
         project: app.spec.project.clone(),
         source: SourceView {
-            // A Git remote routinely carries a personal access token (`https://oauth2:ghp_...@...`).
-            repo_url: ferriscd_engine::manifest::redact_repo_url(&app.spec.source.git.repo_url),
-            path: app.spec.source.git.path.clone(),
-            target_revision: app.spec.source.git.target_revision.clone(),
+            // A Git remote routinely carries a personal access token (`https://oauth2:ghp_...@...`);
+            // the same rule covers an `oci://` reference.
+            repo_url: ferriscd_engine::manifest::redact_repo_url(app.spec.source.repo_url()),
+            path: app.spec.source.source_path().to_owned(),
+            target_revision: app.spec.source.requested_revision().to_owned(),
             renderer: renderer_label(&app.spec.source.renderer).to_owned(),
         },
         destination: DestinationView {

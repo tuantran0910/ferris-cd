@@ -120,10 +120,11 @@ pub enum PolicyError {
         namespace: String,
     },
 
-    /// `spec.source.git.repoURL` is not permitted by `spec.sourceRepos`.
+    /// The `Application`'s source URL (`spec.source.git.repoURL` or `spec.source.oci.url`) is not
+    /// permitted by `spec.sourceRepos`.
     #[error(
-        "{application}: spec.source.git.repoURL {repo_url:?} is not permitted by AppProject \
-         {project:?} spec.sourceRepos"
+        "{application}: source URL {repo_url:?} (spec.source.git.repoURL or spec.source.oci.url) \
+         is not permitted by AppProject {project:?} spec.sourceRepos"
     )]
     SourceRepoNotAllowed {
         /// `<namespace>/<name>` of the `Application`.
@@ -491,11 +492,15 @@ impl AppProjectPolicy {
                 project: self.name.clone(),
             });
         }
-        if !self.allows_source_repo(&app.spec.source.git.repo_url) {
+        // `T18.3`: whichever source the `Application` names — a Git remote or an `oci://`
+        // reference — is matched against `spec.sourceRepos`. An OCI reference therefore has to be
+        // granted explicitly (e.g. `oci://ghcr.io/payments/*`); it is never implied by a Git glob,
+        // so evolving the schema cannot widen an existing project's tenancy.
+        if !self.allows_source_repo(app.spec.source.repo_url()) {
             return Err(PolicyError::SourceRepoNotAllowed {
                 application,
                 project: self.name.clone(),
-                repo_url: redact_repo_url(&app.spec.source.git.repo_url),
+                repo_url: redact_repo_url(app.spec.source.repo_url()),
             });
         }
         if !self.allows_destination(
@@ -933,11 +938,81 @@ spec: {}
         );
     }
 
+    /// **Trap guard (`T18.3`).** An `oci://` source is matched against `spec.sourceRepos` too, so
+    /// evolving the schema cannot let a registry artifact bypass the tenancy boundary: a project
+    /// that lists only Git repositories denies an OCI source, and one that lists `oci://…` allows
+    /// exactly that registry.
+    #[test]
+    fn an_oci_source_is_checked_against_source_repos() {
+        let policy = payments_project();
+        let mut app = application(APPLICATION);
+        app.spec.source.git = None;
+        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+            url: "oci://ghcr.io/example/payments".to_owned(),
+            tag: Some("1.4.2".to_owned()),
+            digest: None,
+            path: String::new(),
+        });
+
+        let err = policy
+            .check_application(&app, &scope())
+            .expect_err("a Git-only project must not allow an OCI source");
+        assert!(
+            matches!(err, PolicyError::SourceRepoNotAllowed { .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("oci://ghcr.io/example/payments"),
+            "{message}"
+        );
+        assert!(message.contains("spec.source.oci.url"), "{message}");
+
+        // The same pattern vocabulary as Git: an `oci://` glob grants exactly that registry path.
+        let oci_project = project(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: payments
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - oci://ghcr.io/example/payments*
+  sourceNamespaces:
+    - ferriscd-system
+    - payments-system
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+"#,
+        );
+        assert_eq!(
+            oci_project.check_application(&app, &scope()),
+            Ok(()),
+            "an explicit oci:// allow-list entry must authorize the artifact"
+        );
+        // ...and a lookalike registry path is still denied.
+        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+            url: "oci://ghcr.io/evil/payments".to_owned(),
+            tag: Some("1.4.2".to_owned()),
+            digest: None,
+            path: String::new(),
+        });
+        assert!(matches!(
+            oci_project.check_application(&app, &scope()),
+            Err(PolicyError::SourceRepoNotAllowed { .. })
+        ));
+    }
+
     #[test]
     fn a_source_repository_mismatch_is_rejected_and_credentials_are_redacted() {
         let policy = payments_project();
         let mut app = application(APPLICATION);
-        app.spec.source.git.repo_url =
+        app.spec.source.git.as_mut().expect("git source").repo_url =
             "https://oauth2:s3cr3t-token@github.com/evil/payments.git".to_owned();
 
         let err = policy

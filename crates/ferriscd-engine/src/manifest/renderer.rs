@@ -288,9 +288,9 @@ impl RenderContext {
     ) -> Self {
         Self {
             root_dir: root_dir.into(),
-            repo_url: app.spec.source.git.repo_url.clone(),
+            repo_url: app.spec.source.repo_url().to_owned(),
             commit_sha: String::new(),
-            source_path: app.spec.source.git.path.clone(),
+            source_path: app.spec.source.source_path().to_owned(),
             app_namespace: app.metadata.namespace.clone().unwrap_or_default(),
             app_name: app.metadata.name.clone().unwrap_or_default(),
             destination_namespace: app.spec.destination.namespace.clone(),
