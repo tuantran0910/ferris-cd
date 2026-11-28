@@ -4,6 +4,84 @@
  * classes win over Preflight and can be used from any component. */
 @import "./motion/motion.css";
 
+/*
+ * Semantic design tokens (dark defaults). Components use these through
+ * Tailwind utilities (`bg-surface`, `text-body`, ...), so a theme only remaps
+ * tokens instead of reinterpreting the brand palette.
+ */
+@theme {
+  --color-canvas: #020617;
+  --color-surface: #0f172a;
+  --color-elevated: #1e293b;
+  --color-handle: #475569;
+  --color-line-subtle: #0f172a;
+  --color-line: #1e293b;
+  --color-line-strong: #334155;
+  --color-line-emphasis: #475569;
+  --color-ink-strong: #f1f5f9;
+  --color-ink: #e2e8f0;
+  --color-ink-body: #cbd5e1;
+  --color-ink-muted: #94a3b8;
+  --color-ink-subtle: #94a3b8;
+  --color-accent: #a5b4fc;
+  --color-accent-alt: #f0abfc;
+  --color-kind-namespace: #c4b5fd;
+  --color-kind-workload: #f0abfc;
+  --color-kind-job: #fdba74;
+  --color-success: #6ee7b7;
+  --color-warning: #fde68a;
+  --color-danger: #fecdd3;
+  --color-info: #7dd3fc;
+  --color-accent-tint: #1e1b4b;
+  --color-success-tint: #022c22;
+  --color-warning-tint: #451a03;
+  --color-danger-tint: #4c0519;
+  --color-info-tint: #082f49;
+  --color-hint: #94a3b8;
+  --color-control: #64748b;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --color-canvas: #f1f5f9;
+  --color-surface: #ffffff;
+  --color-elevated: #e2e8f0;
+  --color-handle: #64748b;
+  --color-line-subtle: #e2e8f0;
+  --color-line: #cbd5e1;
+  --color-line-strong: #94a3b8;
+  --color-line-emphasis: #94a3b8;
+  --color-ink-strong: #0f172a;
+  --color-ink: #1e293b;
+  --color-ink-body: #334155;
+  --color-ink-muted: #475569;
+  --color-ink-subtle: #475569;
+  --color-accent: #4338ca;
+  --color-accent-alt: #a21caf;
+  --color-kind-namespace: #6d28d9;
+  --color-kind-workload: #a21caf;
+  --color-kind-job: #9a3412;
+  --color-success: #065f46;
+  --color-warning: #92400e;
+  --color-danger: #be123c;
+  --color-info: #0369a1;
+  --color-accent-tint: #e0e7ff;
+  --color-success-tint: #d1fae5;
+  --color-warning-tint: #fffbeb;
+  --color-danger-tint: #ffe4e6;
+  --color-info-tint: #e0f2fe;
+  --color-hint: #52627a;
+  --color-control: #64748b;
+}
+
 @layer base {
   body {
     font-family:
@@ -47,28 +125,35 @@
    * that opt out of the browser default (`focus:outline-none`) still get this
    * ring, and it never appears for mouse users.
    */
-  :where(
-    a,
-    button,
-    input,
-    select,
-    textarea,
-    [tabindex]:not([tabindex="-1"])
-  ):focus-visible {
-    outline: 2px solid #818cf8;
+  :where(a, button, [tabindex]:not([tabindex="-1"])):focus-visible {
+    outline: 2px solid var(--color-accent);
     outline-offset: 2px;
   }
 }
 
+/*
+ * Text controls replace their neutral border with an opaque accent ring. This
+ * rule is intentionally unlayered: Tailwind's `border-control` utility lives in
+ * the utilities layer, which would otherwise win the cascade regardless of
+ * selector specificity.
+ */
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px var(--color-accent);
+}
+
 /* React Flow dark theme adjustments */
 .react-flow__controls button {
-  background-color: #1e293b;
-  border-color: #334155;
-  color: #e2e8f0;
+  background-color: var(--color-elevated);
+  border-color: var(--color-line-strong);
+  color: var(--color-ink);
 }
 
 .react-flow__controls button:hover {
-  background-color: #334155;
+  background-color: var(--color-line-strong);
 }
 
 .react-flow__controls button path {
@@ -76,7 +161,21 @@
 }
 
 .react-flow__minimap {
-  background-color: #0f172a;
-  border: 1px solid #334155;
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-line-strong);
   border-radius: 0.5rem;
+}
+
+/* One 180ms cross-fade for the theme switch (View Transitions API). */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 180ms;
+  animation-timing-function: var(--motion-ease-standard, ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+  }
 }

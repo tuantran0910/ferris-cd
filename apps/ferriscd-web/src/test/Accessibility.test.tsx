@@ -55,6 +55,17 @@ describe("WCAG 2.2 AA automated checks (T17.3)", () => {
     await expectNoA11yViolations(container);
   });
 
+  it("ApplicationsPage in light mode", async () => {
+    document.documentElement.dataset.theme = "light";
+    try {
+      const { container } = renderWithProviders(<ApplicationsPage />);
+      await screen.findByTestId("applications-grid");
+      await expectNoA11yViolations(container);
+    } finally {
+      delete document.documentElement.dataset.theme;
+    }
+  });
+
   it("ProjectsPage", async () => {
     const { container } = renderWithProviders(<ProjectsPage />);
     await screen.findByText("payments");

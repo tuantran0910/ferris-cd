@@ -17,6 +17,7 @@
  * and is intentionally not changed here.
  */
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 
 /** sRGB values of the Tailwind tokens used by the UI. */
 const PALETTE: Record<string, string> = {
@@ -103,9 +104,9 @@ describe("WCAG 2.2 AA contrast (T17.3)", () => {
   });
 
   it("keeps the focus indicator at >= 3:1 on every surface it can appear on", () => {
-    // `#818cf8` (indigo-400) is the shared `:focus-visible` outline in `index.css`.
+    // `--color-accent` (#a5b4fc) is the shared `:focus-visible` ring in `index.css`.
     for (const background of ["slate-950", "slate-900", "slate-800", "slate-700"]) {
-      const ratio = contrast("indigo-400", background);
+      const ratio = contrast("indigo-300", background);
       expect(
         ratio,
         `focus ring on ${background} = ${ratio.toFixed(2)}:1`,
@@ -119,5 +120,126 @@ describe("WCAG 2.2 AA contrast (T17.3)", () => {
     expect(contrast("slate-500", "slate-950")).toBeLessThan(4.5);
     expect(contrast("slate-300", "slate-950")).toBeGreaterThan(contrast("slate-500", "slate-950"));
     expect(contrast("slate-400", "slate-900")).toBeGreaterThanOrEqual(4.5);
+  });
+});
+
+/**
+ * Semantic tokens (see `index.css`). The light and dark maps are the exact
+ * values the theme selectors publish, so a token edit that breaks AA fails here.
+ */
+const LIGHT: Record<string, string> = {
+  canvas: "#f1f5f9",
+  surface: "#ffffff",
+  elevated: "#e2e8f0",
+  "line-strong": "#94a3b8",
+  "ink-strong": "#0f172a",
+  ink: "#1e293b",
+  "ink-body": "#334155",
+  "ink-muted": "#475569",
+  "ink-subtle": "#475569",
+  accent: "#4338ca",
+  success: "#065f46",
+  warning: "#92400e",
+  danger: "#be123c",
+  info: "#0369a1",
+  "accent-tint": "#e0e7ff",
+  "success-tint": "#d1fae5",
+  "warning-tint": "#fffbeb",
+  "danger-tint": "#ffe4e6",
+  "info-tint": "#e0f2fe",
+};
+
+const DARK: Record<string, string> = {
+  canvas: "#020617",
+  surface: "#0f172a",
+  elevated: "#1e293b",
+  "line-strong": "#334155",
+  "ink-strong": "#f1f5f9",
+  ink: "#e2e8f0",
+  "ink-body": "#cbd5e1",
+  "ink-muted": "#94a3b8",
+  "ink-subtle": "#94a3b8",
+  accent: "#a5b4fc",
+  success: "#6ee7b7",
+  warning: "#fde68a",
+  danger: "#fecdd3",
+  info: "#7dd3fc",
+  "accent-tint": "#1e1b4b",
+  "success-tint": "#022c22",
+  "warning-tint": "#451a03",
+  "danger-tint": "#4c0519",
+  "info-tint": "#082f49",
+};
+
+function ratioOn(
+  palette: Record<string, string>,
+  foreground: string,
+  background: string,
+): number {
+  const fg = luminance(palette[foreground]!);
+  const bg = luminance(palette[background]!);
+  return (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05);
+}
+
+describe("WCAG 2.2 AA contrast (semantic tokens, both themes)", () => {
+  for (const [name, palette] of [
+    ["light", LIGHT],
+    ["dark", DARK],
+  ] as const) {
+    it(`keeps text pairs at >= 4.5:1 in ${name} mode`, () => {
+      const pairs: [string, string][] = [
+        ["ink-strong", "canvas"],
+        ["ink", "canvas"],
+        ["ink-body", "canvas"],
+        ["ink-muted", "surface"],
+        ["ink-subtle", "surface"],
+        ["ink-body", "elevated"],
+        ["accent", "surface"],
+        ["success", "surface"],
+        ["warning", "surface"],
+        ["danger", "surface"],
+        ["info", "surface"],
+        ["success", "success-tint"],
+        ["warning", "warning-tint"],
+        ["danger", "danger-tint"],
+        ["accent", "accent-tint"],
+        ["info", "info-tint"],
+      ];
+      for (const [foreground, background] of pairs) {
+        const ratio = ratioOn(palette, foreground, background);
+        expect(
+          ratio,
+          `${name}: ${foreground} on ${background} = ${ratio.toFixed(2)}:1`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    });
+
+    it(`keeps the focus indicator at >= 3:1 in ${name} mode`, () => {
+      for (const background of ["canvas", "surface", "elevated"]) {
+        const ratio = ratioOn(palette, "accent", background);
+        expect(
+          ratio,
+          `${name}: accent on ${background} = ${ratio.toFixed(2)}:1`,
+        ).toBeGreaterThanOrEqual(3);
+      }
+    });
+  }
+
+  it("would catch a regression: the old muted shade is not text-safe", () => {
+    expect(ratioOn(LIGHT, "line-strong", "surface")).toBeLessThan(4.5);
+    expect(ratioOn(DARK, "line-strong", "surface")).toBeLessThan(4.5);
+  });
+});
+
+describe("palette drift", () => {
+  it("keeps the asserted light tokens in step with index.css", () => {
+    const css = readFileSync("src/index.css", "utf8");
+    const light = css.slice(css.indexOf(':root[data-theme="light"]'));
+    for (const [name, value] of Object.entries(LIGHT)) {
+      const match = light.match(
+        new RegExp(`--color-${name}:\\s*(#[0-9a-fA-F]{6});`),
+      );
+      expect(match?.[1], name).toBe(value);
+    }
   });
 });

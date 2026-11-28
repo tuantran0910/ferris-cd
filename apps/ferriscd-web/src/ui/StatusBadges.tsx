@@ -89,7 +89,7 @@ export function SyncStatusBadge({
         className={compact ? "h-3 w-3" : "h-3.5 w-3.5"}
         aria-hidden="true"
       />
-      <span className="opacity-75">Sync:</span>
+      <span>Sync:</span>
       <span>{normalized}</span>
     </Badge>
   );
@@ -127,7 +127,7 @@ export function HealthStatusBadge({
         className={compact ? "h-3 w-3" : "h-3.5 w-3.5"}
         aria-hidden="true"
       />
-      <span className="opacity-75">Health:</span>
+      <span>Health:</span>
       <span>{normalized}</span>
     </Badge>
   );

@@ -126,11 +126,8 @@ export function useApplicationStream(
           signal: controller.signal,
           onSnapshot: (snapshot) => {
             lastFrameAt = performance.now();
-            // A slower in-flight poll must not overwrite a newer streamed snapshot.
-            void queryClient.cancelQueries(
-              { queryKey: queryKeys.applications() },
-              { revert: false },
-            );
+            // The page prefers the streamed snapshot while live, and polling is
+            // disabled then; cancelling the poll here only surfaced CancelledError.
             queryClient.setQueryData(queryKeys.applications(), snapshot);
             setSnapshot(snapshot);
             setStatus("live");

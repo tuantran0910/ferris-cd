@@ -150,7 +150,7 @@ function ApplicationDetailContent({
       <div className="space-y-4">
         <Link
           to={{ pathname: "/", search: listSearch }}
-          className="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-400 transition-colors hover:text-indigo-300"
+          className="inline-flex items-center gap-1.5 text-xs font-medium text-accent transition-colors hover:text-accent"
         >
           <ArrowLeft className="h-3.5 w-3.5" />
           Back to Applications
@@ -187,7 +187,7 @@ function ApplicationDetailContent({
         <div className="space-y-2">
           <Link
             to={{ pathname: "/", search: listSearch }}
-            className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-400 transition-colors hover:text-indigo-300"
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-muted transition-colors hover:text-accent"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
             Applications
@@ -195,17 +195,27 @@ function ApplicationDetailContent({
 
           <div className="flex flex-wrap items-center gap-3">
             <h1
-              className="max-w-full break-all text-2xl font-bold tracking-tight text-slate-100"
+              className="max-w-full break-all text-2xl font-bold tracking-tight text-ink-strong"
               title={app.name}
             >
               {app.name}
             </h1>
-            <span className="max-w-full truncate rounded-md border border-slate-700 bg-slate-900 px-2 py-0.5 font-mono text-xs text-slate-300">
-              {app.namespace}
-            </span>
-            <span className="max-w-full truncate rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 font-mono text-xs text-indigo-300">
-              project: {app.project}
-            </span>
+            <Link
+              to={`/?q=${encodeURIComponent(app.namespace)}`}
+              title={`Show applications in namespace ${app.namespace}`}
+              className="inline-flex max-w-full items-center gap-1 truncate rounded-md border border-control bg-surface px-2 py-0.5 text-xs text-ink-body transition-colors hover:border-accent hover:text-accent"
+            >
+              <span className="text-ink-subtle">Namespace:</span>
+              <span className="truncate font-mono">{app.namespace}</span>
+            </Link>
+            <Link
+              to={`/projects?q=${encodeURIComponent(app.project)}`}
+              title={`Show project ${app.project}`}
+              className="inline-flex max-w-full items-center gap-1 truncate rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-xs text-accent transition-colors hover:border-accent"
+            >
+              <span>Project:</span>
+              <span className="truncate font-mono">{app.project}</span>
+            </Link>
           </div>
 
           {/* Trap Guard T16.2: Strictly separate Sync Status & Health Status badges */}
@@ -213,12 +223,30 @@ function ApplicationDetailContent({
             <SyncStatusBadge status={app.sync?.status} />
             <HealthStatusBadge status={app.health?.status} />
             <SyncWindowBadge syncWindow={syncWindow} />
-            {app.health?.message && (
-              <span className="text-xs text-slate-400">
-                — {app.health.message}
-              </span>
-            )}
           </div>
+          {app.health?.message &&
+            app.health.status?.toLowerCase() !== "healthy" && (
+              <div
+                data-testid="health-message"
+                title={app.health.message}
+                className={`mt-2 flex max-w-2xl items-start gap-2 rounded-lg border px-3 py-2 text-xs ${
+                  app.health.status?.toLowerCase() === "degraded" ||
+                  app.health.status?.toLowerCase() === "missing"
+                    ? "border-danger/40 bg-danger-tint text-danger"
+                    : app.health.status?.toLowerCase() === "progressing"
+                      ? "border-info/40 bg-info-tint text-info"
+                      : "border-warning/40 bg-warning-tint text-warning"
+                }`}
+              >
+                <TriangleAlert
+                  aria-hidden="true"
+                  className="mt-0.5 h-4 w-4 shrink-0"
+                />
+                <span className="break-words leading-relaxed">
+                  {app.health.message}
+                </span>
+              </div>
+            )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -263,9 +291,9 @@ function ApplicationDetailContent({
         <div
           role="status"
           data-testid="detail-rbac-readonly-notice"
-          className="flex items-center gap-2 rounded-xl border border-rose-500/40 bg-rose-950/30 px-4 py-2.5 text-xs text-rose-200 motion-fade-in"
+          className="flex items-center gap-2 rounded-xl border border-rose-500/40 bg-danger-tint px-4 py-2.5 text-xs text-danger motion-fade-in"
         >
-          <ShieldOff className="h-4 w-4 shrink-0 text-rose-400" />
+          <ShieldOff className="h-4 w-4 shrink-0 text-danger" />
           <span>
             Read-only RBAC mode: one or more mutation actions were denied (HTTP
             403 Forbidden) and have been disabled.
@@ -274,7 +302,7 @@ function ApplicationDetailContent({
       )}
 
       {operation && (
-        <OperationBanner operation={operation} repoUrl={app.source.repoUrl} />
+        <OperationBanner operation={operation} />
       )}
 
       {/* A blocked window is why an automated (and possibly a manual) sync is doing nothing:
@@ -286,7 +314,7 @@ function ApplicationDetailContent({
       <div
         role="tablist"
         aria-label="Application detail sections"
-        className="flex flex-wrap gap-1 border-b border-slate-800"
+        className="flex flex-wrap gap-1 border-b border-line"
       >
         <TabButton
           active={activeTab === "resources"}
@@ -404,7 +432,6 @@ function ApplicationDetailContent({
         {activeTab === "history" && (
           <HistoryTable
             history={history}
-            repoUrl={app.source.repoUrl}
             rollbackForbidden={rollbackForbidden}
             onRollback={(historyId) => {
               setRollbackInitialId(historyId);
@@ -508,8 +535,8 @@ function TabButton({
       onClick={onClick}
       className={`inline-flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-xs font-semibold transition-colors ${
         active
-          ? "border-indigo-500 text-indigo-300"
-          : "border-transparent text-slate-400 hover:border-slate-700 hover:text-slate-200"
+          ? "border-indigo-500 text-accent"
+          : "border-transparent text-ink-muted hover:border-line-strong hover:text-ink"
       }`}
     >
       {icon}

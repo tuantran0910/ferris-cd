@@ -229,8 +229,8 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
         Command palette
       </h2>
 
-      <div className="flex items-center gap-2 border-b border-slate-800 px-4 py-3">
-        <Search aria-hidden="true" className="h-4 w-4 shrink-0 text-slate-300" />
+      <div className="flex items-center gap-2 border-b border-line px-4 py-3">
+        <Search aria-hidden="true" className="h-4 w-4 shrink-0 text-ink-body" />
         <input
           // No `autoFocus`: the focus trap focuses the first focusable element (this input) when the
           // dialog opens and records *what was focused before* to restore on close. An `autoFocus`
@@ -251,9 +251,9 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
             setActiveIndex(0);
           }}
           onKeyDown={onKeyDown}
-          className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 transition-colors placeholder-slate-400 focus:border-indigo-400 focus:outline-none"
+          className="w-full rounded-lg border border-control bg-canvas px-3 py-2 text-sm text-ink-strong transition-colors placeholder-hint"
         />
-        <kbd className="hidden shrink-0 rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-slate-300 sm:block">
+        <kbd className="hidden shrink-0 rounded border border-control bg-surface px-1.5 py-0.5 font-mono text-[10px] text-ink-body sm:block">
           Esc
         </kbd>
       </div>
@@ -277,17 +277,17 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
                       onMouseEnter={() => setActiveIndex(index)}
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => activate(item)}
-                      className={`flex cursor-pointer items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-xs ${
-                        active ? "bg-slate-800 text-white" : "text-slate-200"
+                      className={`flex cursor-pointer items-center justify-between gap-4 rounded-lg px-3 py-2 text-xs ${
+                        active ? "bg-elevated text-ink-strong" : "text-ink"
                       }`}
                     >
-                      <span className="flex min-w-0 items-center gap-2">
-                        <span aria-hidden="true" className="shrink-0 text-slate-300">
+                      <span className="flex min-w-0 flex-1 items-center gap-2">
+                        <span aria-hidden="true" className="shrink-0 text-ink-body">
                           {item.icon}
                         </span>
                         <span className="truncate font-medium">{item.label}</span>
                       </span>
-                      <span className="shrink-0 text-[11px] text-slate-300">{item.hint}</span>
+                      <span title={item.hint} className="max-w-[45%] shrink-0 truncate text-right text-[11px] text-ink-body">{item.hint}</span>
                     </li>
                   );
                 })}
@@ -302,7 +302,7 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
               role="option"
               aria-disabled="true"
               aria-selected="false"
-              className="px-3 py-6 text-center text-xs text-slate-200"
+              className="px-3 py-6 text-center text-xs text-ink"
             >
               No applications, projects, clusters, or views match “{query}”.
             </li>
@@ -314,7 +314,7 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
         role="status"
         aria-live="polite"
         data-testid="command-palette-status"
-        className="border-t border-slate-800 px-4 py-2 text-[11px] text-slate-300"
+        className="border-t border-line px-4 py-2 text-[11px] text-ink-body"
       >
         {items.length === 0
           ? "No results."
@@ -354,7 +354,7 @@ function buildGroups({
   const projectItems: PaletteItem[] = projects.map((project) => ({
     id: `project-${project.name}`,
     label: project.name,
-    hint: `project${project.description ? ` · ${project.description}` : ""}`,
+    hint: "project",
     group: "Projects",
     icon: <Layers className="h-3.5 w-3.5" />,
     to: { pathname: "/", search: searchFor({ project: project.name }) },

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  commitWebUrl,
   formatTimestamp,
+  parseResourceKey,
   repoWebUrl,
   shortRevision,
 } from "../utils/format";
@@ -44,16 +44,23 @@ describe("format helpers", () => {
     expect(repoWebUrl(null)).toBeNull();
   });
 
-  it("derives commit URLs per host and refuses non-SHA revisions", () => {
-    const sha = "a1b2c3d4e5f60000111122223333444455556666";
-    expect(commitWebUrl("https://github.com/acme/apps.git", sha)).toBe(
-      `https://github.com/acme/apps/commit/${sha}`,
-    );
-    expect(commitWebUrl("https://gitlab.com/acme/apps", sha)).toBe(
-      `https://gitlab.com/acme/apps/-/commit/${sha}`,
-    );
-    expect(commitWebUrl("https://github.com/acme/apps", "main")).toBeNull();
-    expect(commitWebUrl("git@github.com:acme/apps.git", sha)).toBeNull();
-    expect(commitWebUrl("https://github.com/acme/apps", null)).toBeNull();
+  it("parses group, kind, namespace and name, including empty segments", () => {
+    expect(parseResourceKey("apps/Deployment/payments/payments-api")).toEqual({
+      group: "apps",
+      kind: "Deployment",
+      namespace: "payments",
+      name: "payments-api",
+    });
+    expect(parseResourceKey("/Namespace//ferriscd-demo")).toEqual({
+      kind: "Namespace",
+      namespace: undefined,
+      name: "ferriscd-demo",
+    });
+    expect(parseResourceKey("ConfigMap")).toEqual({
+      group: undefined,
+      kind: "ConfigMap",
+      namespace: undefined,
+      name: "",
+    });
   });
 });

@@ -59,7 +59,7 @@ export function Modal({
         aria-hidden="true"
         data-testid="modal-backdrop"
         onClick={onBackdropClick}
-        className="motion-fade-in fixed inset-0 bg-slate-950/80 backdrop-blur-sm"
+        className="motion-fade-in fixed inset-0 bg-black/70 backdrop-blur-sm"
       />
       <div
         data-testid="modal-outside"
@@ -74,7 +74,7 @@ export function Modal({
           ref={dialogRef}
           tabIndex={-1}
           className={cx(
-            "motion-scale-in w-full rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl focus:outline-none",
+            "motion-scale-in w-full rounded-2xl border border-line bg-surface shadow-2xl ",
             panelClassName ?? "max-w-lg",
           )}
         >
@@ -103,10 +103,10 @@ export function ModalHeader({
   closeLabel,
 }: ModalHeaderProps) {
   return (
-    <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
+    <div className="flex items-center justify-between border-b border-line px-5 py-4">
       <div className="flex items-center gap-2">
         {icon}
-        <h2 id={titleId} className="text-base font-semibold text-slate-100">
+        <h2 id={titleId} className="text-base font-semibold text-ink-strong">
           {title}
         </h2>
       </div>
@@ -114,7 +114,7 @@ export function ModalHeader({
         type="button"
         onClick={onClose}
         aria-label={closeLabel}
-        className="rounded-lg p-1 text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-100"
+        className="rounded-lg p-1 text-ink-muted transition-colors hover:bg-elevated hover:text-ink-strong"
       >
         <X className="h-4 w-4" />
       </button>
@@ -136,7 +136,7 @@ export function ModalBody({
 
 export function ModalFooter({ children }: { children: ReactNode }) {
   return (
-    <div className="flex items-center justify-end gap-2.5 border-t border-slate-800 px-5 py-3.5">
+    <div className="flex items-center justify-end gap-2.5 border-t border-line px-5 py-3.5">
       {children}
     </div>
   );

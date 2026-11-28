@@ -1,4 +1,5 @@
 import { render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 import type { ApplicationSummary } from "../api/types";
 import { SourcePanel } from "../features/applications/components/SourcePanel";
@@ -6,7 +7,6 @@ import { sampleApps, sampleMultiSourceApp } from "./fixtures";
 
 const CHART_DIGEST =
   "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e";
-const VALUES_SHA = "2222222222222222222222222222222222222222";
 
 /**
  * Renders the panel and returns its source card.
@@ -16,7 +16,11 @@ const VALUES_SHA = "2222222222222222222222222222222222222222";
  * card.
  */
 function sourceCard(app: ApplicationSummary): HTMLElement {
-  render(<SourcePanel app={app} />);
+  render(
+    <MemoryRouter>
+      <SourcePanel app={app} />
+    </MemoryRouter>,
+  );
   return screen.getByTestId("source-card");
 }
 
@@ -121,16 +125,13 @@ describe("SourcePanel multi-source (T20.1)", () => {
       within(rows[0]!).getByText(`${CHART_DIGEST.slice(0, 12)}\u2026`),
     ).toBeInTheDocument();
 
-    // The values repository is a Git commit, so it becomes a browsable link.
+    // Revisions copy on click; they are not external links.
     expect(within(rows[1]!).getByText("values")).toBeInTheDocument();
     expect(
-      within(rows[1]!).getByRole("link", {
-        name: `${VALUES_SHA.slice(0, 12)}\u2026`,
+      within(rows[1]!).getByRole("button", {
+        name: "Copy source values revision",
       }),
-    ).toHaveAttribute(
-      "href",
-      `https://github.com/acme/payments-values/commit/${VALUES_SHA}`,
-    );
+    ).toBeInTheDocument();
   });
 
   it("shows no per-source block for a multi-source app that has never synced", () => {
@@ -139,7 +140,11 @@ describe("SourcePanel multi-source (T20.1)", () => {
     // badge and the declared sources, but an empty `Source Revisions` heading
     // would read as a controller bug.
     const { sync: _unsynced, ...withoutSync } = sampleMultiSourceApp;
-    render(<SourcePanel app={withoutSync} />);
+    render(
+    <MemoryRouter>
+      <SourcePanel app={withoutSync} />
+    </MemoryRouter>,
+  );
 
     expect(screen.getByTestId("multi-source-badge")).toHaveTextContent(
       "2 sources",
@@ -153,6 +158,7 @@ describe("SourcePanel multi-source (T20.1)", () => {
     // revision, timestamps) but `revisions` is empty — what a partially
     // reconciled or `v1.0`-shaped payload looks like.
     render(
+      <MemoryRouter>
       <SourcePanel
         app={{
           ...sampleMultiSourceApp,
@@ -160,7 +166,8 @@ describe("SourcePanel multi-source (T20.1)", () => {
           // spreading it would widen the required field.
           sync: { ...sampleMultiSourceApp.sync, status: "Synced", revisions: [] },
         }}
-      />,
+      />
+      </MemoryRouter>,
     );
 
     expect(screen.getByText("Rendered Revision")).toBeInTheDocument();

@@ -6,6 +6,7 @@ import type {
   RollbackRequestBody,
 } from "../../api/types";
 import { Button } from "../../ui/Button";
+import { CopyText } from "../../ui/CopyText";
 import { EmptyState } from "../../ui/EmptyState";
 import { Modal, ModalBody, ModalFooter, ModalHeader } from "../../ui/Modal";
 import { describeOperationError } from "../../utils/apiErrorText";
@@ -105,7 +106,7 @@ export function RollbackModal({
       <ModalHeader
         titleId="rollback-modal-title"
         title="Rollback Application"
-        icon={<RotateCcw className="h-4 w-4 text-amber-400" />}
+        icon={<RotateCcw className="h-4 w-4 text-warning" />}
         onClose={onClose}
         closeLabel="Close rollback modal"
       />
@@ -113,10 +114,10 @@ export function RollbackModal({
       <ModalBody>
         <p
           id="rollback-modal-description"
-          className="break-words text-slate-300"
+          className="break-words text-ink-body"
         >
           Select a previous deployment from{" "}
-          <code className="break-all rounded bg-slate-950 px-1.5 py-0.5 font-mono text-xs text-indigo-300">
+          <code className="break-all rounded bg-canvas px-1.5 py-0.5 font-mono text-xs text-accent">
             {namespace}/{name}
           </code>{" "}
           history to redeploy.
@@ -125,17 +126,17 @@ export function RollbackModal({
         <div
           role="note"
           data-testid="rollback-auto-sync-warning"
-          className="flex items-start gap-2.5 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-200"
+          className="flex items-start gap-2.5 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-warning"
         >
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
           <div>
-            <p className="font-semibold text-amber-100">
+            <p className="font-semibold text-warning">
               Automated sync will be paused
             </p>
-            <p className="mt-0.5 leading-relaxed text-amber-200/90">
+            <p className="mt-0.5 leading-relaxed text-warning">
               Rolling back pins this application to the chosen commit and
               disables{" "}
-              <code className="font-mono text-amber-100">
+              <code className="font-mono text-warning">
                 spec.syncPolicy.automated
               </code>{" "}
               so the controller does not immediately overwrite the rollback.
@@ -145,7 +146,7 @@ export function RollbackModal({
 
         {sortedHistory.length === 0 ? (
           <EmptyState>
-            <History className="mx-auto mb-2 h-5 w-5 text-slate-500" />
+            <History className="mx-auto mb-2 h-5 w-5 text-ink-subtle" />
             No deployment history entries are available to roll back to.
           </EmptyState>
         ) : (
@@ -161,8 +162,8 @@ export function RollbackModal({
                   key={entry.id}
                   className={`flex cursor-pointer items-center justify-between gap-3 rounded-xl border px-3.5 py-2.5 text-xs transition-colors ${
                     checked
-                      ? "border-indigo-500 bg-indigo-500/10 text-slate-100"
-                      : "border-slate-800 bg-slate-950/60 text-slate-300 hover:border-slate-700"
+                      ? "border-indigo-500 bg-indigo-500/10 text-ink-strong"
+                      : "border-line bg-canvas text-ink-body hover:border-line-strong"
                   }`}
                 >
                   <div className="flex min-w-0 items-center gap-3">
@@ -172,24 +173,32 @@ export function RollbackModal({
                       value={entry.id}
                       checked={checked}
                       onChange={() => setSelectedId(entry.id)}
-                      className="border-slate-600 bg-slate-900 text-indigo-500"
+                      className="border-control bg-surface text-accent"
                     />
                     <div className="min-w-0">
-                      <p className="font-semibold text-slate-100">
+                      <p className="font-semibold text-ink-strong">
                         Deployment #{entry.id}
                       </p>
                       <p
-                        className="break-all font-mono text-[11px] text-indigo-300"
+                        className="break-all font-mono text-[11px] text-accent"
                         title={entry.revision ?? undefined}
                       >
-                        {shortRevision(entry.revision, 12)}
+                        {entry.revision ? (
+                          <CopyText
+                            value={entry.revision}
+                            display={shortRevision(entry.revision, 12)}
+                            label="rollback revision"
+                          />
+                        ) : (
+                          shortRevision(entry.revision, 12)
+                        )}
                       </p>
                     </div>
                   </div>
                   <time
                     dateTime={entry.deployedAt}
                     title={entry.deployedAt}
-                    className="shrink-0 font-mono text-[11px] text-slate-400"
+                    className="shrink-0 font-mono text-[11px] text-ink-muted"
                   >
                     {entry.deployedAt}
                   </time>
@@ -203,11 +212,11 @@ export function RollbackModal({
           <div
             role="alert"
             data-testid="rollback-rbac-forbidden"
-            className="flex items-start gap-2.5 rounded-lg border border-rose-500/40 bg-rose-950/40 p-3 text-xs text-rose-200 motion-fade-in"
+            className="flex items-start gap-2.5 rounded-lg border border-rose-500/40 bg-danger-tint p-3 text-xs text-danger motion-fade-in"
           >
-            <ShieldOff className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
+            <ShieldOff className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
             <div>
-              <p className="font-semibold text-rose-100">
+              <p className="font-semibold text-danger">
                 RBAC Permission Required (403 Forbidden)
               </p>
               <p className="mt-0.5 break-words">
@@ -222,12 +231,12 @@ export function RollbackModal({
           <div
             role="alert"
             data-testid="rollback-error"
-            className="flex items-start gap-2 rounded-lg border border-rose-500/40 bg-rose-950/40 p-3 text-xs text-rose-200 motion-fade-in"
+            className="flex items-start gap-2 rounded-lg border border-rose-500/40 bg-danger-tint p-3 text-xs text-danger motion-fade-in"
           >
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
             <div>
-              <p className="font-semibold text-rose-100">{error.title}</p>
-              <p className="mt-0.5 break-words text-rose-200/90">
+              <p className="font-semibold text-danger">{error.title}</p>
+              <p className="mt-0.5 break-words text-danger">
                 {error.detail}
               </p>
             </div>
@@ -238,14 +247,14 @@ export function RollbackModal({
           <div
             role="status"
             data-testid="rollback-success-banner"
-            className="rounded-lg border border-emerald-500/40 bg-emerald-950/40 p-3 text-xs text-emerald-200 motion-fade-in"
+            className="rounded-lg border border-emerald-500/40 bg-success-tint p-3 text-xs text-success motion-fade-in"
           >
             <p>
               Rollback request <strong>{successResponse.status}</strong> — the
               controller will redeploy deployment <strong>#{selectedId}</strong>{" "}
               and pause automated sync.
             </p>
-            <p className="mt-1 text-emerald-200/80">
+            <p className="mt-1 text-success">
               Polling for the Sync badge and history to update; this dialog can
               be closed.
             </p>

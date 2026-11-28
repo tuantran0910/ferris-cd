@@ -24,13 +24,13 @@ const VARIANT_CLASSES: Record<ButtonVariant, string> = {
   primary:
     "bg-indigo-600 text-white font-semibold hover:bg-indigo-500 border border-transparent",
   secondary:
-    "border border-slate-700 bg-slate-900 text-slate-200 font-medium hover:border-slate-600 hover:bg-slate-800",
+    "border border-control bg-surface text-ink font-medium hover:border-line-emphasis hover:bg-elevated",
   ghost:
-    "border border-transparent text-slate-300 font-medium hover:bg-slate-800/80 hover:text-white",
+    "border border-transparent text-ink-body font-medium hover:bg-elevated hover:text-ink-strong",
   danger:
-    "border border-rose-500/40 bg-rose-500/15 text-rose-100 font-medium hover:bg-rose-500/25",
+    "border border-rose-500/40 bg-rose-500/15 text-danger font-medium hover:bg-rose-500/25",
   warning:
-    "border border-amber-500/40 bg-amber-500/15 text-amber-200 font-semibold hover:bg-amber-500/25",
+    "border border-amber-500/40 bg-amber-500/15 text-warning font-semibold hover:bg-amber-500/25",
 };
 
 const SIZE_CLASSES: Record<ButtonSize, string> = {

@@ -39,7 +39,7 @@ export function SyncWindowRow({
 
   return (
     <li
-      className="rounded-lg border border-slate-800 bg-slate-950/60 p-2.5"
+      className="rounded-lg border border-line bg-canvas p-2.5"
       data-testid={testId}
       data-window-kind={window.kind}
       data-window-state={state}
@@ -65,17 +65,17 @@ export function SyncWindowRow({
             manual override
           </Badge>
         )}
-        <code className="break-all rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 font-mono text-[11px] text-slate-200">
+        <code className="break-all rounded border border-control bg-surface px-1.5 py-0.5 font-mono text-[11px] text-ink">
           {window.schedule}
         </code>
-        <span className="text-[11px] text-slate-400">
+        <span className="text-[11px] text-ink-muted">
           for {window.duration} in {window.timeZone}
         </span>
       </div>
 
-      <p className="mt-1 text-[11px] text-slate-300">
+      <p className="mt-1 text-[11px] text-ink-body">
         {window.error ? (
-          <span className="text-rose-200">
+          <span className="text-danger">
             Cannot be evaluated ({window.error}) — every sync of this project is denied until the
             schedule is fixed.
           </span>
@@ -99,7 +99,7 @@ export function SyncWindowRow({
           <>This schedule does not fire within the next year.</>
         )}
         {scopeLabel(window) && (
-          <span className="text-slate-400"> Scope: {scopeLabel(window)}.</span>
+          <span className="text-ink-muted"> Scope: {scopeLabel(window)}.</span>
         )}
       </p>
     </li>
@@ -141,8 +141,8 @@ export function SyncWindowsPanel({
   }
   return (
     <div data-testid={testId}>
-      <dt className="flex items-center gap-1.5 font-medium text-slate-200">
-        <CalendarClock aria-hidden="true" className="h-3.5 w-3.5 text-amber-300" />
+      <dt className="flex items-center gap-1.5 font-medium text-ink">
+        <CalendarClock aria-hidden="true" className="h-3.5 w-3.5 text-warning" />
         Sync windows ({windows.length})
       </dt>
       <dd className="mt-1 space-y-1.5">
@@ -156,7 +156,7 @@ export function SyncWindowsPanel({
           ))}
         </ul>
         {nextTransition && (
-          <p className="text-[11px] text-slate-400">
+          <p className="text-[11px] text-ink-muted">
             Next transition{" "}
             <time dateTime={nextTransition}>{formatTimestamp(nextTransition)}</time>.
           </p>
@@ -197,14 +197,14 @@ export function SyncWindowNotice({
       data-sync-window-reason={syncWindow.reason ?? "unknown"}
       className={`flex items-start gap-2.5 rounded-lg border p-3 text-xs motion-fade-in ${
         override
-          ? "border-amber-500/40 bg-amber-950/40 text-amber-200"
-          : "border-rose-500/40 bg-rose-950/40 text-rose-200"
+          ? "border-amber-500/40 bg-warning-tint text-warning"
+          : "border-rose-500/40 bg-danger-tint text-danger"
       }`}
     >
       {override ? (
-        <ShieldCheck aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+        <ShieldCheck aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
       ) : (
-        <Ban aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
+        <Ban aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
       )}
       <div>
         <p className="font-semibold">
@@ -214,7 +214,7 @@ export function SyncWindowNotice({
         </p>
         <p className="mt-0.5 break-words">{syncWindow.message}</p>
         {syncWindow.nextTransition && (
-          <p className="mt-1 flex items-center gap-1.5 text-[11px] opacity-90">
+          <p className="mt-1 flex items-center gap-1.5 text-[11px]">
             <Clock aria-hidden="true" className="h-3 w-3" />
             Next transition{" "}
             <time dateTime={syncWindow.nextTransition}>
@@ -223,7 +223,7 @@ export function SyncWindowNotice({
           </p>
         )}
         {!override && (
-          <p className="mt-1 text-[11px] opacity-90">
+          <p className="mt-1 text-[11px]">
             Drift is still detected and reported. Add{" "}
             <code className="font-mono">manualSync: true</code> to the window in{" "}
             <code className="font-mono">spec.syncWindows</code> if a manual sync should be
@@ -232,7 +232,7 @@ export function SyncWindowNotice({
         )}
         {/* Finding N4: this verdict is a snapshot, not a reservation — the window can close (or
             open) between the page load and the reconcile that submits. */}
-        <p className="mt-1 text-[11px] opacity-75">
+        <p className="mt-1 text-[11px]">
           Evaluated when this page was loaded; the controller re-evaluates the window on
           every pass, so a verdict can still change before the sync runs.
         </p>

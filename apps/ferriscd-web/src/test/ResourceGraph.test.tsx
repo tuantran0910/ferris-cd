@@ -1,5 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MarkerType } from "@xyflow/react";
 import { describe, expect, it, vi } from "vitest";
 import { ResourceGraph } from "../features/resources/ResourceGraph";
 import {
@@ -24,6 +25,22 @@ describe("ResourceGraph & dagre layout (T16.3 & Trap Guard T16.3)", () => {
     // 1 synthetic Application root + 15 resource nodes = 16 total nodes
     expect(nodes).toHaveLength(16);
     expect(edges).toHaveLength(15);
+
+    // Every edge carries a directed arrow in a >=3:1 stroke, so the graph never
+    // regresses to undirected lines.
+    expect(
+      edges.every((edge) => (edge.markerEnd as { type?: string } | undefined)?.type === MarkerType.ArrowClosed),
+    ).toBe(true);
+    expect(
+      edges.every((edge) =>
+        ["var(--color-ink-muted)", "var(--color-danger)"].includes(
+          String(edge.style?.stroke),
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      edges.every((edge) => (edge.markerEnd as { color?: string } | undefined)?.color === edge.style?.stroke),
+    ).toBe(true);
 
     // Verify Deployment -> ReplicaSet -> Pod edges exist
     expect(edges).toContainEqual(
@@ -127,7 +144,9 @@ describe("ResourceGraph & dagre layout (T16.3 & Trap Guard T16.3)", () => {
       />,
     );
 
-    expect(screen.getByTestId("resource-graph-canvas")).toBeInTheDocument();
+    const canvas = screen.getByTestId("resource-graph-canvas");
+    expect(canvas).toBeInTheDocument();
+    expect(canvas.querySelector(".react-flow__minimap")).not.toBeNull();
     expect(screen.queryByTestId("large-graph-banner")).not.toBeInTheDocument();
 
     // Switch to Resource Table View and click a resource row to inspect it

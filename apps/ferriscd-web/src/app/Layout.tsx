@@ -1,13 +1,25 @@
-import { FolderGit2, Layers, LogOut, Search, Server } from "lucide-react";
+import { FolderGit2, Layers, LogOut, Monitor, Moon, Search, Server, Sun } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { Button } from "../ui/Button";
+import { CopyToast } from "../ui/CopyToast";
 import {
   CommandPalette,
   COMMAND_PALETTE_HINT,
   useCommandPaletteShortcut,
 } from "./CommandPalette";
+import {
+  applyMode,
+  applyThemeTransition,
+  nextMode,
+  readMode,
+  resolveMode,
+  syncThemeColor,
+  type Theme,
+  type ThemeMode,
+} from "./theme";
 
 const NAV_ITEMS = [
   { to: "/", label: "Applications", icon: Layers, end: true },
@@ -37,8 +49,48 @@ export function Layout() {
   const { baseUrl, logout, sessionStatus, beginSsoLogin, ssoAvailable } = useAuth();
   const { pathname } = useLocation();
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [mode, setMode] = useState<ThemeMode>(readMode);
+  const [theme, setTheme] = useState<Theme>(() => resolveMode(readMode()));
 
   const togglePalette = useCallback(() => setPaletteOpen((open) => !open), []);
+  const toggleTheme = useCallback(() => {
+    const next = nextMode(mode);
+    applyThemeTransition(() => {
+      const resolved = applyMode(next);
+      flushSync(() => {
+        setMode(next);
+        setTheme(resolved);
+      });
+    });
+  }, [mode]);
+
+  // Keep the document's state attributes truthful even before the first toggle
+  // (the inline script normally sets them, but tests and embeds may not).
+  useEffect(() => {
+    document.documentElement.dataset.themeMode = mode;
+    document.documentElement.dataset.theme = theme;
+    syncThemeColor(theme);
+  }, [mode, theme]);
+
+  // `system` must follow the OS live, not just at first paint.
+  useEffect(() => {
+    if (mode !== "system" || typeof window.matchMedia !== "function") {
+      return;
+    }
+    const query = window.matchMedia("(prefers-color-scheme: light)");
+    const onChange = () => {
+      const resolved = resolveMode("system");
+      document.documentElement.dataset.theme = resolved;
+      syncThemeColor(resolved);
+      setTheme(resolved);
+    };
+    if (typeof query.addEventListener === "function") {
+      query.addEventListener("change", onChange);
+      return () => query.removeEventListener("change", onChange);
+    }
+    query.addListener(onChange);
+    return () => query.removeListener(onChange);
+  }, [mode]);
   useCommandPaletteShortcut(togglePalette);
 
   // A new route starts at the top of the page. Assigning `scrollTop` (rather
@@ -51,7 +103,8 @@ export function Layout() {
   }, [pathname]);
 
   return (
-    <div className="flex min-h-screen flex-col bg-slate-950 text-slate-100">
+    <div className="flex min-h-screen flex-col bg-canvas text-ink-strong">
+      <CopyToast />
       <a
         href="#main-content"
         data-testid="skip-to-content"
@@ -60,12 +113,13 @@ export function Layout() {
         Skip to main content
       </a>
 
-      <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-950/90 backdrop-blur">
+      <header className="sticky top-0 z-30 border-b border-line bg-canvas backdrop-blur">
         <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4 sm:px-6">
           <div className="flex items-center gap-6">
             <Link
               to="/"
-              className="flex items-center gap-2.5 font-semibold tracking-tight text-slate-100 transition-colors hover:text-white"
+              aria-label="FerrisCD home"
+              className="flex items-center gap-2.5 font-semibold tracking-tight text-ink-strong transition-colors hover:text-ink-strong"
             >
               <img
                 src="/ferriscd-mark.svg"
@@ -74,7 +128,7 @@ export function Layout() {
                 height={28}
                 className="h-7 w-7"
               />
-              <span>FerrisCD</span>
+              <span className="hidden sm:inline">FerrisCD</span>
             </Link>
             <nav aria-label="Primary" className="flex items-center gap-1">
               {NAV_ITEMS.map((item) => (
@@ -82,50 +136,70 @@ export function Layout() {
                   key={item.to}
                   to={item.to}
                   end={item.end}
+                  aria-label={item.label}
                   className={({ isActive }) =>
-                    `inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
+                    `inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-sm font-medium transition-colors sm:px-3 ${
                       isActive
-                        ? "bg-slate-800 text-white"
-                        : "text-slate-200 hover:bg-slate-800/80 hover:text-white"
+                        ? "bg-elevated text-ink-strong"
+                        : "text-ink hover:bg-elevated hover:text-ink-strong"
                     }`
                   }
                 >
-                  <item.icon className="h-4 w-4 text-indigo-300" aria-hidden="true" />
-                  {item.label}
+                  <item.icon className="h-4 w-4 text-accent" aria-hidden="true" />
+                  <span className="hidden md:inline">{item.label}</span>
                 </NavLink>
               ))}
             </nav>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3">
+            <button
+              type="button"
+              onClick={toggleTheme}
+              aria-label={`Theme ${mode}${mode === "system" ? ` (${theme})` : ""}. Switch to ${nextMode(mode)}.`}
+              title={`Theme ${mode}${mode === "system" ? ` (${theme})` : ""}. Switch to ${nextMode(mode)}.`}
+              data-testid="theme-toggle"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-control bg-surface text-ink-body transition-colors hover:border-line-emphasis hover:bg-elevated hover:text-ink-strong"
+            >
+              {mode === "system" ? (
+                <Monitor aria-hidden="true" className="h-4 w-4" />
+              ) : theme === "light" ? (
+                <Moon aria-hidden="true" className="h-4 w-4" />
+              ) : (
+                <Sun aria-hidden="true" className="h-4 w-4" />
+              )}
+            </button>
             <button
               type="button"
               onClick={() => setPaletteOpen(true)}
               aria-keyshortcuts="Meta+K Control+K"
               title={`Search everything (${COMMAND_PALETTE_HINT})`}
-              className="hidden items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 transition-colors hover:border-slate-600 hover:bg-slate-800 sm:inline-flex"
+              className="hidden items-center gap-2 rounded-lg border border-control bg-surface px-2.5 py-1.5 text-xs text-ink transition-colors hover:border-line-emphasis hover:bg-elevated sm:inline-flex"
             >
-              <Search aria-hidden="true" className="h-3.5 w-3.5 text-slate-300" />
+              <Search aria-hidden="true" className="h-3.5 w-3.5 text-ink-body" />
               <span>Search</span>
-              <kbd className="rounded border border-slate-600 bg-slate-950 px-1 py-0.5 font-mono text-[10px] text-slate-200">
+              <kbd className="rounded border border-line-emphasis bg-canvas px-1 py-0.5 font-mono text-[10px] text-ink">
                 ⌘K
               </kbd>
             </button>
-            <span
-              className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-slate-800 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-300 sm:inline-flex"
-              title={`Connected FerrisCD API endpoint: ${baseUrl || "same-origin"}`}
-            >
-              <Server className="h-3.5 w-3.5 shrink-0 text-emerald-300" aria-hidden="true" />
-              <span className="truncate">{baseUrl || "same-origin"}</span>
-            </span>
+            {baseUrl && baseUrl !== "same-origin" && (
+              <span
+                className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-line bg-surface px-2.5 py-1 font-mono text-xs text-ink-body sm:inline-flex"
+                title={`Connected FerrisCD API endpoint: ${baseUrl}`}
+              >
+                <Server className="h-3.5 w-3.5 shrink-0 text-success" aria-hidden="true" />
+                <span className="truncate">{baseUrl}</span>
+              </span>
+            )}
             <Button
               variant="secondary"
               size="sm"
               onClick={() => logout()}
               icon={<LogOut className="h-3.5 w-3.5" />}
-              className="px-3 py-1.5"
+              aria-label="Sign out"
+              className="px-2 py-1.5 sm:px-3"
             >
-              Sign Out
+              <span className="hidden sm:inline">Sign Out</span>
             </Button>
           </div>
         </div>
@@ -136,7 +210,7 @@ export function Layout() {
       {sessionStatus === "expiring" && (
         <div
           role="status"
-          className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-200 sm:px-6"
+          className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-warning sm:px-6"
         >
           <div className="mx-auto flex max-w-7xl items-center justify-between gap-3">
             <span>
@@ -147,7 +221,7 @@ export function Layout() {
               <button
                 type="button"
                 onClick={() => void beginSsoLogin()}
-                className="shrink-0 rounded-md border border-amber-400/50 bg-amber-500/20 px-2.5 py-1 font-semibold text-amber-100 transition-colors hover:bg-amber-500/30"
+                className="shrink-0 rounded-md border border-amber-400/50 bg-amber-500/20 px-2.5 py-1 font-semibold text-warning transition-colors hover:bg-amber-500/30"
               >
                 Re-authenticate
               </button>
@@ -159,7 +233,7 @@ export function Layout() {
       <main
         id="main-content"
         tabIndex={-1}
-        className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 focus:outline-none sm:px-6"
+        className="mx-auto focus:outline-none w-full max-w-7xl flex-1 px-4 py-6 sm:px-6"
       >
         <div key={pathname} className="motion-slide-up">
           <Outlet />

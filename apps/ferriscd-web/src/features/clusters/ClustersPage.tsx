@@ -1,6 +1,6 @@
 import { Layers, Server } from "lucide-react";
 import { useMemo } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import type { ClusterView } from "../../api/types";
 import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Badge } from "../../ui/Badge";
@@ -49,10 +49,21 @@ const EMPTY_ROLLUP: ClusterRollup = {
 export function ClustersPage() {
   const clustersQuery = useClusters();
   const applicationsQuery = useApplications();
+  const [params] = useSearchParams();
+  const filter = (params.get("q") ?? "").trim().toLowerCase();
 
-  const clusters = useMemo(
+  const allClusters = useMemo(
     () => clustersQuery.data?.items ?? [],
     [clustersQuery.data],
+  );
+  const clusters = useMemo(
+    () =>
+      filter
+        ? allClusters.filter((cluster) =>
+            cluster.name.toLowerCase().includes(filter),
+          )
+        : allClusters,
+    [allClusters, filter],
   );
   const applications = useMemo(
     () => applicationsQuery.data?.items ?? [],
@@ -93,13 +104,19 @@ export function ClustersPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight text-slate-100">
+        <h1 className="text-2xl font-bold tracking-tight text-ink-strong">
           Clusters
         </h1>
-        <p className="mt-1 text-xs text-slate-300">
-          {clusters.length === 1
-            ? "1 destination cluster visible to your identity"
-            : `${clusters.length} destination clusters visible to your identity`}
+        <p className="mt-1 text-xs text-ink-body">
+          {!clustersQuery.data
+            ? "Loading destination clusters…"
+            : filter
+              ? `${clusters.length} of ${allClusters.length} ${
+                  allClusters.length === 1 ? "cluster" : "clusters"
+                } ${clusters.length === 1 ? "matches" : "match"} “${filter}”`
+              : clusters.length === 1
+                ? "1 destination cluster visible to your identity"
+                : `${clusters.length} destination clusters visible to your identity`}
           {" — "}
           filtered to the destinations your AppProjects allow.
         </p>
@@ -127,12 +144,21 @@ export function ClustersPage() {
             <Skeleton key={index} className="h-40" />
           ))}
         </div>
-      ) : !clustersQuery.data ? null : clusters.length === 0 ? (
+      ) : !clustersQuery.data ? null : allClusters.length === 0 ? (
         <EmptyState size="lg">
           <p>
             No destination clusters are visible to your identity. A cluster appears here once one of
             your AppProjects lists it in <code className="font-mono">spec.destinations</code>.
           </p>
+        </EmptyState>
+      ) : clusters.length === 0 ? (
+        <EmptyState size="lg">
+          <p>
+            No cluster matches <code className="font-mono">{filter}</code>.
+          </p>
+          <Link to="/clusters" className="text-accent hover:underline">
+            Clear the filter
+          </Link>
         </EmptyState>
       ) : (
         <ul className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -179,8 +205,8 @@ function ClusterCard({
   return (
     <Card className="flex h-full flex-col gap-4" data-testid={`cluster-card-${cluster.name}`}>
       <div className="flex flex-wrap items-start justify-between gap-2">
-        <h2 className="flex min-w-0 items-center gap-2 text-base font-semibold text-slate-100">
-          <Server aria-hidden="true" className="h-4 w-4 text-emerald-300" />
+        <h2 className="flex min-w-0 items-center gap-2 text-base font-semibold text-ink-strong">
+          <Server aria-hidden="true" className="h-4 w-4 text-success" />
           <Link
             to={filterLink}
             className="truncate rounded hover:underline"
@@ -212,9 +238,9 @@ function ClusterCard({
       </dl>
 
       <div className="mt-auto flex flex-wrap items-center gap-2 text-xs">
-        <span className="text-slate-300">Rollup:</span>
+        <span className="text-ink-body">Rollup:</span>
         {rollup.total === 0 ? (
-          <span className="text-slate-300">no visible applications</span>
+          <span className="text-ink-body">no visible applications</span>
         ) : (
           <>
             <SyncStatusBadge status={worstSync} compact />
@@ -224,11 +250,11 @@ function ClusterCard({
       </div>
 
       {/* The per-application breakdown stays textual: a colour alone is never the only signal. */}
-      <ul className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-slate-300">
+      <ul className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-ink-body">
         {healthBreakdown(rollup).map(({ status, count }) => (
           <li key={status} data-testid={`cluster-health-${status.toLowerCase()}`}>
             {status}:{" "}
-            <span className="font-mono text-slate-200" data-testid="count">
+            <span className="font-mono text-ink" data-testid="count">
               {count}
             </span>
           </li>
@@ -236,7 +262,7 @@ function ClusterCard({
       </ul>
 
       <p className="text-xs">
-        <Link to={filterLink} className="font-medium text-indigo-300 hover:underline">
+        <Link to={filterLink} className="font-medium text-accent hover:underline">
           View applications on this cluster
         </Link>
       </p>
@@ -267,14 +293,14 @@ function Metric({
 }) {
   return (
     <div>
-      <dt className="text-slate-300">{label}</dt>
+      <dt className="text-ink-body">{label}</dt>
       <dd
         data-testid={`cluster-metric-${testId}`}
         className={`mt-0.5 flex items-center gap-1 font-mono text-sm ${
-          emphasize ? "text-amber-200" : "text-slate-100"
+          emphasize ? "text-warning" : "text-ink-strong"
         }`}
       >
-        <Layers aria-hidden="true" className="h-3.5 w-3.5 text-slate-400" />
+        <Layers aria-hidden="true" className="h-3.5 w-3.5 text-ink-muted" />
         {value}
       </dd>
     </div>

@@ -1,4 +1,5 @@
 import { render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { DiffViewer } from "../features/diff/DiffViewer";
@@ -11,7 +12,7 @@ import {
 describe("DiffViewer (T16.4)", () => {
   it("highlights OutOfSync, Missing, Orphaned, FieldConflict managers, and ***REDACTED(...)*** secret badges", async () => {
     const user = userEvent.setup();
-    render(<DiffViewer diff={sampleDiffPayload} />);
+    render(<MemoryRouter><DiffViewer diff={sampleDiffPayload} /></MemoryRouter>);
 
     // Deployment with OutOfSync + SSA FieldConflict manager
     const deployCard = screen.getByTestId(
@@ -88,7 +89,7 @@ describe("DiffViewer (T16.4)", () => {
       },
       resources: [],
     };
-    const { unmount } = render(<DiffViewer diff={emptyDiff} />);
+    const { unmount } = render(<MemoryRouter><DiffViewer diff={emptyDiff} /></MemoryRouter>);
     expect(screen.getByTestId("diff-empty-state")).toHaveTextContent(
       /both empty/i,
     );
@@ -97,12 +98,12 @@ describe("DiffViewer (T16.4)", () => {
     // `resources` is optional in the OpenAPI schema: an absent array must not
     // crash the page.
     const { resources: _omit, ...withoutResources } = emptyDiff;
-    render(<DiffViewer diff={withoutResources} />);
+    render(<MemoryRouter><DiffViewer diff={withoutResources} /></MemoryRouter>);
     expect(screen.getByTestId("diff-empty-state")).toBeInTheDocument();
   });
 
   it("shows a blocking policy violation banner above the diff (T20.2)", () => {
-    render(<DiffViewer diff={sampleDiffPayloadWithPolicyViolations} />);
+    render(<MemoryRouter><DiffViewer diff={sampleDiffPayloadWithPolicyViolations} /></MemoryRouter>);
 
     const banner = screen.getByTestId("policy-violations-banner");
     expect(banner).toHaveTextContent(/policy violations/i);
@@ -140,7 +141,7 @@ describe("DiffViewer (T16.4)", () => {
         sampleDiffPayloadWithPolicyViolations.policyViolations ?? []
       ).filter((violation) => !isBlockingEnforcement(violation.enforcement)),
     };
-    render(<DiffViewer diff={advisoryOnly} />);
+    render(<MemoryRouter><DiffViewer diff={advisoryOnly} /></MemoryRouter>);
 
     const banner = screen.getByTestId("policy-violations-banner");
     expect(banner).toHaveTextContent(/1 advisory/i);
@@ -149,7 +150,7 @@ describe("DiffViewer (T16.4)", () => {
   });
 
   it("renders no policy banner when no rule fired (T20.2)", () => {
-    render(<DiffViewer diff={sampleDiffPayload} />);
+    render(<MemoryRouter><DiffViewer diff={sampleDiffPayload} /></MemoryRouter>);
     expect(
       screen.queryByTestId("policy-violations-banner"),
     ).not.toBeInTheDocument();

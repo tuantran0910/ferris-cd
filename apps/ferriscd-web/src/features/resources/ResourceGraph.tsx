@@ -9,7 +9,7 @@ import {
   type NodeTypes,
 } from "@xyflow/react";
 import { AlertTriangle, GitFork, Table2 } from "lucide-react";
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { ResourceGraphView } from "../../api/types";
 import { EmptyState } from "../../ui/EmptyState";
 import { HealthStatusBadge, SyncStatusBadge } from "../../ui/StatusBadges";
@@ -23,21 +23,21 @@ import { ResourceTable } from "./ResourceTable";
 
 function getNodeBorderClass(health: string, sync: string, isRoot: boolean): string {
   if (isRoot) {
-    return "border-indigo-500/70 bg-slate-900 shadow-indigo-500/10";
+    return "border-indigo-500/70 bg-surface shadow-indigo-500/10";
   }
   if (health === "Degraded" || health === "Missing") {
-    return "border-rose-500/70 bg-slate-900";
+    return "border-rose-500/70 bg-surface";
   }
   if (sync === "OutOfSync") {
-    return "border-amber-500/70 bg-slate-900";
+    return "border-amber-500/70 bg-surface";
   }
   if (health === "Progressing") {
-    return "border-sky-500/70 bg-slate-900";
+    return "border-sky-500/70 bg-surface";
   }
   if (health === "Healthy") {
-    return "border-emerald-500/60 bg-slate-900";
+    return "border-emerald-500/60 bg-surface";
   }
-  return "border-slate-700 bg-slate-900";
+  return "border-ink-subtle bg-surface";
 }
 
 const ResourceNodeCard = memo(function ResourceNodeCard({
@@ -63,21 +63,21 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
         <Handle
           type="target"
           position={Position.Left}
-          className="!h-2.5 !w-2.5 !border-slate-900 !bg-slate-400"
+          className="!h-2.5 !w-2.5 !border-0 !bg-transparent opacity-0"
         />
       )}
       <div className="flex items-center justify-between gap-2">
-        <span className="truncate text-[10px] font-semibold uppercase tracking-wider text-indigo-300">
+        <span className="truncate text-[10px] font-semibold uppercase tracking-wider text-accent">
           {data.kind}
         </span>
         {data.namespace && (
-          <span className="truncate font-mono text-[10px] text-slate-400">
+          <span className="truncate font-mono text-[10px] text-ink-muted">
             {data.namespace}
           </span>
         )}
       </div>
       <p
-        className="mt-0.5 truncate text-sm font-semibold text-slate-100"
+        className="mt-0.5 truncate text-sm font-semibold text-ink-strong"
         title={data.label}
       >
         {data.label}
@@ -90,7 +90,7 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
         <Handle
           type="source"
           position={Position.Right}
-          className="!h-2.5 !w-2.5 !border-slate-900 !bg-indigo-400"
+          className="!h-2.5 !w-2.5 !border-0 !bg-transparent opacity-0"
         />
       )}
     </div>
@@ -115,11 +115,19 @@ export function ResourceGraph({
   onInspectDiff,
 }: ResourceGraphProps) {
   const isLargeGraph = graph.nodes.length >= LARGE_GRAPH_THRESHOLD;
+  const [narrowScreen] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(max-width: 640px)").matches,
+  );
   const [viewMode, setViewMode] = useState<"graph" | "table">(() =>
-    isLargeGraph ? "table" : "graph",
+    isLargeGraph || narrowScreen ? "table" : "graph",
   );
   const [userPickedMode, setUserPickedMode] = useState(false);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const fitTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(fitTimer.current), []);
 
   const selectedResource = useMemo(
     () =>
@@ -137,9 +145,11 @@ export function ResourceGraph({
     // app defaults to the table, and one that shrank back gets the canvas again
     // (otherwise it would sit on the table with no banner explaining why).
     setViewMode(
-      graph.nodes.length >= LARGE_GRAPH_THRESHOLD ? "table" : "graph",
+      graph.nodes.length >= LARGE_GRAPH_THRESHOLD || narrowScreen
+        ? "table"
+        : "graph",
     );
-  }, [graph.nodes.length, userPickedMode]);
+  }, [graph.nodes.length, narrowScreen, userPickedMode]);
 
   useEffect(() => {
     if (selectedKey && !graph.nodes.some((node) => node.key === selectedKey)) {
@@ -165,26 +175,26 @@ export function ResourceGraph({
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
-          <span className="font-medium text-slate-200">
+        <div className="flex flex-wrap items-center gap-2 text-xs text-ink-muted">
+          <span className="font-medium text-ink">
             {graph.nodes.length} resources
           </span>
           <span>•</span>
           <span>
             Cluster:{" "}
-            <code className="break-all text-slate-300">{graph.cluster}</code>
+            <code className="break-all text-ink-body">{graph.cluster}</code>
           </span>
           <span>•</span>
           <span>
             Namespace:{" "}
-            <code className="break-all text-slate-300">{graph.namespace}</code>
+            <code className="break-all text-ink-body">{graph.namespace}</code>
           </span>
         </div>
 
         <div
           role="group"
           aria-label="Resource view mode"
-          className="inline-flex rounded-lg border border-slate-700 bg-slate-900 p-0.5"
+          className="inline-flex rounded-lg border border-control bg-surface p-0.5"
         >
           <button
             type="button"
@@ -193,7 +203,7 @@ export function ResourceGraph({
             className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
               viewMode === "graph"
                 ? "bg-indigo-600 text-white"
-                : "text-slate-300 hover:text-white"
+                : "text-ink-body hover:text-ink-strong"
             }`}
           >
             <GitFork className="h-3.5 w-3.5" />
@@ -206,7 +216,7 @@ export function ResourceGraph({
             className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
               viewMode === "table"
                 ? "bg-indigo-600 text-white"
-                : "text-slate-300 hover:text-white"
+                : "text-ink-body hover:text-ink-strong"
             }`}
           >
             <Table2 className="h-3.5 w-3.5" />
@@ -219,10 +229,10 @@ export function ResourceGraph({
         <div
           role="status"
           data-testid="large-graph-banner"
-          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200 motion-fade-in"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-xs text-warning motion-fade-in"
         >
           <div className="flex items-center gap-2">
-            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" />
+            <AlertTriangle className="h-4 w-4 shrink-0 text-warning" />
             <span>
               Large application detected ({graph.nodes.length} resources &ge;{" "}
               {LARGE_GRAPH_THRESHOLD}). Defaulted to searchable Resource Table
@@ -233,7 +243,7 @@ export function ResourceGraph({
             <button
               type="button"
               onClick={() => handleSelectViewMode("graph")}
-              className="rounded border border-amber-500/50 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-100 transition-colors hover:bg-amber-500/25"
+              className="rounded border border-amber-500/50 bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-warning transition-colors hover:bg-amber-500/25"
             >
               Switch to Graph View anyway
             </button>
@@ -241,12 +251,26 @@ export function ResourceGraph({
         </div>
       )}
 
+      {narrowScreen && !isLargeGraph && !userPickedMode && (
+        <div
+          role="status"
+          data-testid="narrow-graph-hint"
+          className="flex items-center gap-2 rounded-lg border border-line bg-elevated px-4 py-2 text-xs text-ink-muted"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0 text-ink-muted" />
+          <span>
+            Narrow viewport: showing the searchable Resource Table. Switch to
+            Graph View to see the topology.
+          </span>
+        </div>
+      )}
+
       {graph.truncated && (
         <div
           role="status"
-          className="flex items-center gap-2 rounded-lg border border-sky-500/40 bg-sky-500/10 px-4 py-2 text-xs text-sky-200 motion-fade-in"
+          className="flex items-center gap-2 rounded-lg border border-sky-500/40 bg-sky-500/10 px-4 py-2 text-xs text-info motion-fade-in"
         >
-          <AlertTriangle className="h-4 w-4 shrink-0 text-sky-400" />
+          <AlertTriangle className="h-4 w-4 shrink-0 text-info" />
           <span>
             Graph response was truncated by the server&apos;s node limit (
             <code>MAX_GRAPH_NODES</code>).
@@ -262,7 +286,7 @@ export function ResourceGraph({
       ) : viewMode === "graph" ? (
         <div
           data-testid="resource-graph-canvas"
-          className="h-[560px] w-full overflow-hidden rounded-xl border border-slate-800 bg-slate-950"
+          className="h-[560px] w-full overflow-hidden rounded-xl border border-line bg-canvas"
         >
           <ReactFlow
             nodes={layout.nodes}
@@ -275,8 +299,15 @@ export function ResourceGraph({
             edgesFocusable={false}
             edgesReconnectable={false}
             fitView
-            fitViewOptions={{ padding: 0.2 }}
-            minZoom={0.2}
+            fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+            minZoom={0.15}
+            onInit={(instance) => {
+              // Nodes are measured after the first frame; fitting immediately
+              // can leave the right-most column clipped in a fixed-height card.
+              fitTimer.current = window.setTimeout(() => {
+                void instance.fitView({ padding: 0.2, maxZoom: 1 });
+              }, 0);
+            }}
             maxZoom={1.8}
             proOptions={{ hideAttribution: true }}
             onNodeClick={(_evt, node) => {
@@ -286,17 +317,23 @@ export function ResourceGraph({
               }
             }}
           >
-            <Background color="#1e293b" gap={20} />
+            <Background color="var(--color-elevated)" gap={20} />
             <Controls />
+            {layout.nodes.length > 8 && (
             <MiniMap
+              position="top-right"
+              style={{ background: "var(--color-surface)" }}
+              maskColor="var(--color-canvas)"
+              nodeStrokeColor="var(--color-line-strong)"
               nodeColor={(n) => {
                 const flowNode = n as ResourceFlowNode;
-                if (flowNode.data?.healthStatus === "Degraded") return "#f43f5e";
-                if (flowNode.data?.healthStatus === "Healthy") return "#10b981";
-                if (flowNode.data?.healthStatus === "Progressing") return "#38bdf8";
-                return "#64748b";
+                if (flowNode.data?.healthStatus === "Degraded") return "var(--color-danger)";
+                if (flowNode.data?.healthStatus === "Healthy") return "var(--color-success)";
+                if (flowNode.data?.healthStatus === "Progressing") return "var(--color-info)";
+                return "var(--color-ink-subtle)";
               }}
             />
+            )}
           </ReactFlow>
         </div>
       ) : (

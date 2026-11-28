@@ -4,6 +4,7 @@ import { Link, useLocation, useSearchParams } from "react-router-dom";
 import type { ApplicationSummary } from "../../api/types";
 import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Button } from "../../ui/Button";
+import { CopyText } from "../../ui/CopyText";
 import { EmptyState } from "../../ui/EmptyState";
 import { LiveRegion } from "../../ui/LiveRegion";
 import {
@@ -198,10 +199,10 @@ export function ApplicationsPage() {
       />
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-100">
+          <h1 className="text-2xl font-bold tracking-tight text-ink-strong">
             Applications
           </h1>
-          <p className="mt-1 text-xs text-slate-400">
+          <p className="mt-1 text-xs text-ink-muted">
             Showing {filteredApps.length} of {apps.length} watched applications
             •{" "}
             <span aria-live="polite">
@@ -221,7 +222,7 @@ export function ApplicationsPage() {
             onClick={() => void refetch()}
             icon={
               <RefreshCw
-                className={`h-3.5 w-3.5 ${isFetching ? "animate-spin text-indigo-400" : ""}`}
+                className={`h-3.5 w-3.5 ${isFetching ? "animate-spin text-accent" : ""}`}
                 aria-hidden="true"
               />
             }
@@ -233,7 +234,7 @@ export function ApplicationsPage() {
           <div
             role="group"
             aria-label="Applications layout"
-            className="inline-flex rounded-lg border border-slate-700 bg-slate-900 p-0.5"
+            className="inline-flex rounded-lg border border-control bg-surface p-0.5"
           >
             <button
               type="button"
@@ -243,7 +244,7 @@ export function ApplicationsPage() {
               className={`rounded-md p-1.5 transition-colors ${
                 viewMode === "grid"
                   ? "bg-indigo-600 text-white"
-                  : "text-slate-400 hover:text-slate-100"
+                  : "text-ink-muted hover:text-ink-strong"
               }`}
             >
               <LayoutGrid className="h-4 w-4" />
@@ -256,7 +257,7 @@ export function ApplicationsPage() {
               className={`rounded-md p-1.5 transition-colors ${
                 viewMode === "table"
                   ? "bg-indigo-600 text-white"
-                  : "text-slate-400 hover:text-slate-100"
+                  : "text-ink-muted hover:text-ink-strong"
               }`}
             >
               <List className="h-4 w-4" />
@@ -267,17 +268,17 @@ export function ApplicationsPage() {
 
       <section
         aria-label="Application filters"
-        className="grid grid-cols-1 gap-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4 sm:grid-cols-2 lg:grid-cols-5"
+        className="grid grid-cols-1 gap-3 rounded-xl border border-line bg-surface p-4 sm:grid-cols-2 lg:grid-cols-5"
       >
         <div className="relative lg:col-span-2">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-subtle" />
           <input
             type="search"
             aria-label="Search applications"
             value={search}
             onChange={(e) => setParam(FILTER_PARAMS.search, e.target.value)}
             placeholder="Search by name, namespace, repo, or cluster..."
-            className="w-full rounded-lg border border-slate-700 bg-slate-950 py-2 pl-9 pr-3 text-xs text-slate-100 transition-colors placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
+            className="w-full rounded-lg border border-control bg-canvas py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint"
           />
         </div>
 
@@ -366,10 +367,10 @@ export function ApplicationsPage() {
       ) : (
         <div
           data-testid="applications-table"
-          className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-900/70"
+          className="overflow-x-auto rounded-xl border border-line bg-surface"
         >
           <table className="w-full text-left text-xs">
-            <thead className="border-b border-slate-800 bg-slate-900 text-[11px] uppercase tracking-wider text-slate-400">
+            <thead className="border-b border-line bg-surface text-[11px] uppercase tracking-wider text-ink-muted">
               <tr>
                 <th className="px-4 py-3">Application</th>
                 <th className="px-4 py-3">Project</th>
@@ -380,23 +381,23 @@ export function ApplicationsPage() {
                 <th className="px-4 py-3 text-right">Resources</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-800/80">
+            <tbody className="divide-y divide-line">
               {filteredApps.map((app) => (
                 <tr
                   key={`${app.namespace}/${app.name}`}
-                  className="transition-colors hover:bg-slate-800/50"
+                  className="transition-colors hover:bg-elevated"
                 >
                   <td className="max-w-[280px] px-4 py-3">
                     <Link
                       to={`/applications/${encodeURIComponent(app.namespace)}/${encodeURIComponent(app.name)}`}
                       state={listState}
-                      className="block truncate font-semibold text-indigo-300 hover:underline"
+                      className="block truncate font-semibold text-accent hover:underline"
                       title={`${app.namespace}/${app.name}`}
                     >
                       {app.namespace}/{app.name}
                     </Link>
                   </td>
-                  <td className="max-w-[160px] truncate px-4 py-3 font-mono text-slate-300">
+                  <td className="max-w-[160px] truncate px-4 py-3 font-mono text-ink-body">
                     {app.project}
                   </td>
                   <td className="whitespace-nowrap px-4 py-3">
@@ -406,15 +407,23 @@ export function ApplicationsPage() {
                     <HealthStatusBadge status={app.health?.status} compact />
                   </td>
                   <td
-                    className="px-4 py-3 font-mono text-slate-300"
+                    className="px-4 py-3 font-mono text-ink-body"
                     title={app.sync?.revision ?? undefined}
                   >
-                    {shortRevision(app.sync?.revision, 12)}
+                    {app.sync?.revision ? (
+                      <CopyText
+                        value={app.sync.revision}
+                        display={shortRevision(app.sync.revision, 12)}
+                        label="rendered revision"
+                      />
+                    ) : (
+                      shortRevision(app.sync?.revision, 12)
+                    )}
                   </td>
-                  <td className="max-w-[200px] truncate px-4 py-3 font-mono text-slate-400">
+                  <td className="max-w-[200px] truncate px-4 py-3 font-mono text-ink-muted">
                     {app.destination.cluster}/{app.destination.namespace}
                   </td>
-                  <td className="px-4 py-3 text-right font-mono text-slate-300">
+                  <td className="px-4 py-3 text-right font-mono text-ink-body">
                     {app.resourceCount}
                   </td>
                 </tr>

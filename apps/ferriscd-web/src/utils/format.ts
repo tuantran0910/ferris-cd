@@ -79,18 +79,32 @@ export function repoWebUrl(repoURL: string | null | undefined): string | null {
  * GitLab serves commits under `/-/commit/<sha>`; every other host (GitHub,
  * Gitea, Forgejo, Bitbucket Server, ...) uses `/commit/<sha>`.
  */
-export function commitWebUrl(
-  repoURL: string | null | undefined,
-  revision: string | null | undefined,
-): string | null {
-  const base = repoWebUrl(repoURL);
-  const sha = revision?.trim();
-  if (!base || !sha || !/^[0-9a-f]{7,40}$/i.test(sha)) {
-    return null;
+export interface ParsedResourceKey {
+  group?: string;
+  kind: string;
+  namespace?: string;
+  name: string;
+}
+
+/**
+ * Splits the GKNN inventory key (`[group/]Kind/[namespace/]name`) into the
+ * facts an operator reads. Cluster-scoped resources have an empty namespace
+ * segment, which is why the key contains `//`.
+ */
+export function parseResourceKey(key: string): ParsedResourceKey {
+  const parts = key.split("/");
+  if (parts.length === 1) {
+    return { kind: key, name: "" };
   }
-  const host = new URL(base).hostname.toLowerCase();
-  const segment = host === "gitlab.com" || host.startsWith("gitlab.")
-    ? "/-/commit/"
-    : "/commit/";
-  return `${base}${segment}${sha}`;
+  if (key.startsWith("/")) {
+    const [, kind = key, namespace, name = ""] = parts;
+    return { kind, namespace: namespace || undefined, name };
+  }
+  const [group, kind = key, namespace, name = ""] = parts;
+  return {
+    group: group || undefined,
+    kind,
+    namespace: namespace || undefined,
+    name,
+  };
 }

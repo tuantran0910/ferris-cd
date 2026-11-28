@@ -45,6 +45,17 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
     setStoredToken("test-token");
   });
 
+  it("links the namespace to a filtered applications view and the project to its page", async () => {
+    renderDetailPage();
+    await screen.findByRole("heading", { name: "payments-api" });
+    expect(
+      screen.getByRole("link", { name: /Namespace:\s+ferriscd-system/ }),
+    ).toHaveAttribute("href", "/?q=ferriscd-system");
+    expect(
+      screen.getByRole("link", { name: /Project:\s+payments/ }),
+    ).toHaveAttribute("href", "/projects?q=payments");
+  });
+
   it("supports APG arrow/Home/End navigation between detail tabs", async () => {
     const user = userEvent.setup();
     renderDetailPage();
@@ -88,10 +99,13 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
       "Git",
     );
     expect(
-      within(summarySection).getByText(
-        "https://github.com/acme/gitops-payments.git",
-      ),
+      within(summarySection).getByText("gitops-payments"),
     ).toBeInTheDocument();
+    expect(
+      within(summarySection).getByRole("link", {
+        name: /open repository gitops-payments/i,
+      }),
+    ).toHaveAttribute("href", "https://github.com/acme/gitops-payments");
     expect(within(summarySection).getByText("prod-us-east")).toBeInTheDocument();
 
     // Conditions timeline tab
@@ -133,8 +147,11 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
       "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
     );
     // The registry reference is not a Git web link, and the collapsed revision
-    // row is replaced by the two OCI facts above.
-    expect(within(summarySection).queryByRole("link")).not.toBeInTheDocument();
+    // row is replaced by the two OCI facts above. Namespace/cluster rows are
+    // navigation links, so only the registry reference must stay plain.
+    expect(
+      within(summarySection).queryByRole("link", { name: /sha256:/ }),
+    ).not.toBeInTheDocument();
     expect(
       within(summarySection).queryByText("Target Revision"),
     ).not.toBeInTheDocument();

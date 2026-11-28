@@ -1,6 +1,6 @@
 import { FolderGit2, Search, ShieldCheck, Workflow } from "lucide-react";
-import { useMemo, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { useMemo, type ReactNode } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import type { ProjectView } from "../../api/types";
 import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Badge } from "../../ui/Badge";
@@ -27,7 +27,17 @@ import { useProjects } from "./hooks";
  * project?" is one click (and the filter lives in the URL, so it survives a reload).
  */
 export function ProjectsPage() {
-  const [search, setSearch] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const search = searchParams.get("q") ?? "";
+  const setSearch = (value: string) => {
+    const next = new URLSearchParams(searchParams);
+    if (value) {
+      next.set("q", value);
+    } else {
+      next.delete("q");
+    }
+    setSearchParams(next, { replace: true });
+  };
   const projectsQuery = useProjects();
   // The project → application rollup comes from the same filtered list the Applications page shows.
   const applicationsQuery = useApplications();
@@ -83,10 +93,10 @@ export function ProjectsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight text-slate-100">
+        <h1 className="text-2xl font-bold tracking-tight text-ink-strong">
           Projects
         </h1>
-        <p className="mt-1 text-xs text-slate-300">
+        <p className="mt-1 text-xs text-ink-body">
           {projects.length === 1
             ? "1 AppProject visible to your identity"
             : `${projects.length} AppProjects visible to your identity`}
@@ -108,7 +118,7 @@ export function ProjectsPage() {
       <div className="relative max-w-md">
         <Search
           aria-hidden="true"
-          className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
+          className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-muted"
         />
         <input
           type="search"
@@ -116,7 +126,7 @@ export function ProjectsPage() {
           value={search}
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search by project, repo, namespace, cluster, ServiceAccount, or schedule..."
-          className="w-full rounded-lg border border-slate-700 bg-slate-950 py-2 pl-9 pr-3 text-xs text-slate-100 transition-colors placeholder-slate-400 focus:border-indigo-400 focus:outline-none"
+          className="w-full rounded-lg border border-control bg-canvas py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint"
         />
       </div>
 
@@ -173,8 +183,8 @@ function ProjectCard({
     <Card className="flex h-full flex-col gap-4">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
-          <h2 className="flex items-center gap-2 text-base font-semibold text-slate-100">
-            <FolderGit2 aria-hidden="true" className="h-4 w-4 text-indigo-400" />
+          <h2 className="flex items-center gap-2 text-base font-semibold text-ink-strong">
+            <FolderGit2 aria-hidden="true" className="h-4 w-4 text-accent" />
             <Link
               to={applicationsLink}
               className="truncate rounded hover:underline"
@@ -184,7 +194,7 @@ function ProjectCard({
             </Link>
           </h2>
           {project.description && (
-            <p className="mt-1 break-words text-xs text-slate-300">
+            <p className="mt-1 break-words text-xs text-ink-body">
               {project.description}
             </p>
           )}
@@ -196,7 +206,7 @@ function ProjectCard({
 
       <dl className="grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
         <FactList
-          icon={<Workflow aria-hidden="true" className="h-3.5 w-3.5 text-sky-300" />}
+          icon={<Workflow aria-hidden="true" className="h-3.5 w-3.5 text-info" />}
           title="Source repositories"
           values={project.sourceRepos ?? []}
           testId={`project-source-repos-${project.name}`}
@@ -207,7 +217,7 @@ function ProjectCard({
           testId={`project-source-namespaces-${project.name}`}
         />
         <FactList
-          icon={<ShieldCheck aria-hidden="true" className="h-3.5 w-3.5 text-emerald-300" />}
+          icon={<ShieldCheck aria-hidden="true" className="h-3.5 w-3.5 text-success" />}
           title="Destinations"
           values={project.destinations ?? []}
           testId={`project-destinations-${project.name}`}
@@ -226,10 +236,10 @@ function ProjectCard({
         />
       </dl>
 
-      <p className="mt-auto text-xs text-slate-300">
+      <p className="mt-auto text-xs text-ink-body">
         {counts && counts.outOfSync > 0 ? (
           <>
-            <span className="font-semibold text-amber-200">
+            <span className="font-semibold text-warning">
               {counts.outOfSync} out of sync
             </span>
             {" of "}
@@ -240,7 +250,7 @@ function ProjectCard({
         )}
         <Link
           to={applicationsLink}
-          className="font-medium text-indigo-300 hover:underline"
+          className="font-medium text-accent hover:underline"
         >
           View applications
         </Link>
@@ -271,18 +281,18 @@ function FactList({
 }) {
   return (
     <div data-testid={testId}>
-      <dt className="flex items-center gap-1.5 font-medium text-slate-200">
+      <dt className="flex items-center gap-1.5 font-medium text-ink">
         {icon}
         {title}
       </dt>
       <dd className="mt-1">
         {values.length === 0 ? (
-          <span className="text-slate-400">none</span>
+          <span className="text-ink-muted">none</span>
         ) : (
           <ul className="flex flex-wrap gap-1.5">
             {values.map((value) => (
               <li key={value}>
-                <code className="break-all rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 font-mono text-[11px] text-slate-200">
+                <code className="break-all rounded border border-control bg-canvas px-1.5 py-0.5 font-mono text-[11px] text-ink">
                   {value}
                 </code>
               </li>
