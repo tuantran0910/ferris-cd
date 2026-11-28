@@ -43,6 +43,14 @@
         "totalShards": { "type": ["integer", "null"], "minimum": 1 }
       }
     },
+    "driftWatcher": {
+      "type": "object",
+      "description": "Opt-in label-scoped PartialObjectMetadata drift watcher (T18.2).",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "kinds": { "type": "string" }
+      }
+    },
     "multiTenant": {
       "type": "object",
       "properties": {

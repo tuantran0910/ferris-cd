@@ -2320,6 +2320,12 @@ mod tests {
             crate::metrics::RBAC_WATCH_ERRORS_TOTAL,
             crate::metrics::AUDIT_EVENTS_TOTAL,
             crate::metrics::AUDIT_DROPPED_TOTAL,
+            // `T18.2`: the drift watcher's families are registered (and zero-instantiated) on every
+            // replica, whether or not the opt-in watch is running.
+            crate::metrics::DRIFT_FALLBACK_TOTAL,
+            crate::metrics::DRIFT_EVENTS_TOTAL,
+            crate::metrics::DRIFT_TRIGGERS_TOTAL,
+            crate::metrics::DRIFT_ACTIVE_WATCHES,
             // `T19.4`: the notification families are pre-created too (a replica that has delivered
             // nothing still exposes them, as zeros).
             crate::metrics::NOTIFICATIONS_TOTAL,

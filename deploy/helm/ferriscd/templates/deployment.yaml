@@ -90,6 +90,16 @@ spec:
             - --application-namespaces
             - {{ join "," .Values.multiTenant.applicationNamespaces | quote }}
             {{- end }}
+            {{- /* Opt-in label-scoped `PartialObjectMetadata` drift watcher (`T18.2`). The
+                   allow-list is optional: without it the watcher derives its watches from
+                   `status.inventory`, capped at 64 per cluster. */}}
+            {{- if .Values.driftWatcher.enabled }}
+            - --enable-drift-watcher
+            {{- if .Values.driftWatcher.kinds }}
+            - --drift-watcher-kinds
+            - {{ .Values.driftWatcher.kinds | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.audit }}
             {{- if .logPath }}
             - --audit-log-path
