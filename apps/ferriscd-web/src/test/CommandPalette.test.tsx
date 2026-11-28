@@ -237,6 +237,17 @@ describe("CommandPalette (T17.3)", () => {
     );
   });
 
+  it("closes when the operator clicks outside the palette", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.keyboard("{Control>}k{/Control}");
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    await user.click(screen.getByTestId("modal-outside"));
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+  });
+
   it("closes with Escape while leaving focus restored, and never opens on a bare 'k'", async () => {
     const user = userEvent.setup();
     renderPalette();

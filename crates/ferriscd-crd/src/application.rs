@@ -772,6 +772,20 @@ pub struct SyncPolicy {
     /// Bounded retry policy for failed sync operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryPolicy>,
+
+    /// Opt-in Prometheus metric gates that guard promotion **between** sync waves (`T20.3`).
+    ///
+    /// An entry holds the rollout after wave `afterWave` until `count` consecutive evaluations of
+    /// `query` satisfy `successCondition`. A gate can only name a provider that a cluster
+    /// administrator allowlisted in `ConfigMap/ferriscd-metrics-providers-cm`: the endpoint itself
+    /// is never part of `ApplicationSpec`, so a tenant cannot make the controller dial an arbitrary
+    /// URL (the `T20.3` SSRF trap guard).
+    ///
+    /// Additive on the wire: absent (never `[]`) when no gate is configured, so every stored
+    /// `v1alpha1` object round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 8))]
+    pub metric_gates: Vec<MetricGate>,
 }
 
 impl SyncPolicy {
@@ -779,6 +793,12 @@ impl SyncPolicy {
     #[must_use]
     pub fn is_automated(&self) -> bool {
         self.automated.is_some()
+    }
+
+    /// The metric gates declared by this policy (`[]` when none).
+    #[must_use]
+    pub fn metric_gates(&self) -> &[MetricGate] {
+        &self.metric_gates
     }
 
     /// Returns whether automated self-healing (drift correction) is enabled.
@@ -928,6 +948,141 @@ impl Default for RetryBackoff {
     }
 }
 
+/// Highest number of `spec.syncPolicy.metricGates` entries (`T20.3`).
+///
+/// Every gate is one bounded Prometheus query per pass while it holds a rollout, so the cap bounds
+/// both the query fan-out of one `Application` and the size of the `metricGate` record written back
+/// to `/status`.
+pub const MAX_METRIC_GATES: usize = 8;
+
+/// Highest accepted `spec.syncPolicy.metricGates[].count` (`T20.3`).
+///
+/// A gate needs at least one sample and cannot require more than this many consecutive successes,
+/// so the number of reconciles one gate can hold a rollout for is bounded and known.
+pub const MAX_METRIC_GATE_SAMPLES: u32 = 10;
+
+/// Default `spec.syncPolicy.metricGates[].count`.
+pub const DEFAULT_METRIC_GATE_COUNT: u32 = 1;
+
+/// Default `spec.syncPolicy.metricGates[].intervalSeconds`.
+pub const DEFAULT_METRIC_GATE_INTERVAL_SECONDS: u32 = 30;
+
+/// Highest accepted `spec.syncPolicy.metricGates[].intervalSeconds`.
+pub const MAX_METRIC_GATE_INTERVAL_SECONDS: u32 = 3_600;
+
+/// Longest accepted `spec.syncPolicy.metricGates[].query` (in `char`s).
+///
+/// A PromQL query is executed by an admin-configured Prometheus, so its length is capped before it
+/// is ever sent: an arbitrarily long query is the cheapest way to overload the metrics backend
+/// (the `T20.3` "arbitrary PromQL execution" risk).
+pub const MAX_METRIC_QUERY_CHARS: usize = 2_048;
+
+/// Longest accepted `spec.syncPolicy.metricGates[].successCondition` (in `char`s).
+pub const MAX_METRIC_CONDITION_CHARS: usize = 512;
+
+/// Longest accepted `spec.syncPolicy.metricGates[].provider` (in `char`s).
+pub const MAX_METRIC_PROVIDER_CHARS: usize = 253;
+
+/// One metric gate guarding promotion *after* a sync wave (`T20.3`).
+///
+/// # Why there is no `prometheusUrl` field
+///
+/// The roadmap spells the field as `prometheusUrl`, "referenced via the control-plane allowlisted
+/// `ConfigMap/ferriscd-metrics-providers-cm`". That reference is modelled as an opaque **provider
+/// name** instead of a URL: `provider` is a key of that `ConfigMap`, and the controller resolves it
+/// there, one scoped read per reconcile. An arbitrary URL is therefore not representable in
+/// `ApplicationSpec` at all — the strongest possible form of the SSRF guard, since there is no field
+/// whose validation could be bypassed. `ApplicationSpec::validate` additionally rejects a value that
+/// looks like a URL (`scheme://...`) with an explicit message, so a tenant who copies a URL from a
+/// dashboard gets a terminal, actionable error instead of a gate that silently never resolves.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricGate {
+    /// Sync wave this gate guards: promotion **off** this wave (to the next one) waits for the gate.
+    ///
+    /// Matched against the rendered `ferriscd.io/sync-wave` numbers. A gate **on the last wave of a
+    /// bundle is still gated** (`T20.3` finding M5): declaring any gate puts the operation state
+    /// machine in charge of the rollout, so the gate guards the promotion out of that wave — to
+    /// `PostSync`, and with it to the prune and to `Synced`. A single-wave bundle is therefore *not*
+    /// ungated; it is gated on the only boundary it has.
+    ///
+    /// A gate naming a wave the bundle never renders cannot fire, because there is no boundary after
+    /// it. The controller never treats that as a bypass: it logs a `Warning` naming the gate on every
+    /// pass that renders a bundle the gate does not match, so the mistake is visible instead of
+    /// silent.
+    pub after_wave: i32,
+
+    /// Key of `ConfigMap/ferriscd-metrics-providers-cm` naming the Prometheus provider to query.
+    ///
+    /// Never a URL: the endpoint is configured exclusively by a cluster administrator in the
+    /// control-plane namespace (`T20.3` trap guard).
+    pub provider: String,
+
+    /// PromQL query returning the measurement the gate judges (an instant vector or scalar).
+    pub query: String,
+
+    /// Condition the measurement must satisfy, e.g. `result[0] < 0.01` or `len(result) > 0`.
+    pub success_condition: String,
+
+    /// How long to wait between two samples (default [`DEFAULT_METRIC_GATE_INTERVAL_SECONDS`]).
+    ///
+    /// The wait is always a requeue: no reconcile worker ever sleeps on a bake window.
+    #[serde(default = "default_metric_gate_interval_seconds")]
+    #[schemars(range(min = 1, max = 3600))]
+    pub interval_seconds: u32,
+
+    /// How many consecutive passing samples promote the rollout (default
+    /// [`DEFAULT_METRIC_GATE_COUNT`]).
+    #[serde(default = "default_metric_gate_count")]
+    #[schemars(range(min = 1, max = 10))]
+    pub count: u32,
+
+    /// What a failing sample does (default [`MetricGateFailureAction::Pause`]).
+    #[serde(default)]
+    pub failure_action: MetricGateFailureAction,
+}
+
+fn default_metric_gate_interval_seconds() -> u32 {
+    DEFAULT_METRIC_GATE_INTERVAL_SECONDS
+}
+
+fn default_metric_gate_count() -> u32 {
+    DEFAULT_METRIC_GATE_COUNT
+}
+
+impl MetricGate {
+    /// Returns the sample interval as a [`std::time::Duration`] (validated to be non-zero).
+    #[must_use]
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.interval_seconds.max(1)))
+    }
+
+    /// Returns whether `value` is shaped like a URL (`scheme://…`).
+    ///
+    /// Used by [`ApplicationSpec::validate`] to give a tenant who wrote an endpoint where a provider
+    /// name belongs a precise message. It is deliberately a *shape* test: the field is a name, and
+    /// any value that is not an allowlisted key is refused at runtime either way.
+    #[must_use]
+    pub fn looks_like_url(value: &str) -> bool {
+        value.contains("://")
+    }
+}
+
+/// What a metric gate does when its condition is not satisfied (`T20.3`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema, Default)]
+pub enum MetricGateFailureAction {
+    /// Stop promoting and hold the operation in `Failed` for an operator to inspect (default).
+    ///
+    /// The safest default: nothing is reverted automatically, and `spec.syncPolicy.automated` is
+    /// left exactly as the operator wrote it.
+    #[default]
+    Pause,
+    /// Stop promoting **and** trigger the existing safe rollback path: the previous deployment in
+    /// `status.history` is pinned, `spec.syncPolicy.automated` is removed so `selfHeal` cannot
+    /// overwrite the pin, and a `Warning` condition records why.
+    Rollback,
+}
+
 /// Validation failure for an [`ApplicationSpec`].
 ///
 /// The generated CRD schema rejects the same violations server-side (422); this type
@@ -1073,6 +1228,17 @@ pub enum SpecValidationError {
         /// The rejected value.
         value: i32,
     },
+    /// A `spec.syncPolicy.metricGates[index]` entry is unusable (`T20.3`).
+    ///
+    /// Terminal: the gate is deterministic input, so retrying can never fix it. Every variant names
+    /// the offending entry and what is wrong with it; the `provider` case is the SSRF trap guard.
+    #[error("spec.syncPolicy.metricGates[{index}] is not usable: {reason}")]
+    InvalidMetricGate {
+        /// Zero-based index of the offending entry.
+        index: usize,
+        /// Why it was rejected (never a URL with userinfo: the message names the *shape* only).
+        reason: String,
+    },
 }
 
 impl ApplicationSpec {
@@ -1142,6 +1308,139 @@ impl ApplicationSpec {
             return Err(SpecValidationError::RevisionHistoryLimitOutOfRange {
                 value: self.revision_history_limit,
             });
+        }
+        self.validate_metric_gates()?;
+        Ok(())
+    }
+
+    /// Validates `spec.syncPolicy.metricGates` (`T20.3`).
+    ///
+    /// Every check here is deliberate rather than defensive:
+    ///
+    /// * a **provider** must be a `ConfigMap` key, never a URL — the endpoint is admin-authored, so
+    ///   a tenant-supplied endpoint must be unrepresentable (SSRF trap guard), and a value shaped
+    ///   like `scheme://host` is rejected with a message that says exactly where the endpoint is
+    ///   configured instead;
+    /// * a **query** must be non-empty and length-bounded, because an unbounded PromQL string is the
+    ///   cheapest way to overload the metrics backend;
+    /// * **`count`** and **`intervalSeconds`** are bounded so the number of reconciles (and queries)
+    ///   one gate can hold a rollout for is a known constant;
+    /// * two gates may not guard the same wave: "which sample decides this promotion" would be
+    ///   ambiguous, and one of them would silently never be evaluated.
+    fn validate_metric_gates(&self) -> Result<(), SpecValidationError> {
+        let gates = self
+            .sync_policy
+            .as_ref()
+            .map(SyncPolicy::metric_gates)
+            .unwrap_or_default();
+        if gates.len() > MAX_METRIC_GATES {
+            return Err(SpecValidationError::InvalidMetricGate {
+                index: MAX_METRIC_GATES,
+                reason: format!(
+                    "at most {MAX_METRIC_GATES} metric gates may be declared, got {}",
+                    gates.len()
+                ),
+            });
+        }
+
+        let mut guarded: BTreeSet<i32> = BTreeSet::new();
+        for (index, gate) in gates.iter().enumerate() {
+            let provider = gate.provider.trim();
+            if provider.is_empty() {
+                return Err(SpecValidationError::InvalidMetricGate {
+                    index,
+                    reason: "provider must name an entry of \
+                             ConfigMap/ferriscd-metrics-providers-cm; the Prometheus endpoint is \
+                             configured by a cluster administrator, never by an Application"
+                        .to_owned(),
+                });
+            }
+            if MetricGate::looks_like_url(provider) {
+                return Err(SpecValidationError::InvalidMetricGate {
+                    index,
+                    reason: "provider must be the name of an admin-allowlisted Prometheus provider \
+                             in ConfigMap/ferriscd-metrics-providers-cm, not a URL: the endpoint is \
+                             never read from an Application (SSRF guard)"
+                        .to_owned(),
+                });
+            }
+            // `chars().count()`, not `len()`: the bound the message promises is in characters, and a
+            // byte count would reject a 253-character key that happens to be non-ASCII while letting
+            // a 253-character multi-byte key through as "too long" in a misleading unit (`T20.3`
+            // nit). It is the same rule every other bounded `metricGates` field states.
+            if provider.chars().count() > MAX_METRIC_PROVIDER_CHARS
+                || provider.contains(char::is_whitespace)
+            {
+                return Err(SpecValidationError::InvalidMetricGate {
+                    index,
+                    reason: format!(
+                        "provider must be a ConfigMap key of at most \
+                         {MAX_METRIC_PROVIDER_CHARS} characters with no whitespace"
+                    ),
+                });
+            }
+            if gate.query.trim().is_empty() {
+                return Err(SpecValidationError::InvalidMetricGate {
+                    index,
+                    reason: "query must not be empty".to_owned(),
+                });
+            }
+            if gate.query.chars().count() > MAX_METRIC_QUERY_CHARS {
+                return Err(SpecValidationError::InvalidMetricGate {
+                    index,
+                    reason: format!(
+                        "query must be at most {MAX_METRIC_QUERY_CHARS} characters, got {}",
+                        gate.query.chars().count()
+                    ),
+                });
+            }
+            if gate.success_condition.trim().is_empty() {
+                return Err(SpecValidationError::InvalidMetricGate {
+                    index,
+                    reason: "successCondition must not be empty".to_owned(),
+                });
+            }
+            if gate.success_condition.chars().count() > MAX_METRIC_CONDITION_CHARS {
+                return Err(SpecValidationError::InvalidMetricGate {
+                    index,
+                    reason: format!(
+                        "successCondition must be at most {MAX_METRIC_CONDITION_CHARS} characters, \
+                         got {}",
+                        gate.success_condition.chars().count()
+                    ),
+                });
+            }
+            if gate.interval_seconds == 0
+                || gate.interval_seconds > MAX_METRIC_GATE_INTERVAL_SECONDS
+            {
+                return Err(SpecValidationError::InvalidMetricGate {
+                    index,
+                    reason: format!(
+                        "intervalSeconds must be between 1 and \
+                         {MAX_METRIC_GATE_INTERVAL_SECONDS}, got {}",
+                        gate.interval_seconds
+                    ),
+                });
+            }
+            if gate.count == 0 || gate.count > MAX_METRIC_GATE_SAMPLES {
+                return Err(SpecValidationError::InvalidMetricGate {
+                    index,
+                    reason: format!(
+                        "count must be between 1 and {MAX_METRIC_GATE_SAMPLES}, got {}",
+                        gate.count
+                    ),
+                });
+            }
+            if !guarded.insert(gate.after_wave) {
+                return Err(SpecValidationError::InvalidMetricGate {
+                    index,
+                    reason: format!(
+                        "wave {} is already guarded by an earlier gate: two gates on one boundary \
+                         would leave one of them silently unevaluated",
+                        gate.after_wave
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -2367,5 +2666,263 @@ spec:
                 "{field} must not be required on a sources entry: {entry}"
             );
         }
+    }
+
+    const GATED_APPLICATION: &str = r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: Application
+metadata:
+  name: payment-service
+  namespace: ferriscd-system
+spec:
+  source:
+    git:
+      repoURL: https://github.com/example/payment-service.git
+  destination:
+    namespace: payments
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    metricGates:
+      - afterWave: -1
+        provider: prod
+        query: sum(rate(http_requests_total{code=~"5.."}[5m]))
+        successCondition: result[0] < 0.01
+        intervalSeconds: 60
+        count: 3
+        failureAction: Rollback
+      - afterWave: 0
+        provider: prod
+        query: up{job="api"}
+        successCondition: len(result) > 0
+"#;
+
+    /// `T20.3`: metric gates parse, default, and round-trip; a policy without gates never emits the
+    /// key (so a stored `v1.0` object stays byte-identical).
+    #[test]
+    fn metric_gates_parse_default_and_round_trip() {
+        let app = parse(GATED_APPLICATION);
+        app.spec.validate().expect("a valid gate set must validate");
+        let policy = app.spec.sync_policy.as_ref().expect("syncPolicy");
+        let gates = policy.metric_gates();
+        assert_eq!(gates.len(), 2);
+
+        assert_eq!(gates[0].after_wave, -1);
+        assert_eq!(gates[0].provider, "prod");
+        assert_eq!(gates[0].interval_seconds, 60);
+        assert_eq!(gates[0].count, 3);
+        assert_eq!(gates[0].failure_action, MetricGateFailureAction::Rollback);
+        assert_eq!(gates[0].interval(), std::time::Duration::from_secs(60));
+
+        // Omitted fields default: `Pause` (the safe action) and the documented cadence/count.
+        assert_eq!(gates[1].failure_action, MetricGateFailureAction::Pause);
+        assert_eq!(
+            gates[1].interval_seconds,
+            DEFAULT_METRIC_GATE_INTERVAL_SECONDS
+        );
+        assert_eq!(gates[1].count, DEFAULT_METRIC_GATE_COUNT);
+
+        let value = serde_json::to_value(&app).expect("the application must serialize");
+        let gate = &value["spec"]["syncPolicy"]["metricGates"][0];
+        assert_eq!(gate["afterWave"], json!(-1));
+        assert_eq!(gate["successCondition"], json!("result[0] < 0.01"));
+        assert_eq!(gate["failureAction"], json!("Rollback"));
+        assert!(
+            gate.get("prometheusUrl").is_none(),
+            "a URL is not part of the schema at all: {gate}"
+        );
+
+        // YAML round-trip keeps the gates identical.
+        let serialized = serde_saphyr::to_string(&app).expect("the application must serialize");
+        assert_eq!(parse(&serialized), app);
+
+        // A policy without gates emits no `metricGates` key.
+        let plain = parse(MINIMAL_APPLICATION);
+        plain.spec.validate().expect("minimal application is valid");
+        let value = serde_json::to_value(&plain).expect("serialize");
+        assert!(value["spec"].get("syncPolicy").is_none(), "{value}");
+        let policy = SyncPolicy::default();
+        assert!(policy.metric_gates().is_empty());
+    }
+
+    /// `T20.3` validation: every rejection is terminal and names the offending entry — and the
+    /// provider case is the SSRF trap guard (an `Application` can never name an endpoint).
+    #[test]
+    fn metric_gate_validation_refuses_unsafe_or_ambiguous_gates() {
+        fn gated(gates: Vec<MetricGate>) -> ApplicationSpec {
+            let mut spec = parse(MINIMAL_APPLICATION).spec;
+            spec.sync_policy = Some(SyncPolicy {
+                metric_gates: gates,
+                ..SyncPolicy::default()
+            });
+            spec
+        }
+        fn gate(provider: &str) -> MetricGate {
+            MetricGate {
+                after_wave: 0,
+                provider: provider.to_owned(),
+                query: "up".to_owned(),
+                success_condition: "result[0] > 0".to_owned(),
+                interval_seconds: 30,
+                count: 1,
+                failure_action: MetricGateFailureAction::Pause,
+            }
+        }
+
+        // A URL where a provider name belongs is refused with an actionable message.
+        for provider in [
+            "http://prometheus:9090",
+            "https://169.254.169.254",
+            "ftp://x",
+        ] {
+            let error = gated(vec![gate(provider)])
+                .validate()
+                .expect_err("a URL must be refused");
+            let message = error.to_string();
+            assert!(message.contains("metricGates[0]"), "{message}");
+            assert!(message.contains("SSRF"), "{message}");
+        }
+        for provider in [
+            "",
+            "   ",
+            "prod us",
+            &"p".repeat(MAX_METRIC_PROVIDER_CHARS + 1),
+        ] {
+            assert!(
+                gated(vec![gate(provider)]).validate().is_err(),
+                "provider {provider:?} must be refused"
+            );
+        }
+
+        // Malformed queries / conditions and out-of-range tunables are refused.
+        let cases: Vec<MetricGate> = vec![
+            MetricGate {
+                query: "   ".to_owned(),
+                ..gate("prod")
+            },
+            MetricGate {
+                query: "u".repeat(MAX_METRIC_QUERY_CHARS + 1),
+                ..gate("prod")
+            },
+            MetricGate {
+                success_condition: String::new(),
+                ..gate("prod")
+            },
+            MetricGate {
+                success_condition: "c".repeat(MAX_METRIC_CONDITION_CHARS + 1),
+                ..gate("prod")
+            },
+            MetricGate {
+                interval_seconds: 0,
+                ..gate("prod")
+            },
+            MetricGate {
+                interval_seconds: MAX_METRIC_GATE_INTERVAL_SECONDS + 1,
+                ..gate("prod")
+            },
+            MetricGate {
+                count: 0,
+                ..gate("prod")
+            },
+            MetricGate {
+                count: MAX_METRIC_GATE_SAMPLES + 1,
+                ..gate("prod")
+            },
+        ];
+        for (index, case) in cases.into_iter().enumerate() {
+            assert!(
+                gated(vec![case]).validate().is_err(),
+                "case {index} must be refused"
+            );
+        }
+
+        // Two gates on one wave would leave one silently unevaluated.
+        let error = gated(vec![gate("prod"), gate("prod")])
+            .validate()
+            .expect_err("duplicate waves must be refused");
+        assert!(error.to_string().contains("already guarded"), "{error}");
+
+        // Too many gates.
+        let many: Vec<MetricGate> = (0..=MAX_METRIC_GATES)
+            .map(|index| MetricGate {
+                after_wave: index as i32,
+                ..gate("prod")
+            })
+            .collect();
+        assert!(gated(many).validate().is_err());
+
+        // The boundaries are accepted.
+        gated(vec![MetricGate {
+            interval_seconds: MAX_METRIC_GATE_INTERVAL_SECONDS,
+            count: MAX_METRIC_GATE_SAMPLES,
+            ..gate("prod")
+        }])
+        .validate()
+        .expect("boundary values are valid");
+
+        // The provider bound is a **character** count, like every other bounded gate field
+        // (`T20.3` nit): a `MAX_METRIC_PROVIDER_CHARS`-long key is accepted even when it is
+        // multi-byte, and one character more is refused.
+        let multi_byte = "é".repeat(MAX_METRIC_PROVIDER_CHARS);
+        assert!(
+            multi_byte.len() > MAX_METRIC_PROVIDER_CHARS,
+            "the fixture must be longer in bytes than in characters: {} bytes",
+            multi_byte.len()
+        );
+        gated(vec![gate(&multi_byte)])
+            .validate()
+            .expect("a 253-character (506-byte) key is within the character bound");
+        assert!(
+            gated(vec![gate(&"é".repeat(MAX_METRIC_PROVIDER_CHARS + 1))])
+                .validate()
+                .is_err(),
+            "one character over the bound must be refused"
+        );
+    }
+
+    /// The CRD schema carries the gates, with the documented bounds (server-side 422 parity).
+    #[test]
+    fn the_crd_schema_documents_metric_gates() {
+        let crd = crate::generate::crd_documents().expect("the CRDs must render");
+        let application = crd
+            .iter()
+            .find(|document| document.file_name.contains("applications"))
+            .expect("the Application CRD");
+        let schema: serde_json::Value = serde_saphyr::from_str(&application.manifest)
+            .expect("the rendered CRD must be valid YAML");
+        let gate = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["syncPolicy"]["properties"]["metricGates"];
+        let properties = gate["items"]["properties"]
+            .as_object()
+            .expect("the gate schema has properties");
+        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "afterWave",
+                "count",
+                "failureAction",
+                "intervalSeconds",
+                "provider",
+                "query",
+                "successCondition",
+            ],
+            "the gate schema is exactly the documented field set: no field can name an endpoint"
+        );
+        assert_eq!(gate["maxItems"], json!(MAX_METRIC_GATES as u64));
+        assert_eq!(
+            properties["count"]["maximum"],
+            json!(f64::from(MAX_METRIC_GATE_SAMPLES))
+        );
+        assert_eq!(
+            properties["intervalSeconds"]["maximum"],
+            json!(f64::from(MAX_METRIC_GATE_INTERVAL_SECONDS))
+        );
+        assert_eq!(
+            properties["failureAction"]["enum"],
+            json!(["Pause", "Rollback"])
+        );
     }
 }

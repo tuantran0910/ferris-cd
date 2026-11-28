@@ -22,6 +22,7 @@
 //! | Waves | `ferriscd_engine::graph::waves`: the permanent set grouped by `ferriscd.io/sync-wave`, applied one wave per pass, gated on the wave being `Healthy` (`T10.2`) |
 //! | Hooks | `crate::hooks`: created with `Api::create` (so `generateName` works), tracked in `status.operationState.activeHooks`, reaped by their delete policy, never in `status.inventory` (`T10.3`/`T10.4`) |
 //! | Operation state | `ferriscd_engine::sync::SyncMachine`: `PreSync` -> `Sync(wave)` -> `PostSync` -> `Succeeded`, persisted before the requeue, 5 s while waiting, 10 min timeouts (`T10.1`) |
+//! | Metric gates | `crate::metric_gate` (`T20.3`): `spec.syncPolicy.metricGates[]` holds promotion **off** a converged wave until one bounded Prometheus query per pass has satisfied `successCondition` `count` times. Progress lives in `status.operationState.metricGate`, so a restart resumes the bake; a breach aborts the operation (`Pause`) or re-enters the `T10.5` rollback path (`Rollback`) |
 //! | History & rollback | `ferriscd_engine::sync::history`: bounded `status.history`, and `{"rollback":{"id":N}}` pinned before the diff gate with automation disabled (`T10.5`) |
 //! | Tenancy policy | `ferriscd_engine::policy::AppProjectPolicy`: the referenced `AppProject` is read from the control-plane namespace and enforced **before** the repository is resolved, then re-checked on **every** rendered resource after scope normalization (`T12.1`) |
 //! | Application namespaces | `--application-namespaces` widens the watch (`T12.2`), and a tenant `Application` is refused unless its project lists its namespace and it names its own authorized `serviceAccountName` |
@@ -68,6 +69,15 @@
 //!   stamped, planned, diffed or inventoried; they are created with `Api::create` and tracked in
 //!   `status.operationState.activeHooks` by their rendered id, so a requeue observes the `Job` the
 //!   previous pass created instead of running the migration again (finding H2).
+//! * **A metric gate never sleeps** (`T20.3`). A gate at a wave boundary issues at most one
+//!   bounded (5 s) query per pass, records `gatePhase`/`consecutiveSuccesses`/`lastCheckedAt` in
+//!   `status.operationState.metricGate`, and requeues; the hold moves both timeout clocks so a bake
+//!   is never mistaken for a stuck wave. The provider is named by a `ConfigMap` key, never a URL.
+//! * **A remediation pass is never gated** (`T20.3` finding C1). The pass that honours a rollback —
+//!   the one a *failed gate* requested, and every pass that keeps redeploying the revision the
+//!   rollback warning pinned — renders a known-good revision, so its gates are inert
+//!   (`PassRequest::gate_suppressed`). Sampling it would re-run the query that just failed and
+//!   overwrite the request, and the remediation would never land.
 //! * **A rollback is pinned, not compared** (`T10.5`). `{"rollback":{"id":N}}` is parsed before the
 //!   diff gate: the pass renders the *historical* commit, removes `spec.syncPolicy.automated` and
 //!   records a `Warning` condition, because a rollback `selfHeal` immediately reverts is not a
@@ -520,6 +530,21 @@ struct PassRequest<'a> {
     /// The sync-window verdict behind `decision` (`T17.4`): a `Skip` pass applies and prunes
     /// nothing, and a paused operation requeues for the window boundary.
     window: &'a SyncWindowVerdict,
+    /// `T20.3`: the metric gates declared by `spec.syncPolicy.metricGates` (empty when none).
+    ///
+    /// Carried on the request so the pass-local boundary check cannot disagree with what the diff
+    /// gate ran against: `prepare_pass` validated them and refused an unwired pipeline already.
+    gates: &'a [ferriscd_crd::MetricGate],
+    /// `T20.3` finding C1: this pass is a **remediation**, so no gate may hold it.
+    ///
+    /// A pass that renders a pinned revision — the first pass of a `{"rollback":{"id":N}}` request
+    /// and every pass after it while the rollback's `warning` pin stands — is deploying a *known
+    /// good* revision, not promoting this revision forward. Sampling a gate on it would re-run the
+    /// same query against the same dashboard that just failed, fail again, and overwrite the
+    /// `ferriscd.io/operation` request the rollback path is trying to honour: the remediation never
+    /// lands and the controller oscillates between the two revisions forever. It is the same rule as
+    /// "a failing wave is never gated", one level up.
+    gate_suppressed: bool,
     prune_enabled: bool,
     prev_inventory: &'a Inventory,
     now: &'a Time,
@@ -674,6 +699,13 @@ struct PreparedPass {
     invalid_ignore_pointers: usize,
     /// `T20.2`: the pre-sync policy gate's verdict over the rendered bundle.
     policy_gate: PolicyGateOutcome,
+    /// `T20.3`: the metric gates declared by the spec, copied once so the pass cannot re-read a
+    /// different `spec` than the one it validated.
+    metric_gates: Vec<ferriscd_crd::MetricGate>,
+    /// `T20.3` finding C1: this pass renders a **pinned** (remediation) revision, so its gates are
+    /// inert. Computed here — before anything is fetched — from the same two facts that pin the
+    /// revision, so `pinned_revision` and the suppression can never disagree.
+    gate_suppressed: bool,
 }
 
 /// The wired [`SyncPipeline`].
@@ -740,6 +772,16 @@ pub struct InventorySyncPipeline {
     policy_rule_source: Option<Arc<dyn crate::policy_rules::PolicyRuleSource>>,
     /// `T20.2`: the policy gate, held across passes so the compiled-program cache is reused.
     policy_gate: PolicyGate,
+    /// `T20.3`: the admin-allowlisted Prometheus providers
+    /// (`ConfigMap/ferriscd-metrics-providers-cm`), read on demand — one scoped `GET`, and only for
+    /// an `Application` that actually declares a metric gate.
+    ///
+    /// `None` means this build cannot resolve a provider, and an `Application` that declares a gate
+    /// is refused **terminally** rather than promoted without a sample (fail closed).
+    metric_providers: Option<Arc<dyn crate::metric_gate::MetricProviderSource>>,
+    /// `T20.3`: the bounded Prometheus query transport. `None` fails closed exactly like an
+    /// unwired provider source: a gate that cannot be sampled must never be skipped.
+    metric_transport: Option<Arc<dyn crate::metric_gate::MetricQueryTransport>>,
     /// `T18.1`: what ownership stamp every permanent resource receives before the diff and the
     /// apply. The default (`StampOptions::tracking_id_only`) is the `v1.0` behaviour; the opt-in
     /// `--enable-drift-watcher` adds the `ferriscd.io/managed-by` / `ferriscd.io/app-hash` label
@@ -786,6 +828,60 @@ impl std::fmt::Debug for InventorySyncPipeline {
     }
 }
 
+/// What a metric gate allowed at a wave boundary (`T20.3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Promotion {
+    /// Promotion may continue: the state machine's action stands.
+    Continue,
+    /// Promotion is held for the gate: the operation state and requeue hint are already persisted.
+    Held,
+}
+
+/// Persists "the gate is holding promotion" (`T20.3`).
+///
+/// The operation stays `Running` on the wave it converged from, so a controller restart resumes at
+/// exactly that boundary. Both timeout clocks move to `now`: a bake is not a stuck rollout (the
+/// `T17.4` sync-window rule), and the wait is expressed as a requeue hint — never a `sleep`.
+fn hold_promotion(
+    request: &PassRequest<'_>,
+    step: SyncStep,
+    state: &OperationState,
+    pass: &mut PassExecution,
+    gate_state: ferriscd_crd::status::MetricGateState,
+    requeue_after: Duration,
+) {
+    let mut held = state.clone();
+    held.message = gate_state.message.clone().or_else(|| {
+        Some(format!(
+            "waiting for the metric gate after wave {} to pass",
+            step.wave
+        ))
+    });
+    held.metric_gate = Some(gate_state);
+    held.phase = OperationPhase::Running;
+    held.sync_phase = Some(SyncPhase::Sync);
+    held.current_wave = step.wave;
+    held.phase_started_at = Some(request.now.clone());
+    held.started_at = request.now.clone();
+    held.finished_at = None;
+    pass.operation = Some(held);
+    pass.requeue = Some(requeue_after);
+}
+
+/// The deployment before `current` in `status.history`, as `(history id, revision)`.
+///
+/// `status.history` is newest-first and only records **settled** deployments, so the first entry
+/// whose revision differs from the running one is exactly "the deployment to go back to". Returning
+/// `None` (a first rollout, or a history that only holds the current revision) is what makes
+/// `failureAction: Rollback` degrade to a pause instead of inventing a target.
+fn previous_deployment(status: &ApplicationStatus, current: &str) -> Option<(i64, String)> {
+    status.history.iter().find_map(|entry| {
+        let revision = entry.revision.as_deref()?;
+        (!revision.trim().is_empty() && revision != current)
+            .then(|| (entry.id, revision.to_owned()))
+    })
+}
+
 impl InventorySyncPipeline {
     /// Builds the pipeline from its collaborators.
     ///
@@ -825,6 +921,8 @@ impl InventorySyncPipeline {
             audit: None,
             policy_rule_source: None,
             policy_gate: default_policy_gate(),
+            metric_providers: None,
+            metric_transport: None,
             stamp: ferriscd_engine::inventory::StampOptions::tracking_id_only(),
             self_echo: None,
             oci: None,
@@ -982,6 +1080,31 @@ impl InventorySyncPipeline {
     #[must_use]
     pub fn with_policy_gate(mut self, gate: PolicyGate) -> Self {
         self.policy_gate = gate;
+        self
+    }
+
+    /// Wires the `T20.3` Prometheus provider allowlist
+    /// (`ConfigMap/ferriscd-metrics-providers-cm`).
+    ///
+    /// Without it an `Application` that declares `spec.syncPolicy.metricGates` is refused
+    /// terminally: promoting a metric-gated wave without ever sampling it would defeat the gate
+    /// entirely, and a silent skip is exactly the fail-open the roadmap forbids.
+    #[must_use]
+    pub fn with_metric_providers(
+        mut self,
+        source: Arc<dyn crate::metric_gate::MetricProviderSource>,
+    ) -> Self {
+        self.metric_providers = Some(source);
+        self
+    }
+
+    /// Wires the `T20.3` bounded Prometheus query transport (see [`Self::with_metric_providers`]).
+    #[must_use]
+    pub fn with_metric_transport(
+        mut self,
+        transport: Arc<dyn crate::metric_gate::MetricQueryTransport>,
+    ) -> Self {
+        self.metric_transport = Some(transport);
         self
     }
 
@@ -1346,6 +1469,8 @@ impl InventorySyncPipeline {
             options: &prepared.options,
             decision: prepared.decision,
             window: &prepared.window,
+            gates: prepared.metric_gates.as_slice(),
+            gate_suppressed: prepared.gate_suppressed,
             prune_enabled: prepared.prune_enabled,
             prev_inventory: &prepared.prev_inventory,
             now: &prepared.pass_started,
@@ -1356,11 +1481,16 @@ impl InventorySyncPipeline {
             waves = prepared.bundle.plan.wave_count(),
             prune_enabled = prepared.prune_enabled,
         );
+        // `T20.3`: a declared metric gate forces the operation state machine even for a
+        // single-wave, hook-less bundle. Without it the gate would be silently unreachable (there
+        // is no wave boundary to promote off in a single pass), and a `spec` that asks for a bake
+        // would be promoted in one shot — the exact fail-open the gate exists to prevent.
+        let needs_operation = prepared
+            .bundle
+            .needs_operation(BundleWaves::operation_running(app.status.as_ref()))
+            || !prepared.metric_gates.is_empty();
         let pass = async {
-            if prepared
-                .bundle
-                .needs_operation(BundleWaves::operation_running(app.status.as_ref()))
-            {
+            if needs_operation {
                 self.run_operation(&request).await
             } else {
                 Ok(self.run_single_pass(&request).await)
@@ -1479,10 +1609,20 @@ impl InventorySyncPipeline {
             health: assessment.status,
             settled: pass.settled,
             phase: pass.operation.as_ref().map(|state| {
-                waves::step_label(
+                let label = waves::step_label(
                     state.sync_phase.unwrap_or(SyncPhase::Sync),
                     state.current_wave,
-                )
+                );
+                // `T20.3`: a held operation is not "waiting for a wave to become Healthy" — the
+                // wave already converged and the *gate* is what is holding promotion. Say so, or
+                // an operator reads a perfectly working canary as a stuck rollout.
+                match state.metric_gate.as_ref() {
+                    Some(gate) if !gate.gate_phase.is_terminal() => format!(
+                        "{label}, metric gate after wave {} {}/{} sample(s)",
+                        gate.after_wave, gate.consecutive_successes, gate.required_successes
+                    ),
+                    _ => label,
+                }
             }),
             requeue: pass.requeue,
         };
@@ -1580,6 +1720,33 @@ impl InventorySyncPipeline {
         let previous_status = app.status.clone().unwrap_or_default();
         let pass_started = now();
 
+        // --- Phase 20 (`T20.3`): metric gates must be samplable or the pass is refused ----------
+        // Checked here, before anything is fetched, rendered, diffed or applied: an `Application`
+        // that declares a gate a *build* cannot sample would otherwise be promoted silently, which
+        // is the fail-open the gate exists to prevent. `spec.syncPolicy.metricGates` is validated by
+        // `AppSpec::validate` above (shape, bounds, no URL), so this only decides whether the
+        // controller has the two collaborators the gate needs.
+        let metric_gates: Vec<ferriscd_crd::MetricGate> = app
+            .spec
+            .sync_policy
+            .as_ref()
+            .map(|policy| policy.metric_gates().to_vec())
+            .unwrap_or_default();
+        if !metric_gates.is_empty()
+            && (self.metric_providers.is_none() || self.metric_transport.is_none())
+        {
+            return Err(ReconcileError::Invalid {
+                message: format!(
+                    "spec.syncPolicy.metricGates declares {} gate(s) but the controller has no \
+                     metrics provider source or query transport wired, so the gate could never be \
+                     sampled; refusing to sync. Configure providers in \
+                     ConfigMap/{} in the control-plane namespace",
+                    metric_gates.len(),
+                    crate::metric_gate::METRICS_PROVIDERS_CONFIGMAP_NAME,
+                ),
+            });
+        }
+
         // --- Phase 10: the rollback request decides *which commit* this pass sees ---------
         // Parsed before the diff gate and before `spec.source` is resolved: a rollback that first
         // applied `HEAD` and then "rolled back" would have mutated the cluster towards the wrong
@@ -1591,6 +1758,19 @@ impl InventorySyncPipeline {
             .as_ref()
             .map(|rollback| rollback.decision.pinned_revision().to_owned())
             .or_else(|| pinned_rollback_revision(&previous_status));
+        // `T20.3` finding C1: both halves of "this pass is a remediation". The first pass renders the
+        // revision an operator (or a failed metric gate) asked to go back to; every pass after it
+        // renders the revision the standing rollback warning pinned, until automation is re-enabled.
+        // Neither is a promotion of the current revision, so neither may be gated.
+        let gate_suppressed = rollback.is_some() || pinned_revision.is_some();
+        if gate_suppressed && !metric_gates.is_empty() {
+            tracing::debug!(
+                app.namespace = %owner.namespace,
+                app.name = %owner.name,
+                gates = metric_gates.len(),
+                "remediation pass: metric gates are inert while a pinned revision is redeployed"
+            );
+        }
 
         if options.server_side_force {
             warn!(
@@ -1678,6 +1858,24 @@ impl InventorySyncPipeline {
         // stamped half — a plan built before the stamp would apply every wave member without its
         // `ferriscd.io/tracking-id` and report that annotation as permanent drift.
         bundle.replan().map_err(ReconcileError::Manifest)?;
+
+        // --- Phase 20 (`T20.3` finding M6): a gate that matches no wave is never silent ---------
+        // A gate is evaluated at the boundary *after* its wave, so one naming a wave this bundle does
+        // not render can never fire. That is not a bypass — the promotion it was meant to guard is
+        // simply not the one it names — but an operator who typed `afterWave: 2` against a two-wave
+        // bundle (`0` and `1`) deserves to be told, on every pass, instead of assuming the bake ran.
+        let wave_numbers = bundle.plan.wave_numbers();
+        for gate in crate::metric_gate::unmatched_gates(&metric_gates, &wave_numbers) {
+            warn!(
+                app.namespace = %owner.namespace,
+                app.name = %owner.name,
+                after_wave = gate.after_wave,
+                provider = %gate.provider,
+                waves = ?wave_numbers,
+                "spec.syncPolicy.metricGates: this gate guards a wave the rendered bundle does not \
+                 contain, so it will never be sampled; fix `afterWave` or remove the gate"
+            );
+        }
 
         let desired_inventory = bundle.hooks.permanent_inventory();
         // Safety rail: an empty desired set over a non-empty inventory is far more likely to be
@@ -1820,6 +2018,8 @@ impl InventorySyncPipeline {
             desired_inventory,
             invalid_ignore_pointers,
             policy_gate,
+            metric_gates,
+            gate_suppressed,
         })
     }
 
@@ -2082,7 +2282,37 @@ impl InventorySyncPipeline {
         pass.operation = Some(outcome.state.clone());
         pass.requeue = outcome.action.requeue_after();
 
-        // 4. Execute what the machine asked for.
+        // 4. `T20.3`: the metric gate guards promotion **off** the wave that just converged.
+        //
+        // The machine has already decided to leave `step` (it is `Sync(wave)` and the next action
+        // ranks strictly higher). A gate on that boundary turns that decision into a *sample now,
+        // promote later*: this pass issues at most one bounded query, persists the progress in
+        // `status.operationState.metricGate`, and requeues — no worker ever sleeps on a bake.
+        //
+        // `gate_suppressed` is finding C1: a pass that renders a **pinned** revision (the rollback a
+        // failed gate asked for, or the one the standing rollback warning pins) is a remediation, not
+        // a promotion, so it must never be sampled — otherwise the gate fails again on the same
+        // dashboard, rewrites the rollback request, and the remediation never lands.
+        if !request.gate_suppressed
+            && step.phase == SyncPhase::Sync
+            && outcome.action.step().is_some_and(|next| {
+                // Only a **promotion** is gated. A step that moves to `SyncFail` ranks higher too,
+                // and a failing wave must reach the failure hooks with its own reason — never be
+                // held by a bake, and never be replaced by a metric-gate verdict.
+                next.rank() > step.rank()
+                    && !matches!(next.phase, SyncPhase::SyncFail | SyncPhase::Failed)
+            })
+            && let Some(gate) = crate::metric_gate::gate_after_wave(request.gates, step.wave)
+            && matches!(
+                self.gate_promotion(request, gate, step, &state, &mut pass)
+                    .await?,
+                Promotion::Held
+            )
+        {
+            return Ok(pass);
+        }
+
+        // 5. Execute what the machine asked for.
         let mut targets = Vec::new();
         if let StepAction::Execute { step: target, .. } = outcome.action {
             targets.push(target);
@@ -2184,6 +2414,244 @@ impl InventorySyncPipeline {
 
         pass.settled = outcome.state.phase == OperationPhase::Succeeded;
         Ok(pass)
+    }
+
+    /// Applies the metric gate that guards promotion off `step` (`T20.3`).
+    ///
+    /// Called only when the pure state machine has decided to leave the converged `Sync(wave)`
+    /// step. Exactly one of three things happens, and each of them persists what it learned:
+    ///
+    /// | Gate | What this pass does |
+    /// |---|---|
+    /// | none, or already `Passed` | nothing: the machine's action stands |
+    /// | due for a sample | issues **one** bounded query, folds the result, then holds or promotes |
+    /// | holding | persists the progress, requeues for the remaining interval, applies **nothing** |
+    /// | failed | aborts the operation (`Failed`), and for `failureAction: Rollback` writes the
+    ///   `ferriscd.io/operation` rollback request the existing safe-rollback path consumes |
+    ///
+    /// Not called at all for a remediation pass (`request.gate_suppressed`, finding C1): the pinned
+    /// revision is redeployed as-is, and the caller never even reads the provider allowlist.
+    ///
+    /// The hold deliberately resets both timeout clocks (`startedAt`/`phaseStartedAt`), exactly like
+    /// the `T17.4` sync-window pause: a bake is not a stuck rollout, so a sixty-second sample
+    /// interval with `count: 3` must not trip the ten-minute wave timeout. It is also what keeps the
+    /// pass non-blocking — the wait lives in `/status` and in the requeue hint, never in the worker.
+    ///
+    /// # Errors
+    ///
+    /// A terminal refusal when the gate names a provider that is not allowlisted
+    /// ([`crate::metric_gate::resolve_provider`]), a retryable API error from the provider
+    /// `ConfigMap` read, or the terminal [`ReconcileError::SyncConflict`] a gate failure produces.
+    async fn gate_promotion(
+        &self,
+        request: &PassRequest<'_>,
+        gate: &ferriscd_crd::MetricGate,
+        step: SyncStep,
+        state: &OperationState,
+        pass: &mut PassExecution,
+    ) -> Result<Promotion, ReconcileError> {
+        let Some(source) = self.metric_providers.as_deref() else {
+            // Unreachable: `prepare_pass` refuses a gated `Application` in such a pipeline. Kept as
+            // a refusal rather than an `unwrap`, because "promote without a sample" is the one
+            // outcome the gate exists to prevent.
+            return Err(ReconcileError::Invalid {
+                message: "this controller cannot sample metric gates (no provider source is \
+                          wired); refusing to promote"
+                    .to_owned(),
+            });
+        };
+        let providers = source.providers().await?;
+        let provider = crate::metric_gate::resolve_provider(&providers, gate)?;
+
+        // One pass evaluates the gate once: `plan` says whether a sample is due, the transport
+        // issues at most one bounded query, and `record` folds it into the persisted state.
+        let mut verdict = crate::metric_gate::plan(gate, state.metric_gate.as_ref(), request.now);
+        if let crate::metric_gate::GateStep::Sample { state: sampling } = &verdict {
+            let Some(transport) = self.metric_transport.as_deref() else {
+                return Err(ReconcileError::Invalid {
+                    message: "this controller cannot sample metric gates (no query transport is \
+                              wired); refusing to promote"
+                        .to_owned(),
+                });
+            };
+            let observation = transport
+                .query(crate::metric_gate::MetricQueryRequest {
+                    url: provider.url(),
+                    query: &gate.query,
+                    timeout: crate::metric_gate::METRIC_GATE_QUERY_TIMEOUT,
+                })
+                .await;
+            verdict = crate::metric_gate::record(gate, sampling, &observation, request.now);
+        }
+
+        match verdict {
+            crate::metric_gate::GateStep::Passed { state: gate_state } => {
+                // Promotion is allowed: the machine's action stands, with the gate recorded so a
+                // later pass of the same operation never re-samples it.
+                if let Some(operation) = pass.operation.as_mut() {
+                    operation.metric_gate = Some(gate_state);
+                }
+                Ok(Promotion::Continue)
+            }
+            crate::metric_gate::GateStep::Hold {
+                state: gate_state,
+                requeue_after,
+            } => {
+                hold_promotion(request, step, state, pass, gate_state, requeue_after);
+                tracing::debug!(
+                    app.namespace = %request.owner.namespace,
+                    app.name = %request.owner.name,
+                    wave = step.wave,
+                    provider = %gate.provider,
+                    requeue_after_seconds = requeue_after.as_secs(),
+                    "metric gate holds promotion; requeueing instead of sleeping"
+                );
+                Ok(Promotion::Held)
+            }
+            crate::metric_gate::GateStep::Failed {
+                state: gate_state,
+                action,
+                message,
+            } => {
+                // A failed gate aborts the operation: `Failed` is terminal for this revision, so
+                // `failed_operation_is_not_retried` holds it until a new commit or an explicit
+                // operator request — never a requeue storm against a broken canary.
+                let mut failed = state.clone();
+                failed.metric_gate = Some(gate_state);
+                failed.phase = OperationPhase::Failed;
+                failed.sync_phase = Some(SyncPhase::Failed);
+                failed.finished_at = Some(request.now.clone());
+                failed.message = Some(message.clone());
+
+                let rollback = match action {
+                    ferriscd_crd::MetricGateFailureAction::Pause => None,
+                    ferriscd_crd::MetricGateFailureAction::Rollback => {
+                        self.request_gate_rollback(request, gate, &message, &failed.clone())
+                            .await?
+                    }
+                };
+
+                let summary = match &rollback {
+                    Some(note) => format!("{message}; {note}"),
+                    None => format!("{message}; promotion is paused for an operator"),
+                };
+                failed.message = Some(summary.clone());
+                self.audit_gate_failure(request, gate, step, action, &summary);
+                tracing::warn!(
+                    app.namespace = %request.owner.namespace,
+                    app.name = %request.owner.name,
+                    wave = step.wave,
+                    provider = %gate.provider,
+                    action = ?action,
+                    "metric gate failed: the rollout stopped promoting"
+                );
+                Err(ReconcileError::SyncConflict {
+                    message: summary,
+                    inventory: request.prev_inventory.clone(),
+                    revision: Some(request.revision.to_owned()),
+                    revisions: request.revisions.to_vec(),
+                    operation: Some(Box::new(failed)),
+                })
+            }
+            // Unreachable by construction (`plan` returns `Sample` once and the branch above
+            // consumed it). Treated as a hold rather than a panic: a mis-wired gate must never
+            // promote without a sample, and a reconcile worker must never abort the process.
+            crate::metric_gate::GateStep::Sample { state: gate_state } => {
+                hold_promotion(request, step, state, pass, gate_state, gate.interval());
+                Ok(Promotion::Held)
+            }
+        }
+    }
+
+    /// Writes the `ferriscd.io/operation` rollback request a failed metric gate asks for (`T20.3`).
+    ///
+    /// The rollback itself is **not** performed here: patching the annotation is what re-enters the
+    /// existing, crash-safe rollback path (`T10.5`) on the next reconcile — it renders the pinned
+    /// historical commit, removes `spec.syncPolicy.automated` so `selfHeal` cannot overwrite the pin,
+    /// records the `Warning` condition, and consumes the request. Re-implementing that here would be
+    /// a second rollback implementation that could disagree with the operator-driven one.
+    ///
+    /// `state` is the aborted operation state, so a failed patch still carries it to `/status`
+    /// (the retry must not lose the gate verdict).
+    ///
+    /// Returns the sentence to append to the failure message, or `None` when there is no earlier
+    /// deployment to roll back to — in which case the rollout is simply paused.
+    async fn request_gate_rollback(
+        &self,
+        request: &PassRequest<'_>,
+        gate: &ferriscd_crd::MetricGate,
+        message: &str,
+        state: &OperationState,
+    ) -> Result<Option<String>, ReconcileError> {
+        let status = request.app.status.clone().unwrap_or_default();
+        let Some((history_id, revision)) = previous_deployment(&status, request.revision) else {
+            // `status.history` only records settled deployments, so a gate on the very first
+            // rollout of an application has nothing to go back to. Pausing is the safe answer.
+            return Ok(None);
+        };
+        let annotation = serde_json::json!({ "rollback": { "id": history_id } }).to_string();
+        self.applier
+            .patch_application(ApplicationPatch {
+                namespace: &request.owner.namespace,
+                name: &request.owner.name,
+                patch: serde_json::json!({
+                    "metadata": { "annotations": { annotations::OPERATION: annotation } }
+                }),
+            })
+            .await
+            .map_err(|error| {
+                mid_operation_error(request, &error, request.prev_inventory, Some(state.clone()))
+            })?;
+        warn!(
+            app.namespace = %request.owner.namespace,
+            app.name = %request.owner.name,
+            provider = %gate.provider,
+            history_id,
+            revision = %revision,
+            gate_message = message,
+            "metric gate failed with failureAction: Rollback; requesting a rollback to the \
+             previous deployment (the next reconcile pins it and disables automated sync)"
+        );
+        Ok(Some(format!(
+            "requested a rollback to history id {history_id} (revision {})",
+            short_sha(&revision)
+        )))
+    }
+
+    /// Emits the compliance audit record of a metric-gate failure (`T20.3`, `T17.2`).
+    ///
+    /// Best effort by construction: [`crate::audit::AuditLogger::emit`] never blocks a reconcile.
+    /// The reason is the gate's own bounded message, so no URL and no `Secret` value can reach the
+    /// audit trail.
+    fn audit_gate_failure(
+        &self,
+        request: &PassRequest<'_>,
+        gate: &ferriscd_crd::MetricGate,
+        step: SyncStep,
+        action: ferriscd_crd::MetricGateFailureAction,
+        message: &str,
+    ) {
+        let Some(audit) = &self.audit else {
+            return;
+        };
+        audit.emit(
+            crate::audit::AuditEvent::new(
+                crate::audit::AuditCategory::ApiOperation,
+                crate::audit::AuditActor::system("controller.metric_gate"),
+                crate::audit::AuditTarget {
+                    namespace: Some(request.owner.namespace.clone()),
+                    name: Some(request.owner.name.clone()),
+                    project: Some(request.app.spec.project.clone()),
+                    cluster: Some(request.app.spec.destination.cluster.clone()),
+                },
+                "metric-gate-breach",
+                crate::audit::AuditOutcome::Failed,
+            )
+            .with_reason(format!(
+                "wave {} gate on provider {:?} failed with failureAction {action:?}: {message}",
+                step.wave, gate.provider
+            )),
+        );
     }
 
     /// Builds and executes the plan for one slice of desired resources.
@@ -3754,6 +4222,7 @@ fn succeeded_operation(revision: &str, now: &Time, last_wave: Option<i32>) -> Op
         phase_started_at: Some(now.clone()),
         revision: Some(revision.to_owned()),
         active_hooks: Vec::new(),
+        metric_gate: None,
         message: Some("sync completed: every resource is applied".to_owned()),
         started_at: now.clone(),
         finished_at: Some(now.clone()),
@@ -5282,6 +5751,7 @@ mod tests {
             }),
             sync_options: None,
             retry: None,
+            metric_gates: Vec::new(),
         }
     }
 
@@ -5294,6 +5764,7 @@ mod tests {
             }),
             sync_options: None,
             retry: None,
+            metric_gates: Vec::new(),
         }
     }
 
@@ -5305,6 +5776,7 @@ mod tests {
             }),
             sync_options: None,
             retry: None,
+            metric_gates: Vec::new(),
         });
     }
 
@@ -6905,6 +7377,7 @@ spec:
                 ..SyncOptions::default()
             }),
             retry: None,
+            metric_gates: Vec::new(),
         });
 
         let outcome = fixture
@@ -8940,6 +9413,1222 @@ spec:
         assert!(fixture.cluster.applies().is_empty());
     }
 
+    // ---------------------------------------------------------------------
+    // `T20.3`: metric-gated rollout
+    // ---------------------------------------------------------------------
+
+    /// A wave-`-1` migration plus the wave-0 pair: the smallest bundle with a gateable boundary.
+    const GATED_WAVES: [(&str, &str); 3] = [
+        (
+            "migration.yaml",
+            "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: smoke\n  annotations:\n    ferriscd.io/sync-wave: \"-1\"\n",
+        ),
+        ("configmap.yaml", CONFIGMAP),
+        ("deployment.yaml", DEPLOYMENT),
+    ];
+
+    /// The provider source every metric-gate test wires: one `prod` provider.
+    #[derive(Clone)]
+    struct FakeProviderSource {
+        result: Result<crate::metric_gate::MetricProviderSet, String>,
+        calls: Arc<StdMutex<usize>>,
+    }
+
+    impl FakeProviderSource {
+        fn with_prod() -> Self {
+            Self {
+                result: Ok(crate::metric_gate::MetricProviderSet::from_configmap_data(
+                    crate::metric_gate::METRICS_PROVIDERS_CONFIGMAP_NAME,
+                    &std::collections::BTreeMap::from([(
+                        "prod".to_owned(),
+                        "url: http://prometheus.monitoring.svc:9090".to_owned(),
+                    )]),
+                )
+                .expect("the fixture allowlist parses")),
+                calls: Arc::new(StdMutex::new(0)),
+            }
+        }
+
+        fn empty() -> Self {
+            Self {
+                result: Ok(crate::metric_gate::MetricProviderSet::empty()),
+                calls: Arc::new(StdMutex::new(0)),
+            }
+        }
+
+        /// How many times the allowlist was read (one scoped `GET` per gated pass, at most).
+        fn reads(&self) -> usize {
+            *self.calls.lock().expect("the counter is never poisoned")
+        }
+    }
+
+    impl crate::metric_gate::MetricProviderSource for FakeProviderSource {
+        fn providers(
+            &self,
+        ) -> BoxFuture<'_, Result<crate::metric_gate::MetricProviderSet, ReconcileError>> {
+            *self.calls.lock().expect("the counter is never poisoned") += 1;
+            let result = self.result.clone();
+            Box::pin(async move { result.map_err(|message| ReconcileError::Invalid { message }) })
+        }
+    }
+
+    /// Collects the formatted `tracing` lines one test produces.
+    ///
+    /// Thread-local (`tracing::subscriber::set_default`) rather than global: the suite runs in
+    /// parallel, and a global subscriber would both race other tests and capture their lines. The
+    /// tests that use it are `#[tokio::test]` (current-thread), so every poll produces its logs on
+    /// this thread.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<StdMutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().expect("the log buffer is never poisoned");
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the log buffer is never poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Installs a thread-local log capture and returns it with the guard that uninstalls it.
+    fn log_capture() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (logs, guard)
+    }
+
+    /// A transport that replays a fixed list of sample values and records every query it saw.
+    #[derive(Clone)]
+    struct FakeTransport {
+        samples: Arc<StdMutex<Vec<f64>>>,
+        /// When set, every query fails with this error instead of returning a sample.
+        error: Option<crate::metric_gate::MetricQueryError>,
+        queries: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl FakeTransport {
+        fn returning(values: &[f64]) -> Self {
+            Self {
+                samples: Arc::new(StdMutex::new(values.to_vec())),
+                error: None,
+                queries: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        /// A transport whose every query fails with `error` (`T20.3` finding M4).
+        fn failing(error: crate::metric_gate::MetricQueryError) -> Self {
+            Self {
+                samples: Arc::new(StdMutex::new(Vec::new())),
+                error: Some(error),
+                queries: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        fn queries(&self) -> Vec<String> {
+            self.queries
+                .lock()
+                .expect("the recorder is never poisoned")
+                .clone()
+        }
+    }
+
+    impl crate::metric_gate::MetricQueryTransport for FakeTransport {
+        fn query<'a>(
+            &'a self,
+            request: crate::metric_gate::MetricQueryRequest<'a>,
+        ) -> BoxFuture<
+            'a,
+            Result<
+                crate::metric_gate::PrometheusQueryResponse,
+                crate::metric_gate::MetricQueryError,
+            >,
+        > {
+            self.queries
+                .lock()
+                .expect("the recorder is never poisoned")
+                .push(request.query.to_owned());
+            let error = self.error.clone();
+            let mut samples = self.samples.lock().expect("the samples are never poisoned");
+            let value = if samples.len() > 1 {
+                samples.remove(0)
+            } else {
+                samples.first().copied().unwrap_or(f64::NAN)
+            };
+            Box::pin(async move {
+                // The gate must always issue the bounded timeout, never an unbounded query.
+                assert_eq!(
+                    request.timeout,
+                    crate::metric_gate::METRIC_GATE_QUERY_TIMEOUT
+                );
+                assert_eq!(request.url, "http://prometheus.monitoring.svc:9090");
+                if let Some(error) = error {
+                    return Err(error);
+                }
+                Ok(crate::metric_gate::PrometheusQueryResponse::new(vec![
+                    value,
+                ]))
+            })
+        }
+    }
+
+    /// Wires the `T20.3` provider source and transport into a fixture pipeline.
+    fn with_metric_gates(
+        mut fixture: Fixture,
+        source: FakeProviderSource,
+        transport: FakeTransport,
+    ) -> Fixture {
+        fixture.pipeline = fixture
+            .pipeline
+            .with_metric_providers(Arc::new(source))
+            .with_metric_transport(Arc::new(transport));
+        fixture
+    }
+
+    /// An `Application` carrying exactly `gates`.
+    fn app_with_gates(fixture: &Fixture, gates: Vec<ferriscd_crd::MetricGate>) -> Application {
+        let mut app = fixture.app(".");
+        app.spec
+            .sync_policy
+            .as_mut()
+            .expect("fixture policy")
+            .metric_gates = gates;
+        app
+    }
+
+    /// The gate the fixtures use: two samples after wave `-1`, sampled every second.
+    fn sample_gate(action: ferriscd_crd::MetricGateFailureAction) -> ferriscd_crd::MetricGate {
+        ferriscd_crd::MetricGate {
+            after_wave: -1,
+            provider: "prod".to_owned(),
+            query: "sum(rate(http_requests_total{code=~\"5..\"}[5m]))".to_owned(),
+            success_condition: "result[0] < 0.01".to_owned(),
+            interval_seconds: 1,
+            count: 2,
+            failure_action: action,
+        }
+    }
+
+    /// An `Application` with one gate after wave `-1`.
+    fn gated_app(fixture: &Fixture, action: ferriscd_crd::MetricGateFailureAction) -> Application {
+        app_with_gates(fixture, vec![sample_gate(action)])
+    }
+
+    /// Rebuilds the `Application` the way the API server would hand it to the next pass: only
+    /// `/status` survives, and the gate's own clock is rewound past the sample interval (a test
+    /// injects the elapsed time instead of sleeping).
+    fn next_pass(app: &Application, status: &ApplicationStatus) -> Application {
+        let mut next = app.clone();
+        let mut status = status.clone();
+        if let Some(operation) = status.operation_state.as_mut()
+            && let Some(gate) = operation.metric_gate.as_mut()
+            && let Some(last) = gate.last_checked_at.take()
+        {
+            gate.last_checked_at = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                last.0 - k8s_openapi::jiff::SignedDuration::from_secs(5),
+            ));
+        }
+        next.status = Some(status);
+        next
+    }
+
+    /// `T20.3` acceptance (1)+(2): a `count: 2` gate holds promotion for one extra reconcile,
+    /// requeues instead of sleeping, and resumes from the persisted state after a simulated restart.
+    #[tokio::test]
+    async fn a_metric_gate_holds_promotion_across_requeues_and_resumes_after_a_restart() {
+        let transport = FakeTransport::returning(&[0.001, 0.0005]);
+        let source = FakeProviderSource::with_prod();
+        let fixture = with_metric_gates(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            source.clone(),
+            transport.clone(),
+        );
+        fixture.commit(&GATED_WAVES);
+        let app = gated_app(&fixture, ferriscd_crd::MetricGateFailureAction::Pause);
+
+        // Pass 1: wave -1 is dispatched; no gate is evaluated (nothing converged off it yet).
+        let first = fixture.pipeline.apply(&app).await.expect("wave -1");
+        let mut status = ApplicationStatus {
+            operation_state: first.operation_state.clone(),
+            ..ApplicationStatus::default()
+        };
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["batch/Job/payments/smoke".to_owned()]
+        );
+        assert!(
+            transport.queries().is_empty(),
+            "a pass that dispatches a wave must not sample the gate"
+        );
+        assert_eq!(
+            source.reads(),
+            0,
+            "the allowlist is read only when a gate actually needs it (one scoped GET)"
+        );
+
+        // Pass 2: wave -1 converged, so the machine wants wave 0 — the gate samples 1/2 and holds.
+        fixture.cluster.seed_applied();
+        fixture.cluster.complete_job("smoke");
+        let second_app = next_pass(&app, &status);
+        let second = fixture
+            .pipeline
+            .apply(&second_app)
+            .await
+            .expect("the gate must hold, not fail");
+        assert_eq!(
+            transport.queries().len(),
+            1,
+            "exactly one bounded query per pass"
+        );
+        assert_eq!(
+            source.reads(),
+            1,
+            "one scoped allowlist read for that sample"
+        );
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            1,
+            "no wave-0 resource may be applied while the gate holds"
+        );
+        let held = second.operation_state.clone().expect("state");
+        assert_eq!(
+            held.phase,
+            OperationPhase::Running,
+            "a bake is not a failure"
+        );
+        assert_eq!(held.sync_phase, Some(SyncPhase::Sync));
+        assert_eq!(
+            held.current_wave, -1,
+            "the operation stays on the gated wave"
+        );
+        let gate = held
+            .metric_gate
+            .clone()
+            .expect("gate progress is persisted");
+        assert_eq!(gate.gate_phase, ferriscd_crd::MetricGatePhase::Sampling);
+        assert_eq!(gate.consecutive_successes, 1);
+        assert_eq!(gate.required_successes, 2);
+        assert_eq!(
+            second.requeue,
+            Some(Duration::from_secs(1)),
+            "the sample interval is a requeue hint, never a sleep"
+        );
+        assert!(
+            second.message.contains("metric gate after wave -1 1/2"),
+            "the Ready message must say the gate is what is holding promotion: {}",
+            second.message
+        );
+        assert!(
+            held.message
+                .as_deref()
+                .is_some_and(|message| message.contains("1/2")),
+            "the persisted operation message must say the progress: {:?}",
+            held.message
+        );
+
+        // Pass 3 (a restart: the state is rebuilt from `/status` only): 2/2 passes, wave 0 applies.
+        status = ApplicationStatus {
+            operation_state: Some(held),
+            ..status
+        };
+        let third_app = next_pass(&app, &status);
+        let third = fixture.pipeline.apply(&third_app).await.expect("promoted");
+        assert_eq!(transport.queries().len(), 2);
+        let applies = fixture.cluster.applies();
+        assert!(
+            applies.contains(&CONFIGMAP_KEY.to_owned())
+                && applies.contains(&DEPLOYMENT_KEY.to_owned()),
+            "the passed gate must promote to wave 0: {applies:?}"
+        );
+        let promoted = third.operation_state.clone().expect("state");
+        assert_eq!(promoted.current_wave, 0);
+        assert_eq!(
+            promoted.metric_gate.as_ref().map(|gate| gate.gate_phase),
+            Some(ferriscd_crd::MetricGatePhase::Passed),
+            "the passed gate is recorded with the operation"
+        );
+
+        // A gate is sampled at most once per boundary: the promoted operation never re-queries.
+        let before = transport.queries().len();
+        let after_app = next_pass(
+            &app,
+            &ApplicationStatus {
+                operation_state: Some(promoted),
+                ..status
+            },
+        );
+        fixture.pipeline.apply(&after_app).await.expect("pass");
+        assert_eq!(
+            transport.queries().len(),
+            before,
+            "a passed gate must not be sampled again"
+        );
+    }
+
+    /// `T20.3` acceptance (3): a breaching sample with `failureAction: Pause` aborts the rollout
+    /// deterministically, applies nothing, never touches `spec` or the annotation, and records one
+    /// secret-free audit event.
+    #[tokio::test]
+    async fn a_metric_gate_breach_pauses_the_rollout() {
+        let transport = FakeTransport::returning(&[0.42]);
+        let mut fixture = with_metric_gates(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            FakeProviderSource::with_prod(),
+            transport.clone(),
+        );
+        let sink = Arc::new(crate::audit::RecordingAuditSink::new());
+        fixture.pipeline = fixture
+            .pipeline
+            .with_audit(crate::audit::AuditLogger::with_sinks(
+                vec![sink.clone()],
+                crate::metrics::Metrics::new(),
+            ));
+        fixture.commit(&GATED_WAVES);
+        let app = gated_app(&fixture, ferriscd_crd::MetricGateFailureAction::Pause);
+
+        let first = fixture.pipeline.apply(&app).await.expect("wave -1");
+        fixture.cluster.seed_applied();
+        fixture.cluster.complete_job("smoke");
+        let second_app = next_pass(
+            &app,
+            &ApplicationStatus {
+                operation_state: first.operation_state,
+                ..ApplicationStatus::default()
+            },
+        );
+
+        let error = fixture
+            .pipeline
+            .apply(&second_app)
+            .await
+            .expect_err("a breach must fail the pass");
+        assert_eq!(
+            error.failure_class(),
+            crate::FailureClass::Terminal,
+            "a breached gate is terminal for this revision (no requeue storm)"
+        );
+        assert!(error.to_string().contains("breached"), "{error}");
+        assert!(
+            error.to_string().contains("paused for an operator"),
+            "{error}"
+        );
+        assert_eq!(transport.queries().len(), 1);
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            1,
+            "a breached gate applies nothing"
+        );
+        let operation = error
+            .partial_operation()
+            .expect("the failed state is carried");
+        assert_eq!(operation.phase, OperationPhase::Failed);
+        assert_eq!(operation.sync_phase, Some(SyncPhase::Failed));
+        assert_eq!(
+            operation.metric_gate.as_ref().map(|gate| gate.gate_phase),
+            Some(ferriscd_crd::MetricGatePhase::Failed)
+        );
+        assert!(
+            fixture.cluster.app_patches().is_empty(),
+            "Pause must not write the Application spec or annotation"
+        );
+
+        // `T17.2`: one compliance audit record, naming the gate and the action, never the provider
+        // URL (the gate message carries only the provider *name* and the measurement).
+        let events = sink.events();
+        assert_eq!(events.len(), 1, "one audit event per breach: {events:?}");
+        assert_eq!(
+            events[0].category,
+            crate::audit::AuditCategory::ApiOperation
+        );
+        assert_eq!(events[0].action, "metric-gate-breach");
+        assert_eq!(events[0].outcome, crate::audit::AuditOutcome::Failed);
+        assert_eq!(events[0].target.name.as_deref(), Some("payments"));
+        let reason = events[0].reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("Pause"), "{reason}");
+        assert!(reason.contains("prod"), "{reason}");
+        assert!(
+            !reason.contains("http"),
+            "no endpoint may be audited: {reason}"
+        );
+
+        // The recorded failure keeps the operation from restarting on the next periodic requeue.
+        let retry_app = next_pass(
+            &app,
+            &ApplicationStatus {
+                operation_state: Some(operation.clone()),
+                ..ApplicationStatus::default()
+            },
+        );
+        let retry = fixture.pipeline.apply(&retry_app).await.expect("held");
+        assert_eq!(
+            transport.queries().len(),
+            1,
+            "a failed gate is never re-sampled on an unchanged revision"
+        );
+        assert_eq!(
+            retry.operation_state.as_ref().map(|state| state.phase),
+            Some(OperationPhase::Failed)
+        );
+    }
+
+    /// `T20.3` acceptance (3): `failureAction: Rollback` re-enters the existing safe rollback path
+    /// by writing the `ferriscd.io/operation` request — it never re-implements the rollback.
+    #[tokio::test]
+    async fn a_metric_gate_breach_requests_the_safe_rollback_path() {
+        let transport = FakeTransport::returning(&[0.9]);
+        let fixture = with_metric_gates(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            FakeProviderSource::with_prod(),
+            transport,
+        );
+        let sha = fixture.commit(&GATED_WAVES);
+        let app = gated_app(&fixture, ferriscd_crd::MetricGateFailureAction::Rollback);
+
+        let first = fixture.pipeline.apply(&app).await.expect("wave -1");
+
+        // A previously deployed revision is what a rollback can go back to.
+        let previous_revision = "1111111111111111111111111111111111111111";
+        assert_ne!(previous_revision, sha);
+        let status = ApplicationStatus {
+            operation_state: first.operation_state.clone(),
+            history: vec![ferriscd_crd::status::RevisionHistoryEntry::new(
+                7,
+                Some(previous_revision.to_owned()),
+                first
+                    .operation_state
+                    .as_ref()
+                    .map(|state| state.started_at.clone())
+                    .unwrap_or_else(now),
+            )],
+            ..ApplicationStatus::default()
+        };
+
+        fixture.cluster.seed_applied();
+        fixture.cluster.complete_job("smoke");
+        let error = fixture
+            .pipeline
+            .apply(&next_pass(&app, &status))
+            .await
+            .expect_err("a breach must fail the pass");
+        assert_eq!(error.failure_class(), crate::FailureClass::Terminal);
+        let message = error.to_string();
+        assert!(
+            message.contains("requested a rollback to history id 7"),
+            "{message}"
+        );
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            1,
+            "the breaching pass applies nothing"
+        );
+
+        // The one write is the rollback request the next reconcile consumes (`T10.5`).
+        let patches = fixture.cluster.app_patches();
+        assert_eq!(
+            patches.len(),
+            1,
+            "exactly one Application patch: {patches:?}"
+        );
+        assert_eq!(
+            patches[0]["metadata"]["annotations"][annotations::OPERATION],
+            serde_json::json!("{\"rollback\":{\"id\":7}}".to_string()),
+            "the request is the documented annotation shape: {patches:?}"
+        );
+        assert!(
+            patches[0].get("spec").is_none(),
+            "the spec is patched by the rollback path, not by the gate: {patches:?}"
+        );
+    }
+
+    /// `T20.3` finding C1: the pass that **redeploys the pinned revision** a failed gate asked for
+    /// must never be gated again.
+    ///
+    /// The bug this pins: `failureAction: Rollback` writes the rollback request, the next pass
+    /// re-renders the *pinned* revision, that pass is gated, the same dashboard fails again, the
+    /// request is rewritten — an unbounded oscillation in which the remediation never lands. The fix
+    /// is `PassRequest::gate_suppressed`, so the remediation pass samples **zero** times, applies the
+    /// pinned wave 0, and settles.
+    #[tokio::test]
+    async fn a_gate_rollback_pass_is_never_gated_and_the_remediation_settles() {
+        // 0.001 passes the gate (the first deployment), 0.9 breaches it (the second).
+        let transport = FakeTransport::returning(&[0.001, 0.9]);
+        let fixture = with_metric_gates(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            FakeProviderSource::with_prod(),
+            transport.clone(),
+        );
+        // A single-wave bundle: the gate guards the promotion out of its only wave (to PostSync).
+        let v1 = fixture.commit(&[(
+            "configmap.yaml",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  version: v1\n",
+        )]);
+        let app = app_with_gates(
+            &fixture,
+            vec![ferriscd_crd::MetricGate {
+                after_wave: 0,
+                count: 1,
+                ..sample_gate(ferriscd_crd::MetricGateFailureAction::Rollback)
+            }],
+        );
+
+        // Deploy `v1` normally: apply, pass the gate, settle, and record history entry 1.
+        let mut status = ApplicationStatus::default();
+        let mut current = app.clone();
+        let mut settled = None;
+        for pass in 0..5 {
+            // Model the API server: every object the previous pass applied is live again.
+            fixture.cluster.seed_applied();
+            let outcome = fixture
+                .pipeline
+                .apply(&next_pass(&current, &status))
+                .await
+                .unwrap_or_else(|error| panic!("pass {pass} of the v1 rollout failed: {error}"));
+            status.operation_state = outcome.operation_state.clone();
+            status.history = outcome.history.clone().unwrap_or(status.history);
+            if let Some(sync) = outcome.sync.clone() {
+                status.sync = Some(sync);
+            }
+            status.inventory = outcome
+                .inventory
+                .clone()
+                .map(|inventory| ferriscd_engine::inventory::to_status_entries(&inventory))
+                .unwrap_or(status.inventory);
+            current.status = Some(status.clone());
+            if outcome.operation_state.as_ref().map(|state| state.phase)
+                == Some(OperationPhase::Succeeded)
+            {
+                settled = Some(pass);
+                break;
+            }
+        }
+        assert!(settled.is_some(), "the v1 rollout must settle");
+        assert_eq!(
+            transport.queries().len(),
+            1,
+            "the first deployment samples the gate once (`count: 1`)"
+        );
+        let history = status.history.clone();
+        assert_eq!(history.len(), 1, "one settled deployment: {history:?}");
+        assert_eq!(history[0].id, 1);
+        assert_eq!(history[0].revision.as_deref(), Some(v1.as_str()));
+        assert_eq!(
+            status
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.revision.as_deref()),
+            Some(v1.as_str())
+        );
+
+        // Now `HEAD` moves to `v2`. The gate samples, breaches, and asks for a rollback to entry 1.
+        let v2 = fixture.commit(&[(
+            "configmap.yaml",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  version: v2\n",
+        )]);
+        assert_ne!(v1, v2);
+        let mut v2_status = status.clone();
+        let mut v2_app = app.clone();
+        v2_app.status = Some(v2_status.clone());
+        for pass in 0..3 {
+            fixture.cluster.seed_applied();
+            let outcome = fixture
+                .pipeline
+                .apply(&next_pass(&v2_app, &v2_status))
+                .await;
+            match outcome {
+                Ok(outcome) => {
+                    // The wave-0 apply of v2 is the last thing that may happen before the breach.
+                    v2_status.operation_state = outcome.operation_state.clone();
+                    v2_app.status = Some(v2_status.clone());
+                    assert!(
+                        pass < 2,
+                        "the gate must breach within three passes of the v2 rollout"
+                    );
+                }
+                Err(error) => {
+                    assert_eq!(
+                        error.failure_class(),
+                        crate::FailureClass::Terminal,
+                        "{error}"
+                    );
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("requested a rollback to history id 1"),
+                        "{error}"
+                    );
+                    v2_status.operation_state = error.partial_operation().cloned();
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            transport.queries().len(),
+            2,
+            "the breach is one sample: {:?}",
+            transport.queries()
+        );
+        assert_eq!(
+            fixture
+                .cluster
+                .live_pointer(CONFIGMAP_KEY, "/data/version")
+                .as_deref(),
+            Some("v2"),
+            "the breaching revision is what was applied"
+        );
+
+        // The rollback request the gate wrote — the *existing* `T10.5` path consumes it.
+        let patches = fixture.cluster.app_patches();
+        let request = patches
+            .iter()
+            .find_map(|patch| patch["metadata"]["annotations"][annotations::OPERATION].as_str())
+            .expect("the gate wrote the rollback request");
+        assert_eq!(request, "{\"rollback\":{\"id\":1}}");
+
+        // The remediation pass: the pinned `v1` is rendered, and the gate is **not** sampled.
+        let queries_after_breach = transport.queries().len();
+        let mut remediation = app.clone();
+        remediation.annotations_mut().insert(
+            annotations::OPERATION.to_owned(),
+            "{\"rollback\":{\"id\":1}}".to_owned(),
+        );
+        let mut remediation_status = v2_status.clone();
+        remediation_status.operation_state = None;
+        remediation.status = Some(remediation_status.clone());
+
+        let mut settled_again = None;
+        for pass in 0..4 {
+            fixture.cluster.seed_applied();
+            let outcome = fixture
+                .pipeline
+                .apply(&next_pass(&remediation, &remediation_status))
+                .await
+                .unwrap_or_else(|error| panic!("remediation pass {pass} failed: {error}"));
+            remediation_status.operation_state = outcome.operation_state.clone();
+            remediation_status.history = outcome
+                .history
+                .clone()
+                .unwrap_or(remediation_status.history);
+            remediation_status.conditions = outcome
+                .warnings
+                .clone()
+                .into_iter()
+                .chain(remediation_status.conditions.clone())
+                .collect();
+            if let Some(sync) = outcome.sync.clone() {
+                remediation_status.sync = Some(sync);
+            }
+            remediation_status.inventory = outcome
+                .inventory
+                .clone()
+                .map(|inventory| ferriscd_engine::inventory::to_status_entries(&inventory))
+                .unwrap_or(remediation_status.inventory);
+            // Model the passes' own writes, so the next reconcile sees what the cluster holds: the
+            // rollback path clears `spec.syncPolicy.automated` (and nothing else — `metricGates`
+            // survive, which is exactly why the gate has to be suppressed rather than deleted), and
+            // it consumes the request once the pinned revision has settled.
+            let settled_op = outcome.operation_state.as_ref().map(|state| state.phase);
+            if outcome.warnings.iter().any(|warning| {
+                warning.reason == ferriscd_engine::sync::REASON_AUTOMATED_SYNC_DISABLED_BY_ROLLBACK
+            }) && let Some(policy) = remediation.spec.sync_policy.as_mut()
+            {
+                policy.automated = None;
+            }
+            if settled_op == Some(OperationPhase::Succeeded) {
+                settled_again = Some(pass);
+                break;
+            }
+            remediation.status = Some(remediation_status.clone());
+        }
+        assert!(
+            settled_again.is_some(),
+            "the remediation must settle instead of oscillating"
+        );
+        assert_eq!(
+            transport.queries().len(),
+            queries_after_breach,
+            "a remediation pass must sample ZERO times: {:?}",
+            transport.queries()
+        );
+        assert_eq!(
+            fixture
+                .cluster
+                .live_pointer(CONFIGMAP_KEY, "/data/version")
+                .as_deref(),
+            Some("v1"),
+            "the pinned revision is what reached the cluster: {:?}",
+            fixture.cluster.applies()
+        );
+        assert_eq!(
+            remediation_status
+                .operation_state
+                .as_ref()
+                .and_then(|state| state.revision.clone())
+                .as_deref(),
+            Some(v1.as_str()),
+            "the operation that settled is the pinned revision"
+        );
+        assert!(
+            remediation_status.conditions.iter().any(|condition| {
+                condition.reason
+                    == ferriscd_engine::sync::REASON_AUTOMATED_SYNC_DISABLED_BY_ROLLBACK
+            }),
+            "the rollback warning is what pins the revision: {:?}",
+            remediation_status.conditions
+        );
+        // Exactly the two writes the `T10.5` path owes: pin automation off, consume the request. The
+        // gate never rewrote the request on top of them (that is the oscillation this test exists
+        // for).
+        let rollback_requests = fixture
+            .cluster
+            .app_patches()
+            .iter()
+            .filter(|patch| {
+                patch["metadata"]["annotations"][annotations::OPERATION]
+                    .as_str()
+                    .is_some_and(|value| value.contains("rollback"))
+            })
+            .count();
+        assert_eq!(
+            rollback_requests,
+            1,
+            "the request is written once and never overwritten: {:?}",
+            fixture.cluster.app_patches()
+        );
+
+        // And the pin keeps suppressing gates on every later pass (the warning, not the annotation,
+        // is what holds the revision): the request has been consumed and automation is off, so
+        // nothing is applied — and, crucially, nothing is sampled.
+        remediation.annotations_mut().remove(annotations::OPERATION);
+        fixture.cluster.seed_applied();
+        let parked = fixture
+            .pipeline
+            .apply(&next_pass(&remediation, &remediation_status))
+            .await
+            .expect("a parked rollback is not an error");
+        assert_eq!(
+            transport.queries().len(),
+            queries_after_breach,
+            "a pass pinned by the rollback warning must not sample the gate either"
+        );
+        assert_eq!(
+            parked.reason, REASON_SYNC_SKIPPED,
+            "automation is off, so the pin is not re-applied"
+        );
+        assert_eq!(
+            parked
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.revision.as_deref()),
+            Some(v1.as_str()),
+            "the warning pin keeps resolving the historical revision, never HEAD"
+        );
+    }
+
+    /// `T20.3` finding M6: a declared gate that matches no wave of the rendered bundle can never
+    /// fire, and the pass must **say so** — silently ignoring a `metricGates` entry looks exactly
+    /// like a bake that ran and passed.
+    #[tokio::test]
+    async fn a_gate_that_matches_no_wave_is_warned_about() {
+        let transport = FakeTransport::returning(&[0.001]);
+        let fixture = with_metric_gates(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            FakeProviderSource::with_prod(),
+            transport.clone(),
+        );
+        // Waves -1 and 0 only; the gate guards wave 42, which this bundle never renders.
+        fixture.commit(&GATED_WAVES);
+        let app = app_with_gates(
+            &fixture,
+            vec![ferriscd_crd::MetricGate {
+                after_wave: 42,
+                ..sample_gate(ferriscd_crd::MetricGateFailureAction::Pause)
+            }],
+        );
+
+        let (logs, guard) = log_capture();
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("an inert gate must not refuse or hold the pass");
+        drop(guard);
+
+        let text = logs.contents();
+        assert!(
+            text.contains("will never be sampled"),
+            "the pass must warn about the inert gate: {text}"
+        );
+        assert!(
+            text.contains("after_wave=42"),
+            "the warning must name the wave the gate asked for: {text}"
+        );
+        assert!(
+            text.contains("payments"),
+            "the warning must name the Application: {text}"
+        );
+        // ...and the pass itself is ungated: nothing was sampled, and the first wave was applied.
+        assert!(
+            transport.queries().is_empty(),
+            "a gate matching no wave is never sampled"
+        );
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec!["batch/Job/payments/smoke".to_owned()]
+        );
+        assert_eq!(
+            outcome.reason, REASON_SYNC_IN_PROGRESS,
+            "the rollout still runs, it is just not gated"
+        );
+    }
+
+    /// `T20.3` finding M4: a provider/query failure pauses, and **never** writes a rollback request,
+    /// even when the gate's `failureAction` is `Rollback`.
+    #[tokio::test]
+    async fn a_query_failure_pauses_instead_of_rolling_back() {
+        let transport =
+            FakeTransport::failing(crate::metric_gate::MetricQueryError::Status { code: 400 });
+        let fixture = with_metric_gates(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            FakeProviderSource::with_prod(),
+            transport.clone(),
+        );
+        fixture.commit(&GATED_WAVES);
+        let app = gated_app(&fixture, ferriscd_crd::MetricGateFailureAction::Rollback);
+
+        let first = fixture.pipeline.apply(&app).await.expect("wave -1");
+        fixture.cluster.seed_applied();
+        fixture.cluster.complete_job("smoke");
+
+        // A prior deployment exists, so a *breach* would have rolled back: the point is that this is
+        // not a breach.
+        let status = ApplicationStatus {
+            operation_state: first.operation_state.clone(),
+            history: vec![ferriscd_crd::status::RevisionHistoryEntry::new(
+                1,
+                Some("1111111111111111111111111111111111111111".to_owned()),
+                first
+                    .operation_state
+                    .as_ref()
+                    .map(|state| state.started_at.clone())
+                    .unwrap_or_else(now),
+            )],
+            ..ApplicationStatus::default()
+        };
+
+        let error = fixture
+            .pipeline
+            .apply(&next_pass(&app, &status))
+            .await
+            .expect_err("an unusable gate must stop the rollout");
+        assert_eq!(error.failure_class(), crate::FailureClass::Terminal);
+        let message = error.to_string();
+        assert!(
+            message.contains("could not be evaluated"),
+            "a provider failure must not read as a breach: {message}"
+        );
+        assert!(
+            message.contains("paused for an operator"),
+            "the gate must degrade to a pause: {message}"
+        );
+        assert!(
+            fixture.cluster.app_patches().is_empty(),
+            "a configuration/provider failure must never write a rollback request: {:?}",
+            fixture.cluster.app_patches()
+        );
+        let operation = error
+            .partial_operation()
+            .expect("the failed state is carried");
+        assert_eq!(
+            operation
+                .metric_gate
+                .as_ref()
+                .map(|gate| gate.failure_action),
+            Some(ferriscd_crd::MetricGateFailureAction::Pause),
+            "the persisted decision is a pause, not the spec's Rollback"
+        );
+    }
+
+    /// `T20.3`: `failureAction: Rollback` on a first rollout (no earlier `status.history` entry)
+    /// degrades to a pause instead of inventing a rollback target.
+    #[tokio::test]
+    async fn a_rollback_gate_with_no_prior_deployment_pauses_instead() {
+        let transport = FakeTransport::returning(&[0.9]);
+        let fixture = with_metric_gates(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            FakeProviderSource::with_prod(),
+            transport,
+        );
+        fixture.commit(&GATED_WAVES);
+        let app = gated_app(&fixture, ferriscd_crd::MetricGateFailureAction::Rollback);
+
+        let first = fixture.pipeline.apply(&app).await.expect("wave -1");
+        fixture.cluster.seed_applied();
+        fixture.cluster.complete_job("smoke");
+        let error = fixture
+            .pipeline
+            .apply(&next_pass(
+                &app,
+                &ApplicationStatus {
+                    operation_state: first.operation_state,
+                    ..ApplicationStatus::default()
+                },
+            ))
+            .await
+            .expect_err("a breach must fail the pass");
+        assert!(
+            error.to_string().contains("paused for an operator"),
+            "there is nothing to roll back to: {error}"
+        );
+        assert!(
+            fixture.cluster.app_patches().is_empty(),
+            "no rollback annotation may be written without a target"
+        );
+    }
+
+    /// `T20.3`: a gate on a **single-wave** bundle is not silently ignored — the operation state
+    /// machine runs it (Sync(0) -> gate -> PostSync) instead of one-shotting the apply.
+    #[tokio::test]
+    async fn a_gate_forces_the_operation_state_machine_on_a_single_wave_bundle() {
+        let transport = FakeTransport::returning(&[0.001, 0.002]);
+        let fixture = with_metric_gates(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            FakeProviderSource::with_prod(),
+            transport.clone(),
+        );
+        fixture.commit(&[
+            ("configmap.yaml", CONFIGMAP),
+            ("deployment.yaml", DEPLOYMENT),
+        ]);
+        // One wave only: the gate guards the promotion off it (here: to PostSync).
+        let app = app_with_gates(
+            &fixture,
+            vec![ferriscd_crd::MetricGate {
+                after_wave: 0,
+                count: 2,
+                ..sample_gate(ferriscd_crd::MetricGateFailureAction::Pause)
+            }],
+        );
+
+        // Pass 1: the operation applies wave 0 (the only wave) and stays on it.
+        let first = fixture.pipeline.apply(&app).await.expect("wave 0");
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec![CONFIGMAP_KEY.to_owned(), DEPLOYMENT_KEY.to_owned()]
+        );
+        let state = first
+            .operation_state
+            .clone()
+            .expect("an operation was started");
+        assert_eq!(state.sync_phase, Some(SyncPhase::Sync));
+        assert_eq!(state.current_wave, 0);
+        assert!(transport.queries().is_empty(), "nothing to promote off yet");
+
+        // Pass 2: wave 0 converged, so the gate holds the promotion to PostSync (1/2).
+        fixture.cluster.seed_applied();
+        fixture.cluster.make_deployment_ready("api", 1);
+        let second = fixture
+            .pipeline
+            .apply(&next_pass(
+                &app,
+                &ApplicationStatus {
+                    operation_state: Some(state),
+                    ..ApplicationStatus::default()
+                },
+            ))
+            .await
+            .expect("held by the gate");
+        assert_eq!(transport.queries().len(), 1);
+        let held = second.operation_state.clone().expect("state");
+        assert_eq!(held.sync_phase, Some(SyncPhase::Sync));
+        assert_eq!(held.current_wave, 0);
+        assert_eq!(
+            held.metric_gate
+                .as_ref()
+                .map(|gate| gate.consecutive_successes),
+            Some(1)
+        );
+        assert_eq!(
+            second.requeue,
+            Some(Duration::from_secs(1)),
+            "the hold is a requeue, never a sleep"
+        );
+
+        // Pass 3 (restart + the interval elapsed): 2/2 promotes to PostSync.
+        let third = fixture
+            .pipeline
+            .apply(&next_pass(
+                &app,
+                &ApplicationStatus {
+                    operation_state: Some(held),
+                    ..ApplicationStatus::default()
+                },
+            ))
+            .await
+            .expect("promoted");
+        assert_eq!(transport.queries().len(), 2);
+        let promoted = third.operation_state.expect("state");
+        assert_eq!(
+            promoted.sync_phase,
+            Some(SyncPhase::PostSync),
+            "the passed gate promotes to the next step"
+        );
+        assert_eq!(
+            promoted.metric_gate.as_ref().map(|gate| gate.gate_phase),
+            Some(ferriscd_crd::MetricGatePhase::Passed)
+        );
+    }
+
+    /// `T20.3` trap guard: a **failing** wave must reach `SyncFail` with its own reason. The gate
+    /// only guards promotion, so it must not be consulted (and certainly must not hold or replace
+    /// the wave's failure).
+    #[tokio::test]
+    async fn a_failing_wave_is_never_gated() {
+        let transport = FakeTransport::returning(&[0.0]);
+        let fixture = with_metric_gates(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            FakeProviderSource::with_prod(),
+            transport.clone(),
+        );
+        fixture.commit(&GATED_WAVES);
+        let app = gated_app(&fixture, ferriscd_crd::MetricGateFailureAction::Rollback);
+
+        let first = fixture.pipeline.apply(&app).await.expect("wave -1");
+        fixture.cluster.seed_applied();
+        fixture.cluster.fail_job("smoke");
+
+        let second = fixture
+            .pipeline
+            .apply(&next_pass(
+                &app,
+                &ApplicationStatus {
+                    operation_state: first.operation_state,
+                    ..ApplicationStatus::default()
+                },
+            ))
+            .await
+            .expect("a failing wave dispatches SyncFail, it does not fail the pass");
+        assert!(
+            transport.queries().is_empty(),
+            "a failing wave must not be sampled by a metric gate"
+        );
+        let state = second.operation_state.clone().expect("state");
+        assert_eq!(
+            state.sync_phase,
+            Some(SyncPhase::SyncFail),
+            "the failure path keeps its own reason: {:?}",
+            state.message
+        );
+        assert!(
+            state.metric_gate.is_none(),
+            "no gate verdict may be recorded"
+        );
+        assert!(fixture.cluster.app_patches().is_empty());
+    }
+
+    /// `T20.3` acceptance (4): a gate naming a provider the admin allowlist does not carry refuses
+    /// the pass terminally — before anything is applied.
+    #[tokio::test]
+    async fn a_gate_naming_an_unallowlisted_provider_refuses_the_pass() {
+        let fixture = with_metric_gates(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            FakeProviderSource::empty(),
+            FakeTransport::returning(&[0.0]),
+        );
+        fixture.commit(&GATED_WAVES);
+        let app = gated_app(&fixture, ferriscd_crd::MetricGateFailureAction::Pause);
+
+        // The first pass dispatches wave -1; the gate is only consulted at its boundary.
+        let first = fixture.pipeline.apply(&app).await.expect("wave -1");
+        let applied = fixture.cluster.applies().len();
+        fixture.cluster.seed_applied();
+        fixture.cluster.complete_job("smoke");
+
+        let error = fixture
+            .pipeline
+            .apply(&next_pass(
+                &app,
+                &ApplicationStatus {
+                    operation_state: first.operation_state,
+                    ..ApplicationStatus::default()
+                },
+            ))
+            .await
+            .expect_err("an unallowlisted provider must refuse");
+        assert_eq!(error.failure_class(), crate::FailureClass::Terminal);
+        let message = error.to_string();
+        assert!(
+            message.contains(crate::metric_gate::METRICS_PROVIDERS_CONFIGMAP_NAME),
+            "{message}"
+        );
+        assert!(message.contains("<none>"), "{message}");
+        assert_eq!(
+            fixture.cluster.applies().len(),
+            applied,
+            "the refused pass applies nothing beyond wave -1"
+        );
+    }
+
+    /// `T20.3`: a pipeline with no metric wiring refuses a gated `Application` instead of promoting
+    /// it without a sample (fail closed), and leaves an ungated one completely unaffected.
+    #[tokio::test]
+    async fn a_gated_application_needs_a_wired_metric_gate() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        fixture.commit(&GATED_WAVES);
+        let app = gated_app(&fixture, ferriscd_crd::MetricGateFailureAction::Pause);
+
+        let error = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("a gate that cannot be sampled must refuse");
+        assert_eq!(error.failure_class(), crate::FailureClass::Terminal);
+        assert!(
+            error.to_string().contains("no metrics provider source"),
+            "{error}"
+        );
+        assert!(fixture.cluster.applies().is_empty());
+
+        // An Application without gates is untouched by the new seam.
+        let plain = fixture.app(".");
+        let outcome = fixture
+            .pipeline
+            .apply(&plain)
+            .await
+            .expect("an ungated application syncs as before");
+        assert!(outcome.operation_state.is_some());
+        assert!(
+            outcome
+                .operation_state
+                .as_ref()
+                .is_some_and(|state| state.metric_gate.is_none()),
+            "an ungated operation records no gate"
+        );
+    }
+
     /// `T10.2`: a two-wave bundle is applied one wave at a time, gated on health, and the whole
     /// rollout is recorded as an operation.
     #[tokio::test]
@@ -9655,6 +11344,7 @@ spec:
                 phase_started_at: Some(now()),
                 revision: Some(sha.clone()),
                 active_hooks: Vec::new(),
+                metric_gate: None,
                 message: None,
                 started_at: now(),
                 finished_at: None,
@@ -11532,6 +13222,7 @@ spec:
             }),
             sync_options: None,
             retry: None,
+            metric_gates: Vec::new(),
         });
 
         let (err, status) = reconcile_pass(&fixture, &mut app).await;
@@ -11817,6 +13508,7 @@ spec:
                 ..SyncOptions::default()
             }),
             retry: None,
+            metric_gates: Vec::new(),
         });
         let applies_before = fixture.cluster.applies().len();
         let (err, status) = reconcile_pass(&fixture, &mut app).await;

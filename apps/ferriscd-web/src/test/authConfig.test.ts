@@ -53,6 +53,7 @@ describe("auth config interpretation (T19.2)", () => {
 
   it("keeps the token form available exactly in the two token modes", () => {
     expect(supportsTokenLogin(config({ authMode: "token-review" }))).toBe(true);
+    expect(supportsTokenLogin(config({ authMode: "pass-through" }))).toBe(true);
     expect(supportsTokenLogin(config({ authMode: "token-review-or-oidc" }))).toBe(true);
     expect(supportsTokenLogin(oidc)).toBe(false);
     expect(supportsTokenLogin(config({ authMode: "deny-all" }))).toBe(false);

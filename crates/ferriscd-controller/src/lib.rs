@@ -21,6 +21,7 @@ pub mod hooks;
 pub mod impersonation;
 pub mod leader_election;
 pub mod live_state;
+pub mod metric_gate;
 pub mod metrics;
 pub mod notifications;
 pub mod policy_rules;
@@ -114,6 +115,13 @@ pub use leader_election::{
 pub use live_state::{
     ClusterStateReader, DynamicApiSource, FetchRequest, LiveObjectSource, LiveState,
     LiveStateError, TrackingOwner,
+};
+pub use metric_gate::{
+    ApiMetricProviderSource, GateStep, MAX_GATE_QUERY_ERRORS, MAX_METRIC_GATE_RESPONSE_BYTES,
+    METRIC_GATE_QUERY_TIMEOUT, METRICS_PROVIDERS_CONFIGMAP_NAME, MetricCondition, MetricProvider,
+    MetricProviderError, MetricProviderSet, MetricProviderSource, MetricQueryError,
+    MetricQueryRequest, MetricQueryTransport, PrometheusQueryResponse, ReqwestMetricTransport,
+    gate_after_wave, parse_prometheus_response, resolve_provider,
 };
 pub use metrics::{
     ACTIVE_RECONCILES, APP_HEALTH_STATUS, APP_SYNC_STATUS, AUDIT_DROPPED_COUNTER,
@@ -1335,6 +1343,19 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         client.clone(),
         &config.namespace,
     )))
+    // `T20.3`: metric-gated wave promotion. The Prometheus provider allowlist is read per reconcile
+    // from `ConfigMap/ferriscd-metrics-providers-cm` in the control-plane namespace (a scoped `GET`,
+    // and only for an `Application` that declares a gate), and every query is bounded to 5 s. A gate
+    // names a *provider*, never a URL, so a tenant `Application` cannot make the controller dial an
+    // arbitrary endpoint (SSRF trap guard).
+    .with_metric_providers(Arc::new(metric_gate::ApiMetricProviderSource::new(
+        client.clone(),
+        &config.namespace,
+    )))
+    .with_metric_transport(Arc::new(
+        metric_gate::ReqwestMetricTransport::build()
+            .context("failed to build the bounded Prometheus query client")?,
+    ))
     // `T12.2`: the same scope the watcher uses, so a tenant `Application` is refused here even
     // if it somehow reaches a reconcile.
     .with_application_scope(config.application_scope())
