@@ -251,7 +251,7 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
             setActiveIndex(0);
           }}
           onKeyDown={onKeyDown}
-          className="w-full rounded-lg border border-control bg-canvas px-3 py-2 text-sm text-ink-strong transition-colors placeholder-hint focus-visible:border-accent "
+          className="w-full rounded-lg border border-control bg-canvas px-3 py-2 text-sm text-ink-strong transition-colors placeholder-hint "
         />
         <kbd className="hidden shrink-0 rounded border border-control bg-surface px-1.5 py-0.5 font-mono text-[10px] text-ink-body sm:block">
           Esc
