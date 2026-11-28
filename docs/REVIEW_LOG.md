@@ -456,11 +456,11 @@ above.
 
 ## `T18.3` OCI Source (`T18.4` follow-up: M-D)
 
-`SourceSummary::from_source` copies a Git `repoURL` verbatim, including userinfo, so
-`status.history[].sourceSummary.repoURL` can carry a token today. This is pinned by
-`crates/ferriscd-engine/src/sync/history.rs::a_history_source_summary_still_carries_git_userinfo_verbatim`
-as the red assertion T18.4 must flip; the durable redaction belongs in `from_source`, while
-`record_sync_success` (next to `redact_repo_url`) is the minimal engine-side fix. OCI URLs are
+`SourceSummary::from_source` copied a Git `repoURL` verbatim, including userinfo, so
+`status.history[].sourceSummary.repoURL` could carry a token. **Closed by T18.4:** the
+`record_sync_success` path now redacts per source kind, pinned by
+`crates/ferriscd-engine/src/sync/history.rs::a_history_source_summary_redacts_an_embedded_credential`
+(replacing the old passing-leak assertion). The durable place remains `from_source`; OCI URLs are
 already refused by the offline `validate` when they embed credentials.
 
 ---

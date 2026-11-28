@@ -158,16 +158,49 @@ pub struct ApplicationSummary {
     pub observed_generation: Option<i64>,
 }
 
+/// The `sourceType` value assumed for a payload that predates the field (`T18.4`).
+///
+/// A `v1.1` server only serves Git sources, so `git` is the honest default rather than an error
+/// that would make an upgraded CLI unusable against a not-yet-upgraded control plane.
+fn git_source_type() -> String {
+    "git".to_owned()
+}
+
 /// `spec.source` summary.
+///
+/// `T18.4` added the source **kind** and, for an OCI artifact, its `tag` and pinned `digest`. The
+/// fields are additive: a Git `Application` keeps `sourceType: "git"` with no `tag`/`digest` key at
+/// all, so an existing client sees exactly the payload it saw before.
+///
+/// **Client/server skew (finding M6).** `sourceType` is *new*, so a `v1.1` server does not send it.
+/// Deserializing therefore defaults to `"git"` (the only source kind that version could serve)
+/// instead of failing the whole response, while the **response** schema keeps the field required
+/// (`#[schema(required = true)]`) — a `v1.2` server always fills it in, and the generated
+/// TypeScript client must keep treating it as present.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceView {
-    /// Repository URL, redacted (a remote URL may carry a token).
+    /// Source kind (`git` or `oci`).
+    ///
+    /// Defaults to `git` when absent: an older server has no OCI support, so every source it can
+    /// report *is* a Git source.
+    #[serde(default = "git_source_type")]
+    #[schema(required = true)]
+    pub source_type: String,
+    /// Repository or registry URL, redacted (a remote URL may carry a token).
     pub repo_url: String,
-    /// Path inside the repository.
+    /// Path inside the repository (`""` for its root).
     pub path: String,
-    /// Requested revision (branch, tag, or `HEAD`).
+    /// Requested revision (`spec.source.git.targetRevision`, else `oci.tag`, else `oci.digest`).
     pub target_revision: String,
+    /// OCI tag to resolve (`spec.source.oci.tag`); absent for a Git source and for a digest-only
+    /// reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// Pinned OCI manifest digest (`spec.source.oci.digest`, `sha256:<64-hex>`); never set by a
+    /// resolution — this is what the `Application` *pinned*, not what the registry answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     /// Selected renderer (`auto`, `plainYaml`, `kustomize`, `helm`).
     pub renderer: String,
 }
@@ -2113,11 +2146,25 @@ fn application_summary(app: &Application) -> ApplicationSummary {
         name: app.name_any(),
         project: app.spec.project.clone(),
         source: SourceView {
+            // `T18.4`: an OCI source reports `oci`, and its tag/digest, through the same view — the
+            // URL goes through the same redaction rule either way.
+            source_type: if app.spec.source.oci.is_some() {
+                "oci".to_owned()
+            } else {
+                "git".to_owned()
+            },
             // A Git remote routinely carries a personal access token (`https://oauth2:ghp_...@...`);
             // the same rule covers an `oci://` reference.
             repo_url: ferriscd_engine::manifest::redact_repo_url(app.spec.source.repo_url()),
             path: app.spec.source.source_path().to_owned(),
             target_revision: app.spec.source.requested_revision().to_owned(),
+            tag: app.spec.source.oci.as_ref().and_then(|oci| oci.tag.clone()),
+            digest: app
+                .spec
+                .source
+                .oci
+                .as_ref()
+                .and_then(|oci| oci.digest.clone()),
             renderer: renderer_label(&app.spec.source.renderer).to_owned(),
         },
         destination: DestinationView {
@@ -2463,6 +2510,49 @@ mod tests {
         assert_eq!(
             renderer_label(&ferriscd_crd::RendererSpec::Helm(HelmRenderer::default())),
             "helm"
+        );
+    }
+
+    /// **Finding M6.** A `v1.1` server's `SourceView` payload — no `sourceType` key at all —
+    /// deserializes into a Git source instead of failing the whole response, while the **schema**
+    /// keeps `sourceType` required (a `v1.2` server always sends it, and the generated TypeScript
+    /// client depends on it being present).
+    #[test]
+    fn a_v1_1_source_view_deserializes_as_a_git_source_and_the_schema_stays_strict() {
+        // Exactly what a `v1.1` server emitted: no `sourceType`, no `tag`, no `digest`.
+        let payload = serde_json::json!({
+            "repoUrl": "https://github.com/example/manifests",
+            "path": "apps/payments",
+            "targetRevision": "main",
+            "renderer": "kustomize",
+        });
+        let view: SourceView =
+            serde_json::from_value(payload.clone()).expect("a v1.1 payload must still deserialize");
+        assert_eq!(
+            view.source_type, "git",
+            "the only kind a v1.1 server can serve"
+        );
+        assert_eq!(view.tag, None);
+        assert_eq!(view.digest, None);
+        assert_eq!(view.repo_url, "https://github.com/example/manifests");
+
+        // A `v1.2` payload still overrides the default, so the fallback cannot mask a real OCI
+        // source.
+        let mut oci = payload.clone();
+        oci["sourceType"] = serde_json::json!("oci");
+        oci["tag"] = serde_json::json!("1.4.2");
+        let view: SourceView = serde_json::from_value(oci).expect("an OCI payload must parse");
+        assert_eq!(view.source_type, "oci");
+        assert_eq!(view.tag.as_deref(), Some("1.4.2"));
+
+        // The response schema is strict: `sourceType` is required even though deserialization
+        // defaults it.
+        let schema = serde_json::to_value(<SourceView as utoipa::PartialSchema>::schema())
+            .expect("the schema must serialize");
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            required.contains(&serde_json::json!("sourceType")),
+            "the OpenAPI schema must keep `sourceType` required: {schema}"
         );
     }
 

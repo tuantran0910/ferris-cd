@@ -481,7 +481,7 @@ pub(super) fn redact_url_credentials(url: &str) -> String {
 /// absolute" rejection as `token@ghcr.io/org/chart`, and the Git rule would keep it intact because
 /// there is no `:`. A registry reference has no SCP-style spelling — every `@` before the end of
 /// the authority is a credential (finding M-A).
-pub(super) fn redact_oci_url_credentials(url: &str) -> String {
+pub(crate) fn redact_oci_url_credentials(url: &str) -> String {
     redact_userinfo(url, false)
 }
 

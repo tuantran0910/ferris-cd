@@ -104,7 +104,9 @@ use ferriscd_engine::policy::{
     AppProjectPolicy, ApplicationScope, PolicyError, SyncWindowSet, SyncWindowTarget,
     SyncWindowVerdict,
 };
-use ferriscd_engine::repo::{GitSource, RepoCache, RepoCredentials, RepoUrlPolicy};
+use ferriscd_engine::repo::{
+    GitSource, OciClient, OciSource, OciUrlPolicy, RepoCache, RepoCredentials, RepoUrlPolicy,
+};
 use ferriscd_engine::sync::{
     DEFAULT_REQUEUE_AFTER, OrphanCandidate, OrphanOwnership, PlanRequest, RollbackDecision,
     RollbackError, StepAction, SyncMachine, SyncPlan, SyncStep, parse_rollback_request,
@@ -602,6 +604,25 @@ enum PassMode {
     Preview,
 }
 
+/// What the OCI fetch half of a pass produced (`T18.4`).
+///
+/// Either the render cache already holds the digest's bundle (so nothing was fetched), or the
+/// artifact was materialized and still has to be rendered. The distinction is what makes the
+/// "cached digest hits execute zero registry fetches and zero renderer subprocesses" criterion
+/// observable from a test rather than inferred from timings.
+enum OciFetch {
+    /// The digest was already rendered: no registry request beyond resolution, no subprocess.
+    Cached {
+        digest: String,
+        bundle: Arc<Vec<DesiredResource>>,
+    },
+    /// The artifact was fetched and extracted; it still has to go through the renderer.
+    Fetched {
+        digest: String,
+        checkout: ferriscd_engine::repo::RepoCheckout,
+    },
+}
+
 /// Everything one pass learns before it writes anything (`T14.1`).
 ///
 /// Shared by [`InventorySyncPipeline::sync_apply`] and [`InventorySyncPipeline::diff_preview`], so
@@ -703,6 +724,18 @@ pub struct InventorySyncPipeline {
     /// opt-in drift watcher can suppress the watch event FerrisCD's own write produces. `None`
     /// (the default) records nothing, which is exactly the pre-`v1.2` behaviour.
     self_echo: Option<Arc<crate::drift_watcher::SelfEchoCache>>,
+    /// `T18.4`: the registry transport that materializes `spec.source.oci`.
+    ///
+    /// `None` means this build cannot fetch an artifact, and an OCI `Application` is refused
+    /// **terminally** — never rendered as an empty bundle and never silently fetched from Git.
+    oci: Option<Arc<dyn OciClient>>,
+    /// `T18.4`: which `spec.source.oci.url` schemes that client may dial.
+    ///
+    /// [`OciUrlPolicy::Production`] (the default) is HTTPS-only; plaintext is reachable only through
+    /// the controller's explicit local-development opt-in (`--allow-local-repos`), which a
+    /// `kind`-hosted `registry:2` needs. It is enforced here *as well as* inside the client, so a
+    /// pipeline with a different client cannot widen it by accident.
+    oci_url_policy: OciUrlPolicy,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -721,6 +754,8 @@ impl std::fmt::Debug for InventorySyncPipeline {
             .field("credentials", &self.credentials.is_some())
             .field("clusters", &self.clusters.is_some())
             .field("metrics", &self.metrics.is_some())
+            .field("oci", &self.oci.is_some())
+            .field("oci_url_policy", &self.oci_url_policy)
             .finish_non_exhaustive()
     }
 }
@@ -764,6 +799,8 @@ impl InventorySyncPipeline {
             audit: None,
             stamp: ferriscd_engine::inventory::StampOptions::tracking_id_only(),
             self_echo: None,
+            oci: None,
+            oci_url_policy: OciUrlPolicy::Production,
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -820,6 +857,41 @@ impl InventorySyncPipeline {
     #[must_use]
     pub fn self_echo(&self) -> Option<&Arc<crate::drift_watcher::SelfEchoCache>> {
         self.self_echo.as_ref()
+    }
+
+    /// Wires the OCI registry client that serves `spec.source.oci` (`T18.4`).
+    ///
+    /// Without one, an OCI `Application` is refused with a **terminal** diagnostic: the pre-`T18.4`
+    /// behaviour, kept honest rather than turned into a silent empty render. The production
+    /// controller always wires a [`RegistryOciClient`](ferriscd_engine::repo::RegistryOciClient) —
+    /// this seam exists so a test can script the registry without a socket.
+    #[must_use]
+    pub fn with_oci_client(mut self, client: Arc<dyn OciClient>) -> Self {
+        self.oci = Some(client);
+        self
+    }
+
+    /// Selects the `spec.source.oci.url` transport policy (`T18.4`).
+    ///
+    /// [`OciUrlPolicy::Production`] (the default) accepts `oci://`/`https://` only. The
+    /// local-development opt-in (`--allow-local-repos`) selects [`OciUrlPolicy::AllowLocal`], which
+    /// additionally allows a plaintext `http://` registry such as the `kind` test's `registry:2`.
+    #[must_use]
+    pub fn with_oci_url_policy(mut self, policy: OciUrlPolicy) -> Self {
+        self.oci_url_policy = policy;
+        self
+    }
+
+    /// The wired OCI registry client, if any (`T18.4`).
+    #[must_use]
+    pub fn oci_client(&self) -> Option<&Arc<dyn OciClient>> {
+        self.oci.as_ref()
+    }
+
+    /// The `spec.source.oci.url` transport policy (`T18.4`).
+    #[must_use]
+    pub fn oci_url_policy(&self) -> OciUrlPolicy {
+        self.oci_url_policy
     }
 
     /// Number of mutating Server-Side Apply calls this pipeline has issued so far.
@@ -2378,28 +2450,48 @@ impl InventorySyncPipeline {
     /// sorted, and its result cache is keyed on the full render tuple, so a periodic requeue at an
     /// unchanged commit costs one hash lookup instead of a `kustomize`/`helm` subprocess.
     ///
-    /// `pinned` overrides `spec.source.git.targetRevision` (`T10.5`): a rollback — or an application
-    /// still holding a rollback warning — must render the commit it was pinned to, never `HEAD`.
+    /// `pinned` overrides the source's requested revision (`T10.5`): a rollback — or an application
+    /// still holding a rollback warning — must render the revision it was pinned to, never the tip.
+    /// For a Git source that is a commit SHA, for an OCI source (`T18.4`) a manifest digest.
+    ///
+    /// The `AppProject` policy has already authorized this source before this point
+    /// ([`Self::prepare_pass`]), which is what keeps an unauthorized `oci://` URL from becoming an
+    /// SSRF probe against an internal registry (trap guard `T18.4`).
     async fn fetch_desired(
         &self,
         app: &Application,
         pinned: Option<&str>,
         discovery: &DiscoveryCache,
     ) -> Result<(String, Vec<DesiredResource>), ReconcileError> {
-        // `T18.3` accepts `spec.source.oci` at the API boundary (schema + offline validation),
-        // but the registry client that would turn it into a checkout is wired in `T18.4`. Until
-        // then an OCI source is a terminal, honest refusal — never a silent empty render and never
-        // a Git fetch of an empty URL.
+        match (&app.spec.source.git, &app.spec.source.oci) {
+            (Some(_), _) => self.fetch_git_desired(app, pinned, discovery).await,
+            (None, Some(oci)) => {
+                let oci = oci.clone();
+                let pinned = pinned.map(str::to_owned);
+                self.fetch_oci_desired(app, &oci, pinned.as_deref(), discovery)
+                    .await
+            }
+            // `ApplicationSpec::validate` already rejects this, so the arm exists to keep the
+            // function total without an `unwrap`.
+            (None, None) => Err(ReconcileError::Invalid {
+                message: "spec.source must set exactly one of `git` or `oci`".to_owned(),
+            }),
+        }
+    }
+
+    /// Fetches and renders a Git-backed `Application` (the `v1.0` path, unchanged).
+    async fn fetch_git_desired(
+        &self,
+        app: &Application,
+        pinned: Option<&str>,
+        discovery: &DiscoveryCache,
+    ) -> Result<(String, Vec<DesiredResource>), ReconcileError> {
         let git = app
             .spec
             .source
             .git_source()
             .ok_or_else(|| ReconcileError::Invalid {
-                message:
-                    "spec.source.oci is not served by this controller build yet: this release \
-                          can only render a Git source (spec.source.git). No artifact was fetched \
-                          and nothing in the cluster was changed."
-                        .to_owned(),
+                message: "spec.source.git is required for a Git-backed Application".to_owned(),
             })?;
         let source = GitSource::new(
             git.repo_url.clone(),
@@ -2419,7 +2511,8 @@ impl InventorySyncPipeline {
         // `T15.1`: resolve + checkout is the Git work of one pass (both go through the `RepoCache`,
         // which carries the mirror/worktree state), so they are timed together. The observation is
         // recorded for a failed fetch too — the latency of a timeout is exactly what an operator
-        // needs — and the histogram has no label, so neither the URL nor the error can widen it.
+        // needs — and the histogram carries only the enum label `source_kind="git"`, so neither the
+        // URL nor the error can widen it.
         let fetch_started = std::time::Instant::now();
         let git_span = tracing::info_span!(
             "git_fetch",
@@ -2437,6 +2530,10 @@ impl InventorySyncPipeline {
         .instrument(git_span)
         .await;
         if let Some(metrics) = &self.metrics {
+            // `record_git_fetch` *is* the `source_kind="git"` observation (it writes the historical
+            // unlabelled family and forwards to `record_source_fetch`), so it is recorded once. A
+            // second `record_source_fetch` call here would double every Git observation in
+            // `ferriscd_source_fetch_duration_seconds_count{source_kind="git"}` (finding H1).
             metrics.record_git_fetch(fetch_started.elapsed());
         }
         let (resolved, checkout) = fetched?;
@@ -2474,6 +2571,170 @@ impl InventorySyncPipeline {
         // The pipeline hands back a shared, already-normalized bundle; stamping ownership below
         // mutates the resources, so this pass needs its own copy.
         Ok((resolved.commit_sha, rendered.as_ref().clone()))
+    }
+
+    /// Fetches and renders an OCI-backed `Application` (`T18.4`).
+    ///
+    /// The artifact flows through exactly the same render path as a Git checkout, so
+    /// `PlainYaml`/`Kustomize`/`Helm` — and the whole Phase 03/04 parse-and-normalize chain — behave
+    /// identically; the only difference is how the read-only checkout was produced. Three rules make
+    /// this cheap and safe:
+    ///
+    /// 1. **The digest is the revision.** `status.sync.lastSyncedRevision`, every
+    ///    `status.history[].revision`, and the render cache key all carry `sha256:<64-hex>`, so the
+    ///    existing `sourceChanged` decision gate, rollback, and history views work untouched.
+    /// 2. **A cached digest costs nothing.** When the digest is already known without asking the
+    ///    registry — a pinned `spec.source.oci.digest`, or a rollback pin from `status.history` — the
+    ///    render cache is probed *before* the artifact is resolved or downloaded. A hit therefore
+    ///    issues **zero** registry requests and starts **zero** renderer subprocesses, which is what
+    ///    makes a periodic requeue of an unchanged digest free.
+    /// 3. **A pin means a pin — but a moved tag is reported.** A pinned digest is authoritative for
+    ///    *what is fetched*: the artifact is asked for by `digest` and verified byte for byte. When
+    ///    the operator wrote **both** a `tag` and a `digest` and the cache is cold, the tag is
+    ///    resolved first (one `HEAD`) so that a tag which no longer points at the pin is a terminal
+    ///    `OciDigestMismatch` instead of a silently ignored tag — which is exactly what
+    ///    `spec.source.oci.digest` documents. A digest-only pin (and a rollback pin) resolves
+    ///    nothing, and a warm cache still returns before any round trip, so rule 2 is untouched.
+    ///
+    /// `pinned` (a rollback target) overrides `tag`/`digest` exactly like the Git path overrides
+    /// `targetRevision`, so "roll back to history entry N" redeploys that entry's digest.
+    async fn fetch_oci_desired(
+        &self,
+        app: &Application,
+        oci: &ferriscd_crd::OciSourceSpec,
+        pinned: Option<&str>,
+        discovery: &DiscoveryCache,
+    ) -> Result<(String, Vec<DesiredResource>), ReconcileError> {
+        let client = self.oci.as_deref().ok_or_else(|| ReconcileError::Invalid {
+            message: "spec.source.oci is not served by this controller build: no OCI registry \
+                      client is wired. No artifact was fetched and nothing in the cluster was \
+                      changed."
+                .to_owned(),
+        })?;
+        // The engine's reference type: the *effective* source, with the rollback pin replacing both
+        // the tag and the digest.
+        let source = OciSource::new(
+            oci.url.clone(),
+            pinned.is_none().then(|| oci.tag.clone()).flatten(),
+            pinned.map(str::to_owned).or_else(|| oci.digest.clone()),
+            oci.path.clone(),
+        );
+        // The transport policy is enforced here as well as inside the client, so a plaintext
+        // registry can never be dialled by a pipeline whose client was built for production.
+        source.validate(self.oci_url_policy)?;
+
+        // Helm's `.Capabilities.KubeVersion` must match the destination cluster for OCI charts
+        // exactly as it does for Git ones, and the render cache key contains it — so the snapshot is
+        // refreshed before the probe, not after the download.
+        discovery.ensure_fresh().await?;
+        let kube_version = discovery.kube_version();
+        let probe = |digest: &str| {
+            RenderContext::for_application(std::path::PathBuf::new(), app, &kube_version)
+                .with_commit_sha(digest.to_owned())
+                .with_loader_config(self.loader.clone())
+                .with_binaries(self.renderer_binaries.clone())
+        };
+
+        // Rule 2: a digest we already hold needs no registry round trip at all.
+        if let Some(digest) = source.digest.clone()
+            && let Some(cached) = self.render.cached(&probe(&digest))
+        {
+            tracing::debug!(
+                app.namespace = %app.namespace().unwrap_or_default(),
+                app.name = %app.name_any(),
+                digest = %digest,
+                "OCI artifact already rendered; serving the render cache without touching the \
+                 registry"
+            );
+            self.record_render_metrics();
+            return Ok((digest, cached.as_ref().clone()));
+        }
+
+        // `T12.4`/`T18.3`: registry credentials come from a
+        // `ferriscd.io/secret-type=repository` Secret, matched on the effective `oci://` URL — and
+        // only after `AppProjectPolicy::check_application` authorized that URL, so a credential is
+        // never resolved for a project that does not permit the registry.
+        let credentials = self.credentials_for(&source.url).await?;
+        let fetch_started = std::time::Instant::now();
+        let oci_span = tracing::info_span!(
+            "oci_fetch",
+            registry = %manifest::redact_repo_url(&source.url),
+            reference = %source.requested_reference().unwrap_or_default(),
+        );
+        // Resolve (or take the pin), probe the cache once more, and download only on a real miss.
+        // All three steps share one fetch span and one duration observation, because together they
+        // are "what this pass spent on the registry".
+        let fetched: Result<OciFetch, ReconcileError> = async {
+            let digest = match (source.digest.clone(), source.tag.clone()) {
+                // Rule 3: a digest *without* a tag is authoritative, so there is nothing to
+                // resolve.
+                (Some(digest), None) => digest,
+                // A tag next to the pin is a claim the registry has to confirm: resolve it so a
+                // moved tag surfaces as the terminal `OciDigestMismatch` the CRD documents, instead
+                // of the tag being silently dropped and the pin fetched anyway. The warm-cache
+                // probe above already returned, so this costs one `HEAD` only on a cold cache.
+                (_pinned, _) => {
+                    let resolved = client
+                        .resolve_digest(&source, &credentials)
+                        .await?
+                        .manifest_digest;
+                    // The client compares the resolved digest against `source.digest` and fails with
+                    // a terminal `OciDigestMismatch`, so `resolved` *is* the pin when one is set.
+                    resolved
+                }
+            };
+            // A mutable tag may resolve to a digest that is already rendered: probe once more so a
+            // reconcile that finds nothing new still skips the layer download and the renderer.
+            if let Some(cached) = self.render.cached(&probe(&digest)) {
+                return Ok(OciFetch::Cached {
+                    digest,
+                    bundle: cached,
+                });
+            }
+            let checkout = client
+                .fetch_artifact(&source, &digest, &credentials)
+                .await?;
+            Ok(OciFetch::Fetched { digest, checkout })
+        }
+        .instrument(oci_span)
+        .await;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_source_fetch(crate::metrics::SourceKind::Oci, fetch_started.elapsed());
+        }
+        let (digest, checkout) = match fetched? {
+            OciFetch::Cached { digest, bundle } => {
+                // A cached digest hit: no layer download and no subprocess.
+                self.record_render_metrics();
+                return Ok((digest, bundle.as_ref().clone()));
+            }
+            OciFetch::Fetched { digest, checkout } => (digest, checkout),
+        };
+
+        // The checkout was materialized by `fetch_artifact` (verified, bounded, and extracted inside
+        // `spawn_blocking`); the render key is `(oci.url, digest, oci.path, …)` — the *effective*
+        // spec source — so two OCI applications never collide, and a new digest is a new entry.
+        let context =
+            RenderContext::for_application(checkout.root_dir().to_path_buf(), app, &kube_version)
+                .with_commit_sha(digest.clone())
+                .with_loader_config(self.loader.clone())
+                .with_binaries(self.renderer_binaries.clone());
+
+        let render_span = tracing::info_span!(
+            "manifest_render",
+            commit_sha = %digest,
+            path = %source.path,
+        );
+        let rendered = self.render.render(&context).instrument(render_span).await;
+        self.record_render_metrics();
+        let rendered = rendered?;
+        Ok((digest, rendered.as_ref().clone()))
+    }
+
+    /// Bridges the render cache's counters to `ferriscd_render_cache_total` (`T15.1`).
+    fn record_render_metrics(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_render_cache(self.render.cache().stats());
+        }
     }
 
     /// Rejects unsupported manifests, collects in-bundle CRDs/namespaces, refreshes discovery
@@ -3565,7 +3826,9 @@ mod tests {
     use ferriscd_engine::health::Observation;
     use ferriscd_engine::manifest::GroupVersionKind;
     use ferriscd_engine::policy::ApplicationNamespaces;
-    use ferriscd_engine::repo::{FakeGitClient, FakeGitClientConfig, RepoCacheConfig};
+    use ferriscd_engine::repo::{
+        FakeGitClient, FakeGitClientConfig, FakeOciClient, FakeOciClientConfig, RepoCacheConfig,
+    };
     use kube::api::GroupVersionKind as KubeGvk;
     use kube::discovery::{ApiCapabilities, Scope};
     use serde_json::json;
@@ -5031,6 +5294,94 @@ spec:
     ) -> Fixture {
         Fixture {
             pipeline: fixture.pipeline.with_stamp_options(stamp),
+            git: fixture.git,
+            cluster: fixture.cluster,
+            discovery: fixture.discovery,
+            dry_run: fixture.dry_run,
+            projects: fixture.projects,
+            impersonation: fixture.impersonation,
+            repo_url: fixture.repo_url,
+            _temp: fixture._temp,
+        }
+    }
+
+    /// An `Application` whose source is an OCI artifact (`T18.4`).
+    fn oci_app(url: &str, tag: Option<&str>, digest: Option<&str>, path: &str) -> Application {
+        let mut app = application("", path, "payments");
+        app.spec.source.git = None;
+        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+            url: url.to_owned(),
+            tag: tag.map(str::to_owned),
+            digest: digest.map(str::to_owned),
+            path: path.to_owned(),
+        });
+        app
+    }
+
+    /// A `FakeOciClient` serving one generic-layer artifact, plus that artifact's manifest digest.
+    ///
+    /// The client runs the **real** extraction pipeline, so a test that drives it exercises digest
+    /// verification, the budgets, and the post-extraction sanitizer — not a stub.
+    fn oci_client_with(
+        url: &str,
+        reference: &str,
+        files: &[(&str, &str)],
+    ) -> (Arc<FakeOciClient>, String) {
+        let layer = ferriscd_engine::repo::tar_gzip_layer(files).expect("fixture layer");
+        let manifest = ferriscd_engine::repo::artifact_manifest(
+            ferriscd_engine::repo::OCI_IMAGE_LAYER_MEDIA_TYPE,
+            &layer,
+        );
+        let digest = ferriscd_engine::repo::sha256_digest(&manifest);
+        let mut client = FakeOciClient::with_config(FakeOciClientConfig {
+            limits: ferriscd_engine::repo::WorktreeLimits::default(),
+            // The reference is plaintext in these fixtures (`oci://` is HTTPS, but the fake never
+            // dials): `AllowLocal` is the policy the production controller selects with
+            // `--allow-local-repos`, and it is what a `kind`-hosted registry needs.
+            url_policy: OciUrlPolicy::AllowLocal,
+        });
+        // A registry serves a manifest under its tag **and** under its digest; registering both
+        // makes a digest-pinned (and a rolled-back) source resolvable without a resolution call.
+        client.register(url, reference, manifest.clone(), layer.clone());
+        client.register(url, &digest, manifest, layer);
+        (Arc::new(client), digest)
+    }
+
+    /// An `AppProject` that lists one `oci://` repository glob (`T18.4`).
+    fn oci_only_project() -> AppProject {
+        serde_saphyr::from_str(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: oci
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - "oci://ghcr.io/example/*"
+  sourceNamespaces:
+    - ferriscd-system
+  destinations:
+    - cluster: in-cluster
+      namespace: "*"
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+"#,
+        )
+        .expect("the OCI project must parse")
+    }
+
+    /// Returns `fixture` with the `T18.4` OCI client and policy wired into its pipeline.
+    fn with_oci(fixture: Fixture, client: Arc<FakeOciClient>) -> Fixture {
+        Fixture {
+            pipeline: fixture
+                .pipeline
+                .with_oci_client(client as Arc<dyn OciClient>)
+                .with_oci_url_policy(OciUrlPolicy::AllowLocal),
             git: fixture.git,
             cluster: fixture.cluster,
             discovery: fixture.discovery,
@@ -10932,6 +11283,18 @@ spec:
             "2",
             "one Git resolve/checkout per pass:\n{body}"
         );
+        // Finding H1, at the call site: `record_git_fetch` already forwards to the labelled family,
+        // so a pass must advance `source_kind="git"` exactly once. Recording both here read `4`.
+        assert_eq!(
+            crate::metrics::exposition::value_of(
+                &samples,
+                &format!("{}_count", crate::metrics::SOURCE_FETCH_DURATION_SECONDS),
+                &[("source_kind", "git")],
+                &body
+            ),
+            "2",
+            "one `source_kind=\"git\"` observation per pass, not two:\n{body}"
+        );
         // The histogram carries no label at all, so neither the repository URL nor an error can
         // widen it.
         for sample in crate::metrics::exposition::samples_of(
@@ -11128,21 +11491,14 @@ spec:
         assert!(fixture.cluster.applies().is_empty());
     }
 
-    /// **Trap guard (`T18.3`).** `spec.source.oci` is accepted by the API (schema + offline
-    /// validation) but the registry client is `T18.4`'s work: this build must refuse it *terminally
-    /// and before any fetch*, never fall through to a Git clone of an empty URL and never render an
-    /// empty bundle.
+    /// **`T18.4`.** A pipeline with no registry client must refuse an OCI source *terminally and
+    /// before any fetch*: never fall through to a Git clone of an empty URL, never render an empty
+    /// bundle. (The production controller always wires one; this is the honest failure of a build or
+    /// a wiring that does not.)
     #[tokio::test]
-    async fn an_oci_source_is_refused_terminally_before_any_fetch() {
+    async fn an_oci_source_without_a_registry_client_is_refused_terminally() {
         let fixture = fixture(FakeCluster::default().with_namespace("payments"));
-        let mut app = fixture.app(".");
-        app.spec.source.git = None;
-        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
-            url: "oci://ghcr.io/example/payments".to_owned(),
-            tag: Some("1.4.2".to_owned()),
-            digest: None,
-            path: String::new(),
-        });
+        let app = oci_app("oci://ghcr.io/example/payments", Some("1.4.2"), None, "");
         assert!(
             app.spec.validate().is_ok(),
             "the spec itself must be valid: the refusal is about this build's pipeline"
@@ -11162,6 +11518,513 @@ spec:
         assert_eq!(fixture.git.resolve_calls(), 0);
         assert!(fixture.dry_run.calls().is_empty());
         assert!(fixture.cluster.applies().is_empty());
+    }
+
+    /// **`T18.4` end-to-end, offline.** An OCI artifact renders through the *same* pipeline as a
+    /// Git checkout, records its `sha256:<64-hex>` digest as the revision, and lands in
+    /// `status.history` with a redacted `oci://` source summary — with no registry, no Git and no
+    /// renderer subprocess.
+    #[tokio::test]
+    async fn an_oci_artifact_renders_offline_and_records_its_digest() {
+        let (client, digest) = oci_client_with(
+            "oci://ghcr.io/example/payments",
+            "1.4.2",
+            &[("configmap.yaml", POLICY_CONFIGMAP)],
+        );
+        let fixture = with_oci(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            client,
+        );
+        let app = oci_app("oci://ghcr.io/example/payments", Some("1.4.2"), None, "");
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("the artifact renders");
+        assert_eq!(
+            outcome.sync.as_ref().and_then(|sync| sync.revision.clone()),
+            Some(digest.clone()),
+            "status.sync.revision carries the manifest digest, exactly like a commit SHA"
+        );
+        let history = outcome.history.clone().expect("history");
+        let entry = history.first().expect("one history entry");
+        assert_eq!(entry.revision.as_deref(), Some(digest.as_str()));
+        let summary = entry.source_summary.clone().expect("a source summary");
+        assert_eq!(summary.repo_url, "oci://ghcr.io/example/payments");
+        assert_eq!(summary.target_revision, "1.4.2");
+
+        // `generateName`-free fixture: the rendered ConfigMap really reached the applier.
+        fixture.cluster.seed_applied();
+        assert_eq!(
+            fixture
+                .cluster
+                .live_pointer(CONFIGMAP_KEY, "/data/key")
+                .as_deref(),
+            Some("value"),
+            "the artifact's manifest is what reached the cluster: {:?}",
+            fixture.cluster.applies()
+        );
+        // No Git work at all, and the digest is a digests-shaped revision.
+        assert_eq!(fixture.git.resolve_calls(), 0);
+        assert!(digest.starts_with("sha256:"), "{digest}");
+        assert_eq!(digest.len(), "sha256:".len() + 64);
+    }
+
+    /// **Trap guard (`T18.4`).** `AppProjectPolicy::check_application` runs *before* the registry
+    /// client is consulted, so an unauthorized `oci://` URL cannot become an SSRF probe against an
+    /// internal registry — and no credential is resolved for it either.
+    #[tokio::test]
+    async fn an_unauthorized_oci_url_never_reaches_the_registry_client() {
+        let (client, _digest) = oci_client_with(
+            "oci://ghcr.io/evil/payments",
+            "1.4.2",
+            &[("configmap.yaml", POLICY_CONFIGMAP)],
+        );
+        let projects = FakeProjectSource::default().with_project(oci_only_project());
+        let credentials = Arc::new(FakeCredentialSource::returning(
+            RepoCredentials::HttpBasic {
+                username: "robot".to_owned(),
+                password: "s3cr3t".to_owned(),
+            },
+        ));
+        let fixture = with_oci(
+            fixture_with_policy(
+                FakeCluster::default().with_namespace("payments"),
+                projects,
+                ApplicationScope::default(),
+            ),
+            client.clone(),
+        );
+        // The credential seam has to be wired too, to prove it is not asked either.
+        let fixture = Fixture {
+            pipeline: fixture
+                .pipeline
+                .with_credential_source(credentials.clone() as Arc<dyn CredentialSource>),
+            git: fixture.git,
+            cluster: fixture.cluster,
+            discovery: fixture.discovery,
+            dry_run: fixture.dry_run,
+            projects: fixture.projects,
+            impersonation: fixture.impersonation,
+            repo_url: fixture.repo_url,
+            _temp: fixture._temp,
+        };
+
+        let mut app = oci_app("oci://ghcr.io/evil/payments", Some("1.4.2"), None, "");
+        app.spec.project = "oci".to_owned();
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("the project does not list this registry");
+        assert!(
+            matches!(
+                err,
+                ReconcileError::Policy(PolicyError::SourceRepoNotAllowed { .. })
+            ),
+            "expected SourceRepoNotAllowed, got {err:?}"
+        );
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert!(
+            client.resolves().is_empty(),
+            "no registry probe may happen before the project authorizes the URL: {:?}",
+            client.resolves()
+        );
+        assert!(client.fetches().is_empty(), "{:?}", client.fetches());
+        assert!(
+            credentials.lookups().is_empty(),
+            "no credential may be resolved for a denied registry: {:?}",
+            credentials.lookups()
+        );
+        assert!(fixture.cluster.applies().is_empty());
+
+        // Non-vacuity: the very same client, credential seam and project *do* reach the registry
+        // for a URL the project lists, so the assertions above are about the policy — not about a
+        // fixture that could never have fetched anything.
+        let mut permitted = app.clone();
+        permitted.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+            url: "oci://ghcr.io/evil/payments".to_owned(),
+            tag: Some("1.4.2".to_owned()),
+            digest: None,
+            path: String::new(),
+        });
+        // `oci_only_project` lists `oci://ghcr.io/example/*`, so this is still denied…
+        assert!(fixture.pipeline.apply(&permitted).await.is_err());
+        // …while the same wiring allows a listed reference. (The fake has no artifact registered
+        // for it, so the pass fails *after* the policy — which is exactly the point: it reached the
+        // client.)
+        let mut allowed = permitted.clone();
+        allowed.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+            url: "oci://ghcr.io/example/payments".to_owned(),
+            tag: Some("1.4.2".to_owned()),
+            digest: None,
+            path: String::new(),
+        });
+        let reached = fixture
+            .pipeline
+            .apply(&allowed)
+            .await
+            .expect_err("no artifact");
+        assert!(
+            !matches!(reached, ReconcileError::Policy(_)),
+            "a listed reference must get past the policy: {reached:?}"
+        );
+        assert_eq!(
+            client.resolves().len(),
+            1,
+            "the allowed URL did reach the registry"
+        );
+    }
+
+    /// **`T18.4` non-functional criterion.** A digest that is already rendered costs **zero**
+    /// registry requests and **zero** renderer runs on the next pass.
+    #[tokio::test]
+    async fn a_cached_oci_digest_costs_no_registry_fetch_and_no_render() {
+        let (client, digest) = oci_client_with(
+            "oci://ghcr.io/example/payments",
+            "1.4.2",
+            &[("configmap.yaml", POLICY_CONFIGMAP)],
+        );
+        let fixture = with_oci(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            client.clone(),
+        );
+        // Pin the digest: with a digest in hand there is nothing left to resolve.
+        let mut app = oci_app(
+            "oci://ghcr.io/example/payments",
+            None,
+            Some(digest.as_str()),
+            "",
+        );
+
+        let first = fixture.pipeline.apply(&app).await.expect("first pass");
+        assert_eq!(
+            first
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.revision.clone())
+                .as_deref(),
+            Some(digest.as_str())
+        );
+        assert_eq!(client.fetches().len(), 1, "the first pass downloads once");
+        let after_first = fixture.pipeline.render.cache().stats();
+        assert_eq!(after_first.misses, 1, "the first pass renders once");
+
+        // The second pass re-runs `fetch_desired` (a periodic requeue does exactly this).
+        app.status = Some(ApplicationStatus {
+            sync: first.sync.clone(),
+            operation_state: first.operation_state.clone(),
+            history: first.history.clone().unwrap_or_default(),
+            ..ApplicationStatus::default()
+        });
+        let second = fixture.pipeline.apply(&app).await.expect("second pass");
+        assert_eq!(
+            second
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.revision.clone())
+                .as_deref(),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            client.fetches().len(),
+            1,
+            "a cached digest must not download the layer again: {:?}",
+            client.fetches()
+        );
+        assert!(
+            client.resolves().is_empty(),
+            "a pinned digest needs no registry round trip at all: {:?}",
+            client.resolves()
+        );
+        let after_second = fixture.pipeline.render.cache().stats();
+        assert_eq!(
+            after_second.misses, after_first.misses,
+            "a cached digest must not start a renderer"
+        );
+        assert!(
+            after_second.hits > after_first.hits,
+            "the probe is served from the cache: {after_second:?}"
+        );
+    }
+
+    /// **Finding M2.** A tag *and* a digest on a cold cache: the tag is resolved first, so a moved
+    /// tag is the terminal `OciDigestMismatch` the CRD documents — and the artifact is never
+    /// downloaded against a pin the registry has already contradicted.
+    #[tokio::test]
+    async fn a_moved_tag_beside_a_pinned_digest_fails_terminally_before_the_download() {
+        let (client, digest) = oci_client_with(
+            "oci://ghcr.io/example/payments",
+            "1.4.2",
+            &[("configmap.yaml", POLICY_CONFIGMAP)],
+        );
+        let fixture = with_oci(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            client.clone(),
+        );
+        // A syntactically valid digest that is not what the tag resolves to.
+        let stale = format!("sha256:{}", "0".repeat(64));
+        assert_ne!(stale, digest);
+        let app = oci_app(
+            "oci://ghcr.io/example/payments",
+            Some("1.4.2"),
+            Some(stale.as_str()),
+            "",
+        );
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("a moved tag must not be silently ignored");
+        match &err {
+            ReconcileError::Repo(ferriscd_engine::repo::RepoError::OciDigestMismatch {
+                expected,
+                actual,
+            }) => {
+                assert_eq!(expected, &stale);
+                assert_eq!(actual, &digest);
+            }
+            other => panic!("expected a terminal OciDigestMismatch, got {other:?}"),
+        }
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert_eq!(
+            client.resolves().len(),
+            1,
+            "the tag is resolved exactly once before the download: {:?}",
+            client.resolves()
+        );
+        assert!(
+            client.fetches().is_empty(),
+            "nothing may be downloaded against a pin the tag contradicts: {:?}",
+            client.fetches()
+        );
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    /// **Finding M2 (the warm half).** A matching tag + digest costs **one** resolution on the cold
+    /// cache, and the requeue after that is served from the render cache with no registry round trip
+    /// at all — so the added confirmation does not make an unchanged digest cost anything.
+    #[tokio::test]
+    async fn a_matching_tag_and_digest_resolves_once_and_then_costs_nothing() {
+        let (client, digest) = oci_client_with(
+            "oci://ghcr.io/example/payments",
+            "1.4.2",
+            &[("configmap.yaml", POLICY_CONFIGMAP)],
+        );
+        let fixture = with_oci(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            client.clone(),
+        );
+        let mut app = oci_app(
+            "oci://ghcr.io/example/payments",
+            Some("1.4.2"),
+            Some(digest.as_str()),
+            "",
+        );
+
+        let first = fixture.pipeline.apply(&app).await.expect("first pass");
+        assert_eq!(
+            first
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.revision.clone())
+                .as_deref(),
+            Some(digest.as_str())
+        );
+        assert_eq!(
+            client.resolves().len(),
+            1,
+            "the cold cache confirms the tag once: {:?}",
+            client.resolves()
+        );
+        assert_eq!(client.fetches().len(), 1, "and downloads once");
+
+        // The next periodic pass: the digest is pinned *and* rendered, so the probe returns before
+        // any registry call.
+        app.status = Some(ApplicationStatus {
+            sync: first.sync.clone(),
+            operation_state: first.operation_state.clone(),
+            history: first.history.clone().unwrap_or_default(),
+            ..ApplicationStatus::default()
+        });
+        fixture.pipeline.apply(&app).await.expect("second pass");
+        assert_eq!(
+            client.resolves().len(),
+            1,
+            "a cached digest is not re-resolved: {:?}",
+            client.resolves()
+        );
+        assert_eq!(client.fetches().len(), 1, "and not re-downloaded");
+    }
+
+    /// A *mutable tag* needs one digest resolution per pass, but a resolution that lands on the
+    /// cached digest still must not download the layer or re-render.
+    #[tokio::test]
+    async fn a_tag_that_resolves_to_a_cached_digest_downloads_nothing() {
+        let (client, digest) = oci_client_with(
+            "oci://ghcr.io/example/payments",
+            "1.4.2",
+            &[("configmap.yaml", POLICY_CONFIGMAP)],
+        );
+        let fixture = with_oci(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            client.clone(),
+        );
+        let app = oci_app("oci://ghcr.io/example/payments", Some("1.4.2"), None, "");
+
+        let first = fixture.pipeline.apply(&app).await.expect("first pass");
+        assert_eq!(client.fetches().len(), 1);
+        let misses_after_first = fixture.pipeline.render.cache().stats().misses;
+
+        let mut requeued = app.clone();
+        requeued.status = Some(ApplicationStatus {
+            sync: first.sync.clone(),
+            operation_state: first.operation_state.clone(),
+            history: first.history.clone().unwrap_or_default(),
+            ..ApplicationStatus::default()
+        });
+        let second = fixture
+            .pipeline
+            .apply(&requeued)
+            .await
+            .expect("second pass");
+        assert_eq!(
+            second
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.revision.clone())
+                .as_deref(),
+            Some(digest.as_str())
+        );
+        assert_eq!(client.resolves().len(), 2, "one resolution per pass");
+        assert_eq!(
+            client.fetches().len(),
+            1,
+            "the second resolution hit the cache, so nothing was downloaded"
+        );
+        assert_eq!(
+            fixture.pipeline.render.cache().stats().misses,
+            misses_after_first,
+            "a cached digest must not start a renderer"
+        );
+    }
+
+    /// **`T18.4` acceptance criterion.** Rolling back to a prior history entry redeploys that
+    /// entry's **digest**, not the current tag — and the pass is pinned, so it does not re-resolve
+    /// the moved tag.
+    #[tokio::test]
+    async fn a_rollback_to_a_prior_oci_history_entry_redeploys_that_digest() {
+        let url = "oci://ghcr.io/example/payments";
+        let mut client = FakeOciClient::with_config(FakeOciClientConfig {
+            limits: ferriscd_engine::repo::WorktreeLimits::default(),
+            url_policy: OciUrlPolicy::AllowLocal,
+        });
+        let v1 = client
+            .with_chart(
+                url,
+                "1.0.0",
+                &[(
+                    "configmap.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  enabled: \"1.0.0\"\n",
+                )],
+            )
+            .expect("1.0.0 chart layer");
+        let v2 = client
+            .with_chart(
+                url,
+                "2.0.0",
+                &[(
+                    "configmap.yaml",
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: settings\ndata:\n  enabled: \"2.0.0\"\n",
+                )],
+            )
+            .expect("2.0.0 chart layer");
+        let client = Arc::new(client);
+        let fixture = with_oci(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            client.clone(),
+        );
+
+        // Two deployments: tag 1.0.0, then tag 2.0.0.
+        let mut app = oci_app(url, Some("1.0.0"), None, "");
+        let first = fixture.pipeline.apply(&app).await.expect("v1");
+        app.status = Some(ApplicationStatus {
+            sync: first.sync.clone(),
+            operation_state: first.operation_state.clone(),
+            history: first.history.clone().unwrap_or_default(),
+            ..ApplicationStatus::default()
+        });
+        fixture.cluster.seed_applied();
+
+        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+            url: url.to_owned(),
+            tag: Some("2.0.0".to_owned()),
+            digest: None,
+            path: String::new(),
+        });
+        app.metadata.generation = Some(5);
+        let second = fixture.pipeline.apply(&app).await.expect("v2");
+        assert_eq!(
+            second
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.revision.clone())
+                .as_deref(),
+            Some(v2.as_str())
+        );
+        fixture.cluster.seed_applied();
+        let history = second.history.clone().expect("history");
+        assert_eq!(history.len(), 2, "both deployments are recorded");
+        assert_eq!(history[1].revision.as_deref(), Some(v1.as_str()));
+
+        // The operator rolls back to history id 1 (`1.0.0`), while the tag says `2.0.0`.
+        let mut rolled_back = app.clone();
+        rolled_back.status = Some(ApplicationStatus {
+            sync: second.sync.clone(),
+            operation_state: second.operation_state.clone(),
+            history: history.clone(),
+            ..ApplicationStatus::default()
+        });
+        rolled_back.annotations_mut().insert(
+            annotations::OPERATION.to_owned(),
+            r#"{"rollback":{"id":1}}"#.to_owned(),
+        );
+        let resolves_before = client.resolves().len();
+        let outcome = fixture
+            .pipeline
+            .apply(&rolled_back)
+            .await
+            .expect("rollback");
+
+        assert_eq!(
+            outcome.sync.as_ref().and_then(|sync| sync.revision.clone()),
+            Some(v1.clone()),
+            "a rollback renders the historical digest, never the tag"
+        );
+        // The proof that the *prior artifact* was redeployed: the live object holds the 1.0.0 data
+        // again, and the pass did not need the moved tag to find it.
+        fixture.cluster.seed_applied();
+        assert_eq!(
+            fixture
+                .cluster
+                .live_pointer(CONFIGMAP_KEY, "/data/enabled")
+                .as_deref(),
+            Some("1.0.0"),
+            "the rollback must redeploy the historical digest's contents: {:?}",
+            fixture.cluster.applies()
+        );
+        assert_eq!(
+            client.resolves().len(),
+            resolves_before,
+            "a pinned rollback needs no digest resolution: {:?}",
+            client.resolves()
+        );
+        // The rollback contract is unchanged: automation is disabled so self-heal cannot undo it.
+        assert!(outcome.warnings.iter().any(|warning| {
+            warning.reason == ferriscd_engine::sync::REASON_AUTOMATED_SYNC_DISABLED_BY_ROLLBACK
+        }));
     }
 
     #[tokio::test]

@@ -16,8 +16,9 @@
 //! deny-by-default rather than "unpack and then look":
 //!
 //! * the **manifest** and **layer** SHA-256 digests are verified before a single archive byte is
-//!   interpreted ([`verify_digest`], [`extract_layer`]'s spool-then-verify order), and the layer's
-//!   declared `size` must match the blob exactly — a `Content-Length` header is never trusted;
+//!   interpreted ([`verify_digest`], and the spool-then-verify order of [`extract_layer`] /
+//!   [`extract_spooled_layer`]), and the layer's declared `size` must match the blob exactly — a
+//!   `Content-Length` header is never trusted;
 //! * decompression is **streaming and bounded**: every byte the gzip decoder produces is charged
 //!   against [`WorktreeLimits::max_bytes`] as it is read, so a decompression bomb stops at the
 //!   budget instead of filling the disk (the compressed blob is bounded too, by the same budget
@@ -36,8 +37,17 @@
 //! ## Async hygiene
 //!
 //! Everything here is blocking (`flate2`, `sha2`, and `std::fs`). Callers must run
-//! [`extract_artifact`]/[`extract_layer`] inside [`tokio::task::spawn_blocking`]; the bundled
-//! [`FakeOciClient`] does exactly that so the pattern is demonstrated rather than documented.
+//! [`extract_artifact`]/[`extract_layer`]/[`extract_spooled_layer`] inside
+//! [`tokio::task::spawn_blocking`]; the bundled [`FakeOciClient`] and the live
+//! [`RegistryOciClient`](super::RegistryOciClient) do exactly that so the pattern is demonstrated
+//! rather than documented.
+//!
+//! ## Written once
+//!
+//! A network client already has the blob on disk when it is finished downloading, so it must call
+//! [`extract_spooled_layer`] with its own spool path (finding M3): the bytes are written once, in
+//! the caller's work root, and this module reads that file twice — hash, then decompress.
+//! [`extract_layer`] remains the in-memory/streaming entry point and spools internally.
 
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -99,11 +109,13 @@ pub fn is_supported_layer_media_type(media_type: &str) -> bool {
 /// is available **only** through an explicit local-development opt-in (a `kind`-hosted registry at
 /// `http://localhost:5000`), never by simply writing `http://` in an `Application`.
 ///
-/// **Deferred to `T18.4`:** nothing plumbs the local-development opt-in yet — there is no controller
-/// flag that selects [`OciUrlPolicy::AllowLocal`], because `T18.3` ships only the CRD schema, the
-/// extraction pipeline, and this policy type. Until `T18.4` wires the flag, every production caller
-/// (and the `FakeOciClientConfig` default) uses [`OciUrlPolicy::Production`], so a
-/// plaintext registry stays impossible outside a test that opts in explicitly.
+/// **Selected by `--allow-local-repos`.** Since `T18.4` the controller's existing local-development
+/// flag is the one knob that relaxes *both* source kinds: it selects
+/// [`RepoUrlPolicy::AllowLocal`](super::RepoUrlPolicy) for Git and [`OciUrlPolicy::AllowLocal`] for
+/// OCI, logs a startup `warn!` naming each relaxation, and stays off by default. Production callers
+/// (and the `FakeOciClientConfig` default) therefore use [`OciUrlPolicy::Production`], so a
+/// plaintext registry is impossible outside an explicit opt-in — either the flag or a test that
+/// asks for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OciUrlPolicy {
     /// Production policy: `oci://` and `https://` only; `http://` is rejected.
@@ -235,6 +247,17 @@ fn validate_oci_url(url: &str, policy: OciUrlPolicy) -> Result<(), RepoError> {
             "registry URL must be oci://<registry>/<repository> (a repository is required)",
         )
     })?;
+    // A registry reference is a `<host>[:port]/<repository>` pair and nothing else. A `?`, a `#`, or
+    // a `%` would be re-interpreted by the HTTP client (`?` opens a query, `#` a fragment, `%` a
+    // percent-escape) — so the request would no longer name the repository (and the scope) the
+    // operator wrote, and a `%2f` could smuggle a path separator past the segment rules below. The
+    // distribution API has no use for any of them.
+    if authority.contains(['?', '#', '%']) || repository.contains(['?', '#', '%']) {
+        return Err(invalid(
+            url,
+            "the registry authority and repository must not contain '?', '#', or '%'",
+        ));
+    }
     if authority.contains('@') {
         return Err(invalid(
             url,
@@ -517,6 +540,10 @@ pub fn extract_artifact(
 /// cause (a full disk, a busy device, a cancelled worker) — and deleting a caller-owned directory
 /// would take storage this module never owned.
 ///
+/// This is the variant for an **in-memory** or still-streaming layer (the [`FakeOciClient`], a unit
+/// test). A caller that already wrote the blob to disk must use [`extract_spooled_layer`] instead,
+/// so the bytes are written once.
+///
 /// # Errors
 ///
 /// See [`extract_artifact`].
@@ -530,15 +557,8 @@ pub fn extract_layer(
     dest: &Path,
     limits: &WorktreeLimits,
 ) -> Result<PathBuf, RepoError> {
-    if !is_supported_layer_media_type(&layer.media_type) {
-        return Err(RepoError::OciUnsupportedMediaType {
-            media_type: layer.media_type.clone(),
-        });
-    }
-    validate_digest(&layer.digest)?;
-    // The compressed blob is bounded by the same budget as the checkout, plus a documented
-    // allowance for tar headers/padding and gzip framing.
-    let spool_limit = limits.max_bytes.saturating_add(ARCHIVE_OVERHEAD_BYTES);
+    check_layer_descriptor(layer)?;
+    let limit = compressed_budget(limits);
 
     let mut spool = tempfile::NamedTempFile::new().map_err(|source| RepoError::Io {
         context: "creating the OCI layer spool file".to_owned(),
@@ -546,62 +566,14 @@ pub fn extract_layer(
     })?;
     let (spooled, actual_digest) = {
         let mut writer = BufWriter::new(spool.as_file_mut());
-        let mut hasher = Sha256::new();
-        let mut input = raw;
-        let mut buffer = vec![0u8; 64 * 1024];
-        let mut spooled = 0u64;
-        loop {
-            let read = input.read(&mut buffer).map_err(|source| RepoError::Io {
-                context: "reading the OCI artifact layer".to_owned(),
-                source,
-            })?;
-            if read == 0 {
-                break;
-            }
-            spooled = spooled.saturating_add(read as u64);
-            if spooled > spool_limit {
-                return Err(RepoError::CheckoutLimitExceeded {
-                    reason: format!(
-                        "OCI artifact layer exceeds the {spool_limit}-byte compressed budget \
-                         ({})",
-                        limits.max_bytes
-                    ),
-                });
-            }
-            hasher.update(&buffer[..read]);
-            writer
-                .write_all(&buffer[..read])
-                .map_err(|source| RepoError::Io {
-                    context: "spooling the OCI artifact layer".to_owned(),
-                    source,
-                })?;
-        }
+        let hashed = hash_and_copy(raw, &mut writer, limit)?;
         writer.flush().map_err(|source| RepoError::Io {
             context: "flushing the OCI artifact layer spool".to_owned(),
             source,
         })?;
-        let digest = format!("{DIGEST_PREFIX}{:x}", hasher.finalize());
-        (spooled, digest)
+        hashed
     };
-
-    // 2. Digest and size are checked against the (verified) manifest descriptor before the spool is
-    //    interpreted. A registry cannot smuggle extra bytes in: anything beyond the declared size
-    //    changes the digest, which is fatal.
-    if actual_digest != layer.digest {
-        return Err(RepoError::OciDigestMismatch {
-            expected: layer.digest.clone(),
-            actual: actual_digest,
-        });
-    }
-    if let Some(expected) = layer.size
-        && expected != spooled
-    {
-        return Err(RepoError::OciInvalidArtifact {
-            reason: format!(
-                "layer descriptor declares {expected} bytes but the registry served {spooled}"
-            ),
-        });
-    }
+    verify_layer_bytes(&actual_digest, spooled, layer)?;
 
     let mut reader = spool.reopen().map_err(|source| RepoError::Io {
         context: "reopening the OCI layer spool".to_owned(),
@@ -613,7 +585,145 @@ pub fn extract_layer(
             context: "rewinding the OCI layer spool".to_owned(),
             source,
         })?;
+    extract_verified(reader, layer, dest, limits)
+}
 
+/// Verifies an **already-spooled** layer file against `layer` and extracts it into `dest`.
+///
+/// This is what a registry client calls after streaming the blob to a file of its own (finding M3):
+/// the client writes the bytes **once**, in the work root, and this function reads that file twice
+/// (hash, then decompress) instead of copying it into a second temporary file. The verification
+/// order is unchanged — the file is hashed and compared against the manifest descriptor *before* a
+/// byte of it is decompressed or interpreted — so a caller cannot skip the check by handing in a
+/// path.
+///
+/// The spool is read, never modified or removed: it stays the caller's to clean up (the registry
+/// client keeps it inside the extraction's scratch directory, which the checkout lease removes).
+///
+/// # Errors
+///
+/// See [`extract_artifact`].
+///
+/// # Blocking
+///
+/// Performs blocking I/O and CPU work: call it inside [`tokio::task::spawn_blocking`].
+pub fn extract_spooled_layer(
+    spool: &Path,
+    layer: &OciDescriptor,
+    dest: &Path,
+    limits: &WorktreeLimits,
+) -> Result<PathBuf, RepoError> {
+    check_layer_descriptor(layer)?;
+    let limit = compressed_budget(limits);
+
+    let file = std::fs::File::open(spool).map_err(|source| RepoError::Io {
+        context: format!("opening the OCI layer spool {}", spool.display()),
+        source,
+    })?;
+    let mut reader = BufReader::new(file);
+    let (spooled, actual_digest) = hash_and_copy(&mut reader, std::io::sink(), limit)?;
+    verify_layer_bytes(&actual_digest, spooled, layer)?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| RepoError::Io {
+            context: "rewinding the OCI layer spool".to_owned(),
+            source,
+        })?;
+    extract_verified(reader, layer, dest, limits)
+}
+
+/// The compressed-size budget of one layer: the checkout budget plus tar/gzip framing.
+fn compressed_budget(limits: &WorktreeLimits) -> u64 {
+    limits.max_bytes.saturating_add(ARCHIVE_OVERHEAD_BYTES)
+}
+
+/// Rejects a layer descriptor this module cannot extract, before any byte is read.
+fn check_layer_descriptor(layer: &OciDescriptor) -> Result<(), RepoError> {
+    if !is_supported_layer_media_type(&layer.media_type) {
+        return Err(RepoError::OciUnsupportedMediaType {
+            media_type: layer.media_type.clone(),
+        });
+    }
+    validate_digest(&layer.digest)
+}
+
+/// Reads `input` to the end, writing every byte to `sink`, and returns `(bytes, sha256 digest)`.
+///
+/// One pass does both jobs, and the byte counter is what bounds the **compressed** stream: an input
+/// that is not what its manifest declared cannot grow past the budget while it is being read.
+fn hash_and_copy(
+    mut input: impl Read,
+    mut sink: impl Write,
+    limit: u64,
+) -> Result<(u64, String), RepoError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut written = 0u64;
+    loop {
+        let read = input.read(&mut buffer).map_err(|source| RepoError::Io {
+            context: "reading the OCI artifact layer".to_owned(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        written = written.saturating_add(read as u64);
+        if written > limit {
+            return Err(RepoError::CheckoutLimitExceeded {
+                reason: format!(
+                    "OCI artifact layer exceeds the {limit}-byte compressed budget while it is \
+                     being read"
+                ),
+            });
+        }
+        hasher.update(&buffer[..read]);
+        sink.write_all(&buffer[..read])
+            .map_err(|source| RepoError::Io {
+                context: "spooling the OCI artifact layer".to_owned(),
+                source,
+            })?;
+    }
+    Ok((written, format!("{DIGEST_PREFIX}{:x}", hasher.finalize())))
+}
+
+/// Compares a spooled layer's digest and size against its (already verified) manifest descriptor.
+///
+/// A registry cannot smuggle extra bytes in: anything beyond the declared size changes the digest,
+/// which is fatal, and a declared size that disagrees with the served length is fatal too.
+fn verify_layer_bytes(
+    actual_digest: &str,
+    spooled: u64,
+    layer: &OciDescriptor,
+) -> Result<(), RepoError> {
+    if actual_digest != layer.digest {
+        return Err(RepoError::OciDigestMismatch {
+            expected: layer.digest.clone(),
+            actual: actual_digest.to_owned(),
+        });
+    }
+    if let Some(expected) = layer.size
+        && expected != spooled
+    {
+        return Err(RepoError::OciInvalidArtifact {
+            reason: format!(
+                "layer descriptor declares {expected} bytes but the registry served {spooled}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Extracts a **verified** layer stream into `dest` and returns the effective root.
+///
+/// Split out of [`extract_layer`] so every spool variant shares one extraction path (and one
+/// rollback), and a later step can never be added that bypasses either the digest check that
+/// precedes it or the cleanup below.
+fn extract_verified(
+    reader: impl Read,
+    layer: &OciDescriptor,
+    dest: &Path,
+    limits: &WorktreeLimits,
+) -> Result<PathBuf, RepoError> {
     // Everything below runs against a directory this call created or proved empty. A failure
     // there (an I/O error, a rejected entry, a budget overrun, a cancelled worker) must not leave a
     // half-extracted tree behind: `create_empty_directory` refuses a non-empty `dest`, so a retry
@@ -1412,7 +1522,7 @@ pub trait OciClient: Send + Sync {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use fake::{FakeOciClient, FakeOciClientConfig};
+pub use fake::{FakeOciClient, FakeOciClientConfig, artifact_manifest, tar_gzip_layer};
 
 /// Deterministic, hermetic [`OciClient`] for tests and downstream crates.
 #[cfg(any(test, feature = "test-utils"))]
@@ -1470,6 +1580,7 @@ mod fake {
         config: FakeOciClientConfig,
         artifacts: BTreeMap<(String, String), FakeArtifact>,
         fetches: Arc<Mutex<Vec<String>>>,
+        resolves: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeOciClient {
@@ -1495,21 +1606,28 @@ mod fake {
         /// that wants a corrupt one registers a raw manifest instead.
         #[must_use]
         pub fn with_layer(mut self, url: &str, reference: &str, layer: Vec<u8>) -> Self {
-            // Assembled as text, not through a map: the manifest bytes (and therefore the digest)
-            // must be byte-stable, and there is no fallible step to paper over.
-            let manifest = format!(
-                concat!(
-                    r#"{{"schemaVersion":2,"#,
-                    r#""mediaType":"application/vnd.oci.image.manifest.v1+json","#,
-                    r#""layers":[{{"mediaType":"{media_type}","digest":"{digest}","size":{size}}}]}}"#
-                ),
-                media_type = OCI_IMAGE_LAYER_MEDIA_TYPE,
-                digest = super::sha256_digest(&layer),
-                size = layer.len(),
-            )
-            .into_bytes();
+            let manifest = artifact_manifest(OCI_IMAGE_LAYER_MEDIA_TYPE, &layer);
             self.register(url, reference, manifest, layer);
             self
+        }
+
+        /// Registers `files` as a Helm chart layer (`application/vnd.cncf.helm.chart…`) under
+        /// `(url, reference)` and answers the artifact's manifest digest.
+        ///
+        /// The Helm media type makes the extractor unwrap a single `<chart>/` directory, which is
+        /// what a chart pushed by `helm push` looks like — so a test can register a chart exactly
+        /// the way it will arrive from a registry.
+        pub fn with_chart(
+            &mut self,
+            url: &str,
+            reference: &str,
+            files: &[(&str, &str)],
+        ) -> std::io::Result<String> {
+            let layer = tar_gzip_layer(files)?;
+            let manifest = artifact_manifest(super::HELM_CHART_MEDIA_TYPE, &layer);
+            let digest = super::sha256_digest(&manifest);
+            self.register(url, reference, manifest, layer);
+            Ok(digest)
         }
 
         /// Registers an artifact from raw bytes, so a test can serve a manifest whose digest does
@@ -1542,6 +1660,19 @@ mod fake {
                 .unwrap_or_default()
         }
 
+        /// The `(url, reference)` pairs `resolve_digest` was called with, in order.
+        ///
+        /// Separate from [`Self::fetches`] on purpose: "did this pass probe the registry at all?" is
+        /// the assertion the `T18.4` trap guard and the cached-digest criterion are made of, and a
+        /// resolve is exactly the probe.
+        #[must_use]
+        pub fn resolves(&self) -> Vec<String> {
+            self.resolves
+                .lock()
+                .map(|resolves| resolves.clone())
+                .unwrap_or_default()
+        }
+
         fn artifact(&self, src: &OciSource, reference: &str) -> Result<FakeArtifact, RepoError> {
             self.artifacts
                 .get(&(src.url.clone(), reference.to_owned()))
@@ -1566,6 +1697,9 @@ mod fake {
                         reason: "spec.source.oci must set a tag or a digest".to_owned(),
                     })?
                     .to_owned();
+                if let Ok(mut resolves) = self.resolves.lock() {
+                    resolves.push(fake_reference(&src.url, &requested_ref));
+                }
                 let artifact = self.artifact(src, &requested_ref)?;
                 if let Some(pinned) = src.digest.as_deref()
                     && pinned != artifact.manifest_digest
@@ -1633,6 +1767,70 @@ mod fake {
                 Ok(RepoCheckout::with_lease(root, expected, lease))
             })
         }
+    }
+
+    /// Builds a gzip-compressed tar layer holding `files` (regular files, `ustar` headers).
+    ///
+    /// The builder lives behind the same `test-utils` gate as [`FakeOciClient`] because a
+    /// downstream test would otherwise have to hand-roll a tar+gzip archive — and the only code
+    /// that should know how to build one is the code next to the only code that unpacks one.
+    ///
+    /// The `io::Result` is written out rather than `expect`-ed away: this is compiled into the
+    /// library under `test-utils`, where the crate's `expect_used` deny would (rightly) reject a
+    /// panic path. The gzip sink is a `Vec<u8>`, so the error is unreachable in practice and the
+    /// test call sites `expect` it.
+    pub fn tar_gzip_layer(files: &[(&str, &str)]) -> std::io::Result<Vec<u8>> {
+        fn octal(value: u64, width: usize) -> String {
+            let digits = format!("{value:o}");
+            format!("{}{}\0", "0".repeat(width - 1 - digits.len()), digits)
+        }
+
+        let mut archive = Vec::new();
+        for (name, content) in files {
+            let mut header = vec![0u8; 512];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            header[100..108].copy_from_slice(octal(0o644, 8).as_bytes());
+            header[108..116].copy_from_slice(octal(0, 8).as_bytes());
+            header[116..124].copy_from_slice(octal(0, 8).as_bytes());
+            header[124..136].copy_from_slice(octal(content.len() as u64, 12).as_bytes());
+            header[136..148].copy_from_slice(octal(0, 12).as_bytes());
+            header[148..156].copy_from_slice(b"        ");
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum: u64 = header.iter().map(|byte| u64::from(*byte)).sum();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            archive.extend(header);
+            archive.extend_from_slice(content.as_bytes());
+            let padding = (512 - content.len() % 512) % 512;
+            archive.extend(std::iter::repeat_n(0u8, padding));
+        }
+        // Two zero blocks end a tar archive.
+        archive.extend(std::iter::repeat_n(0u8, 1024));
+
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&archive)?;
+        encoder.finish()
+    }
+
+    /// The one-layer OCI image manifest that declares `layer`.
+    ///
+    /// Assembled as text, not through a map: the manifest bytes (and therefore the artifact digest)
+    /// must be byte-stable across compilations.
+    #[must_use]
+    pub fn artifact_manifest(media_type: &str, layer: &[u8]) -> Vec<u8> {
+        format!(
+            concat!(
+                r#"{{"schemaVersion":2,"#,
+                r#""mediaType":"application/vnd.oci.image.manifest.v1+json","#,
+                r#""layers":[{{"mediaType":"{media_type}","digest":"{digest}","size":{size}}}]}}"#
+            ),
+            media_type = media_type,
+            digest = super::sha256_digest(layer),
+            size = layer.len(),
+        )
+        .into_bytes()
     }
 }
 
@@ -2135,6 +2333,47 @@ mod tests {
         assert!(reason.contains("whitespace"), "{reason}");
     }
 
+    /// A query, a fragment, or a percent-escape in the authority or the repository is refused: the
+    /// HTTP client would re-interpret it, so the request would not name the repository (and the
+    /// token scope) the operator wrote — and `%2f` would smuggle a separator past the segment rules.
+    #[test]
+    fn a_registry_url_with_a_query_fragment_or_escape_is_refused() {
+        let rejected = [
+            "oci://ghcr.io/example/payments?tag=latest",
+            "oci://ghcr.io/example/payments#fragment",
+            "oci://ghcr.io/example/pa%79ments",
+            "oci://ghcr.io%3F/example/payments",
+            "https://ghcr.io/example/payments?",
+        ];
+        for url in rejected {
+            let source = OciSource::new(url, Some("1.4.2".to_owned()), None, "");
+            for policy in [OciUrlPolicy::Production, OciUrlPolicy::AllowLocal] {
+                let err = source
+                    .validate(policy)
+                    .expect_err(&format!("{policy:?} must refuse {url:?}"));
+                let RepoError::InvalidUrl { reason, .. } = &err else {
+                    panic!("{policy:?} must report InvalidUrl for {url:?}, got {err:?}");
+                };
+                assert!(
+                    reason.contains("'?', '#', or '%'"),
+                    "{policy:?}: the reason names the characters: {reason}"
+                );
+                assert!(!err.is_retryable(), "{policy:?}: {err}");
+            }
+        }
+
+        // The neighbouring shapes still validate, so this is not a blanket refusal of punctuation.
+        for url in [
+            "oci://ghcr.io:5000/example/payments",
+            "oci://127.0.0.1:5000/charts",
+            "oci://ghcr.io/example/payments.v2",
+        ] {
+            OciSource::new(url, Some("1.4.2".to_owned()), None, "")
+                .validate(OciUrlPolicy::AllowLocal)
+                .unwrap_or_else(|error| panic!("{url} must validate: {error:?}"));
+        }
+    }
+
     #[test]
     fn oci_sources_require_an_immutable_reference_and_a_safe_path() {
         let digest = format!("sha256:{}", "0123456789abcdef".repeat(4));
@@ -2270,6 +2509,133 @@ mod tests {
                 assert!(reason.contains("extraction root"), "{reason}");
             }
             other => panic!("expected UnsafeArchive, got {other:?}"),
+        }
+    }
+
+    /// **Finding M3.** A caller that already has the blob on disk extracts it **in place**: the
+    /// spool is read (hashed, then decompressed) and never copied, moved, or rewritten.
+    ///
+    /// The assertion is on the spool's own bytes and inode-visible state: same length, same content,
+    /// still present next to the extracted tree, and no extra file appears in the directory. A
+    /// re-spooling implementation would either add a temporary file there or leave the original
+    /// shorter/emptier.
+    #[test]
+    fn a_spooled_layer_is_extracted_in_place_without_a_second_copy() {
+        let archive = Tar::new()
+            .file("configmap.yaml", b"kind: ConfigMap\n")
+            .finish();
+        let layer = gzip(&archive);
+        let descriptor = manifest_for(&layer, OCI_IMAGE_LAYER_MEDIA_TYPE);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spool = temp.path().join("layer.tar.gz");
+        std::fs::write(&spool, &layer).expect("write the spool");
+
+        let dest = temp.path().join("artifact");
+        let root = extract_spooled_layer(&spool, &descriptor, &dest, &WorktreeLimits::default())
+            .expect("a verified spool must extract");
+
+        assert_eq!(root, dest, "a generic layer does not unwrap");
+        assert_eq!(
+            std::fs::read_to_string(root.join("configmap.yaml")).expect("read"),
+            "kind: ConfigMap\n"
+        );
+        assert_eq!(
+            std::fs::read(&spool).expect("the spool is still readable"),
+            layer,
+            "the spool is read, never rewritten or truncated"
+        );
+        let mut entries: Vec<String> = std::fs::read_dir(temp.path())
+            .expect("the fixture directory")
+            .map(|entry| {
+                entry
+                    .expect("a directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["artifact".to_owned(), "layer.tar.gz".to_owned()],
+            "no second spool is created beside the caller's"
+        );
+    }
+
+    /// The verification order survives the in-place path: a spool whose bytes are not the declared
+    /// layer is refused **before** it is decompressed, and its destination is not created.
+    #[test]
+    fn a_spooled_layer_that_does_not_match_its_descriptor_is_refused_before_extraction() {
+        let archive = Tar::new()
+            .file("configmap.yaml", b"kind: ConfigMap\n")
+            .finish();
+        let layer = gzip(&archive);
+        let descriptor = manifest_for(&layer, OCI_IMAGE_LAYER_MEDIA_TYPE);
+        let tampered = gzip(
+            &Tar::new()
+                .file("configmap.yaml", b"kind: Secret\n")
+                .finish(),
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spool = temp.path().join("layer.tar.gz");
+        std::fs::write(&spool, &tampered).expect("write the spool");
+        let dest = temp.path().join("artifact");
+        let error = extract_spooled_layer(&spool, &descriptor, &dest, &WorktreeLimits::default())
+            .expect_err("a tampered spool must be refused");
+        assert!(
+            matches!(
+                error,
+                RepoError::OciDigestMismatch { ref actual, .. } if *actual == sha256_digest(&tampered)
+            ),
+            "unexpected variant: {error:?}"
+        );
+        assert!(!error.is_retryable());
+        assert!(
+            !dest.exists(),
+            "the destination is not created for a refused spool"
+        );
+
+        // A declared size that does not match the spool is refused too, even when the digest is
+        // right: the descriptor is authoritative about both.
+        std::fs::write(&spool, &layer).expect("rewrite the spool with the real layer");
+        let wrong_size = OciDescriptor::new(
+            OCI_IMAGE_LAYER_MEDIA_TYPE,
+            sha256_digest(&layer),
+            Some(layer.len() as u64 + 1),
+        );
+        match extract_spooled_layer(&spool, &wrong_size, &dest, &WorktreeLimits::default()) {
+            Err(RepoError::OciInvalidArtifact { reason }) => {
+                assert!(reason.contains("declares"), "{reason}");
+            }
+            other => panic!("expected OciInvalidArtifact, got {other:?}"),
+        }
+        assert!(!dest.exists(), "the destination is still not created");
+    }
+
+    /// A spool that does not exist is a clear, retryable-shaped I/O error naming the path — never a
+    /// panic and never a silent empty extraction.
+    #[test]
+    fn a_missing_spool_is_an_io_error_that_names_the_path() {
+        let descriptor = OciDescriptor::new(
+            OCI_IMAGE_LAYER_MEDIA_TYPE,
+            format!("sha256:{}", "a".repeat(64)),
+            None,
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("absent.tar.gz");
+        let error = extract_spooled_layer(
+            &missing,
+            &descriptor,
+            &temp.path().join("artifact"),
+            &WorktreeLimits::default(),
+        )
+        .expect_err("a missing spool must fail");
+        match error {
+            RepoError::Io { context, .. } => {
+                assert!(context.contains("absent.tar.gz"), "{context}");
+            }
+            other => panic!("expected Io, got {other:?}"),
         }
     }
 

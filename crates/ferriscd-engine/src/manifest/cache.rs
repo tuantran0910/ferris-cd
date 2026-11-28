@@ -269,6 +269,37 @@ impl RenderCache {
         }
     }
 
+    /// Looks `key` up and bumps the hit counter and the LRU position on a hit, but **never** the
+    /// miss counter.
+    ///
+    /// A **probe** is a lookup that precedes the authoritative one: [`RenderPipeline::cached`] asks
+    /// whether a source has to be materialized at all, and when it misses, the caller materializes
+    /// the source and calls [`RenderPipeline::render`], which counts the one real miss. Counting the
+    /// probe too would report two misses for a single pass — and `ferriscd_render_cache_total` is
+    /// exactly the counter operators read to decide whether rendering is paying off (`T18.4`).
+    #[must_use]
+    pub fn probe(&self, key: &RenderCacheKey) -> Option<Arc<Vec<DesiredResource>>> {
+        let Ok(mut state) = self.state.lock() else {
+            // A poisoned lock already counts as a miss for `get`; a probe stays silent instead of
+            // reporting a miss it cannot follow up on.
+            tracing::warn!("render cache mutex was poisoned; treating the probe as a miss");
+            return None;
+        };
+
+        state.tick += 1;
+        let tick = state.tick;
+        match state.entries.get_mut(key) {
+            Some(entry) => {
+                entry.tick = tick;
+                let resources = Arc::clone(&entry.resources);
+                drop(state);
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(resources)
+            }
+            None => None,
+        }
+    }
+
     /// Stores `resources` under `key`, evicting the least-recently-used entry when over capacity.
     pub fn insert(&self, key: RenderCacheKey, resources: Arc<Vec<DesiredResource>>) {
         if self.capacity == 0 {
@@ -387,6 +418,29 @@ impl RenderPipeline {
     #[must_use]
     pub fn cache(&self) -> &RenderCache {
         &self.cache
+    }
+
+    /// Answers whether `ctx` is **already** rendered, without touching the source.
+    ///
+    /// This is the seam that makes a cached digest hit cost nothing at all (`T18.4`): an OCI source
+    /// whose `commit_sha` is the pinned manifest digest can be looked up *before* the artifact is
+    /// resolved or downloaded, so a periodic requeue at an unchanged digest issues **zero** registry
+    /// requests and starts **zero** renderer subprocesses.
+    ///
+    /// The key is [`RenderCacheKey::from_context`], which does not include `ctx.root_dir`: how a
+    /// source is materialized (or whether it is materialized at all) is deliberately not part of the
+    /// identity, which is what lets the probe run before the checkout exists. A hit is counted as a
+    /// hit; a miss is **not** counted, because the caller is expected to fetch and then call
+    /// [`Self::render`], which counts the one real miss.
+    #[must_use]
+    pub fn cached(&self, ctx: &RenderContext) -> Option<Arc<Vec<DesiredResource>>> {
+        if ctx.commit_sha.is_empty() {
+            return None;
+        }
+        // Binaries are excluded from the key (`RendererConfig::canonical`), so the overrides that
+        // `render` applies cannot change whether this probe is a hit.
+        let key = RenderCacheKey::from_context(ctx);
+        self.cache.probe(&key)
     }
 
     /// Renders `ctx`, reusing a cached result when the full key matches.
@@ -959,6 +1013,78 @@ mod tests {
         assert_eq!(stats.hits, 3);
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.entries, 1);
+    }
+
+    /// **`T18.4` non-functional criterion.** A probe answers "is this already rendered?" without
+    /// paying for a miss: a probe that hits counts a hit, a probe that misses counts nothing (the
+    /// authoritative `render` counts the one real miss).
+    #[test]
+    fn a_probe_counts_a_hit_but_never_a_miss() {
+        let cache = RenderCache::new(4);
+        let first = key("apps/a", "payments");
+
+        assert!(cache.probe(&first).is_none());
+        let stats = cache.stats();
+        assert_eq!(
+            (stats.hits, stats.misses),
+            (0, 0),
+            "a probe that misses must not be reported as a miss"
+        );
+
+        cache.insert(first.clone(), Arc::new(vec![resource("alpha", "payments")]));
+        assert!(cache.probe(&first).is_some(), "the entry is now cached");
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 0);
+
+        // A different identity (the OCI path, the digest) is a different entry.
+        assert!(cache.probe(&key("apps/b", "payments")).is_none());
+        assert_eq!(cache.stats().misses, 0);
+    }
+
+    /// The OCI fast path depends on the probe running **before** a checkout exists, so the key must
+    /// not depend on `root_dir` — and an unresolved digest must never probe.
+    #[test]
+    fn the_pipeline_answers_a_cached_oci_digest_without_a_checkout() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let ctx = RenderContext::new("/does/not/exist")
+            .with_repo_url("oci://ghcr.io/example/payments")
+            .with_commit_sha(digest.clone())
+            .with_source_path("charts/api");
+        let pipeline = RenderPipeline::new(8);
+
+        assert!(
+            pipeline.cached(&ctx).is_none(),
+            "nothing is cached before the first render"
+        );
+        assert_eq!(
+            pipeline.cache().stats().misses,
+            0,
+            "the probe does not count a miss"
+        );
+
+        pipeline
+            .cache()
+            .insert(RenderCacheKey::from_context(&ctx), Arc::new(vec![]));
+        assert!(pipeline.cached(&ctx).is_some(), "the digest is cached");
+        assert_eq!(pipeline.cache().stats().hits, 1);
+
+        // A moved digest, a different path, and a different registry are all distinct.
+        for variant in [
+            ctx.clone()
+                .with_commit_sha(format!("sha256:{}", "b".repeat(64))),
+            ctx.clone().with_source_path("charts/web"),
+            ctx.clone().with_repo_url("oci://ghcr.io/example/other"),
+        ] {
+            assert!(
+                pipeline.cached(&variant).is_none(),
+                "the render cache key must distinguish {variant:?}"
+            );
+        }
+
+        // Without a resolved digest there is nothing to key on (`render` refuses to cache it too).
+        let unresolved = RenderContext::new("/does/not/exist").with_repo_url(ctx.repo_url.clone());
+        assert!(pipeline.cached(&unresolved).is_none());
     }
 
     #[tokio::test]

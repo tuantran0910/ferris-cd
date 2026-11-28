@@ -277,9 +277,9 @@ impl OciSourceSpec {
     /// Validates the reference against the invariants the CRD schema enforces.
     ///
     /// The structural checks mirror the injected CEL rules
-    /// (`(has(self.tag) && self.tag != null) || (has(self.digest) && self.digest != null)` — the
-    /// null half matters: `has()` alone is true for an explicit `tag: null`, which this method reads
-    /// as "no tag"); URL *transport* policy (HTTPS-only in production) is the engine's job, exactly
+    /// (`self.?tag.hasValue() || self.?digest.hasValue()` — the null half matters: an explicit
+    /// `tag: null` is "no tag" here and "no value" to `hasValue()`, while a bare `has()` would be
+    /// true for it); URL *transport* policy (HTTPS-only in production) is the engine's job, exactly
     /// like `RepoUrlPolicy` for `spec.source.git.repoURL`.
     pub fn validate(&self) -> Result<(), SpecValidationError> {
         validate_oci_reference_url(&self.url)?;
@@ -779,8 +779,8 @@ pub enum SpecValidationError {
     /// Neither `spec.source.oci.tag` nor `spec.source.oci.digest` was set.
     ///
     /// The CRD enforces the same rule with CEL
-    /// (`(has(self.tag) && self.tag != null) || (has(self.digest) && self.digest != null)`); a
-    /// floating artifact would make "which artifact did this revision come from?" unanswerable.
+    /// (`self.?tag.hasValue() || self.?digest.hasValue()`); a floating artifact would make "which
+    /// artifact did this revision come from?" unanswerable.
     #[error(
         "at least one of spec.source.oci.tag or spec.source.oci.digest must be specified: an OCI \
          artifact reference must name an immutable artifact"
@@ -1378,7 +1378,11 @@ spec:
         );
         assert_eq!(
             crate::generate::OCI_REFERENCE_RULE,
-            "(has(self.tag) && self.tag != null) || (has(self.digest) && self.digest != null)"
+            // `T18.4`: the `has(self.tag) && self.tag != null` spelling is a **static CEL error** —
+            // a `nullable: true` *string* is typed `string`, and `string != null` has no overload —
+            // so the API server refused the entire CRD. `self.?tag.hasValue()` is the same
+            // "present and not null" predicate with the right static types.
+            "self.?tag.hasValue() || self.?digest.hasValue()"
         );
 
         // CEL mirror, spelled exactly like the rule: `has(self.x) && self.x != null`.
@@ -1386,9 +1390,8 @@ spec:
             (git.has() && git.non_null() && !(oci.has() && oci.non_null()))
                 || (!(git.has() && git.non_null()) && oci.has() && oci.non_null())
         };
-        let oci_reference = |tag: Field, digest: Field| {
-            (tag.has() && tag.non_null()) || (digest.has() && digest.non_null())
-        };
+        // `self.?x.hasValue()`: true only for `Field::Set` — present *and* not null.
+        let oci_reference = |tag: Field, digest: Field| tag.non_null() || digest.non_null();
 
         let fields = [Field::Absent, Field::Null, Field::Set];
 
@@ -1477,8 +1480,7 @@ spec:
             spec.validate()
         };
 
-        // `(has(self.tag) && self.tag != null) || (has(self.digest) && self.digest != null)`: a
-        // floating reference is refused.
+        // `self.?tag.hasValue() || self.?digest.hasValue()`: a floating reference is refused.
         assert_eq!(
             oci_spec(&|oci| {
                 oci.tag = None;

@@ -89,6 +89,23 @@ pub enum RepoError {
     #[error("unsupported OCI artifact media type '{media_type}'")]
     OciUnsupportedMediaType { media_type: String },
 
+    /// A registry answered with a redirect, which FerrisCD deliberately does not follow.
+    ///
+    /// Terminal on purpose: the redirect is normally a CDN `Location`, and following it would mean
+    /// carrying the `Authorization` header to a host the operator never configured. Naming the
+    /// status (rather than reporting a generic `4xx`) is what lets an operator tell "this registry
+    /// always redirects (ECR/GAR), put a proxy in front of it" apart from "this repository is
+    /// missing".
+    ///
+    /// Note: `url` MUST have any embedded credentials redacted before constructing this variant, and
+    /// the redirect `Location` is intentionally not part of the error.
+    #[error(
+        "the registry refused to serve {url} directly: HTTP {status} redirect (FerrisCD does not \
+         follow registry redirects, because the Authorization header must not be carried to a host \
+         the operator never configured)"
+    )]
+    RegistryRedirectRefused { status: u16, url: String },
+
     /// An archive entry is unsafe to materialize (tar-slip, link, device node, duplicate path).
     #[error("unsafe archive entry at '{}': {reason}", path.display())]
     UnsafeArchive { path: PathBuf, reason: String },
@@ -129,6 +146,7 @@ impl RepoError {
             | Self::OciDigestMismatch { .. }
             | Self::OciInvalidArtifact { .. }
             | Self::OciUnsupportedMediaType { .. }
+            | Self::RegistryRedirectRefused { .. }
             | Self::UnsafeArchive { .. }
             | Self::RepositoryError { .. } => false,
         }
@@ -299,6 +317,14 @@ mod tests {
                 "OciUnsupportedMediaType",
                 RepoError::OciUnsupportedMediaType {
                     media_type: "application/vnd.example".into(),
+                },
+                false,
+            ),
+            (
+                "RegistryRedirectRefused",
+                RepoError::RegistryRedirectRefused {
+                    status: 307,
+                    url: "https://ghcr.io/v2/org/chart/blobs/sha256:abc".into(),
                 },
                 false,
             ),

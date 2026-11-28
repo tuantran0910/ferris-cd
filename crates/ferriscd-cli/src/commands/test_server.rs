@@ -216,6 +216,7 @@ mod tests {
         "name": "payments-api",
         "project": "payments",
         "source": {
+            "sourceType": "git",
             "repoUrl": "https://github.com/example/payments.git",
             "path": "deploy",
             "targetRevision": "main",

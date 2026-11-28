@@ -46,6 +46,10 @@ serde_json.workspace = true
 axum.workspace = true
 # Unix permission assertions on the stored token file (`0600`).
 tempfile.workspace = true
+# `T18.4`: the live OCI suite (`tests/v1_2_oci_and_drift.rs`) addresses the artifacts it pushes to a
+# `registry:2` by digest, so the test computes the SHA-256 of each layer it uploads. `sha2` is
+# already in the lock file (the engine verifies OCI layer digests with it), so this adds no package.
+sha2.workspace = true
 # `T19.4`: the live notifications suite (`tests/v0_5_notifications.rs`) runs an in-test **HTTPS**
 # receiver so the controller's `--notifications-ca-file` path is proven against a private CA with an
 # IP SAN. `rustls` is already a workspace dependency (and already in `Cargo.lock` via `reqwest`), so

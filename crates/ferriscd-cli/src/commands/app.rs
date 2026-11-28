@@ -447,10 +447,18 @@ pub fn detail_table(detail: &ApplicationDetailView) -> String {
     let mut rendered = String::new();
     rendered.push_str(&format!("Application   {}/{}\n", app.namespace, app.name));
     rendered.push_str(&format!("Project       {}\n", app.project));
+    // `T18.4`: an OCI source names its kind and, when pinned, the immutable digest — the two facts
+    // an operator needs to answer "which artifact is deployed?" without reading the CR.
     rendered.push_str(&format!(
-        "Source        {} ({}, {})\n",
-        app.source.repo_url, app.source.path, app.source.target_revision
+        "Source        {} ({}, {}) [{}]\n",
+        app.source.repo_url, app.source.path, app.source.target_revision, app.source.source_type
     ));
+    if let Some(tag) = app.source.tag.as_deref() {
+        rendered.push_str(&format!("OCI tag       {tag}\n"));
+    }
+    if let Some(digest) = app.source.digest.as_deref() {
+        rendered.push_str(&format!("OCI digest    {digest}\n"));
+    }
     rendered.push_str(&format!(
         "Destination   {}/{}\n",
         app.destination.cluster, app.destination.namespace
@@ -699,9 +707,12 @@ mod tests {
             name: "payments-api".to_owned(),
             project: "payments".to_owned(),
             source: SourceView {
+                source_type: "git".to_owned(),
                 repo_url: "https://github.com/example/payments.git".to_owned(),
                 path: "deploy".to_owned(),
                 target_revision: "main".to_owned(),
+                tag: None,
+                digest: None,
                 renderer: "plainYaml".to_owned(),
             },
             destination: DestinationView {

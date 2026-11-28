@@ -15,6 +15,25 @@ anything: project lookups are **never** treated as permissive, and the failure n
 `deploy/crds/appprojects.ferriscd.io.yaml` instead of pretending the project is missing
 (finding M3).
 
+### Kubernetes version floor: `>= 1.29`
+
+The `Application` CRD validates `spec.source.oci` with a CEL rule written in the optional-field
+form (`self.?tag.hasValue() || self.?digest.hasValue()`, see `deploy/crds/applications.ferriscd.io.yaml`).
+CEL optional chaining arrived in Kubernetes **1.29**: an older API server cannot compile that rule
+and refuses the *CRD itself* at `kubectl apply` time — nothing installs, with an error naming the
+rule. Newer is fine (the project targets `1.35`; `deploy/kind-config.yaml` and the `k8s-openapi`
+version feature agree). The rule is what makes `oci: {}` — an OCI source with neither a `tag` nor a
+`digest` — fail admission instead of reaching the controller and failing every reconcile; do not
+"fix" an install error by deleting it.
+
+```bash
+kubectl apply -f deploy/crds/
+kubectl wait --for=condition=Established crd/applications.ferriscd.io --timeout=120s
+# The installed rule really is the current one (a CRD left by an earlier revision is not upgraded
+# by a failed apply):
+kubectl get crd applications.ferriscd.io -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.source.properties.oci.x-kubernetes-validations[0].rule}'
+```
+
 ---
 
 ## Controller `ClusterRole`
