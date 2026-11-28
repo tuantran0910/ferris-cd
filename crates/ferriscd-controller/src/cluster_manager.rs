@@ -66,7 +66,7 @@
 //! plane** — the remote credential is never asked to write a FerrisCD CR the remote cluster may not
 //! even serve.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1070,6 +1070,21 @@ impl ClusterHandleBuilder for KubeClusterBuilder {
     }
 }
 
+/// One registered cluster as the `T19.3` `clusters` generator sees it.
+///
+/// Deliberately credential-free: the cluster name, the registration `Secret`'s **labels** (which is
+/// what a label selector matches), and the optional default namespace. No API server URL, token, CA
+/// bundle, or kubeconfig ever leaves the registry through this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterRegistrationInfo {
+    /// Cluster name (`spec.destination.cluster` value).
+    pub name: String,
+    /// Labels of the registration `Secret`, recorded when it was seeded.
+    pub labels: BTreeMap<String, String>,
+    /// The registration's default namespace, when it sets one.
+    pub default_namespace: Option<String>,
+}
+
 /// What seeding one `Secret` did to the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterChange {
@@ -1143,6 +1158,10 @@ impl ClusterLifecycleEvent {
 pub struct ClusterManager {
     handles: DashMap<ClusterName, Arc<ClusterHandle>>,
     materials: DashMap<ClusterName, ClusterSecret>,
+    /// `T19.3`: the registration `Secret`'s labels, keyed by cluster name. Kept beside (not inside)
+    /// [`ClusterSecret`] on purpose: a label edit must not change the parsed material, otherwise
+    /// every label change would rebuild the connector.
+    labels: DashMap<ClusterName, BTreeMap<String, String>>,
     in_cluster: Arc<ClusterHandle>,
     namespace: String,
     options: ClusterOptions,
@@ -1186,6 +1205,7 @@ impl ClusterManager {
         Self {
             handles: DashMap::new(),
             materials: DashMap::new(),
+            labels: DashMap::new(),
             in_cluster,
             namespace: namespace.into(),
             options,
@@ -1333,6 +1353,35 @@ impl ClusterManager {
         names
     }
 
+    /// The `T19.3` cluster-generator view: every registered cluster with its `Secret` labels.
+    ///
+    /// Sorted by cluster name and credential-free. `in-cluster` is deliberately absent: an
+    /// `ApplicationSet` selects *registered* clusters (`ferriscd.io/secret-type=cluster`), and the
+    /// control plane's own cluster is not a registration an operator can label.
+    #[must_use]
+    pub fn registrations(&self) -> Vec<ClusterRegistrationInfo> {
+        let mut registrations: Vec<ClusterRegistrationInfo> = self
+            .handles
+            .iter()
+            .map(|entry| {
+                let name = entry.key().clone();
+                ClusterRegistrationInfo {
+                    labels: self
+                        .labels
+                        .get(&name)
+                        .map(|labels| labels.value().clone())
+                        .unwrap_or_default(),
+                    default_namespace: self.materials.get(&name).and_then(|material| {
+                        material.value().default_namespace().map(str::to_owned)
+                    }),
+                    name: name.as_str().to_owned(),
+                }
+            })
+            .collect();
+        registrations.sort_by(|left, right| left.name.cmp(&right.name));
+        registrations
+    }
+
     /// How many remote clusters are registered.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1383,12 +1432,29 @@ impl ClusterManager {
     pub async fn seed(&self, secret: &Secret) -> Result<ClusterChange, ClusterError> {
         let material = ClusterSecret::parse(secret, self.options)?;
         let name = material.name.clone();
+        // `T19.3`: the labels are what the `clusters` generator's selector matches. They are tracked
+        // separately from the connection material so a label-only edit never rebuilds a connector —
+        // but it *is* a registration change, so it must be published and re-selected.
+        let labels: BTreeMap<String, String> = secret
+            .labels()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         if self
             .materials
             .get(&name)
             .is_some_and(|existing| existing.value() == &material)
         {
-            return Ok(ClusterChange::Unchanged);
+            let labels_changed = self
+                .labels
+                .get(&name)
+                .is_none_or(|existing| existing.value() != &labels);
+            if !labels_changed {
+                return Ok(ClusterChange::Unchanged);
+            }
+            self.labels.insert(name.clone(), labels);
+            self.publish(ClusterLifecycleEvent::Rebuilt(name.as_str().to_owned()));
+            return Ok(ClusterChange::Rebuilt);
         }
         let replaced = self.materials.contains_key(&name);
         let handle = self.builder.build(&material).await?;
@@ -1407,6 +1473,7 @@ impl ClusterManager {
             .map(|entry| entry.key().clone())
             .collect();
         let secret_name = material.secret.clone();
+        self.labels.insert(name.clone(), labels);
         self.store(material, Arc::new(handle));
         for old in stale {
             if self.remove(&old) {
@@ -1517,6 +1584,7 @@ impl ClusterManager {
     ///
     /// [`Removed`]: ClusterLifecycleEvent::Removed
     fn remove(&self, name: &ClusterName) -> bool {
+        self.labels.remove(name);
         let material = self.materials.remove(name).is_some();
         let handle = self.handles.remove(name).is_some();
         if material || handle {
@@ -2861,6 +2929,120 @@ VvvhRCE9YVNC/nP/0IrzmyUJjadxsSjY9K50kjOxukR8diF5fBhlpWz5n11sh+Sw
     // -----------------------------------------------------------------
     // The watch seam (no cluster needed)
     // -----------------------------------------------------------------
+
+    /// **`T19.3`:** the `clusters` generator's view is sorted, credential-free, and tracks the
+    /// registration `Secret`'s **labels** — including a label-only edit, which must publish a
+    /// `Rebuilt` event (a selector result changed) without rebuilding the connector.
+    #[tokio::test]
+    async fn registrations_expose_sorted_labels_and_react_to_a_label_only_change() {
+        let builder = Arc::new(FakeBuilder::default());
+        let manager = manager(builder.clone());
+        let mut subscribed = manager.subscribe();
+
+        let mut registration = token_secret("workload");
+        registration
+            .metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert("env".to_owned(), "prod".to_owned());
+        registration
+            .metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert("region".to_owned(), "eu".to_owned());
+        registration
+            .data
+            .as_mut()
+            .expect("data")
+            .insert(KEY_NAMESPACE.to_owned(), ByteString(b"payments".to_vec()));
+        let mut second = token_secret("another");
+        second
+            .metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert("env".to_owned(), "dev".to_owned());
+
+        manager.seed(&registration).await.expect("seeds");
+        manager.seed(&second).await.expect("seeds");
+        assert_eq!(builder.builds.load(Ordering::SeqCst), 2);
+        // Drain the two `Added` events so the relabel assertions below only see what follows.
+        while subscribed.try_recv().is_ok() {}
+
+        let registrations = manager.registrations();
+        assert_eq!(
+            registrations
+                .iter()
+                .map(|registration| registration.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["another", "workload"],
+            "the generator view is sorted by name"
+        );
+        let workload = &registrations[1];
+        assert_eq!(workload.labels.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(
+            workload.labels.get(SECRET_TYPE_LABEL).map(String::as_str),
+            Some(SECRET_TYPE_CLUSTER)
+        );
+        assert_eq!(workload.default_namespace.as_deref(), Some("payments"));
+        assert_eq!(registrations[0].default_namespace, None);
+        // The view carries no credential material at all.
+        let rendered = format!("{registrations:?}");
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+        assert!(!rendered.contains("workload.example.com"), "{rendered}");
+        // `in-cluster` is never a registration.
+        assert!(
+            !registrations
+                .iter()
+                .any(|registration| registration.name == IN_CLUSTER)
+        );
+
+        // A label-only edit changes the material not at all, but it does change what a selector
+        // matches: it must publish `Rebuilt` and must not rebuild the connector.
+        let mut relabeled = registration.clone();
+        relabeled
+            .metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert("region".to_owned(), "us".to_owned());
+        assert_eq!(
+            manager.seed(&relabeled).await.expect("relabel"),
+            ClusterChange::Rebuilt
+        );
+        assert_eq!(
+            builder.builds.load(Ordering::SeqCst),
+            2,
+            "a label edit must not rebuild the connector"
+        );
+        assert_eq!(
+            manager
+                .registrations()
+                .into_iter()
+                .find(|registration| registration.name == "workload")
+                .and_then(|registration| registration.labels.get("region").cloned()),
+            Some("us".to_owned())
+        );
+        let event = subscribed
+            .try_recv()
+            .expect("a lifecycle event was published");
+        assert_eq!(event, ClusterLifecycleEvent::Rebuilt("workload".to_owned()));
+
+        // Re-registering the identical `Secret` still publishes nothing and rebuilds nothing.
+        assert_eq!(
+            manager.seed(&relabeled).await.expect("unchanged"),
+            ClusterChange::Unchanged
+        );
+        assert_eq!(builder.builds.load(Ordering::SeqCst), 2);
+        assert!(subscribed.try_recv().is_err());
+
+        // A forgotten registration disappears from the generator view.
+        assert!(manager.forget("workload"));
+        assert!(
+            !manager
+                .registrations()
+                .iter()
+                .any(|registration| registration.name == "workload")
+        );
+    }
 
     /// A scripted registration source: the whole add/change/delete behaviour without a cluster.
     struct ScriptedSource {

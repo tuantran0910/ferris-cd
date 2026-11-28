@@ -7,6 +7,7 @@ anything:
 |---|---|
 | `crds/applications.ferriscd.io.yaml` | `Application` CRD (`ferriscd.io/v1alpha1`) |
 | `crds/appprojects.ferriscd.io.yaml` | `AppProject` CRD — the multi-tenancy boundary (`T12.1`) |
+| `crds/applicationsets.ferriscd.io.yaml` | `ApplicationSet` CRD — opt-in fleet generation (`T19.3`, `--enable-applicationsets`) |
 | `manifests/default-project.yaml` | the permissive single-tenant `default` project every `Application` falls back to |
 | `kind-config.yaml` | local development cluster definition (`make kind-up`) |
 
@@ -541,6 +542,109 @@ Operational notes:
   including a cluster whose `Secret` vanished while the watch was reconnecting, which Kubernetes
   never reports as a delete. A subscriber that falls behind is told so (`Lagged`) and resynchronises
   against the registry's live name set; the registry never waits for a consumer.
+
+### `ApplicationSet` controller (`T19.3`) — opt-in, namespaced grants
+
+`--enable-applicationsets` (`FERRISCD_ENABLE_APPLICATIONSETS`, default `false`) starts an
+independent loop that turns `ApplicationSet` objects (`ferriscd.io/v1alpha1`, `kubectl get appset`)
+into ordinary `Application`s **in the `ApplicationSet`'s own namespace** — the control-plane
+namespace — passing every one of them through the same `AppProject` policy as a hand-authored
+`Application`.
+
+Nothing is granted for it by default: the shipped Role in `deploy/manifests/rbac.yaml` keeps the
+opt-in rules commented out, and the Helm chart gates them behind `rbac.applicationsets: false`. Add
+exactly these three rules (control-plane namespace only) before turning the flag on:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferriscd-applicationsets
+  namespace: ferriscd-system
+rules:
+  # `patch` (not `update`): the finalizer is set and cleared with a merge patch on
+  # `metadata.finalizers` of the ApplicationSet object itself. The `applicationsets/finalizers`
+  # subresource is never used, so granting it would be a permission nothing needs.
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applicationsets"]
+    verbs: ["get", "list", "watch", "patch"]
+  # `/status` is patched on every pass (`Ready`, `observedGeneration`, `generatedCount`).
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applicationsets/status"]
+    verbs: ["get", "patch", "update"]
+  # Server-Side Apply on the generated Applications: `patch` for an existing object, `create`
+  # for a new one. Never `update` (SSA does not use it).
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "patch", "create"]
+```
+
+**`delete` is a second, separate opt-in (`rbac.applicationsetPrune`).** The two verbs above are
+everything a *non-destructive* `ApplicationSet` needs. Two features do delete generated
+`Application`s, and each is opt-in per object: `spec.syncPolicy.prune: true` (drop the Applications
+a generator no longer produces) and `spec.syncPolicy.preserveResourcesOnDeletion: false` (delete
+them when the `ApplicationSet` itself is deleted). Add `delete` to the `applications` rule **only**
+if some `ApplicationSet` sets one of them:
+
+```yaml
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "patch", "create", "delete"]
+```
+
+With Helm, that is `rbac.applicationsets: true` plus `rbac.applicationsetPrune: true` (both default
+`false`: the chart widens the `applications` grant — and only that rule — when the second is on).
+The Kustomize manifest keeps the `delete`-bearing rule commented out for the same reason: it is a
+namespace-wide grant, so it applies to *every* `ApplicationSet` in the control-plane namespace, not
+just the one that opted in.
+
+With Kustomize, patch the shipped Role instead of adding a second one:
+
+```yaml
+patches:
+  - target:
+      kind: Role
+      name: ferriscd
+    patch: |-
+      - op: add
+        path: /rules/-
+        value:
+          apiGroups: ["ferriscd.io"]
+          resources: ["applicationsets"]
+          verbs: ["get", "list", "watch", "patch"]
+      - op: add
+        path: /rules/-
+        value:
+          apiGroups: ["ferriscd.io"]
+          resources: ["applicationsets/status"]
+          verbs: ["get", "patch", "update"]
+      - op: add
+        path: /rules/-
+        value:
+          apiGroups: ["ferriscd.io"]
+          resources: ["applications"]
+          verbs: ["get", "list", "watch", "patch", "create"]
+```
+
+Operational notes:
+
+* **The `clusters` generator never yields `in-cluster`.** The reserved pseudo-cluster is not a
+  registration `Secret`, so it is not a generator parameter: an `ApplicationSet` that wants a
+  control-plane `Application` writes it in the template instead of relying on a cluster match.
+* **Deletion is non-destructive by default.** Deleting an `ApplicationSet` *orphans* the generated
+  `Application`s (their `ownerReference` is dropped, the objects and their workloads stay) unless
+  `spec.syncPolicy.preserveResourcesOnDeletion: false`. Pruning a stale generated `Application` is
+  separately opt-in (`spec.syncPolicy.prune: true`).
+* **Turning the flag off with `ApplicationSet`s in place wedges their deletion.** The controller
+  adds `ferriscd.io/applicationset-cleanup` to every `ApplicationSet` it manages; if the feature is
+  disabled afterwards, nothing runs that finalizer, so deleting an `ApplicationSet` leaves it
+  `Terminating` and its generated `Application`s owned. Re-enable the flag (the finalizer then runs
+  and orphans them) or remove the finalizer by hand
+  (`kubectl patch applicationset <name> --type=merge -p '{"metadata":{"finalizers":null}}'`).
+* **Changes are event-driven, not timer-driven.** A cluster registration appearing/changing/
+  disappearing (`T18.1` broadcast) or a generated `Application` being created/edited/deleted
+  re-runs the pass immediately; `spec.requeueAfterSeconds` (default 180) and the 10-minute re-list
+  are backstops, not the reaction time.
 
 ### Multi-tenancy RBAC matrix
 

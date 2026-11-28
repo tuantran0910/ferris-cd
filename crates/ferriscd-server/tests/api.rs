@@ -129,6 +129,15 @@ impl ProjectCatalog for Projects {
     }
 }
 
+/// A read-only `ApplicationSet` catalog (`T19.3`).
+struct ApplicationSets(Vec<ferriscd_crd::ApplicationSet>);
+
+impl ferriscd_server::state::ApplicationSetCatalog for ApplicationSets {
+    fn list(&self) -> SeamFuture<'_, Vec<ferriscd_crd::ApplicationSet>> {
+        Box::pin(async { Ok(self.0.clone()) })
+    }
+}
+
 struct Clusters(Vec<ClusterEntry>);
 
 impl ClusterCatalog for Clusters {
@@ -1168,6 +1177,99 @@ async fn rollback_records_the_history_id_and_rejects_an_unknown_one() {
 // Projects and clusters
 // ---------------------------------------------------------------------------
 
+/// **`T19.3`:** the read view exposes each `ApplicationSet`'s generator kinds, its safe
+/// deletion/prune defaults, and its generation count — and is empty when no catalog is wired.
+#[tokio::test]
+async fn applicationsets_are_listed_with_their_generator_and_safety_policy() {
+    // The default state has no catalog: a control plane that never opted in still answers 200.
+    let (status, body) = get(state(Vec::new()), "/api/v1/applicationsets").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"], json!([]));
+
+    let matrix: ferriscd_crd::ApplicationSet = serde_json::from_value(json!({
+        "apiVersion": "ferriscd.io/v1alpha1",
+        "kind": "ApplicationSet",
+        "metadata": {"name": "payments-fleet", "namespace": "ferriscd-system"},
+        "spec": {
+            "generators": [{"matrix": {"generators": [
+                {"clusters": {"selector": {"matchLabels": {"env": "prod"}}}},
+                {"git": {"repoURL": "https://github.com/example/config.git", "directories": [{"path": "apps/*"}]}},
+            ]}}],
+            "template": {
+                "metadata": {"name": "{{path.basename}}-{{cluster.name}}"},
+                "spec": {
+                    "project": "payments",
+                    "source": {"git": {"repoURL": "https://github.com/example/payments.git"}},
+                    "destination": {"cluster": "{{cluster.name}}", "namespace": "{{path.basename}}"},
+                },
+            },
+            "syncPolicy": {"prune": true},
+        },
+        "status": {
+            "observedGeneration": 4,
+            "generatedCount": 6,
+            "conditions": [{
+                "type": "Ready",
+                "status": "True",
+                "reason": "ApplicationsGenerated",
+                "message": "6 Applications generated",
+                "lastTransitionTime": "2027-01-15T10:30:00Z",
+            }],
+        },
+    }))
+    .expect("a valid ApplicationSet");
+
+    let state =
+        state(Vec::new()).with_applicationset_catalog(Arc::new(ApplicationSets(vec![matrix])));
+    let (status, body) = get(state, "/api/v1/applicationsets").await;
+    assert_eq!(status, StatusCode::OK);
+    let item = &body["items"][0];
+    assert_eq!(item["name"], "payments-fleet");
+    assert_eq!(item["namespace"], "ferriscd-system");
+    assert_eq!(item["generator"], "matrix");
+    assert_eq!(item["matrix"], json!(["clusters", "git"]));
+    assert_eq!(item["project"], "payments");
+    assert_eq!(
+        item["preserveResourcesOnDeletion"], true,
+        "the non-destructive default is reported, never implied"
+    );
+    assert_eq!(item["prune"], true);
+    assert_eq!(item["generatedCount"], 6);
+    assert_eq!(item["observedGeneration"], 4);
+    assert_eq!(item["ready"], "True");
+}
+
+/// **`T19.3`:** a generated `Application` is badged from its own label; a hand-authored one is not.
+#[tokio::test]
+async fn applications_carry_the_applicationset_label_in_the_read_view() {
+    let mut generated = application("ferriscd-system", "api-prod");
+    generated.metadata.labels = Some(BTreeMap::from([(
+        ferriscd_crd::APPLICATIONSET_LABEL.to_owned(),
+        "payments-fleet".to_owned(),
+    )]));
+    let hand_authored = application("ferriscd-system", "hand-written");
+    let (status, body) = get(
+        state(vec![generated, hand_authored]),
+        "/api/v1/applications",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["items"].as_array().expect("a list");
+    let generated = items
+        .iter()
+        .find(|item| item["name"] == "api-prod")
+        .expect("the generated Application is listed");
+    assert_eq!(generated["applicationset"], "payments-fleet");
+    let hand_authored = items
+        .iter()
+        .find(|item| item["name"] == "hand-written")
+        .expect("the hand-authored Application is listed");
+    assert!(
+        hand_authored.get("applicationset").is_none(),
+        "an unlabelled Application must not be badged as generated"
+    );
+}
+
 #[tokio::test]
 async fn projects_and_clusters_are_listed() {
     let project: AppProject = serde_json::from_value(json!({
@@ -1274,6 +1376,8 @@ async fn the_auth_seam_protects_exactly_the_api_routes() {
         "/api/v1/applications",
         "/api/v1/applications/ferriscd-system/payment-api",
         "/api/v1/projects",
+        // `T19.3`: the read-only `ApplicationSet` view is protected exactly like the rest.
+        "/api/v1/applicationsets",
         "/api/v1/clusters",
         "/api/v1/openapi.json",
     ] {

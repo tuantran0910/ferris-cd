@@ -5,7 +5,7 @@
 #   kubectl apply -f deploy/crds/ && kubectl apply -k deploy/manifests
 #
 # Installs:
-# - CRDs (`Application`, `AppProject`) — byte-for-byte synced with `deploy/crds/` (enforced in CI)
+# - CRDs (`Application`, `AppProject`, `ApplicationSet`) — byte-for-byte synced with `deploy/crds/` (enforced in CI)
 # - `ferriscd-system` Namespace with Kubernetes `restricted` PodSecurity Admission labels
 # - Least-privilege RBAC (namespaced `Role`/`RoleBinding` + scoped `ClusterRole`/`ClusterRoleBinding`)
 # - Default-deny `ferriscd-rbac-cm` ConfigMap and single-tenant `default` AppProject
@@ -18,6 +18,7 @@ kind: Kustomization
 resources:
   - crds/applications.ferriscd.io.yaml
   - crds/appprojects.ferriscd.io.yaml
+  - crds/applicationsets.ferriscd.io.yaml
   - namespace.yaml
   - serviceaccount.yaml
   - rbac.yaml

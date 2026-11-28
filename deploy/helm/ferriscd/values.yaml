@@ -166,6 +166,24 @@ rbac:
   # prefer impersonated tenant ServiceAccounts for managing RBAC objects.
   manageRbacResources: false
 
+  # Opt-in `ApplicationSet` controller grants (`T19.3`).
+  # Adds, in the control-plane namespace only: `applicationsets` (`get`, `list`, `watch`,
+  # `patch` — the finalizer is a merge patch, so the `finalizers` subresource is never needed),
+  # `applicationsets/status` (`get`, `patch`, `update`), and `create` on `applications`
+  # (Server-Side Apply needs `patch` *and* `create`).
+  # Enable it together with the controller flag:
+  #   server.extraArgs: ["--enable-applicationsets"]
+  # or the environment fallback `FERRISCD_ENABLE_APPLICATIONSETS=true`.
+  applicationsets: false
+
+  # Opt-in `delete` on `applications` for the `ApplicationSet` controller's *destructive* mode
+  # (`T19.3`): pruning a stale generated Application (`spec.syncPolicy.prune: true`) and honouring
+  # `preserveResourcesOnDeletion: false` are the only two code paths that delete anything, and
+  # Helm cannot grant `delete` without also granting it to every ApplicationSet in the namespace.
+  # Leave it off unless an ApplicationSet actually opts in to either. Requires
+  # `rbac.applicationsets: true` (it only widens that block).
+  applicationsetPrune: false
+
   # Enumerated workload rules granted to the controller's ClusterRole.
   # NEVER add `apiGroups: ["*"] / resources: ["*"]` or `secrets` here: repository and
   # remote-cluster Secrets are strictly scoped to the control-plane namespace Role.

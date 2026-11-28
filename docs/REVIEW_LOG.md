@@ -216,3 +216,69 @@ Executed all **26/26** ignored live Kubernetes integration & chaos suites agains
   3. `crates/ferriscd-controller/src/sync_recovery.rs`: placed the `ferriscd.io/sync-options: Replace=true` hint ahead of the server error text so the 200-char `Ready` condition cap (`reconcile::bounded`) preserves the operator fix.
   4. `crates/ferriscd-controller/src/sync.rs` + `sync_executor.rs`: ran `ensure_namespace_exists` before `PreSync` hooks when `syncOptions.createNamespace: true`, preventing `404 namespaces "<ns>" not found` on brand-new namespaces.
 - **30-minute soak (`T15.3`, recorded in `docs/benchmarks/v1.0.md`):** `50/50` cold convergence in `21s`, steady-state `p50=0.058s` / `p95=0.145s`, `2,995` successful reconciles (`0` errors), `100.00%` `RenderCache` hit rate, flat/declining RSS (`23.70 -> 22.28 MiB`, `-6.00%`, `-124.61 KB/min`), `0` restarts/panics, `end_fd=39` (`fd_delta=-18`, zero leak; two transient synchronized-wave bursts reached `80` and `102` FDs). Fixed `benchmarks/scale_harness.sh:1642` (`printf --`).
+
+---
+
+## `T19.3` Acceptance Review — `ApplicationSet` CRD & Safe Generator Engine
+
+Final Medium/Nit pass over `T19.3` (`ferriscd.io/v1alpha1` `ApplicationSet`, opt-in
+`--enable-applicationsets`). **8 findings closed** in the first round, **7 more in the adversarial
+review's fix round** (`C-1`, `H-1`, `M-1`, `M-2`, `N-a`, `N-b`, `N-d`, `N-e` — the last one log-only);
+each with a regression test, and no behaviour outside the findings changed.
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| **M-a** | Medium | One `AppProject` GET per *generated* `Application` per pass: a 200-`Application` plan performed 200 identical project reads | `ApplicationAuthorizer::authorize_all` (default: the old per-`Application` loop) is what `reconcile_inner` now calls; `ProjectPolicyAuthorizer` overrides it with a pass-scoped `project → AuthorizedProject` memo (the compiled policy, or the not-found verdict), so each distinct project is read **once**. Proven by `a_two_hundred_application_plan_performs_one_project_get` (2 clusters × 100 list elements = the 200 fan-out cap, one counting `ProjectSource` read) |
+| **M-b** | Medium | A generated-`Application` trigger forced **every** `ApplicationSet` due, so one drifting child re-evaluated a 200-object fleet | `TriggerEvent::GeneratedApplication` carries the `ferriscd.io/applicationset` value; the loop calls the new `force_due_named` for it and only falls back to `force_due` for `Cluster`/`Lagged`/no label (a re-list, or a hand-removed label). Proven by `a_generated_application_trigger_forces_only_its_own_applicationset` (selective forcing, unknown-owner no-op, all three fallbacks) |
+| **M-c** | Medium | Helm could not grant `delete` on `applications`, so an opted-in prune (`spec.syncPolicy.prune: true` / `preserveResourcesOnDeletion: false`) failed with `403` on a chart install | New `rbac.applicationsetPrune` (default `false`, in `values.schema.json`) widens **only** the `applications` rule to `get, list, watch, patch, create, delete`, nested inside the existing `rbac.applicationsets` gate. `deploy/README.md` documents it as a second, namespace-wide opt-in; `deploy/manifests/rbac.yaml` documents the rule while still granting nothing by default. Proven by `the_applicationset_prune_grant_is_a_documented_separate_opt_in` |
+| **M-d** | Medium | `GET /api/v1/applicationsets` was missing from the protected-route inventories | Added to `PROTECTED` in `crates/ferriscd-server/tests/auth_rbac.rs` (default-deny `401` with the `WWW-Authenticate` challenge), to the protected list in `crates/ferriscd-server/tests/api.rs::the_auth_seam_protects_exactly_the_api_routes`, and to both route lists in `crates/ferriscd-server/src/openapi.rs` (declared path + documented bearer requirement). The third textual inventory, the module-level route table in `crates/ferriscd-server/src/api.rs`, is updated in `M-1` below |
+| **N-1** | Nit | The orphan patch replaced `metadata.ownerReferences` from a list snapshot with no concurrency guard, so a name re-created between list and patch could lose the *new* object's owners | `orphan_patch_body` carries the listed object's `uid` **and** `resourceVersion`; a mismatch makes the API server reject the write before the patch is applied. `PatchParams` has no precondition field in `kube 5.1`, so the guard lives in the patch body — stated in the code comment. **Corrected by `C-1`/`H-1` below:** the guard produces *two* codes with opposite meanings — `409 Conflict` is a stale `resourceVersion` (a routine `/status` write on the child is enough: the same object is still there and the patch is retried from a live read) and `422 Invalid` is a `uid` that is no longer the stored one (`metadata.uid` is immutable: the listed object is gone). Proven by `the_orphan_patch_carries_the_listed_objects_identity`, `delete_and_orphan_treat_already_gone_objects_as_success`, and the four scripted-API-server orphan tests |
+| **N-2** | Nit | Finalizer patches stated the whole `metadata.finalizers` array from the cached watch snapshot, silently dropping a finalizer another manager had added | `write_finalizer` does a **read-modify-write**: nothing is read when the cached view is already converged, otherwise the transition is recomputed from a live `GET` and sent as a merge patch carrying that read's `resourceVersion` (so a concurrent write is rejected with `409` and retried, never clobbered); `404` is "nothing left to finalize" and `409` is classified retryable. Proven by `finalizer_patches_preserve_another_managers_finalizer` (another manager's finalizer survives both the add and the remove, including the empty-list case) and `finalizer_patch_failures_are_classified` |
+| **N-3** | Nit | `DEFAULT_APPLICATIONSET_INTERVAL` was referenced only by a test — dead in production | It is now the production fallback in `requeue_interval` (also used for a zero/absent `spec.requeueAfterSeconds`, instead of spinning), and a test asserts it equals `ferriscd_crd::applicationset::DEFAULT_APPLICATIONSET_REQUEUE_AFTER_SECONDS` so the loop and the CRD schema cannot drift |
+| **N-4** | Nit | No `T19.3` acceptance record in this log | This section |
+
+**Gate results (this pass):** `make gate` green — `cargo fmt --check`, `cargo clippy --workspace
+--all-targets -D warnings`, the `test-utils` clippy pass, `crd generate --check`, and
+`cargo test --workspace` = **1,329 passed / 0 failed / 28 ignored** across 30 suites. The affected
+modules (`applicationset_controller` 27, `deploy_docs` 13, `auth_rbac` 17, `openapi` 3) were run
+**3×** back-to-back with identical results.
+
+**Live `kind` run (once, `kind-ferriscd-dev`, Kubernetes v1.35):**
+`cargo test -p ferriscd-cli --test v1_3_applicationsets -- --ignored --test-threads=1` → **1 passed**
+in `2.88 s`. The log shows the acceptance shape end to end: `ApplicationSet reconciled appset=payments-fleet
+generated=6 created=6` (then `unchanged=6` on the following passes, i.e. the new selective trigger
+still converges), the six `Application`s carrying their `ownerReference` and label, and the deletion
+path orphaning them and releasing the finalizer through the new read-modify-write `N-2` patch.
+
+### Fix round — adversarial review (`C-1`, `H-1`, `M-1`, `M-2`, `N-a`, `N-b`, `N-d`, `N-e`)
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| **C-1** / **H-1** | Critical / High | `orphan_outcome` mapped `409` to `Ok`, so the *ordinary* stale-`resourceVersion` answer to a routine `/status` write on a child counted as "orphaned": the child kept its `ownerReference`, the `ApplicationSet` finalizer was released anyway, and Kubernetes GC then deleted the whole fleet. The mirror case (a re-created name, `422` for the immutable `metadata.uid`) was classified terminal, wedging the set in `Terminating` | The classifier no longer decides either code (`orphan_patch_outcome`: `404` → gone, `409`/`422` → `Conflict`). `KubeApplicationSetStore::orphan` reads the live object **once** on a conflict: no object (`404`) **or** a different `uid` → the listed object is gone (`Ok`); the same `uid` → the patch was only stale, so it is recomputed from the live read (identity from *that* read) and retried **once**. A second conflict is **retryable**, never "gone", so the `ApplicationSet` stays `Terminating` for one pass instead of handing its children to GC. Proven against a scripted API server (real `KubeApplicationSetStore`, request bodies asserted): `a_stale_resource_version_orphan_conflict_is_retried_from_a_live_read` (two patches, the retry carrying the live `resourceVersion`, `orphaned=1`, finalizer released), `a_second_orphan_conflict_is_retryable_and_never_releases_the_finalizer` (`orphaned=0`, `is_retryable()`, **zero** `ApplicationSet` patches, `/status` still updated), `a_uid_mismatch_orphan_conflict_means_the_listed_application_is_gone` (`422` + foreign `uid` → one patch, `Ok`), `an_orphan_conflict_on_a_vanished_application_is_not_a_failure` (`409` then `GET` `404`) |
+| **M-1** | Medium | `GET /api/v1/applicationsets` was missing from the module-level route inventory in `crates/ferriscd-server/src/api.rs` | Added to the protected-route table in the module docs (the third textual inventory; see `N-e`) |
+| **M-2** | Medium | The trigger arm reconciled after *every* ready trigger, so one fan-out change (a cluster registration, a re-list, a `Lagged` collapse) caused N back-to-back passes over the same unchanged generators | New `drain_due` folds the first trigger plus everything **already buffered** (`now_or_never`, never awaiting) into one `BTreeSet` due-set, and the loop reconciles each affected `ApplicationSet` once. Proven by `a_burst_of_ready_triggers_is_coalesced_into_one_pass_per_applicationset` (9 ready events → exactly 2 names, the stream drained so no second round is possible, an untracked owner contributing nothing) |
+| **N-a** | Nit | `log_report` omitted `orphaned`/`deleted`, so a successful `ApplicationSet` deletion logged as a pass that generated nothing | Both fields are logged on the success path |
+| **N-b** | Nit | `ProjectPolicyAuthorizer::check` mapped **every** `ProjectSource` failure to retryable, so a permanently forbidden `AppProject` read (`403`) retried forever as `ApiError` instead of reporting the RBAC misconfiguration | New `project_error`: an `ReconcileError::Api` is classified by `api_error` (`400`/`403`/`409`/`422` terminal, everything else retryable), and the seam's non-API errors follow `ReconcileError::failure_class`. Proven by `a_permanently_rejected_project_read_is_terminal_and_a_transient_one_is_retryable` (`400`/`403`/`409`/`422` → `ApiRejected`, no writes; `0`/`429`/`500`/`503` → `ApiError`, retryable) |
+| **N-d** | Nit | The `/status` patch the deletion pass issues after releasing the finalizer usually answers `404` and was reported as a failure | New `status_outcome`: `404`/`410` is the object being gone (success, so no warn-level "failed to patch ApplicationSet /status"), everything else keeps `api_error`'s classification. Proven by `a_status_patch_on_a_vanished_applicationset_is_gone_not_a_failure` (attempted once, `Ok` from the store, a `500` still surfaced) and the classifier assertions in `delete_and_orphan_treat_already_gone_objects_as_success` |
+| **N-e** | Nit | This log named only two of the three textual protected-route inventories | It now names `crates/ferriscd-server/src/api.rs` (module docs, `M-1`), `crates/ferriscd-server/tests/auth_rbac.rs::PROTECTED`, and `crates/ferriscd-server/tests/api.rs::the_auth_seam_protects_exactly_the_api_routes` |
+
+**Fix-round gate results:** `make gate` green — `cargo fmt --check`, `cargo clippy --workspace
+--all-targets -D warnings`, the `test-utils` clippy pass, `crd generate --check`, and
+`cargo test --workspace` = **1,336 passed / 0 failed / 28 ignored** across 30 suites (7 new tests).
+The affected module (`applicationset_controller`, 34 tests) was run **3×** back-to-back with
+identical results, and the four orphan tests were mutation-checked (reverting the classifier to
+"`409` = gone" fails `a_stale_resource_version_…` and `a_second_orphan_conflict_…`; reverting
+`status_outcome` or `project_error` fails their tests).
+
+**Live `kind` re-run (once, `kind-ferriscd-dev`, Kubernetes v1.35):** `cargo test -p ferriscd-cli
+--test v1_3_applicationsets -- --ignored --test-threads=1` → **1 passed** in `2.91 s`. The new log
+fields are visible end to end (`generated=6 created=6 … orphaned=0 deleted=0`, then `unchanged=6` on
+the converging passes) and the deletion pass reports `orphaned=6` with **no** "failed to patch
+ApplicationSet /status" warning: the `404` on the final status write is now the expected end state
+(`N-d`), and the orphan patches succeeded against a real API server — no `409` wedge.
+
+**Not changed (explicitly out of scope for this pass):** the generator engine, templating, the
+fan-out cap, ownership/prune planning, the CRD schema, and the `ApplicationSet` watch predicate are
+untouched; no new dependencies were added (`json-patch`/`kube`'s `jsonpatch` feature was considered
+for N-2 and rejected in favour of the resourceVersion-preconditioned merge the finding also allows).
+

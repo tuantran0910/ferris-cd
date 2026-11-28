@@ -16,7 +16,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use ferriscd_crd::{AppProject, Application};
+use ferriscd_crd::{AppProject, Application, ApplicationSet};
 use ferriscd_engine::manifest::ResourceKey;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -229,6 +229,25 @@ pub trait ApplicationSource: Send + Sync + 'static {
 pub trait ProjectCatalog: Send + Sync + 'static {
     /// Lists every `AppProject` of the control-plane namespace.
     fn list(&self) -> SeamFuture<'_, Vec<AppProject>>;
+}
+
+/// Reads `ApplicationSet` objects (`GET /api/v1/applicationsets`, `T19.3`).
+pub trait ApplicationSetCatalog: Send + Sync + 'static {
+    /// Lists every `ApplicationSet` of the control-plane namespace.
+    fn list(&self) -> SeamFuture<'_, Vec<ApplicationSet>>;
+}
+
+/// No `ApplicationSet` catalog is configured: the read view is empty.
+///
+/// This is the default so a control plane that never opted into `--enable-applicationsets` still
+/// serves a valid (empty) page instead of failing the whole API.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoApplicationSets;
+
+impl ApplicationSetCatalog for NoApplicationSets {
+    fn list(&self) -> SeamFuture<'_, Vec<ApplicationSet>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 /// The most Kubernetes `Event`s one `GET .../events` response carries (`T17.3`).
@@ -506,6 +525,8 @@ pub struct AppState {
     pub applications: Arc<dyn ApplicationSource>,
     /// `AppProject` reads.
     pub projects: Arc<dyn ProjectCatalog>,
+    /// `ApplicationSet` reads (`T19.3`).
+    pub applicationsets: Arc<dyn ApplicationSetCatalog>,
     /// Kubernetes `Event` reads for the `Application` events timeline (`T17.3`).
     pub events: Arc<dyn EventSource>,
     /// The SSE snapshot feed (`GET /api/v1/applications/stream`, `T17.3`).
@@ -584,6 +605,7 @@ impl AppState {
         Self {
             applications,
             projects,
+            applicationsets: Arc::new(NoApplicationSets),
             events: Arc::new(NoEvents),
             snapshots: Arc::new(NoSnapshots),
             clusters,
@@ -664,6 +686,16 @@ impl AppState {
     #[must_use]
     pub fn with_rbac_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.rbac_namespace = namespace.into();
+        self
+    }
+
+    /// Replaces the `ApplicationSet` catalog (`T19.3`).
+    #[must_use]
+    pub fn with_applicationset_catalog(
+        mut self,
+        applicationsets: Arc<dyn ApplicationSetCatalog>,
+    ) -> Self {
+        self.applicationsets = applicationsets;
         self
     }
 

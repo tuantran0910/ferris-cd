@@ -712,6 +712,53 @@
         ]
       }
     },
+    "/api/v1/applicationsets": {
+      "get": {
+        "tags": [
+          "platform"
+        ],
+        "summary": "Lists `ApplicationSet` objects (`T19.3`).",
+        "description": "Every `ApplicationSet` of the control-plane namespace whose template targets an `AppProject` the caller may see, with its generator kinds, deletion/prune policy, and generation count.",
+        "operationId": "list_applicationsets",
+        "responses": {
+          "200": {
+            "description": "Every visible ApplicationSet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationSetListView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The cluster could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/clusters": {
       "get": {
         "tags": [
@@ -1213,6 +1260,96 @@
           }
         }
       },
+      "ApplicationSetListView": {
+        "type": "object",
+        "description": "`GET /api/v1/applicationsets` body (`T19.3`).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApplicationSetView"
+            },
+            "description": "Every `ApplicationSet` of the control-plane namespace."
+          }
+        }
+      },
+      "ApplicationSetView": {
+        "type": "object",
+        "description": "One `ApplicationSet`, reduced to its generation facts.",
+        "required": [
+          "namespace",
+          "name",
+          "generator",
+          "project",
+          "preserveResourcesOnDeletion",
+          "prune",
+          "generatedCount"
+        ],
+        "properties": {
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConditionView"
+            },
+            "description": "`status.conditions`, newest last."
+          },
+          "generatedCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`status.generatedCount`.",
+            "minimum": 0
+          },
+          "generator": {
+            "type": "string",
+            "description": "`spec.generators[0]`'s kind (`list`, `git`, `clusters`, `matrix`)."
+          },
+          "matrix": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "For a `matrix`, the two child generator kinds (empty otherwise)."
+          },
+          "name": {
+            "type": "string",
+            "description": "`metadata.name`."
+          },
+          "namespace": {
+            "type": "string",
+            "description": "`metadata.namespace`."
+          },
+          "observedGeneration": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`status.observedGeneration`."
+          },
+          "preserveResourcesOnDeletion": {
+            "type": "boolean",
+            "description": "`spec.syncPolicy.preserveResourcesOnDeletion` (always present, defaults to `true`)."
+          },
+          "project": {
+            "type": "string",
+            "description": "`spec.template.spec.project`."
+          },
+          "prune": {
+            "type": "boolean",
+            "description": "`spec.syncPolicy.prune` (defaults to `false`)."
+          },
+          "ready": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`status` `Ready` condition, `True`/`False`/`Unknown` (absent before the first pass)."
+          }
+        }
+      },
       "ApplicationSummary": {
         "type": "object",
         "description": "One `Application`, reduced to what a UI/CLI lists.",
@@ -1225,6 +1362,13 @@
           "resourceCount"
         ],
         "properties": {
+          "applicationset": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`metadata.labels[\"ferriscd.io/applicationset\"]`: the `ApplicationSet` that generated this\n`Application` (`T19.3`). Absent for a hand-authored one, which is what the web UI badges on."
+          },
           "conditions": {
             "type": "array",
             "items": {

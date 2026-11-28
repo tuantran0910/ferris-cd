@@ -35,7 +35,20 @@ rules:
   # Application and AppProject lifecycle in the control-plane namespace.
   - apiGroups: ["ferriscd.io"]
     resources: ["applications"]
+    {{- if .Values.rbac.applicationsets }}
+    # Opt-in `ApplicationSet` controller (`T19.3`, `--enable-applicationsets`): the generated
+    # Applications are written with Server-Side Apply, which needs `patch` *and* `create`.
+    {{- if .Values.rbac.applicationsetPrune }}
+    # `delete` is a *separate* opt-in: it is only used by `spec.syncPolicy.prune: true` or
+    # `preserveResourcesOnDeletion: false`, and it lets the loop delete generated Applications in
+    # this namespace. Leave `rbac.applicationsetPrune` off unless an ApplicationSet sets one of them.
+    verbs: ["get", "list", "watch", "patch", "create", "delete"]
+    {{- else }}
+    verbs: ["get", "list", "watch", "patch", "create"]
+    {{- end }}
+    {{- else }}
     verbs: ["get", "list", "watch", "patch"]
+    {{- end }}
   - apiGroups: ["ferriscd.io"]
     resources: ["applications/status"]
     verbs: ["get", "patch", "update"]
@@ -45,6 +58,18 @@ rules:
   - apiGroups: ["ferriscd.io"]
     resources: ["appprojects"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.rbac.applicationsets }}
+  # Opt-in `ApplicationSet` controller (`T19.3`). `patch` (not `update`) is what sets and clears
+  # `metadata.finalizers` with a merge patch — the `finalizers` subresource is never used — and
+  # `/status` is patched on every pass. Pair this with
+  # `server.extraArgs: ["--enable-applicationsets"]`.
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applicationsets"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applicationsets/status"]
+    verbs: ["get", "patch", "update"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

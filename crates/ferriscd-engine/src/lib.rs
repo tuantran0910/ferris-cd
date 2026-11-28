@@ -1,8 +1,9 @@
 //! FerrisCD core GitOps engine: repository acquisition, manifest rendering,
 //! GKNN inventory tracking, SSA diffing, sync wave planning, health evaluation,
-//! the Phase 10 wave/hook state machine with bounded history and rollback, and the
-//! Phase 12 `AppProject` policy enforcer.
+//! the Phase 10 wave/hook state machine with bounded history and rollback, the
+//! Phase 12 `AppProject` policy enforcer, and the Phase 19 `ApplicationSet` generators.
 
+pub mod applicationset;
 pub mod diff;
 pub mod graph;
 pub mod health;
