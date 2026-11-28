@@ -1,4 +1,4 @@
-import { Boxes, FolderGit2, Layers, Server } from "lucide-react";
+import { Boxes, ExternalLink, FolderGit2, Layers, Server } from "lucide-react";
 import type { ApplicationSummary, SourceEntryView } from "../../../api/types";
 import { Badge } from "../../../ui/Badge";
 import { CopyText } from "../../../ui/CopyText";
@@ -6,6 +6,13 @@ import { Link } from "react-router-dom";
 import { Card } from "../../../ui/Card";
 import { repoWebUrl } from "../../../utils/format";
 import { SyncMetadata } from "./SyncMetadata";
+
+/** Last path/colon segment, without a `.git` suffix. */
+function repositoryName(url: string): string {
+  const trimmed = url.replace(/[\\/]+$/, "");
+  const segment = trimmed.split(/[\\/:]/).filter(Boolean).pop() ?? trimmed;
+  return segment.replace(/\.git$/, "");
+}
 
 /** The two source kinds the API reports (`SourceView.sourceType`, `T18.4`). */
 function isOciSource(app: ApplicationSummary): boolean {
@@ -59,6 +66,13 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
     app.source.repoUrl.startsWith("./") ||
     app.source.repoUrl.startsWith("../") ||
     app.source.repoUrl.startsWith("~");
+  const repoHref =
+    repoWeb ??
+    (localPath
+      ? app.source.repoUrl.startsWith("file://")
+        ? app.source.repoUrl
+        : `file://${app.source.repoUrl}`
+      : null);
   const sources = declaredSources(app);
   const multiSource = app.source.multiSource === true || sources.length > 1;
   return (
@@ -101,8 +115,8 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
           ) : null}
         </p>
         <dl className="mt-3 space-y-1.5">
-          <div>
-            <dt className="flex items-center gap-1.5 text-ink-subtle">
+          <div className="flex min-h-6 items-center justify-between gap-3">
+            <dt className="flex shrink-0 items-center gap-1.5 text-ink-subtle">
               {oci ? "Registry" : "Repository"}
               {localPath && !oci ? (
                 <Badge tone="neutral" size="sm">
@@ -111,29 +125,30 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
               ) : null}
             </dt>
             <dd
-              className="flex items-start justify-between gap-1 font-mono text-ink"
+              className="flex min-w-0 items-center justify-end gap-1.5 font-mono text-ink"
               title={app.source.repoUrl}
             >
-              <span className="min-w-0">
-                {repoWeb ? (
-                  <a
-                    href={repoWeb}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="break-all underline decoration-dotted underline-offset-2 hover:text-accent"
-                  >
-                    {app.source.repoUrl}
-                  </a>
-                ) : (
-                  <span className="break-all">{app.source.repoUrl}</span>
-                )}
+              <span className="min-w-0 truncate">
+                {oci ? app.source.repoUrl : repositoryName(app.source.repoUrl)}
               </span>
+              {repoHref ? (
+                <a
+                  href={repoHref}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={`Open repository ${repositoryName(app.source.repoUrl)} in a new tab`}
+                  title={`Open ${app.source.repoUrl}`}
+                  className="shrink-0 rounded p-1 text-ink-muted transition-colors hover:bg-elevated hover:text-accent"
+                >
+                  <ExternalLink aria-hidden="true" className="h-3.5 w-3.5" />
+                </a>
+              ) : null}
             </dd>
           </div>
-          <div className="flex justify-between gap-3">
+          <div className="flex min-h-6 items-center justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Path</dt>
             <dd
-              className="flex min-w-0 items-start justify-end gap-1 text-right font-mono text-ink"
+              className="flex min-w-0 items-center justify-end gap-1 text-right font-mono text-ink"
               title={app.source.path}
             >
               <span className="min-w-0 break-all">{app.source.path}</span>
@@ -148,7 +163,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
           {oci ? (
             <>
               {app.source.tag ? (
-                <div className="flex justify-between gap-3">
+                <div className="flex min-h-6 items-center justify-between gap-3">
                   <dt className="shrink-0 text-ink-subtle">Tag</dt>
                   <dd
                     data-testid="source-tag"
@@ -160,7 +175,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
                 </div>
               ) : null}
               {app.source.digest ? (
-                <div className="flex justify-between gap-3">
+                <div className="flex min-h-6 items-center justify-between gap-3">
                   <dt className="shrink-0 text-ink-subtle">Digest</dt>
                   <dd
                     data-testid="source-digest"
@@ -172,7 +187,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
                 </div>
               ) : null}
               {!app.source.tag && !app.source.digest ? (
-                <div className="flex justify-between gap-3">
+                <div className="flex min-h-6 items-center justify-between gap-3">
                   <dt className="shrink-0 text-ink-subtle">Target Revision</dt>
                   <dd
                     className="min-w-0 break-all text-right font-mono text-ink"
@@ -187,7 +202,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
               ) : null}
             </>
           ) : (
-            <div className="flex justify-between gap-3">
+            <div className="flex min-h-6 items-center justify-between gap-3">
               <dt className="shrink-0 text-ink-subtle">Target Revision</dt>
               <dd
                 className="min-w-0 break-all text-right font-mono text-ink"
@@ -200,7 +215,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
               </dd>
             </div>
           )}
-          <div className="flex justify-between gap-3">
+          <div className="flex min-h-6 items-center justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Renderer</dt>
             <dd className="min-w-0 break-all text-right font-mono text-ink">
               {app.source.renderer}
@@ -280,7 +295,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
           Destination
         </p>
         <dl className="mt-3 space-y-1.5">
-          <div className="flex justify-between gap-3">
+          <div className="flex min-h-6 items-center justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Cluster</dt>
             <dd className="min-w-0 text-right font-mono text-ink">
               <Link
@@ -292,7 +307,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
               </Link>
             </dd>
           </div>
-          <div className="flex justify-between gap-3">
+          <div className="flex min-h-6 items-center justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Namespace</dt>
             <dd className="min-w-0 text-right font-mono text-ink">
               <Link
@@ -304,11 +319,11 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
               </Link>
             </dd>
           </div>
-          <div className="flex justify-between gap-3">
+          <div className="flex min-h-6 items-center justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Tracked Resources</dt>
             <dd className="font-mono text-ink">{app.resourceCount}</dd>
           </div>
-          <div className="flex justify-between gap-3">
+          <div className="flex min-h-6 items-center justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Observed Generation</dt>
             <dd className="font-mono text-ink">
               {app.observedGeneration ?? "—"}

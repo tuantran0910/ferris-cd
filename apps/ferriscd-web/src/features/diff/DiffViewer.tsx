@@ -573,7 +573,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Filter by kind, name or namespace..."
-            className="w-full rounded-lg border border-control bg-surface py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint "
+            className="w-full rounded-lg border border-control bg-surface py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint"
           />
         </div>
         <Select

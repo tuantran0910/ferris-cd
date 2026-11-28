@@ -67,6 +67,9 @@ const LIGHT = {
   kindWorkload: "#a21caf",
   kindJob: "#9a3412",
   amber500: "#f59e0b",
+  emerald500: "#10b981",
+  rose500: "#f43f5e",
+  sky500: "#0ea5e9",
   violet500: "#8b5cf6",
   fuchsia500: "#d946ef",
   orange500: "#f97316",
@@ -89,6 +92,9 @@ const DARK = {
   kindWorkload: "#f0abfc",
   kindJob: "#fdba74",
   amber500: "#f59e0b",
+  emerald500: "#10b981",
+  rose500: "#f43f5e",
+  sky500: "#0ea5e9",
   violet500: "#8b5cf6",
   fuchsia500: "#d946ef",
   orange500: "#f97316",
@@ -102,10 +108,10 @@ describe.each([
 
   it("keeps semantic text on tinted surfaces at >= 4.5:1", () => {
     const pairs: [string, string, string][] = [
-      [t.success, tinted(t.amber500), "success tint"],
+      [t.success, tinted(t.emerald500), "success tint"],
       [t.warning, tinted(t.amber500), "warning badge"],
-      [t.danger, tinted(t.fuchsia500), "danger tint"],
-      [t.info, tinted(t.info), "info tint"],
+      [t.danger, tinted(t.rose500), "danger tint"],
+      [t.info, tinted(t.sky500), "info tint"],
       [t.accent, tinted(t.violet500), "accent tint"],
       [t.kindNamespace, tinted(t.violet500), "namespace badge"],
       [t.kindWorkload, tinted(t.fuchsia500), "workload badge"],

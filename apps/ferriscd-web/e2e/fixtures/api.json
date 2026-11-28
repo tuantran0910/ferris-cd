@@ -1,0 +1,354 @@
+{
+  "/api/v1/auth/config": {
+    "authMode": "pass-through",
+    "scopes": [],
+    "bffEnabled": false
+  },
+  "/api/v1/applications": {
+    "items": [
+      {
+        "namespace": "ferriscd-system",
+        "name": "broken-source",
+        "project": "default",
+        "source": {
+          "sourceType": "git",
+          "repoUrl": "/nonexistent/repo",
+          "path": ".",
+          "targetRevision": "main",
+          "renderer": "auto"
+        },
+        "destination": {
+          "cluster": "in-cluster",
+          "namespace": "demo-broken"
+        },
+        "conditions": [
+          {
+            "type": "Ready",
+            "status": "False",
+            "reason": "SyncError",
+            "message": "repository error: Could not verify that \"/nonexistent/repo\" is a valid git directory before attempting to use it: Could not retrieve metadata of \"/nonexistent/repo/.git\": No such file or directory (os…",
+            "lastTransitionTime": "2026-11-28T11:01:17Z",
+            "observedGeneration": 1
+          }
+        ],
+        "resourceCount": 0,
+        "observedGeneration": 1
+      },
+      {
+        "namespace": "ferriscd-system",
+        "name": "checkout-web",
+        "project": "default",
+        "source": {
+          "sourceType": "git",
+          "repoUrl": "/private/tmp/commandcode-501/-Users-tranngoctuan0910-Workspaces-PersonalRepo-ferris-cd/d9b22162-82f1-4e32-a822-3ea5ba3805f5/scratchpad/demo-repo",
+          "path": "basic-checkout",
+          "targetRevision": "main",
+          "renderer": "auto"
+        },
+        "destination": {
+          "cluster": "in-cluster",
+          "namespace": "demo-checkout"
+        },
+        "sync": {
+          "status": "Synced",
+          "revision": "2ad23d4840af5572cefde81c3765ec52951ba4dd",
+          "lastSyncedRevision": "2ad23d4840af5572cefde81c3765ec52951ba4dd",
+          "lastSyncedAt": "2026-11-28T11:09:52Z"
+        },
+        "health": {
+          "status": "Healthy",
+          "message": "all 4 resource(s) are healthy"
+        },
+        "conditions": [
+          {
+            "type": "Ready",
+            "status": "True",
+            "reason": "SyncSkipped",
+            "message": "no sync performed: self-heal is disabled and the source is unchanged; 4 resource(s) at revision 2ad23d4, 0 out of sync, 0 missing, 1 orphan(s); 1 orphan(s) retained (not owned, not prunable, or still …",
+            "lastTransitionTime": "2026-11-28T11:09:53Z",
+            "observedGeneration": 2
+          }
+        ],
+        "resourceCount": 5,
+        "observedGeneration": 2
+      },
+      {
+        "namespace": "ferriscd-system",
+        "name": "helm-guestbook",
+        "project": "default",
+        "source": {
+          "sourceType": "git",
+          "repoUrl": "/private/tmp/commandcode-501/-Users-tranngoctuan0910-Workspaces-PersonalRepo-ferris-cd/d9b22162-82f1-4e32-a822-3ea5ba3805f5/scratchpad/demo-repo",
+          "path": "helm",
+          "targetRevision": "main",
+          "renderer": "helm"
+        },
+        "destination": {
+          "cluster": "in-cluster",
+          "namespace": "demo-helm"
+        },
+        "sync": {
+          "status": "OutOfSync",
+          "revision": "2ad23d4840af5572cefde81c3765ec52951ba4dd"
+        },
+        "conditions": [
+          {
+            "type": "Ready",
+            "status": "False",
+            "reason": "SyncError",
+            "message": "apps/Deployment/demo-helm/helm-guestbook: immutable field cannot be patched in place; annotate with `ferriscd.io/sync-options: Replace=true` to delete and recreate (Deployment.apps \"helm-guestbook\" is…",
+            "lastTransitionTime": "2026-11-28T11:01:17Z",
+            "observedGeneration": 1
+          }
+        ],
+        "resourceCount": 2,
+        "observedGeneration": 1
+      },
+      {
+        "namespace": "ferriscd-system",
+        "name": "payments-api",
+        "project": "default",
+        "source": {
+          "sourceType": "git",
+          "repoUrl": "/private/tmp/commandcode-501/-Users-tranngoctuan0910-Workspaces-PersonalRepo-ferris-cd/d9b22162-82f1-4e32-a822-3ea5ba3805f5/scratchpad/demo-repo",
+          "path": "basic",
+          "targetRevision": "main",
+          "renderer": "auto"
+        },
+        "destination": {
+          "cluster": "in-cluster",
+          "namespace": "demo-payments"
+        },
+        "sync": {
+          "status": "Synced",
+          "revision": "2ad23d4840af5572cefde81c3765ec52951ba4dd",
+          "lastSyncedRevision": "2ad23d4840af5572cefde81c3765ec52951ba4dd",
+          "lastSyncedAt": "2026-11-28T11:09:57Z"
+        },
+        "health": {
+          "status": "Healthy",
+          "message": "all 4 resource(s) are healthy"
+        },
+        "conditions": [
+          {
+            "type": "Ready",
+            "status": "True",
+            "reason": "SyncSkipped",
+            "message": "no sync performed: live state already matches Git; 4 resource(s) at revision 2ad23d4, 0 out of sync, 0 missing, 0 orphan(s)",
+            "lastTransitionTime": "2026-11-28T11:01:40Z",
+            "observedGeneration": 1
+          }
+        ],
+        "resourceCount": 4,
+        "observedGeneration": 1
+      }
+    ]
+  },
+  "/api/v1/projects": {
+    "items": [
+      {
+        "name": "default",
+        "description": "Default FerrisCD project used when an Application does not name a project. Permits every source repository, destination, GroupKind, and ServiceAccount; it is only appropriate for single-tenant clusters.",
+        "sourceRepos": [
+          "*"
+        ],
+        "sourceNamespaces": [
+          "ferriscd-system"
+        ],
+        "destinations": [
+          "in-cluster/*"
+        ],
+        "allowedServiceAccounts": [
+          "*"
+        ]
+      }
+    ]
+  },
+  "/api/v1/clusters": {
+    "items": [
+      {
+        "name": "in-cluster",
+        "inCluster": true
+      }
+    ]
+  },
+  "/api/v1/applications/ferriscd-system/payments-api": {
+    "application": {
+      "namespace": "ferriscd-system",
+      "name": "payments-api",
+      "project": "default",
+      "source": {
+        "sourceType": "git",
+        "repoUrl": "/private/tmp/commandcode-501/-Users-tranngoctuan0910-Workspaces-PersonalRepo-ferris-cd/d9b22162-82f1-4e32-a822-3ea5ba3805f5/scratchpad/demo-repo",
+        "path": "basic",
+        "targetRevision": "main",
+        "renderer": "auto"
+      },
+      "destination": {
+        "cluster": "in-cluster",
+        "namespace": "demo-payments"
+      },
+      "sync": {
+        "status": "Synced",
+        "revision": "2ad23d4840af5572cefde81c3765ec52951ba4dd",
+        "lastSyncedRevision": "2ad23d4840af5572cefde81c3765ec52951ba4dd",
+        "lastSyncedAt": "2026-11-28T11:09:57Z"
+      },
+      "health": {
+        "status": "Healthy",
+        "message": "all 4 resource(s) are healthy"
+      },
+      "conditions": [
+        {
+          "type": "Ready",
+          "status": "True",
+          "reason": "SyncSkipped",
+          "message": "no sync performed: live state already matches Git; 4 resource(s) at revision 2ad23d4, 0 out of sync, 0 missing, 0 orphan(s)",
+          "lastTransitionTime": "2026-11-28T11:01:40Z",
+          "observedGeneration": 1
+        }
+      ],
+      "resourceCount": 4,
+      "observedGeneration": 1
+    },
+    "history": [
+      {
+        "id": 2,
+        "revision": "2ad23d4840af5572cefde81c3765ec52951ba4dd",
+        "deployedAt": "2026-11-28T11:09:57Z"
+      },
+      {
+        "id": 1,
+        "revision": "87bbca7f53006e6d0e2d4cbbd600d75b46e524da",
+        "deployedAt": "2026-11-28T11:01:40Z"
+      }
+    ],
+    "operation": {
+      "phase": "Succeeded",
+      "currentWave": 0,
+      "revision": "2ad23d4840af5572cefde81c3765ec52951ba4dd",
+      "startedAt": "2026-11-28T11:09:57Z",
+      "finishedAt": "2026-11-28T11:09:57Z",
+      "message": "sync completed: every resource is applied"
+    }
+  },
+  "/api/v1/applications/ferriscd-system/payments-api/resources": {
+    "namespace": "demo-payments",
+    "cluster": "in-cluster",
+    "syncStatus": "Synced",
+    "healthStatus": "Healthy",
+    "nodes": [
+      {
+        "key": "/ConfigMap/demo-payments/demo-config",
+        "group": "",
+        "kind": "ConfigMap",
+        "namespace": "demo-payments",
+        "name": "demo-config",
+        "present": true,
+        "ownership": "OwnedBySelf",
+        "health": "Healthy",
+        "healthMessage": "ConfigMap exists"
+      },
+      {
+        "key": "/Namespace//ferriscd-demo",
+        "group": "",
+        "kind": "Namespace",
+        "name": "ferriscd-demo",
+        "present": true,
+        "ownership": "OwnedBySelf",
+        "health": "Healthy",
+        "healthMessage": "Namespace exists"
+      },
+      {
+        "key": "/Service/demo-payments/demo-app",
+        "group": "",
+        "kind": "Service",
+        "namespace": "demo-payments",
+        "name": "demo-app",
+        "present": true,
+        "ownership": "OwnedBySelf",
+        "health": "Healthy",
+        "healthMessage": "Service is of type ClusterIP"
+      },
+      {
+        "key": "apps/Deployment/demo-payments/demo-app",
+        "group": "apps",
+        "kind": "Deployment",
+        "namespace": "demo-payments",
+        "name": "demo-app",
+        "present": true,
+        "ownership": "OwnedBySelf",
+        "health": "Healthy",
+        "healthMessage": "all 1 replica(s) are updated and available"
+      },
+      {
+        "key": "apps/ReplicaSet/demo-payments/demo-app-7f897fb4fc",
+        "group": "apps",
+        "kind": "ReplicaSet",
+        "namespace": "demo-payments",
+        "name": "demo-app-7f897fb4fc",
+        "present": true,
+        "parent": "apps/Deployment/demo-payments/demo-app"
+      },
+      {
+        "key": "/Pod/demo-payments/demo-app-7f897fb4fc-pj6nx",
+        "group": "",
+        "kind": "Pod",
+        "namespace": "demo-payments",
+        "name": "demo-app-7f897fb4fc-pj6nx",
+        "present": true,
+        "parent": "apps/ReplicaSet/demo-payments/demo-app-7f897fb4fc"
+      }
+    ],
+    "truncated": false
+  },
+  "/api/v1/applications/ferriscd-system/payments-api/diff": {
+    "revision": "2ad23d4840af5572cefde81c3765ec52951ba4dd",
+    "desired": 4,
+    "wouldSync": false,
+    "summary": {
+      "total": 4,
+      "synced": 4,
+      "outOfSync": 0,
+      "missing": 0,
+      "orphaned": 0,
+      "ownershipConflicts": 0,
+      "fieldConflicts": 0
+    },
+    "resources": [
+      {
+        "key": "/ConfigMap/demo-payments/demo-config",
+        "status": "synced",
+        "changes": [],
+        "conflicts": [],
+        "truncated": false
+      },
+      {
+        "key": "/Namespace//ferriscd-demo",
+        "status": "synced",
+        "changes": [],
+        "conflicts": [],
+        "truncated": false
+      },
+      {
+        "key": "/Service/demo-payments/demo-app",
+        "status": "synced",
+        "changes": [],
+        "conflicts": [],
+        "truncated": false
+      },
+      {
+        "key": "apps/Deployment/demo-payments/demo-app",
+        "status": "synced",
+        "changes": [],
+        "conflicts": [],
+        "truncated": false
+      }
+    ],
+    "policyViolations": []
+  },
+  "/api/v1/applications/ferriscd-system/payments-api/events": {
+    "items": [],
+    "truncated": false
+  }
+}

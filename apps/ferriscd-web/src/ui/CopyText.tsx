@@ -1,5 +1,5 @@
+import { copyToClipboard } from "../utils/clipboard";
 import { cx } from "../utils/cx";
-import { COPY_EVENT } from "./CopyToast";
 
 export interface CopyTextProps {
   value: string;
@@ -22,26 +22,8 @@ export function CopyText({
   className,
   wrap = false,
 }: CopyTextProps) {
-  const copy = async () => {
-    let copied = true;
-    try {
-      await navigator.clipboard.writeText(value);
-    } catch {
-      const area = document.createElement("textarea");
-      area.value = value;
-      area.style.position = "fixed";
-      area.style.opacity = "0";
-      document.body.appendChild(area);
-      area.select();
-      copied =
-        typeof document.execCommand === "function" &&
-        document.execCommand("copy");
-      area.remove();
-    }
-    if (!copied) {
-      return;
-    }
-    window.dispatchEvent(new CustomEvent(COPY_EVENT, { detail: { label } }));
+  const copy = () => {
+    void copyToClipboard(value, label);
   };
 
   return (
@@ -49,12 +31,12 @@ export function CopyText({
       type="button"
       onClick={(event) => {
         event.stopPropagation();
-        void copy();
+        copy();
       }}
       title={`Click to copy ${label}`}
       aria-label={`Copy ${label}`}
       className={cx(
-        "relative -mx-0.5 inline-flex min-h-7 min-w-6 max-w-full cursor-pointer items-center px-0.5 py-1 text-left align-baseline hover:text-accent hover:underline",
+        "relative inline-flex min-h-6 max-w-full cursor-pointer items-center text-left align-baseline hover:text-accent hover:underline",
         className,
       )}
     >

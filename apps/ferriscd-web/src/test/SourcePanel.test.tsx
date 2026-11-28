@@ -18,6 +18,37 @@ function sourceCard(app: ApplicationSummary): HTMLElement {
   return screen.getByTestId("source-card");
 }
 
+describe("SourcePanel repository affordances", () => {
+  it("opens a local repository through a file:// link", () => {
+    const local: ApplicationSummary = {
+      ...sampleApps[0]!,
+      source: { ...sampleApps[0]!.source, repoUrl: "/tmp/demo-repo" },
+    };
+    const card = sourceCard(local);
+
+    expect(within(card).getByText("local")).toBeInTheDocument();
+    expect(within(card).getByText("demo-repo")).toBeInTheDocument();
+    expect(
+      within(card).getByRole("link", { name: /open repository demo-repo/i }),
+    ).toHaveAttribute("href", "file:///tmp/demo-repo");
+  });
+
+  it("does not label an SSH remote as a local checkout", () => {
+    const ssh: ApplicationSummary = {
+      ...sampleApps[0]!,
+      source: {
+        ...sampleApps[0]!.source,
+        repoUrl: "git@github.com:acme/apps.git",
+      },
+    };
+    const card = sourceCard(ssh);
+
+    expect(within(card).queryByText("local")).not.toBeInTheDocument();
+    expect(within(card).getByText("apps")).toBeInTheDocument();
+    expect(within(card).queryByRole("link")).not.toBeInTheDocument();
+  });
+});
+
 describe("SourcePanel (T18.4)", () => {
   it("names the source kind and splits an OCI tag from its pinned digest", () => {
     const card = sourceCard(sampleOciApp);
@@ -88,10 +119,11 @@ describe("SourcePanel (T18.4)", () => {
     expect(within(card).queryByText("Registry")).not.toBeInTheDocument();
     expect(within(card).queryByTestId("source-tag")).not.toBeInTheDocument();
     expect(within(card).queryByTestId("source-digest")).not.toBeInTheDocument();
-    // The HTTP(S) repo keeps its browsable link.
+    // The HTTP(S) repo shows its short name next to a "open repository" action.
+    expect(within(card).getByText("gitops-payments")).toBeInTheDocument();
     expect(
       within(card).getByRole("link", {
-        name: "https://github.com/acme/gitops-payments.git",
+        name: /open repository gitops-payments/i,
       }),
     ).toHaveAttribute("href", "https://github.com/acme/gitops-payments");
   });

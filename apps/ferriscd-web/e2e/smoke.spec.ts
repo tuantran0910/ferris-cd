@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { mockApi } from "./mock-api";
 import {
   APP,
   expectAccessible,
@@ -9,11 +10,31 @@ import {
 
 test.describe("login", () => {
   test("renders the token form accessibly in every theme", async ({ page }) => {
+    await mockApi(page);
     await page.goto("/");
     await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
     await expect(page.locator('input[name="token"]')).toBeVisible();
     await expectNoHorizontalOverflow(page);
     await expectAccessible(page);
+  });
+
+  test("paints the persisted theme before the app bundle runs", async ({
+    page,
+  }) => {
+    await page.addInitScript(() =>
+      localStorage.setItem("ferriscd-theme", "light"),
+    );
+    // Block the React entry so only the inline boot script can set the theme.
+    await page.route("**/src/app/main.tsx*", (route) => route.abort());
+    await page.goto("/");
+    const boot = await page.evaluate(() => ({
+      theme: document.documentElement.dataset.theme,
+      meta: document
+        .querySelector('meta[name="theme-color"]')
+        ?.getAttribute("content"),
+    }));
+    expect(boot.theme).toBe("light");
+    expect(boot.meta).toBe("#f1f5f9");
   });
 });
 
@@ -25,6 +46,20 @@ test.describe("applications", () => {
     await expect(page.getByRole("heading", { name: "Applications" })).toBeVisible();
 
     const search = page.getByPlaceholder(/search by name, namespace/i);
+    // The focused control must expose a visible ring that is not just a 1.5:1 wash.
+    const blurred = await search.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { border: style.borderTopColor, shadow: style.boxShadow };
+    });
+    await search.focus();
+    await page.waitForTimeout(250); // border-colour transition
+    const focused = await search.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { border: style.borderTopColor, shadow: style.boxShadow };
+    });
+    expect(focused.border).not.toBe(blurred.border);
+    expect(focused.shadow).not.toBe("none");
+
     await search.fill("payments");
     await expect(
       page.getByRole("link", { name: new RegExp(APP.name, "i") }).first(),

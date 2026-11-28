@@ -108,11 +108,15 @@ export function ClustersPage() {
           Clusters
         </h1>
         <p className="mt-1 text-xs text-ink-body">
-          {filter
-            ? `${clusters.length} of ${allClusters.length} clusters match “${filter}”`
-            : clusters.length === 1
-              ? "1 destination cluster visible to your identity"
-              : `${clusters.length} destination clusters visible to your identity`}
+          {!clustersQuery.data
+            ? "Loading destination clusters…"
+            : filter
+              ? `${clusters.length} of ${allClusters.length} ${
+                  allClusters.length === 1 ? "cluster" : "clusters"
+                } match “${filter}”`
+              : clusters.length === 1
+                ? "1 destination cluster visible to your identity"
+                : `${clusters.length} destination clusters visible to your identity`}
           {" — "}
           filtered to the destinations your AppProjects allow.
         </p>

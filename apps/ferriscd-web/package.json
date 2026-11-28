@@ -12,7 +12,8 @@
     "test:watch": "vitest",
     "generate-api": "openapi-typescript ../../docs/api/openapi.json -o src/api/schema.d.ts",
     "test:e2e": "playwright test",
-    "test:e2e:update": "playwright test --update-snapshots"
+    "test:e2e:update": "playwright test --update-snapshots",
+    "test:e2e:ci": "playwright test e2e/smoke.spec.ts"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.0",

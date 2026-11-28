@@ -1,9 +1,8 @@
 import { Check } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { COPY_EVENT } from "../utils/clipboard";
 import { cx } from "../utils/cx";
-
-export const COPY_EVENT = "ferriscd:copied";
 
 interface ToastState {
   label: string;

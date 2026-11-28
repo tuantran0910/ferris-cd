@@ -40,8 +40,8 @@ export function buildResourceGraphElements(
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({
     rankdir: direction,
-    nodesep: 40,
-    ranksep: 88,
+    nodesep: 48,
+    ranksep: 120,
     marginx: 24,
     marginy: 24,
   });
@@ -149,7 +149,7 @@ export function buildResourceGraphElements(
       source: sourceId,
       target: resource.key,
       animated: derivedHealth === "Progressing",
-      markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 16, height: 16 },
+      markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
       style: {
         stroke,
         strokeWidth: 1.5,

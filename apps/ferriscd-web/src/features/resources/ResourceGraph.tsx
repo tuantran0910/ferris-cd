@@ -63,7 +63,7 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
         <Handle
           type="target"
           position={Position.Left}
-          className="!h-2.5 !w-2.5 !border-line-subtle !bg-handle"
+          className="!h-2.5 !w-2.5 !border-0 !bg-transparent opacity-0"
         />
       )}
       <div className="flex items-center justify-between gap-2">
@@ -90,7 +90,7 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
         <Handle
           type="source"
           position={Position.Right}
-          className="!h-2.5 !w-2.5 !border-line-subtle !bg-indigo-400"
+          className="!h-2.5 !w-2.5 !border-0 !bg-transparent opacity-0"
         />
       )}
     </div>
@@ -115,13 +115,15 @@ export function ResourceGraph({
   onInspectDiff,
 }: ResourceGraphProps) {
   const isLargeGraph = graph.nodes.length >= LARGE_GRAPH_THRESHOLD;
-  const [viewMode, setViewMode] = useState<"graph" | "table">(() => {
-    const narrow =
+  const [narrowScreen] = useState(
+    () =>
       typeof window !== "undefined" &&
       typeof window.matchMedia === "function" &&
-      window.matchMedia("(max-width: 640px)").matches;
-    return isLargeGraph || narrow ? "table" : "graph";
-  });
+      window.matchMedia("(max-width: 640px)").matches,
+  );
+  const [viewMode, setViewMode] = useState<"graph" | "table">(() =>
+    isLargeGraph || narrowScreen ? "table" : "graph",
+  );
   const [userPickedMode, setUserPickedMode] = useState(false);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const fitTimer = useRef<number | undefined>(undefined);
@@ -142,14 +144,12 @@ export function ResourceGraph({
     // Follow the graph size until the operator makes an explicit choice: a big
     // app defaults to the table, and one that shrank back gets the canvas again
     // (otherwise it would sit on the table with no banner explaining why).
-    const narrow =
-      typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(max-width: 640px)").matches;
     setViewMode(
-      graph.nodes.length >= LARGE_GRAPH_THRESHOLD || narrow ? "table" : "graph",
+      graph.nodes.length >= LARGE_GRAPH_THRESHOLD || narrowScreen
+        ? "table"
+        : "graph",
     );
-  }, [graph.nodes.length, userPickedMode]);
+  }, [graph.nodes.length, narrowScreen, userPickedMode]);
 
   useEffect(() => {
     if (selectedKey && !graph.nodes.some((node) => node.key === selectedKey)) {

@@ -32,7 +32,7 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
         Sync Metadata
       </p>
       <dl className="mt-3 space-y-1.5">
-        <div className="flex justify-between gap-3">
+        <div className="flex min-h-6 items-center justify-between gap-3">
           <dt className="shrink-0 text-ink-subtle">Rendered Revision</dt>
           <dd
             className="min-w-0 break-all text-right font-mono text-ink"
@@ -50,7 +50,7 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
             )}
           </dd>
         </div>
-        <div className="flex justify-between gap-3">
+        <div className="flex min-h-6 items-center justify-between gap-3">
           <dt className="shrink-0 text-ink-subtle">Last Synced Revision</dt>
           <dd
             className="min-w-0 break-all text-right font-mono text-ink"
@@ -68,7 +68,7 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
             )}
           </dd>
         </div>
-        <div className="flex justify-between gap-3">
+        <div className="flex min-h-6 items-center justify-between gap-3">
           <dt className="shrink-0 text-ink-subtle">Last Synced At</dt>
           <dd
             className="text-right font-mono text-ink"
@@ -94,7 +94,7 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
                   <li
                     key={`${alias ?? "source"}-${index}`}
                     data-testid={`source-revision-${index}`}
-                    className="flex justify-between gap-3"
+                    className="flex min-h-6 items-center justify-between gap-3"
                   >
                     <span className="shrink-0 font-mono text-ink-muted">
                       {alias ?? `source ${index + 1}`}

@@ -233,7 +233,7 @@ export function Layout() {
       <main
         id="main-content"
         tabIndex={-1}
-        className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6"
+        className="mx-auto focus:outline-none w-full max-w-7xl flex-1 px-4 py-6 sm:px-6"
       >
         <div key={pathname} className="motion-slide-up">
           <Outlet />

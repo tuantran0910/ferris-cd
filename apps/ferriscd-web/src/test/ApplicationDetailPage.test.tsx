@@ -99,10 +99,13 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
       "Git",
     );
     expect(
-      within(summarySection).getByText(
-        "https://github.com/acme/gitops-payments.git",
-      ),
+      within(summarySection).getByText("gitops-payments"),
     ).toBeInTheDocument();
+    expect(
+      within(summarySection).getByRole("link", {
+        name: /open repository gitops-payments/i,
+      }),
+    ).toHaveAttribute("href", "https://github.com/acme/gitops-payments");
     expect(within(summarySection).getByText("prod-us-east")).toBeInTheDocument();
 
     // Conditions timeline tab

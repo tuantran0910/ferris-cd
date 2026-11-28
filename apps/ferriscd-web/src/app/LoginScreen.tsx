@@ -184,7 +184,7 @@ export function LoginScreen() {
                 value={tokenInput}
                 onChange={(e) => setTokenInput(e.target.value)}
                 placeholder="Paste TokenReview-valid bearer token"
-                className="w-full rounded-lg border border-control bg-canvas px-3.5 py-2.5 font-mono text-sm text-ink-strong transition-colors placeholder-hint  "
+                className="w-full rounded-lg border border-control bg-canvas px-3.5 py-2.5 font-mono text-sm text-ink-strong transition-colors placeholder-hint "
               />
             </div>
 
@@ -206,7 +206,7 @@ export function LoginScreen() {
                 value={serverInput}
                 onChange={(e) => setServerInput(e.target.value)}
                 placeholder="http://127.0.0.1:8080"
-                className="w-full rounded-lg border border-control bg-canvas px-3.5 py-2 font-mono text-xs text-ink transition-colors placeholder-hint  "
+                className="w-full rounded-lg border border-control bg-canvas px-3.5 py-2 font-mono text-xs text-ink transition-colors placeholder-hint "
               />
             </div>
 

@@ -38,6 +38,7 @@ describe("CopyText", () => {
       "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
     );
     expect(await screen.findByText("Copied")).toBeInTheDocument();
+    expect(screen.getByText("rendered revision copied")).toBeInTheDocument();
   });
 
   it("does not claim success when both clipboard paths fail", async () => {

@@ -1,5 +1,9 @@
 import { defineConfig, devices } from "@playwright/test";
 
+// Use the host Chrome locally; CI installs the bundled Chromium instead.
+const channel = process.env.PW_CHANNEL ?? (process.env.CI ? undefined : "chrome");
+const browserChannel = channel ? { channel } : {};
+
 export default defineConfig({
   testDir: "./e2e",
   timeout: 45_000,
@@ -20,7 +24,7 @@ export default defineConfig({
       name: "desktop-dark",
       use: {
         ...devices["Desktop Chrome"],
-        channel: "chrome",
+        ...browserChannel,
         viewport: { width: 1440, height: 1000 },
         colorScheme: "dark",
       },
@@ -29,7 +33,7 @@ export default defineConfig({
       name: "desktop-light",
       use: {
         ...devices["Desktop Chrome"],
-        channel: "chrome",
+        ...browserChannel,
         viewport: { width: 1440, height: 1000 },
         colorScheme: "light",
       },
@@ -38,7 +42,7 @@ export default defineConfig({
       name: "mobile",
       use: {
         ...devices["Desktop Chrome"],
-        channel: "chrome",
+        ...browserChannel,
         viewport: { width: 390, height: 844 },
         isMobile: true,
         hasTouch: true,
@@ -49,7 +53,7 @@ export default defineConfig({
   webServer: {
     command: "npm run dev -- --host 127.0.0.1",
     url: "http://127.0.0.1:5173",
-    reuseExistingServer: true,
+    reuseExistingServer: !process.env.CI,
     timeout: 120_000,
   },
 });

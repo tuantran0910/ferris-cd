@@ -1,5 +1,6 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, type Page } from "@playwright/test";
+import { mockApi } from "./mock-api";
 
 export const APP = {
   namespace: "ferriscd-system",
@@ -7,6 +8,7 @@ export const APP = {
 };
 
 export async function signIn(page: Page): Promise<void> {
+  await mockApi(page);
   await page.goto("/");
   const token = page.locator('input[name="token"]');
   if (await token.count()) {
@@ -36,7 +38,14 @@ export async function expectNoHorizontalOverflow(page: Page): Promise<void> {
 
 export async function expectAccessible(page: Page): Promise<void> {
   // Let entrance animations settle so opacity mid-flight is not measured.
-  await page.waitForTimeout(350);
+  await page
+    .waitForFunction(
+      () =>
+        document.getAnimations().every((animation) => animation.playState !== "running"),
+      undefined,
+      { timeout: 1000 },
+    )
+    .catch(() => undefined);
   const results = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa", "wcag22aa"])
     .analyze();
@@ -60,10 +69,6 @@ export async function expectAccessible(page: Page): Promise<void> {
 
 /** Volatile values (sync times, revisions, generated IDs) masked in snapshots. */
 export function frozenMasks(page: Page) {
-  return [
-    page.locator("time"),
-    page.locator('[data-testid="operation-banner"]'),
-    page.locator('[data-testid="history-table"]'),
-    page.locator('[data-testid="events-timeline"]'),
-  ];
+  // The API is mocked, so only locale-rendered times vary between machines.
+  return [page.locator("time")];
 }
