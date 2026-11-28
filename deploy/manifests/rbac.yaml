@@ -42,6 +42,12 @@ rules:
   - apiGroups: ["ferriscd.io"]
     resources: ["appprojects"]
     verbs: ["get", "list", "watch"]
+  # `T17.4`: report an unusable `spec.syncWindows` entry as a `Ready=False`
+  # (`reason=SyncWindowInvalid`) condition on the AppProject. `status` is a subresource, so this
+  # cannot edit the project's spec.
+  - apiGroups: ["ferriscd.io"]
+    resources: ["appprojects/status"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

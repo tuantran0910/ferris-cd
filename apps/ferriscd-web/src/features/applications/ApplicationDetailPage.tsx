@@ -21,6 +21,7 @@ import { DiffViewer } from "../diff/DiffViewer";
 import { ResourceGraph } from "../resources/ResourceGraph";
 import { RollbackModal } from "../sync/RollbackModal";
 import { SyncModal } from "../sync/SyncModal";
+import { SyncWindowBadge, SyncWindowNotice } from "../sync/SyncWindows";
 import { ConditionsList } from "./components/ConditionsList";
 import { EventsTimeline } from "./components/EventsTimeline";
 import { HistoryTable } from "./components/HistoryTable";
@@ -167,6 +168,9 @@ function ApplicationDetailContent({
   const conditions = app.conditions ?? [];
   const history = detail.history ?? [];
   const operation = detail.operation ?? null;
+  // `T17.4`: the sync-window verdict the control plane evaluated for this application. `null`
+  // means the project configures no window at all.
+  const syncWindow = detail.syncWindow ?? null;
 
   return (
     <div className="space-y-6">
@@ -208,6 +212,7 @@ function ApplicationDetailContent({
           <div className="flex flex-wrap items-center gap-2.5 pt-1">
             <SyncStatusBadge status={app.sync?.status} />
             <HealthStatusBadge status={app.health?.status} />
+            <SyncWindowBadge syncWindow={syncWindow} />
             {app.health?.message && (
               <span className="text-xs text-slate-400">
                 — {app.health.message}
@@ -271,6 +276,10 @@ function ApplicationDetailContent({
       {operation && (
         <OperationBanner operation={operation} repoUrl={app.source.repoUrl} />
       )}
+
+      {/* A blocked window is why an automated (and possibly a manual) sync is doing nothing:
+          say so on the page, not only inside the dialog. */}
+      <SyncWindowNotice syncWindow={syncWindow} testId="detail-sync-window-notice" />
 
       <SourcePanel app={app} />
 
@@ -411,6 +420,7 @@ function ApplicationDetailContent({
         name={app.name}
         targetRevision={app.source.targetRevision}
         disabledByRbac={syncForbidden}
+        syncWindow={syncWindow}
         onClose={() => setSyncModalOpen(false)}
         onForbidden={() => setSyncForbidden(true)}
         onPreviewDiff={() => {

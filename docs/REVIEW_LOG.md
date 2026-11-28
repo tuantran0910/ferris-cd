@@ -216,3 +216,18 @@ Executed all **26/26** ignored live Kubernetes integration & chaos suites agains
   3. `crates/ferriscd-controller/src/sync_recovery.rs`: placed the `ferriscd.io/sync-options: Replace=true` hint ahead of the server error text so the 200-char `Ready` condition cap (`reconcile::bounded`) preserves the operator fix.
   4. `crates/ferriscd-controller/src/sync.rs` + `sync_executor.rs`: ran `ensure_namespace_exists` before `PreSync` hooks when `syncOptions.createNamespace: true`, preventing `404 namespaces "<ns>" not found` on brand-new namespaces.
 - **30-minute soak (`T15.3`, recorded in `docs/benchmarks/v1.0.md`):** `50/50` cold convergence in `21s`, steady-state `p50=0.058s` / `p95=0.145s`, `2,995` successful reconciles (`0` errors), `100.00%` `RenderCache` hit rate, flat/declining RSS (`23.70 -> 22.28 MiB`, `-6.00%`, `-124.61 KB/min`), `0` restarts/panics, `end_fd=39` (`fd_delta=-18`, zero leak; two transient synchronized-wave bursts reached `80` and `102` FDs). Fixed `benchmarks/scale_harness.sh:1642` (`printf --`).
+
+---
+
+## `v1.1` Sync Windows (`T17.4`)
+
+Hermetic proof only: `make gate` needs no cluster. Everything below is either asserted by a test
+that runs in it or explicitly marked pending.
+
+- **Live suite existence and status:** `tests/integration/v1_1_sync_windows.rs` (shim:
+  `crates/ferriscd-cli/tests/v1_1_sync_windows.rs`, `#[ignore]` + `kind-` context guard) is the live
+  `T17.4` acceptance run — deny window blocks a push (`status.sync.status` reports `OutOfSync`,
+  `Ready=True/SyncWindowActive`, `lastSyncedRevision` untouched, nothing pruned), and the sync
+  resumes on the window's own schedule. It has **not been run against a `kind` cluster yet**, so no
+  pass/fail and no output are recorded here; like the other live suites, its `kind` run is
+  **pending**.
