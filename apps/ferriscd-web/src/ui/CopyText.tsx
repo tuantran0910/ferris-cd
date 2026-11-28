@@ -28,7 +28,7 @@ export function CopyText({ value, display, label, className }: CopyTextProps) {
       area.remove();
     }
     window.dispatchEvent(
-      new CustomEvent(COPY_EVENT, { detail: { label, value } }),
+      new CustomEvent(COPY_EVENT, { detail: { label } }),
     );
   };
 
