@@ -9,7 +9,28 @@ import type {
   ProjectListView,
   ResourceGraphView,
   ResourceNodeView,
+  SyncWindowGateView,
 } from "../api/types";
+
+/** A project whose window blocks a manual sync with no override (`T17.4`). */
+export const blockedSyncWindow: SyncWindowGateView = {
+  blocked: true,
+  reason: "denyWindowActive",
+  message:
+    "a deny sync window is active (deny \"0 9-17 * * MON-FRI\" in America/New_York); the next window transition is 2026-11-25T22:00:00Z (5h); manual sync does not override this window (set manualSync: true to allow it)",
+  manualOverride: false,
+  nextTransition: "2026-11-25T22:00:00Z",
+};
+
+/** The same block, on a window that opted into `manualSync: true` (`T17.4`). */
+export const overridableSyncWindow: SyncWindowGateView = {
+  blocked: true,
+  reason: "denyWindowActive",
+  message:
+    "a deny sync window is active (deny \"0 9-17 * * MON-FRI\" in America/New_York); a manual sync may override this window (manualSync: true)",
+  manualOverride: true,
+  nextTransition: "2026-11-25T22:00:00Z",
+};
 
 export const sampleApps: ApplicationSummary[] = [
   {
@@ -443,6 +464,36 @@ export const sampleProjects: ProjectListView = {
       sourceNamespaces: ["ferriscd-system"],
       destinations: ["prod-us-east/payments", "in-cluster/payments"],
       allowedServiceAccounts: ["payments-deployer"],
+      // `T17.4`: a change freeze that is open right now, and a Saturday release window.
+      syncWindows: [
+        {
+          kind: "deny",
+          schedule: "0 9-17 * * MON-FRI",
+          duration: "8h",
+          timeZone: "America/New_York",
+          applications: ["payments-*"],
+          namespaces: [],
+          clusters: ["prod-*"],
+          manualSync: false,
+          active: true,
+          startsAt: "2026-11-25T14:00:00Z",
+          endsAt: "2026-11-25T22:00:00Z",
+          nextStart: "2026-11-26T14:00:00Z",
+        },
+        {
+          kind: "allow",
+          schedule: "0 2 * * SAT",
+          duration: "2h",
+          timeZone: "UTC",
+          applications: [],
+          namespaces: [],
+          clusters: [],
+          manualSync: true,
+          active: false,
+          nextStart: "2026-11-28T02:00:00Z",
+        },
+      ],
+      nextSyncWindowTransition: "2026-11-25T22:00:00Z",
     },
     {
       name: "storefront",
@@ -517,6 +568,12 @@ export function createMockApiClient(
     }),
     listProjects: async () => sampleProjects,
     listClusters: async () => sampleClusters,
+    getAuthConfig: async () => ({
+      authMode: "token-review",
+      scopes: [],
+      bffEnabled: false,
+    }),
+    logoutSession: async () => {},
     ...overrides,
   };
 }

@@ -1159,11 +1159,12 @@ mod tests {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
             source: ferriscd_crd::SourceSpec {
-                git: ferriscd_crd::GitSourceSpec {
+                git: Some(ferriscd_crd::GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "main".to_owned(),
                     path: String::new(),
-                },
+                }),
+                oci: None,
                 renderer: ferriscd_crd::RendererSpec::default(),
             },
             destination: ferriscd_crd::DestinationSpec {

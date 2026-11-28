@@ -1406,11 +1406,12 @@ mod tests {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: service_account.map(str::to_owned),
             source: SourceSpec {
-                git: GitSourceSpec {
+                git: Some(GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "main".to_owned(),
                     path: String::new(),
-                },
+                }),
+                oci: None,
                 renderer: Default::default(),
             },
             destination: DestinationSpec {

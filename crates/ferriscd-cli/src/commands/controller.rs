@@ -244,6 +244,83 @@ pub struct ControllerArgs {
         hide_env_values = true
     )]
     pub audit_webhook_url: Option<String>,
+
+    /// Enable event-driven notifications (`T19.4`).
+    ///
+    /// Off by default. When enabled, the `/status` writer is decorated with a notification observer,
+    /// and `Application`s opt in **exclusively** through annotations:
+    ///
+    ///   notifications.ferriscd.io/subscribe.<trigger>.<service>: <recipient>
+    ///
+    /// where `<trigger>` is one of `on-sync-succeeded`, `on-sync-failed`, `on-health-degraded`,
+    /// `on-out-of-sync`, `<service>` is `slack`, `teams`, `pagerduty` or `webhook`, and `<recipient>`
+    /// names a `Secret` labelled `ferriscd.io/secret-type=notifications` in `--namespace` with
+    /// `url` (https:// only), `service`, and optionally `signingKey` (generic webhook HMAC-SHA256,
+    /// sent as `X-FerrisCD-Signature-256`), `routingKey` (PagerDuty Events API v2), `token` (Slack
+    /// Bot API bearer credential, sent in the `Authorization` header) or `channel` (the Slack
+    /// channel `chat.postMessage` posts into). Slack therefore supports both an Incoming Webhook
+    /// URL and the Bot API; Teams Workflow webhooks send an Adaptive Card.
+    ///
+    /// Message templates and the `on-out-of-sync` debounce come from
+    /// `ConfigMap/ferriscd-notifications-cm` (key `notifications.yaml`); without it the built-in
+    /// templates are used. No credential ever lives in an annotation or a `ConfigMap`.
+    ///
+    /// Delivery is non-blocking (bounded queue of 512, dropped and counted when full), SSRF-guarded
+    /// (HTTPS only, loopback/link-local/cloud-metadata/private addresses refused, redirects never
+    /// followed, validated IP pinned at connect) and retried at most 3 times with a 5 s timeout per
+    /// attempt. Failures increment `ferriscd_notifications_total{service, outcome}`.
+    ///
+    /// The controller therefore needs `get`/`list` on `configmaps` and `secrets` in the control-plane
+    /// namespace (the same namespaced grants `T12.4`/`T13.1` already require).
+    #[arg(long = "enable-notifications", env = "FERRISCD_ENABLE_NOTIFICATIONS")]
+    pub enable_notifications: bool,
+
+    /// CIDRs whose **private** notification destinations are allowed through the SSRF guard.
+    ///
+    /// Comma-separated (`10.20.0.0/16,fd00:20::/48`). Only RFC 1918 / CGNAT / IPv6 ULA targets can
+    /// be unlocked: loopback, link-local and cloud metadata addresses (`169.254.169.254`,
+    /// `fd00:ec2::254`, `::ffff:169.254.169.254`) stay refused, and a `/0` entry is rejected rather
+    /// than silently disabling the guard. Falls back to
+    /// `FERRISCD_NOTIFICATIONS_ALLOW_PRIVATE_CIDRS`.
+    #[arg(
+        long = "notifications-allow-private-cidrs",
+        value_name = "CIDRS",
+        env = "FERRISCD_NOTIFICATIONS_ALLOW_PRIVATE_CIDRS"
+    )]
+    pub notifications_allow_private_cidrs: Option<String>,
+
+    /// Namespaces whose `Application`s may subscribe to notifications at all.
+    ///
+    /// Comma-separated (`team-a,team-b`). Unset means **every** namespace may opt in through its
+    /// annotations, which is the default. Because a channel `Secret` lives in the control-plane
+    /// namespace, an `Application` in *any* namespace could otherwise name another team's channel
+    /// and page them; this flag is the tenancy boundary: an `Application` outside the list is
+    /// ignored before any edge, deduplication, rate-limit or delivery decision (finding R1-M6). At most
+    /// 256 namespaces, and an empty entry is refused at startup rather than ignored.
+    /// Falls back to `FERRISCD_NOTIFICATIONS_ALLOWED_NAMESPACES`.
+    #[arg(
+        long = "notifications-allowed-namespaces",
+        value_name = "NAMESPACES",
+        env = "FERRISCD_NOTIFICATIONS_ALLOWED_NAMESPACES"
+    )]
+    pub notifications_allowed_namespaces: Option<String>,
+
+    /// PEM CA bundle whose certificates are **added** to the notification client's trust roots.
+    ///
+    /// Use this for an internal HTTPS receiver signed by a private or self-signed CA: the
+    /// certificates are *added* to the platform roots, so verification and hostname/IP checks stay on
+    /// and the SSRF guard is untouched. There is deliberately no flag to skip verification or to
+    /// allow plaintext: a receiver that cannot present a certificate the controller trusts is not a
+    /// valid notification destination. The file is read (and must parse) at startup, so a typo fails
+    /// immediately instead of failing TLS on the first alert. It is read **even when
+    /// `--enable-notifications` is off**, so a bad path can never sit dormant until the feature is
+    /// switched on. Falls back to `FERRISCD_NOTIFICATIONS_CA_FILE`.
+    #[arg(
+        long = "notifications-ca-file",
+        value_name = "PATH",
+        env = "FERRISCD_NOTIFICATIONS_CA_FILE"
+    )]
+    pub notifications_ca_file: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for ControllerArgs {
@@ -283,6 +360,16 @@ impl std::fmt::Debug for ControllerArgs {
                     .as_deref()
                     .map(ferriscd_controller::audit::redact_audit_url),
             )
+            .field("enable_notifications", &self.enable_notifications)
+            .field(
+                "notifications_allow_private_cidrs",
+                &self.notifications_allow_private_cidrs,
+            )
+            .field(
+                "notifications_allowed_namespaces",
+                &self.notifications_allowed_namespaces,
+            )
+            .field("notifications_ca_file", &self.notifications_ca_file)
             .finish()
     }
 }
@@ -339,6 +426,16 @@ pub(crate) fn run_options(args: ControllerArgs) -> ferriscd_controller::RunOptio
         metrics_addr: Some(args.metrics_addr),
         audit_log_path: args.audit_log_path,
         audit_webhook_url: args.audit_webhook_url,
+        // `T19.4`: notifications stay off unless `--enable-notifications` is given; the CIDR
+        // allowlist and the tenant allowlist are only meaningful with them on, and both are
+        // validated by the controller at startup (a malformed entry must fail loudly, never
+        // silently default).
+        notifications: ferriscd_controller::NotificationOptions {
+            enabled: args.enable_notifications,
+            allow_private_cidrs: args.notifications_allow_private_cidrs,
+            allowed_namespaces: args.notifications_allowed_namespaces,
+            ca_file: args.notifications_ca_file,
+        },
     }
 }
 
@@ -703,6 +800,212 @@ mod tests {
         assert_eq!(unusable.metrics_addr.as_deref(), Some("9090"));
     }
 
+    /// **`T19.4`:** notifications are opt-in, the allowlist reaches the controller untouched, and the
+    /// flag help documents the annotation contract, the `Secret` label, the metrics family and the
+    /// RBAC an operator must grant.
+    #[test]
+    fn controller_parses_the_notification_flags_and_documents_the_contract() {
+        let defaults = parse(&["ferriscd", "controller"]);
+        assert!(
+            !defaults.enable_notifications,
+            "notifications must stay opt-in"
+        );
+        assert_eq!(defaults.notifications_allow_private_cidrs, None);
+        let options = run_options(parse(&["ferriscd", "controller"]));
+        assert!(!options.notifications.enabled);
+        assert_eq!(options.notifications.allow_private_cidrs, None);
+        assert!(
+            options
+                .notifications
+                .egress_policy()
+                .expect("the default policy is the strict one")
+                .is_strict()
+        );
+
+        let args = parse(&[
+            "ferriscd",
+            "controller",
+            "--enable-notifications",
+            "--notifications-allow-private-cidrs",
+            "10.20.0.0/16,fd00:20::/48",
+        ]);
+        assert!(args.enable_notifications);
+        let options = run_options(args);
+        assert!(options.notifications.enabled);
+        assert_eq!(
+            options.notifications.allow_private_cidrs.as_deref(),
+            Some("10.20.0.0/16,fd00:20::/48")
+        );
+        assert_eq!(
+            options
+                .notifications
+                .egress_policy()
+                .expect("the allowlist is valid")
+                .allowlisted_networks()
+                .len(),
+            2
+        );
+
+        // A malformed allowlist is refused by the controller (here: the same validation), not
+        // silently ignored.
+        let invalid = run_options(parse(&[
+            "ferriscd",
+            "controller",
+            "--enable-notifications",
+            "--notifications-allow-private-cidrs",
+            "0.0.0.0/0",
+        ]));
+        assert!(invalid.notifications.egress_policy().is_err());
+
+        let mut command = Harness::command();
+        let help = command
+            .find_subcommand_mut("controller")
+            .expect("the controller subcommand exists")
+            .render_long_help()
+            .to_string();
+        for expected in [
+            "--enable-notifications",
+            "--notifications-allow-private-cidrs",
+            "notifications.ferriscd.io/subscribe.",
+            "on-sync-failed",
+            "on-health-degraded",
+            "on-out-of-sync",
+            "ferriscd.io/secret-type=notifications",
+            "X-FerrisCD-Signature-256",
+            "ferriscd-notifications-cm",
+            "ferriscd_notifications_total",
+            "169.254.169.254",
+            "FERRISCD_ENABLE_NOTIFICATIONS",
+            "FERRISCD_NOTIFICATIONS_ALLOW_PRIVATE_CIDRS",
+        ] {
+            assert!(
+                help.contains(expected),
+                "the flag help must document {expected:?}"
+            );
+        }
+    }
+
+    /// **`T19.4` findings R1-M6 + P19-H1:** the tenancy allowlist and the private-CA bundle reach the
+    /// controller untouched, both have an environment fallback, and the help states why there is no
+    /// "skip TLS verification" escape hatch.
+    #[test]
+    fn controller_parses_the_notification_scope_and_ca_flags() {
+        // Finding R1-M6: the tenant allowlist is forwarded verbatim and normalised by the controller.
+        let options = run_options(parse(&[
+            "ferriscd",
+            "controller",
+            "--enable-notifications",
+            "--notifications-allowed-namespaces",
+            "team-a, team-b",
+        ]));
+        assert_eq!(
+            options.notifications.allowed_namespaces.as_deref(),
+            Some("team-a, team-b"),
+            "the raw flag reaches the controller untouched"
+        );
+        assert_eq!(
+            options
+                .notifications
+                .allowed_namespaces()
+                .expect("a valid allowlist"),
+            Some(vec!["team-a".to_owned(), "team-b".to_owned()]),
+            "the controller normalises (and bounds) it at startup"
+        );
+
+        // Unset means "every namespace may opt in", the pre-existing behaviour.
+        assert_eq!(
+            run_options(parse(&["ferriscd", "controller"]))
+                .notifications
+                .allowed_namespaces()
+                .expect("no allowlist is valid"),
+            None
+        );
+        // A blank entry fails closed instead of silently widening the list.
+        assert!(
+            run_options(parse(&[
+                "ferriscd",
+                "controller",
+                "--notifications-allowed-namespaces",
+                "team-a,",
+            ]))
+            .notifications
+            .allowed_namespaces()
+            .is_err(),
+            "an empty entry must be refused at startup"
+        );
+
+        // Finding P19-H1: the CA path is forwarded untouched; the controller reads and parses it at
+        // startup (a typo must fail then, not on the first alert).
+        let options = run_options(parse(&[
+            "ferriscd",
+            "controller",
+            "--enable-notifications",
+            "--notifications-ca-file",
+            "/etc/ferriscd/notifications-ca.pem",
+        ]));
+        assert_eq!(
+            options.notifications.ca_file.as_deref(),
+            Some(std::path::Path::new("/etc/ferriscd/notifications-ca.pem"))
+        );
+        assert_eq!(
+            run_options(parse(&["ferriscd", "controller"]))
+                .notifications
+                .ca_file,
+            None,
+            "no CA file means the platform trust store alone"
+        );
+        // A path is not a credential, so the options' `Debug` may print it.
+        assert!(
+            format!("{options:?}").contains("/etc/ferriscd/notifications-ca.pem"),
+            "{options:?}"
+        );
+
+        // Both flags have an environment fallback (asserted through clap's own metadata, so the
+        // process environment is never mutated by a test).
+        let mut command = Harness::command();
+        let controller = command
+            .find_subcommand_mut("controller")
+            .expect("the controller subcommand exists");
+        for (id, expected_env) in [
+            (
+                "notifications_allowed_namespaces",
+                "FERRISCD_NOTIFICATIONS_ALLOWED_NAMESPACES",
+            ),
+            ("notifications_ca_file", "FERRISCD_NOTIFICATIONS_CA_FILE"),
+        ] {
+            let arg = controller
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .expect("the argument exists");
+            assert_eq!(
+                arg.get_env().and_then(|env| env.to_str()),
+                Some(expected_env),
+                "{id} must fall back to {expected_env}"
+            );
+        }
+
+        let mut command = Harness::command();
+        let help = command
+            .find_subcommand_mut("controller")
+            .expect("the controller subcommand exists")
+            .render_long_help()
+            .to_string();
+        for expected in [
+            "--notifications-allowed-namespaces",
+            "FERRISCD_NOTIFICATIONS_ALLOWED_NAMESPACES",
+            "--notifications-ca-file",
+            "FERRISCD_NOTIFICATIONS_CA_FILE",
+            "private or self-signed CA",
+            "SSRF guard",
+            "tenancy boundary",
+        ] {
+            assert!(
+                help.contains(expected),
+                "the flag help must document {expected:?}"
+            );
+        }
+    }
+
     /// **`T18.1`:** `--enable-drift-watcher` is off by default, reaches `RunOptions`, and declares
     /// its environment fallback. It is the only switch that adds the ownership label pair to every
     /// applied object, so a mistaken default would rewrite the whole fleet's metadata.
@@ -758,8 +1061,7 @@ mod tests {
         );
     }
 
-    /// **Finding M1:** the RBAC an operator has to grant for multi-tenancy is in the flag help, not
-    /// only in a doc file nobody reads before turning the flag on.
+    /// **Finding T12-M1:** the RBAC an operator has to grant for multi-tenancy is in the flag help, not    /// only in a doc file nobody reads before turning the flag on.
     #[test]
     fn the_application_namespaces_help_documents_the_required_rbac() {
         let mut command = Harness::command();

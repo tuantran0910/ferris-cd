@@ -207,7 +207,7 @@ mod tests {
         ListArgs, RollbackArgs, SyncArgs, TargetArgs,
     };
     use crate::commands::platform::{
-        self, ClusterArgs, ClusterCommand, ProjectArgs, ProjectCommand,
+        self, ClusterArgs, ClusterCommand, ProjectArgs, ProjectCommand, sync_windows_cell,
     };
     use crate::output::OutputFormat;
 
@@ -327,7 +327,8 @@ mod tests {
                 ),
         )
         .await;
-        let client = Client::connect(Some(server.base_url()), Some("fake-cli-test-token"))
+        let client = Client::connect_async(Some(server.base_url()), Some("fake-cli-test-token"))
+            .await
             .expect("a client");
 
         let list = client.list_applications().await.expect("the list");
@@ -497,6 +498,117 @@ mod tests {
         assert_eq!(body, serde_json::json!({"id": 7}));
     }
 
+    /// `T17.4`: `ferriscd project list` renders each sync window with the state the server
+    /// evaluated it in — "blocked" is invisible otherwise.
+    #[tokio::test]
+    async fn project_list_shows_sync_windows_with_their_live_state() {
+        let server = FakeServer::start(Routes::new().get_json(
+            "/api/v1/projects",
+            StatusCode::OK,
+            serde_json::json!({"items": [
+                {
+                    "name": "governed",
+                    "sourceRepos": ["*"],
+                    "destinations": ["in-cluster/payments"],
+                    "syncWindows": [
+                        {
+                            "kind": "deny",
+                            "schedule": "0 9-17 * * MON-FRI",
+                            "duration": "8h",
+                            "timeZone": "America/New_York",
+                            "manualSync": false,
+                            "active": true,
+                            "startsAt": "2027-01-15T14:00:00Z",
+                            "endsAt": "2027-01-15T22:00:00Z",
+                            "nextStart": "2027-01-18T14:00:00Z"
+                        },
+                        {
+                            "kind": "allow",
+                            "schedule": "0 2 * * SAT",
+                            "duration": "2h",
+                            "timeZone": "UTC",
+                            "manualSync": true,
+                            "active": false,
+                            "nextStart": "2027-01-16T02:00:00Z"
+                        }
+                    ],
+                    "nextSyncWindowTransition": "2027-01-15T22:00:00Z"
+                },
+                {"name": "ungoverned", "sourceRepos": ["*"], "destinations": ["in-cluster/*"]}
+            ]}),
+        ))
+        .await;
+
+        let projects = Client::connect_async(Some(server.base_url()), Some("fake-cli-test-token"))
+            .await
+            .expect("a client")
+            .list_projects()
+            .await
+            .expect("the project list");
+        let governed = &projects.items[0];
+        assert_eq!(governed.sync_windows.len(), 2);
+        assert!(governed.sync_windows[0].active);
+        assert_eq!(
+            governed.next_sync_window_transition.as_deref(),
+            Some("2027-01-15T22:00:00Z")
+        );
+        assert!(
+            projects.items[1].sync_windows.is_empty(),
+            "a project without windows must not grow an empty list (the field stays omitted)"
+        );
+
+        // The table cell says what the window does *and* what it is doing right now.
+        let cell = sync_windows_cell(&governed.sync_windows);
+        assert!(
+            cell.contains(
+                "deny 0 9-17 * * MON-FRI America/New_York active until 2027-01-15T22:00:00Z"
+            ),
+            "{cell}"
+        );
+        assert!(
+            cell.contains("allow 0 2 * * SAT UTC next 2027-01-16T02:00:00Z, manual sync allowed"),
+            "{cell}"
+        );
+        assert_eq!(sync_windows_cell(&[]), "<none>");
+
+        // An unparseable entry is reported, never hidden (the project is deny-all while it is
+        // broken).
+        let broken = ferriscd_server::api::ProjectSyncWindowView {
+            kind: "deny".to_owned(),
+            schedule: "every weekday".to_owned(),
+            duration: "2h".to_owned(),
+            time_zone: "UTC".to_owned(),
+            applications: Vec::new(),
+            namespaces: Vec::new(),
+            clusters: Vec::new(),
+            manual_sync: false,
+            active: false,
+            starts_at: None,
+            ends_at: None,
+            next_start: None,
+            error: Some("not a cron expression".to_owned()),
+        };
+        let cell = sync_windows_cell(std::slice::from_ref(&broken));
+        assert!(cell.contains("invalid (not a cron expression)"), "{cell}");
+
+        // And the table command itself still exits cleanly.
+        let args = ProjectArgs {
+            connection: connection(server.base_url()),
+            command: ProjectCommand::List(platform::ListArgs {
+                output: OutputFormat::Table,
+            }),
+        };
+        assert_eq!(
+            platform::run_project(args).await.expect("the table"),
+            EXIT_OK
+        );
+        assert_eq!(
+            server.paths(),
+            vec!["/api/v1/projects".to_owned(), "/api/v1/projects".to_owned()],
+            "the table render costs exactly one more `GET /api/v1/projects`"
+        );
+    }
+
     /// `app list`, `app get`, `app history`, `project list` and `cluster list` all succeed against
     /// the fake server and never request an endpoint the OpenAPI document does not declare.
     #[tokio::test]
@@ -608,8 +720,10 @@ mod tests {
             }}),
         ))
         .await;
-        let client = Client::connect(Some(unauthorized.base_url()), Some("expired-token-value"))
-            .expect("a client");
+        let client =
+            Client::connect_async(Some(unauthorized.base_url()), Some("expired-token-value"))
+                .await
+                .expect("a client");
         let error = client
             .list_applications()
             .await
@@ -683,7 +797,9 @@ mod tests {
             Reply::Raw(StatusCode::OK, "{not json".to_owned()),
         ))
         .await;
-        let client = Client::connect(Some(malformed.base_url()), Some("token")).expect("a client");
+        let client = Client::connect_async(Some(malformed.base_url()), Some("token"))
+            .await
+            .expect("a client");
         let error = client
             .list_applications()
             .await
@@ -691,7 +807,9 @@ mod tests {
         assert!(matches!(error, ClientError::Decode { .. }), "{error:?}");
 
         // A port nobody listens on: `127.0.0.1:1` is refused immediately by the kernel.
-        let client = Client::connect(Some("http://127.0.0.1:1"), Some("token")).expect("a client");
+        let client = Client::connect_async(Some("http://127.0.0.1:1"), Some("token"))
+            .await
+            .expect("a client");
         let error = client
             .list_applications()
             .await
@@ -717,7 +835,8 @@ mod tests {
             }),
         ))
         .await;
-        let client = Client::connect(Some(server.base_url()), Some("fake-cli-test-token"))
+        let client = Client::connect_async(Some(server.base_url()), Some("fake-cli-test-token"))
+            .await
             .expect("a client");
         // A long timeout and a long interval: success must come from the first poll, not the clock.
         let code = app::watch_for_tests(

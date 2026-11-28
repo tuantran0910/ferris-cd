@@ -31,6 +31,7 @@
 //! | Layer | What it does |
 //! |---|---|
 //! | [`auth`] (`T14.3`) | Default-deny `TokenReview` on every protected `/api/v1/*` route; `401` without a valid bearer token. `/healthz`, `/readyz` and `/api/v1/webhooks/*` are separate groups (probes carry no credential; webhooks authenticate with their own secret). |
+//! | [`oidc`] (`T19.1`) | Optional OIDC JWT authentication (`AuthPolicy::Oidc` / `TokenReviewOrOidc`): a strict asymmetric `alg` allow-list, local JWKS verification with a rate-limited refresh, exact `iss`/`aud`/`exp`/`nbf` checks, and mandatory `oidc:` identity prefixes. |
 //! | [`rbac`] (`T14.4`) | Project-scoped `(user\|group, project, action)` policy from `ferriscd-rbac-cm`, deny-by-default; unauthorized reads cannot distinguish "forbidden" from "missing". |
 //! | [`webhooks`] (`T14.2`) | Constant-time HMAC/token verification, `X-GitHub-Delivery` replay cache, per-repository debounce. |
 //! | Router | A 1 MiB body cap installed before any parsing. |
@@ -43,8 +44,10 @@
 pub mod api;
 pub mod audit;
 pub mod auth;
+pub mod auth_bff;
 pub mod error;
 pub mod kube;
+pub mod oidc;
 pub mod openapi;
 pub mod rbac;
 pub mod state;
@@ -63,11 +66,21 @@ pub use audit::{
     TracingAuditSink, ValidatedAuditWebhookUrl, WebhookAuditSink,
 };
 pub use auth::{
-    AuthPolicy, AuthenticatedIdentity, BearerError, BearerToken, DEFAULT_IDENTITY_CACHE_TTL,
-    IdentityCache, TokenAuthenticator, UnconfiguredTokenAuthenticator, UnknownAuthPolicy,
-    fingerprint_label, token_fingerprint,
+    AuthPolicy, AuthenticatedCredential, AuthenticatedIdentity, BearerError, BearerToken,
+    DEFAULT_IDENTITY_CACHE_TTL, IdentityCache, TokenAuthenticator, UnconfiguredTokenAuthenticator,
+    UnknownAuthPolicy, fingerprint_label, token_fingerprint,
+};
+pub use auth_bff::{
+    BffConfig, BffConfigError, BffError, BffState, CodeExchangeRequest, ExchangedTokens,
+    HttpsOidcSession, OidcEndpoints, OidcSession, PkcePair, Session, SessionKey, SessionSealer,
+    s256_challenge,
 };
 pub use error::{ApiError, ApiErrorBody, ApiErrorDetail};
+pub use oidc::{
+    CompositeTokenAuthenticator, DiscoveryDocument, HttpsJwksSource, JoseAlgorithm, JoseCurve, Jwk,
+    JwkKey, JwkKeyType, JwkSet, JwksCache, JwksSource, NotApplicable, OidcConfig, OidcConfigError,
+    OidcError, OidcOutcome, OidcTokenAuthenticator, Rejection,
+};
 pub use rbac::{
     Action, Actor, DEFAULT_RBAC_NAMESPACE, Grant, RBAC_CONFIGMAP_KEY, RBAC_CONFIGMAP_NAME,
     RbacConfigMapEvent, RbacPolicy, RbacPolicyError, RbacPolicyStore, Rule, SubjectKind,
@@ -76,7 +89,8 @@ pub use state::{
     AppState, ApplicationEvent, ApplicationSnapshotSource, ApplicationSource, ClusterCatalog,
     ClusterEntry, DiffSource, EventSource, GraphRequest, GraphTraversal, InventoryReader,
     LiveResourceState, MAX_APPLICATION_EVENTS, NoEvents, NoSnapshots, OperationRequest,
-    OperationWriter, ProjectCatalog, Readiness, SeamFuture, ServingReadiness, WorkloadGraphSource,
+    OperationWriter, ProjectCatalog, PublicAuthConfig, Readiness, SeamFuture, ServingReadiness,
+    WorkloadGraphSource,
 };
 pub use webhooks::{FanOut, RefreshSink, RefreshTarget, WebhookConfig, WebhookSecret};
 
@@ -168,7 +182,7 @@ where
     // authorizes none of them, so every protected request answers `404`/`403` while `healthz` says
     // the server is fine. Say so where the address is known, instead of leaving an operator to
     // discover it from a `403` nobody expected.
-    if state.auth == AuthPolicy::TokenReview && state.rbac.is_empty() {
+    if kube::denies_every_authenticated_caller(&state) {
         tracing::warn!(
             auth = state.auth.as_str(),
             configmap = %format!("{}/{}", state.rbac_namespace, rbac::RBAC_CONFIGMAP_NAME),
@@ -198,10 +212,17 @@ where
              default TokenReview authentication, or bind --api-addr to 127.0.0.1"
         );
     }
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(|source| ServeError::Serve { source })
+    // **`T19.2`:** with connect info installed, `/api/v1/auth/login` can charge its per-client
+    // sign-in budget to the *peer address* instead of to a single shared bucket. Without it the
+    // handler sees `Option<ConnectInfo>` = `None` and every anonymous caller shares one budget, which
+    // would refuse legitimate operators while leaving the per-client cap meaningless.
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .map_err(|source| ServeError::Serve { source })
 }
 
 /// Builds the router from a state (a convenience alias for [`api::router`]).

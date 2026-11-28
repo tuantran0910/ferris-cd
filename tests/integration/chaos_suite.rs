@@ -647,11 +647,12 @@ fn chaos_application(prune: bool) -> Application {
         project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
         service_account_name: None,
         source: SourceSpec {
-            git: GitSourceSpec {
+            git: Some(GitSourceSpec {
                 repo_url: FAKE_REPO_URL.to_owned(),
                 target_revision: "main".to_owned(),
                 path: "manifests".to_owned(),
-            },
+            }),
+            oci: None,
             renderer: RendererSpec::default(),
         },
         destination: DestinationSpec {

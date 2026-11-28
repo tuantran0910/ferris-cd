@@ -995,6 +995,8 @@ mod tests {
             SkipReason::AutomatedDisabled,
             SkipReason::SelfHealDisabled,
             SkipReason::AlreadySynced,
+            // `T17.4`: a blocking sync window is a gate skip too — it must never apply *or* prune.
+            SkipReason::SyncWindowDenied,
         ] {
             let request = PlanRequest::new(
                 SyncDecision::Skip(reason),

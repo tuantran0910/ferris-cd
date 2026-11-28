@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AuthProvider } from "../auth/AuthContext";
 import { resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
@@ -10,6 +10,7 @@ import { createMockApiClient } from "./fixtures";
 
 const encoder = new TextEncoder();
 const frame = `event: applications\ndata: ${JSON.stringify({ items: [] })}\n\n`;
+let nativeFetch: typeof fetch;
 
 function wrapper({ children }: { children: ReactNode }) {
   const queryClient = new QueryClient({
@@ -40,14 +41,27 @@ function streamResponse(
   return new Response(body, { status: 200 });
 }
 
+/** Advances fake time and flushes the promise/effect work it unblocks. */
+async function tick(ms: number): Promise<void> {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+}
+
 describe("useApplicationStream liveness watchdog", () => {
   beforeEach(() => {
+    nativeFetch = globalThis.fetch;
     resetTokenMemoryCache();
     setStoredToken("test-token");
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    globalThis.fetch = nativeFetch;
   });
 
   it("aborts a half-open stream into the retry path and never retries after unmount", async () => {
-    const nativeFetch = globalThis.fetch;
     let calls = 0;
     globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).includes("/api/v1/applications/stream")) {
@@ -63,41 +77,39 @@ describe("useApplicationStream liveness watchdog", () => {
       return nativeFetch(input, init);
     }) as typeof fetch;
 
-    try {
-      const { result, unmount } = renderHook(
-        () => useApplicationStream(true, { stallMs: 50 }),
-        { wrapper },
-      );
-      await waitFor(() => expect(result.current.status).toBe("live"));
-      await waitFor(() => expect(calls).toBeGreaterThanOrEqual(2), { timeout: 3_000 });
-      expect(result.current.status).not.toBe("live");
+    const { result, unmount } = renderHook(
+      () => useApplicationStream(true, { stallMs: 100 }),
+      { wrapper },
+    );
 
-      unmount();
-      const afterUnmount = calls;
-      await act(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 300));
-      });
-      expect(calls).toBe(afterUnmount);
-    } finally {
-      globalThis.fetch = nativeFetch;
-    }
+    await tick(0);
+    expect(result.current.status).toBe("live");
+    expect(calls).toBe(1);
+
+    // Stall watchdog fires at ~100ms; the first retry backoff is 500-600ms.
+    await tick(700);
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(result.current.status).not.toBe("live");
+
+    unmount();
+    const afterUnmount = calls;
+    await tick(120_000);
+    expect(calls).toBe(afterUnmount);
   });
 
   it("does not abort a healthy stream that keeps sending frames", async () => {
-    const nativeFetch = globalThis.fetch;
     let calls = 0;
-    let interval: ReturnType<typeof setInterval> | undefined;
     globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).includes("/api/v1/applications/stream")) {
         calls += 1;
         return Promise.resolve(
           streamResponse((controller) => {
             controller.enqueue(encoder.encode(frame));
-            interval = setInterval(() => {
+            setInterval(() => {
               try {
                 controller.enqueue(encoder.encode(frame));
               } catch {
-                clearInterval(interval);
+                // The abort listener already errored the controller.
               }
             }, 20);
           }, init?.signal ?? undefined),
@@ -106,25 +118,18 @@ describe("useApplicationStream liveness watchdog", () => {
       return nativeFetch(input, init);
     }) as typeof fetch;
 
-    try {
-      const { result, unmount } = renderHook(
-        () => useApplicationStream(true, { stallMs: 250 }),
-        { wrapper },
-      );
-      await waitFor(() => expect(result.current.status).toBe("live"));
-      // Outlive the stall threshold *and* the first retry backoff, so a spurious abort would
-      // surface as a second fetch instead of staying invisible inside the window.
-      await act(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 1_500));
-      });
-      expect(calls).toBe(1);
-      expect(result.current.status).toBe("live");
-      unmount();
-    } finally {
-      if (interval !== undefined) {
-        clearInterval(interval);
-      }
-      globalThis.fetch = nativeFetch;
-    }
+    const { result, unmount } = renderHook(
+      () => useApplicationStream(true, { stallMs: 250 }),
+      { wrapper },
+    );
+
+    await tick(0);
+    expect(result.current.status).toBe("live");
+
+    // Three seconds of 20ms frames against a 250ms watchdog: never a false stall.
+    await tick(3_000);
+    expect(calls).toBe(1);
+    expect(result.current.status).toBe("live");
+    unmount();
   });
 });

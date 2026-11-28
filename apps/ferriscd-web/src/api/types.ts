@@ -24,11 +24,15 @@ export type SyncRequestBody = components["schemas"]["SyncRequestBody"];
 export type RollbackRequestBody = components["schemas"]["RollbackRequestBody"];
 export type ProjectListView = components["schemas"]["ProjectListView"];
 export type ProjectView = components["schemas"]["ProjectView"];
+export type ProjectSyncWindowView =
+  components["schemas"]["ProjectSyncWindowView"];
+export type SyncWindowGateView = components["schemas"]["SyncWindowGateView"];
 export type ClusterListView = components["schemas"]["ClusterListView"];
 export type ClusterView = components["schemas"]["ClusterView"];
 export type ApplicationEventListView =
   components["schemas"]["ApplicationEventListView"];
 export type ApplicationEventView = components["schemas"]["ApplicationEventView"];
+export type AuthConfigView = components["schemas"]["AuthConfigView"];
 export type HealthResponse = components["schemas"]["HealthResponse"];
 export type ReadyResponse = components["schemas"]["ReadyResponse"];
 

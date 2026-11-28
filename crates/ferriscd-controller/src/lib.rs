@@ -21,6 +21,7 @@ pub mod impersonation;
 pub mod leader_election;
 pub mod live_state;
 pub mod metrics;
+pub mod notifications;
 pub mod predicate;
 pub mod project;
 pub mod prune;
@@ -107,18 +108,23 @@ pub use live_state::{
 pub use metrics::{
     ACTIVE_RECONCILES, APP_HEALTH_STATUS, APP_SYNC_STATUS, AUDIT_DROPPED_COUNTER,
     AUDIT_DROPPED_TOTAL, AUDIT_EVENTS_COUNTER, AUDIT_EVENTS_TOTAL, CACHE_OUTCOMES,
-    DEFAULT_METRICS_ADDR, GIT_FETCH_DURATION_SECONDS, METRICS_ADDR_ENV, METRICS_PATH, Metrics,
+    DEFAULT_METRICS_ADDR, DRIFT_ACTIVE_WATCHES, DRIFT_EVENT_OUTCOMES, DRIFT_EVENTS_TOTAL,
+    DRIFT_FALLBACK_REASONS, DRIFT_FALLBACK_TOTAL, DRIFT_TRIGGERS_TOTAL, DriftFallbackReason,
+    DriftWatchOutcome, GIT_FETCH_DURATION_SECONDS, METRICS_ADDR_ENV, METRICS_PATH, Metrics,
     MetricsEncodeError, MetricsServeError, MetricsStatusWriter, RBAC_RELOAD_COUNTER,
     RBAC_RELOAD_OUTCOMES, RBAC_RELOAD_TOTAL, RECONCILE_DURATION_SECONDS, RECONCILE_RESULTS,
     RECONCILE_TOTAL, RENDER_CACHE_TOTAL, RbacReloadOutcome, ReconcileGuard, ReconcileResult,
     SYNC_STATUS_VALUES,
 };
-pub use metrics::{
-    DRIFT_ACTIVE_WATCHES, DRIFT_EVENT_OUTCOMES, DRIFT_EVENTS_TOTAL, DRIFT_FALLBACK_REASONS,
-    DRIFT_FALLBACK_TOTAL, DRIFT_TRIGGERS_TOTAL, DriftFallbackReason, DriftWatchOutcome,
+pub use notifications::{
+    BlockReason, EgressConfigError, EgressPolicy, NotificationObserver, NotificationService,
+    NotificationWorkerHandle, OpenTenantAllowlist, SsrfError,
 };
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
-pub use project::{ApiProjectSource, ProjectSource};
+pub use project::{
+    ApiProjectSource, ApiProjectStatusSink, ProjectSource, ProjectStatusSink,
+    REASON_SYNC_WINDOW_INVALID, sync_window_condition,
+};
 pub use prune::{
     OwnershipVerifiedPruner, PruneResult, ResourcePruner, RetainReason, prune_opted_out, prune_rail,
 };
@@ -258,6 +264,12 @@ pub struct RunOptions {
 
     /// Optional async batched HTTPS audit webhook URL (`--audit-webhook-url`, `T17.2`).
     pub audit_webhook_url: Option<String>,
+
+    /// Opt-in event-driven notifications (`--enable-notifications`, `T19.4`).
+    ///
+    /// Off by default: with it off, nothing in the process opens a socket to a notification
+    /// destination and the `/status` writer chain is exactly the pre-Phase-19 one.
+    pub notifications: NotificationOptions,
 }
 
 impl std::fmt::Debug for RunOptions {
@@ -281,7 +293,108 @@ impl std::fmt::Debug for RunOptions {
                     .as_deref()
                     .map(audit::redact_audit_url),
             )
+            .field("notifications", &self.notifications)
             .finish()
+    }
+}
+
+/// The `T19.4` knobs [`RunOptions::notifications`] carries.
+///
+/// `Debug` is derived: neither field is a credential (the destinations live in `Secret`s that this
+/// struct never sees).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationOptions {
+    /// Attach the notification observer and start the delivery worker.
+    pub enabled: bool,
+
+    /// CIDRs whose **private** destinations the SSRF egress guard may reach
+    /// (`--notifications-allow-private-cidrs 10.20.0.0/16,...`).
+    ///
+    /// Loopback, link-local/cloud metadata, multicast and unspecified addresses stay blocked even
+    /// when they fall inside an allowlisted CIDR.
+    pub allow_private_cidrs: Option<String>,
+
+    /// Namespaces whose `Application`s may opt in at all
+    /// (`--notifications-allowed-namespaces team-a,team-b`).
+    ///
+    /// `None` (the default) keeps the historical behaviour: any namespace may subscribe through its
+    /// annotations. An explicit list is the tenancy boundary (finding **R1-M6**): a tenant outside it
+    /// cannot page another team's channel in the control-plane namespace, nor spend the controller's
+    /// delivery budget and rate-limit tokens.
+    pub allowed_namespaces: Option<String>,
+
+    /// PEM CA bundle whose certificates are **added** to the trust roots of the notification client
+    /// (`--notifications-ca-file`).
+    ///
+    /// The supported way to deliver to an internal HTTPS receiver signed by a private CA. It adds
+    /// roots; it never disables verification and never enables plaintext, so the SSRF guard and TLS
+    /// are unchanged.
+    pub ca_file: Option<std::path::PathBuf>,
+}
+
+impl NotificationOptions {
+    /// Resolves the egress policy from [`Self::allow_private_cidrs`].
+    ///
+    /// # Errors
+    ///
+    /// [`notifications::EgressConfigError`] for a malformed or over-broad CIDR.
+    pub fn egress_policy(
+        &self,
+    ) -> Result<notifications::EgressPolicy, notifications::EgressConfigError> {
+        notifications::EgressPolicy::from_allowlist_spec(self.allow_private_cidrs.as_deref())
+    }
+
+    /// Resolves the tenant allowlist from [`Self::allowed_namespaces`].
+    ///
+    /// # Errors
+    ///
+    /// [`notifications::TenantScopeError`] for a blank entry or a list above
+    /// [`notifications::MAX_ALLOWED_NAMESPACES`].
+    pub fn allowed_namespaces(
+        &self,
+    ) -> Result<Option<Vec<String>>, notifications::TenantScopeError> {
+        notifications::parse_allowed_namespaces(self.allowed_namespaces.as_deref())
+    }
+
+    /// The startup warning this configuration deserves, if any (finding **P19-M2**).
+    ///
+    /// Notifications are on, no tenant allowlist was given, and the controller watches
+    /// `Application`s beyond the control-plane namespace: every one of those tenants may page any
+    /// channel `Secret` in the control plane through an annotation. That combination is announced
+    /// once at startup rather than left to be discovered, because the default-open allowlist is a
+    /// compatibility decision, not a recommendation.
+    ///
+    /// `allowed_namespaces` is the **parsed** list ([`Self::allowed_namespaces`]) so that a malformed
+    /// flag is a startup error on its own path and this predicate stays infallible. `None` (or an
+    /// empty list) means "no allowlist configured".
+    #[must_use]
+    pub fn open_tenant_allowlist_warning(
+        &self,
+        application_scope: &ApplicationScope,
+        allowed_namespaces: Option<&[String]>,
+    ) -> Option<notifications::OpenTenantAllowlist> {
+        if !self.enabled {
+            return None;
+        }
+        notifications::open_tenant_allowlist_warning(application_scope, allowed_namespaces)
+    }
+
+    /// Loads [`Self::ca_file`] into the root certificates the notification client adds.
+    ///
+    /// `Ok(None)` when no file is configured (the platform trust store alone). The read is async and
+    /// fails closed: a missing or unusable CA file is a startup error, because the alternative — a
+    /// controller that starts and then fails TLS on every alert — is strictly worse.
+    ///
+    /// # Errors
+    ///
+    /// [`notifications::TransportError`] when the file cannot be read or holds no PEM certificate.
+    pub async fn root_certificates(
+        &self,
+    ) -> Result<Option<Vec<reqwest::Certificate>>, notifications::TransportError> {
+        let Some(path) = self.ca_file.as_deref() else {
+            return Ok(None);
+        };
+        notifications::load_root_certificates(path).await.map(Some)
     }
 }
 
@@ -494,6 +607,8 @@ pub struct ControlPlane {
     cluster_stop: tokio_util::sync::CancellationToken,
     cluster_watch: tokio::task::JoinHandle<()>,
     audit: audit::AuditLogger,
+    /// `T19.4`: the notification delivery worker (`None` when notifications are disabled).
+    notifications: Option<notifications::NotificationWorkerHandle>,
 }
 
 impl std::fmt::Debug for ControlPlane {
@@ -508,6 +623,7 @@ impl std::fmt::Debug for ControlPlane {
             .field("leader_election", &self.leader_election.is_some())
             .field("metrics_addr", &self.metrics_addr)
             .field("otlp_enabled", &self.telemetry.otlp_enabled())
+            .field("notifications", &self.notifications.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -669,6 +785,13 @@ impl ControlPlane {
                 tracing::warn!(error = %err, "cluster registry watcher panicked during shutdown")
             }
             Err(_) => tracing::warn!("cluster registry watcher did not stop before the deadline"),
+        }
+        // `T19.4`: stop the notification worker once the reconcile loops have drained. Shutdown
+        // cancels *before* it drains, so notifications still **queued** are dropped (and logged);
+        // only a delivery already in flight gets the bounded grace period, which is what keeps a
+        // hung receiver from holding shutdown open.
+        if let Some(notifications) = self.notifications.take() {
+            notifications.shutdown().await;
         }
         // The controller has drained: stop the listener too (idempotent — a `SIGTERM` already
         // cancelled the token) and report its outcome, so a dead `/metrics` endpoint can never be
@@ -1024,6 +1147,12 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         client.clone(),
         &config.namespace,
     )))
+    // `T17.4`: an unusable `spec.syncWindows` entry is deny-all at runtime; this is the one
+    // `AppProject` `/status` write that explains it (skipped unless the condition changed).
+    .with_project_status(Arc::new(ApiProjectStatusSink::new(
+        client.clone(),
+        &config.namespace,
+    )))
     // `T12.2`: the same scope the watcher uses, so a tenant `Application` is refused here even
     // if it somehow reaches a reconcile.
     .with_application_scope(config.application_scope())
@@ -1056,6 +1185,100 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         pipeline = pipeline.with_self_echo(echo);
     }
     let pipeline: Arc<dyn SyncPipeline> = Arc::new(pipeline);
+    // `T19.4`: opt-in event-driven notifications. The observer decorates the `/status` writer (so it
+    // sees exactly the status a pass persisted, with zero extra API reads), and the delivery worker
+    // runs on its own task behind a bounded queue: a hung receiver can delay alerts, never a
+    // reconcile. Both the templates (`ConfigMap`) and the destinations (labelled `Secret`s) are
+    // read once at startup; a missing/`unusable` ConfigMap falls back to the built-in templates
+    // rather than failing the controller.
+    let status_before_notifications: Arc<dyn StatusWriter> = status;
+    // Validated whether or not notifications are enabled: a typo in the allowlist must fail startup
+    // now, not silently become "no allowlist" on the day somebody flips the feature on.
+    let notification_policy = options
+        .notifications
+        .egress_policy()
+        .context("failed to parse --notifications-allow-private-cidrs")?;
+    // Same for the tenancy boundary (finding R1-M6): a typo must fail startup, not silently widen
+    // (or narrow) which tenants may page.
+    let notification_namespaces = options
+        .notifications
+        .allowed_namespaces()
+        .context("failed to parse --notifications-allowed-namespaces")?;
+    // `--notifications-ca-file` is read (async, once) before the branch for the same reason: a
+    // missing or non-PEM file is a startup error, never a controller that comes up and then fails
+    // TLS on the first real alert. Only a *configured* file is read.
+    let notification_roots = options
+        .notifications
+        .root_certificates()
+        .await
+        .context("failed to load --notifications-ca-file")?
+        .unwrap_or_default();
+    let (status, notifications) = if options.notifications.enabled {
+        let policy = notification_policy;
+        // Finding P19-M2: the tenant allowlist is default-open for compatibility, so the one combination
+        // that makes it dangerous — tenants outside the control plane, no allowlist — is announced
+        // before the first alert rather than discovered by the first tenant that pages another team.
+        let application_scope = config.application_scope();
+        if let Some(open) = options
+            .notifications
+            .open_tenant_allowlist_warning(&application_scope, notification_namespaces.as_deref())
+        {
+            tracing::warn!(
+                control_plane_namespace = %open.control_plane,
+                application_namespaces = %open.application_scope,
+                "--notifications-allowed-namespaces is unset, so every namespace whose Application is \
+                 reconciled may subscribe to notifications and name any channel Secret in the \
+                 control-plane namespace: set it to the tenants you actually trust, or keep \
+                 --application-namespaces at the control-plane default"
+            );
+        }
+        tracing::info!(
+            namespace = %config.namespace,
+            config_map = notifications::CONFIG_MAP_NAME,
+            selector = %notifications::channel_label_selector(),
+            allowed_namespaces = ?notification_namespaces,
+            allowlisted_networks = ?policy
+                .allowlisted_networks()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ca_file = ?options.notifications.ca_file,
+            custom_root_certificates = notification_roots.len(),
+            queue_capacity = notifications::DEFAULT_QUEUE_CAPACITY,
+            request_timeout_seconds = notifications::DEFAULT_REQUEST_TIMEOUT.as_secs(),
+            max_attempts = notifications::DEFAULT_MAX_ATTEMPTS,
+            "event-driven notifications enabled: destinations are read from labelled Secrets in the \
+             control-plane namespace only, every delivery is SSRF-checked (HTTPS only, no redirects), \
+             and a full bounded queue drops the notification instead of delaying a reconcile"
+        );
+        let config_document = notifications::load_config(client.clone(), &config.namespace).await;
+        let channels: Arc<dyn notifications::ChannelSource> = Arc::new(
+            notifications::SecretChannelSource::new(client.clone(), &config.namespace),
+        );
+        let transport: Arc<dyn notifications::NotificationTransport> = Arc::new(
+            notifications::ReqwestTransport::build_with_root_certificates(
+                policy.clone(),
+                notification_roots,
+            )
+            .context("failed to build the SSRF-guarded notification HTTPS client")?,
+        );
+        let (notifier, worker) = notifications::observer::spawn_worker(
+            config_document,
+            channels,
+            transport,
+            policy,
+            metrics.clone(),
+            notification_namespaces,
+        );
+        let decorated: Arc<dyn StatusWriter> = Arc::new(notifications::NotificationObserver::new(
+            status_before_notifications,
+            notifier,
+        ));
+        (decorated, Some(worker))
+    } else {
+        (status_before_notifications, None)
+    };
+
     // `T15.2`: rate-limited Kubernetes Events on `Application` CRs (deduplicates identical
     // consecutive `Warning` reasons within 5 minutes before calling `Recorder::publish`).
     let events = events::EventRecorder::for_client(client.clone());
@@ -1099,6 +1322,7 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         // never exist without the watcher that selects on it.
         drift,
         audit,
+        notifications,
     })
 }
 
@@ -1576,6 +1800,124 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// **`T19.4`:** notifications are opt-in, and the private-CIDR allowlist fails closed — a
+    /// malformed or over-broad entry is an error, never a silently disabled guard.
+    #[test]
+    fn notifications_are_opt_in_and_the_egress_allowlist_fails_closed() {
+        let default = RunOptions::default();
+        assert!(
+            !default.notifications.enabled,
+            "notifications must stay opt-in: with them off nothing opens a socket to a receiver"
+        );
+        assert_eq!(default.notifications.allow_private_cidrs, None);
+        assert!(
+            default
+                .notifications
+                .egress_policy()
+                .expect("the default policy is valid")
+                .is_strict(),
+            "the default egress policy refuses every private destination"
+        );
+
+        let allowlisted = NotificationOptions {
+            enabled: true,
+            allow_private_cidrs: Some("10.20.0.0/16".to_owned()),
+            allowed_namespaces: None,
+            ca_file: None,
+        };
+        assert_eq!(
+            allowlisted
+                .egress_policy()
+                .expect("a valid allowlist")
+                .allowlisted_networks()
+                .len(),
+            1
+        );
+        // Finding R1-M6: an unset tenant list means "no restriction", and the explicit list is parsed
+        // and bounded (see `notifications::parse_allowed_namespaces`).
+        assert_eq!(
+            allowlisted
+                .allowed_namespaces()
+                .expect("no tenant allowlist is fine"),
+            None
+        );
+
+        // A malformed allowlist fails even with notifications **off**: `prepare` validates it before
+        // the enablement branch, so a typo cannot sit dormant until the feature is switched on.
+        for malformed in [
+            "10.0.0.0",
+            "0.0.0.0/0",
+            "::/0",
+            "10.0.0.0/33",
+            "10.0.0.0/8,",
+        ] {
+            assert!(
+                NotificationOptions {
+                    enabled: true,
+                    allow_private_cidrs: Some(malformed.to_owned()),
+                    allowed_namespaces: None,
+                    ca_file: None,
+                }
+                .egress_policy()
+                .is_err(),
+                "{malformed:?} must be refused at startup"
+            );
+        }
+
+        // The options never carry a credential, so their `Debug` is safe to log.
+        let printed = format!("{allowlisted:?}");
+        assert!(printed.contains("10.20.0.0/16"), "{printed}");
+    }
+
+    /// **`T19.4` finding P19-M2:** the tenant allowlist is default-open, so the option wiring announces
+    /// the combination that makes it dangerous — notifications on, no allowlist, `Application`s
+    /// outside the control-plane namespace — and stays silent in every other shape.
+    #[test]
+    fn an_open_tenant_allowlist_is_warned_about_through_the_options() {
+        let wider = ApplicationScope::new(
+            ferriscd_crd::CONTROL_PLANE_NAMESPACE,
+            ApplicationNamespaces::All,
+        );
+        let control_plane_only = ApplicationScope::default();
+        let tenant_only = ApplicationScope::new(
+            ferriscd_crd::CONTROL_PLANE_NAMESPACE,
+            ApplicationNamespaces::Listed(vec!["team-a".to_owned()]),
+        );
+
+        let enabled = NotificationOptions {
+            enabled: true,
+            ..NotificationOptions::default()
+        };
+        let warning = enabled
+            .open_tenant_allowlist_warning(&wider, None)
+            .expect("an open allowlist over a wider scope must be warned about");
+        assert_eq!(warning.control_plane, ferriscd_crd::CONTROL_PLANE_NAMESPACE);
+        assert_eq!(warning.application_scope, "*");
+        assert!(
+            enabled
+                .open_tenant_allowlist_warning(&tenant_only, None)
+                .is_some(),
+            "a listed tenant namespace is already wider than the control plane"
+        );
+
+        // Notifications off: nothing opens a socket, so nothing is warned about.
+        assert_eq!(
+            NotificationOptions::default().open_tenant_allowlist_warning(&wider, None),
+            None
+        );
+        // The safe scope: every subscriber lives in the control-plane namespace.
+        assert_eq!(
+            enabled.open_tenant_allowlist_warning(&control_plane_only, None),
+            None
+        );
+        // An explicit allowlist: the operator chose the boundary.
+        let allowlist = vec!["team-a".to_owned()];
+        assert_eq!(
+            enabled.open_tenant_allowlist_warning(&wider, Some(&allowlist)),
+            None
+        );
+    }
 
     #[test]
     fn controller_name_matches_field_manager() {
