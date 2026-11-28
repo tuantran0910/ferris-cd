@@ -10,6 +10,12 @@
 name: v2 Fleet Benchmark (temporary)
 
 on:
+  # `workflow_dispatch` only works once this file is on the default branch, so the
+  # one-off run on the release branch is triggered by a push whose commit message
+  # contains `[benchmark]`. The guard below means ordinary pushes do not start a
+  # 60-minute soak.
+  push:
+    branches: [feat/v2-release]
   workflow_dispatch:
     inputs:
       apps:
@@ -35,6 +41,7 @@ concurrency:
 jobs:
   fleet-benchmark:
     name: 250 apps / 2,500 resources / 3 shards
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[benchmark]')
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -65,9 +72,9 @@ jobs:
 
       - name: Run the sharded fleet benchmark
         env:
-          BENCH_APPS: ${{ github.event.inputs.apps }}
-          BENCH_SOAK_MINUTES: ${{ github.event.inputs.soak_minutes }}
-          BENCH_TOTAL_SHARDS: ${{ github.event.inputs.total_shards }}
+          BENCH_APPS: ${{ github.event.inputs.apps || '250' }}
+          BENCH_SOAK_MINUTES: ${{ github.event.inputs.soak_minutes || '60' }}
+          BENCH_TOTAL_SHARDS: ${{ github.event.inputs.total_shards || '3' }}
         run: |
           set -euo pipefail
           # Workflow inputs go through `env`, never straight into a shell line, and are
