@@ -1408,8 +1408,8 @@ impl InventorySyncPipeline {
 
         let desired_inventory = bundle.hooks.permanent_inventory();
         // Safety rail: an empty desired set over a non-empty inventory is far more likely to be
-        // a wrong `spec.source.git.path` than an intentional "delete everything". Require an
-        // explicit opt-in before a pass that would prune the whole inventory.
+        // a wrong source path than an intentional "delete everything". Require an explicit opt-in
+        // before a pass that would prune the whole inventory.
         if desired_inventory.is_empty() && !prev_inventory.is_empty() && !empty_desired_allowed() {
             return Err(ReconcileError::Invalid {
                 message: format!(
@@ -1420,8 +1420,8 @@ impl InventorySyncPipeline {
                     // Finding M4: this message reaches `Application.status`, so the repository URL
                     // is quoted through the shared redaction helper — a Git remote routinely
                     // carries a personal access token.
-                    manifest::redact_repo_url(&app.spec.source.git.repo_url),
-                    app.spec.source.git.path,
+                    manifest::redact_repo_url(app.spec.source.repo_url()),
+                    app.spec.source.source_path(),
                     prev_inventory.len()
                 ),
             });
@@ -2136,12 +2136,27 @@ impl InventorySyncPipeline {
         pinned: Option<&str>,
         discovery: &DiscoveryCache,
     ) -> Result<(String, Vec<DesiredResource>), ReconcileError> {
+        // `T18.3` accepts `spec.source.oci` at the API boundary (schema + offline validation),
+        // but the registry client that would turn it into a checkout is wired in `T18.4`. Until
+        // then an OCI source is a terminal, honest refusal — never a silent empty render and never
+        // a Git fetch of an empty URL.
+        let git = app
+            .spec
+            .source
+            .git_source()
+            .ok_or_else(|| ReconcileError::Invalid {
+                message:
+                    "spec.source.oci is not served by this controller build yet: this release \
+                          can only render a Git source (spec.source.git). No artifact was fetched \
+                          and nothing in the cluster was changed."
+                        .to_owned(),
+            })?;
         let source = GitSource::new(
-            app.spec.source.git.repo_url.clone(),
+            git.repo_url.clone(),
             pinned
                 .map(str::to_owned)
-                .unwrap_or_else(|| app.spec.source.git.target_revision.clone()),
-            app.spec.source.git.path.clone(),
+                .unwrap_or_else(|| git.target_revision.clone()),
+            git.path.clone(),
         );
         // Explicit, configurable local-repository policy: `Production` rejects `file://` and
         // bare local paths, so a misconfigured `Application` cannot read the pod's filesystem.
@@ -2196,7 +2211,7 @@ impl InventorySyncPipeline {
         let render_span = tracing::info_span!(
             "manifest_render",
             commit_sha = %resolved.commit_sha,
-            path = %app.spec.source.git.path,
+            path = %source.path,
         );
         let rendered = self.render.render(&context).instrument(render_span).await;
         // `T15.1`: the render cache owns the `hits`/`misses` counters; the recorder turns the
@@ -3894,11 +3909,12 @@ mod tests {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
             source: SourceSpec {
-                git: GitSourceSpec {
+                git: Some(GitSourceSpec {
                     repo_url: repo_url.to_owned(),
                     target_revision: "main".to_owned(),
                     path: path.to_owned(),
-                },
+                }),
+                oci: None,
                 renderer: RendererSpec::default(),
             },
             destination: DestinationSpec {
@@ -8132,7 +8148,7 @@ spec:
             .expect("the first pass persists the spec hash");
 
         // The operator points the Application at a different directory in the *same* commit.
-        app.spec.source.git.path = "config".to_owned();
+        app.spec.source.git.as_mut().expect("git source").path = "config".to_owned();
         let new_hash = source_spec_hash(&app.spec).expect("spec hash");
         assert_ne!(old_hash, new_hash, "a path edit must change the hash");
 
@@ -9422,6 +9438,42 @@ spec:
         );
         assert!(err.to_string().contains("default"), "{err}");
         assert_eq!(fixture.projects.reads(), vec!["default".to_owned()]);
+        // Nothing was read from Git, diffed, or applied.
+        assert_eq!(fixture.git.resolve_calls(), 0);
+        assert!(fixture.dry_run.calls().is_empty());
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    /// **Trap guard (`T18.3`).** `spec.source.oci` is accepted by the API (schema + offline
+    /// validation) but the registry client is `T18.4`'s work: this build must refuse it *terminally
+    /// and before any fetch*, never fall through to a Git clone of an empty URL and never render an
+    /// empty bundle.
+    #[tokio::test]
+    async fn an_oci_source_is_refused_terminally_before_any_fetch() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let mut app = fixture.app(".");
+        app.spec.source.git = None;
+        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+            url: "oci://ghcr.io/example/payments".to_owned(),
+            tag: Some("1.4.2".to_owned()),
+            digest: None,
+            path: String::new(),
+        });
+        assert!(
+            app.spec.validate().is_ok(),
+            "the spec itself must be valid: the refusal is about this build's pipeline"
+        );
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("an OCI source must be refused, not silently rendered");
+        assert!(matches!(err, ReconcileError::Invalid { .. }), "{err:?}");
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        let message = err.to_string();
+        assert!(message.contains("spec.source.oci"), "{message}");
+        assert!(message.contains("No artifact was fetched"), "{message}");
         // Nothing was read from Git, diffed, or applied.
         assert_eq!(fixture.git.resolve_calls(), 0);
         assert!(fixture.dry_run.calls().is_empty());

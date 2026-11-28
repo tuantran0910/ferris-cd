@@ -239,7 +239,7 @@ impl DiffSource for Diffs {
         self.asked.lock().expect("test state").push((
             app.metadata.namespace.clone().unwrap_or_default(),
             app.metadata.name.clone().unwrap_or_default(),
-            app.spec.source.git.repo_url.clone(),
+            app.spec.source.repo_url().to_owned(),
         ));
         let preview = self.preview.clone();
         let error = self.error.clone();
@@ -428,7 +428,7 @@ async fn the_readiness_probe_reports_the_seam() {
 #[tokio::test]
 async fn applications_are_listed_with_a_redacted_repository_url() {
     let mut app = application("ferriscd-system", "payment-api");
-    app.spec.source.git.repo_url =
+    app.spec.source.git.as_mut().expect("git source").repo_url =
         "https://oauth2:ghp_averysecrettoken@github.com/example/payment-service.git".to_owned();
     let (status, body) = get(state(vec![app]), "/api/v1/applications").await;
     assert_eq!(status, StatusCode::OK);
@@ -1713,12 +1713,19 @@ async fn a_monorepo_push_fans_out_once_per_application() {
     let mut apps = Vec::new();
     for name in ["api", "worker", "cron"] {
         let mut app = application("ferriscd-system", name);
-        app.spec.source.git.repo_url = "git@github.com:example/payment-service.git".to_owned();
+        app.spec.source.git.as_mut().expect("git source").repo_url =
+            "git@github.com:example/payment-service.git".to_owned();
         apps.push(app);
     }
     // An application tracking a different branch must not be woken.
     let mut other = application("ferriscd-system", "release-only");
-    other.spec.source.git.target_revision = "release/1.2".to_owned();
+    other
+        .spec
+        .source
+        .git
+        .as_mut()
+        .expect("git source")
+        .target_revision = "release/1.2".to_owned();
     apps.push(other);
 
     let state = webhook_state(apps, sink.clone());

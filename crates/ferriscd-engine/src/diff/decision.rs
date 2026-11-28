@@ -327,11 +327,12 @@ mod tests {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
             source: SourceSpec {
-                git: GitSourceSpec {
+                git: Some(GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "main".to_owned(),
                     path: "deploy/production".to_owned(),
-                },
+                }),
+                oci: None,
                 renderer: RendererSpec::default(),
             },
             destination: DestinationSpec {
@@ -615,7 +616,7 @@ mod tests {
     fn a_git_path_edit_with_an_unchanged_sha_triggers_a_sync() {
         let before = spec();
         let mut after = spec();
-        after.source.git.path = "deploy/staging".to_owned();
+        after.source.git.as_mut().expect("git source").path = "deploy/staging".to_owned();
 
         let before_hash = source_spec_hash(&before).expect("hash");
         let after_hash = source_spec_hash(&after).expect("hash");
@@ -684,19 +685,24 @@ mod tests {
             (
                 "repoURL",
                 Box::new(|spec: &mut ApplicationSpec| {
-                    spec.source.git.repo_url = "https://example.com/other.git".to_owned();
+                    spec.source.git.as_mut().expect("git source").repo_url =
+                        "https://example.com/other.git".to_owned();
                 }),
             ),
             (
                 "targetRevision",
                 Box::new(|spec: &mut ApplicationSpec| {
-                    spec.source.git.target_revision = "release".to_owned();
+                    spec.source
+                        .git
+                        .as_mut()
+                        .expect("git source")
+                        .target_revision = "release".to_owned();
                 }),
             ),
             (
                 "path",
                 Box::new(|spec: &mut ApplicationSpec| {
-                    spec.source.git.path = String::new();
+                    spec.source.git.as_mut().expect("git source").path = String::new();
                 }),
             ),
             (

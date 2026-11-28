@@ -9,9 +9,9 @@ pub mod status;
 
 pub use application::{
     Application, ApplicationSpec, AutoRenderer, AutomatedSyncPolicy, DestinationSpec,
-    GitSourceSpec, HelmRenderer, IgnoreDifference, KustomizeRenderer, PlainYamlRenderer,
-    RendererSpec, RetryBackoff, RetryPolicy, SourceSpec, SpecValidationError, SyncOptions,
-    SyncPolicy,
+    GitSourceSpec, HelmRenderer, IgnoreDifference, KustomizeRenderer, MAX_OCI_TAG_LEN,
+    OCI_DIGEST_HEX_LEN, OCI_DIGEST_PREFIX, OciSourceSpec, PlainYamlRenderer, RendererSpec,
+    RetryBackoff, RetryPolicy, SourceSpec, SpecValidationError, SyncOptions, SyncPolicy,
 };
 pub use project::{AppProject, AppProjectSpec, AppProjectStatus, GroupKind, ProjectDestination};
 pub use status::{
