@@ -40,6 +40,7 @@
 //! `observedGeneration`) provable in a hermetic snapshot test.
 
 pub mod crd;
+pub mod progressive;
 pub mod runtime;
 pub(crate) mod values;
 pub mod workloads;
@@ -53,6 +54,11 @@ use crate::manifest::ResourceKey;
 
 pub use crd::{CONDITION_PRIORITY, TRANSIENT_REASONS, generic_crd_health};
 pub use ferriscd_crd::status::{HealthStatus, MAX_STATUS_MESSAGE_CHARS};
+pub use progressive::{
+    ARGO_ROLLOUT_GROUP, CANARY_DEGRADED_PHASES, CANARY_HEALTHY_PHASES, CANARY_PROGRESSING_PHASES,
+    CanaryHealth, FLAGGER_GROUP, GATEWAY_GROUP, HttpRouteHealth, ROLLOUT_PHASES,
+    ROUTE_PARENT_CONDITIONS, RolloutHealth, argo_rollout, flagger_canary, http_route,
+};
 pub use runtime::{LOAD_BALANCER_HEALTH_ANNOTATION, LoadBalancerPolicy};
 
 /// Message every workload evaluator reports while `status.observedGeneration` lags
@@ -271,7 +277,8 @@ impl HealthRegistry {
     }
 
     /// The production registry: passive built-ins (`T09.1`), core workloads (`T09.2`), runtime
-    /// resources (`T09.3`), and the generic CR heuristic (`T09.4`).
+    /// resources (`T09.3`), the generic CR heuristic (`T09.4`), and progressive delivery
+    /// (`T20.3`).
     #[must_use]
     pub fn builtin() -> Self {
         let mut registry = Self::empty();
@@ -319,6 +326,15 @@ impl HealthRegistry {
             "PersistentVolumeClaim",
             runtime::PersistentVolumeClaimHealth,
         );
+
+        // --- T20.3: progressive delivery ---------------------------------------------------
+        // Keyed on `(group, kind)` like every other entry (ADR-003): a Gateway API `v1beta1` ->
+        // `v1` upgrade, an Argo Rollouts `v1alpha1` promotion, or a Flagger `v1beta1` bump all keep
+        // resolving to the same evaluator, so an API upgrade can never silently fall back to the
+        // generic `Ready` heuristic in the middle of a canary.
+        self.insert(GATEWAY_GROUP, "HTTPRoute", HttpRouteHealth);
+        self.insert(ARGO_ROLLOUT_GROUP, "Rollout", RolloutHealth);
+        self.insert(FLAGGER_GROUP, "Canary", CanaryHealth);
     }
 
     /// Registers (or replaces) the evaluator of `group`/`kind`.

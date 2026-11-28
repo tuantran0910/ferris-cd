@@ -540,3 +540,55 @@ that runs in it or explicitly marked pending.
   resumes on the window's own schedule. It has **not been run against a `kind` cluster yet**, so no
   pass/fail and no output are recorded here; like the other live suites, its `kind` run is
   **pending**.
+
+---
+
+## `v2.0` Progressive Delivery (`T20.3`)
+
+### `M1` — `provider` vs the roadmap's `prometheusUrl` (documented deviation, reconciled in `T20.5`)
+
+The roadmap specifies `spec.syncPolicy.metricGates[].prometheusUrl`, "referenced via the control-plane
+allowlisted `ConfigMap/ferriscd-metrics-providers-cm`". The implementation ships the field as
+**`provider`**: an opaque *key* of that `ConfigMap`, resolved by the controller (one namespaced `GET`
+per reconcile, only for an `Application` that declares a gate).
+
+Why the deviation: the roadmap's own non-functional requirement is that Prometheus endpoint URLs are
+"configured exclusively by cluster admins … never arbitrary tenant-supplied URLs in `ApplicationSpec`
+— prevents SSRF". A field *named* `prometheusUrl` invites exactly the value the requirement forbids,
+and leaves the guard resting on validation of a URL-shaped string (every such validator has a bypass:
+`169.254.169.254`, a redirecting proxy, `@`-userinfo, `//` scheme-relative). Naming the field
+`provider` makes the endpoint **unrepresentable** in `ApplicationSpec` — there is no field whose
+validation could be circumvented — and moves the URL to a cluster-admin object the tenant cannot read
+or write. `ApplicationSpec::validate` additionally rejects a value shaped like a URL with an explicit
+message, and the rendered CRD carries the same rule as CEL
+(`self.all(g, !g.provider.contains('://'))`), so a tenant who pastes an endpoint from a dashboard gets
+a terminal, actionable 422 instead of a gate that silently never resolves.
+
+Cost, stated plainly: an operator porting a manifest from a tool whose field is a URL must translate
+it (`provider: prod` + a `ConfigMap` entry). `docs/roadmap/track-e-enterprise-evolution.md` still
+spells the roadmap's field name; **`T20.5` (release verification) reconciles the roadmap text to
+`provider`** — it is the task that authors the `T20` lessons and re-verifies the phase docs, so the
+rename lands there rather than in a `T20.3` implementation diff that must not edit the spec it is
+built against. Until then, the authoritative field name is the one in the CRD.
+
+### Review findings closed in the `T20.3` fix round
+
+| ID | Finding | Closure |
+|----|---------|---------|
+| `C1` | The metric gate also gated the **rollback** it had just requested: `failureAction: Rollback` wrote the request, the next pass re-rendered the pinned revision, was gated again, failed, and overwrote the request — the remediation never landed | `PassRequest::gate_suppressed`, set from `prepared.rollback.is_some() \|\| pinned_revision.is_some()` (both halves of "this pass is a remediation"); the gate is not even consulted, so the pass issues zero queries. Pinned by `a_gate_rollback_pass_is_never_gated_and_the_remediation_settles` (0 samples on the remediation, pinned wave 0 applied, operation `Succeeded`, exactly one rollback request ever written) — and it fails without the fix |
+| `H1` | `consecutiveSuccesses` was not reset on a query error, so `count` "consecutive" samples could be accumulated across failures (fail-open) | Reset in the error arm; pinned by `a_query_error_breaks_the_run_of_consecutive_successes` (S,E,S holds at 1/2, never `Passed`) |
+| `H2` | Flagger phase was spelled `Finalising`, but the wire value is `Finalizing` (and `Terminating` exists), so a *successful* production canary reported `Unknown` and burned the wave timeout | The list carries the literal wire spellings (`Finalizing`, `Terminating`); pinned with literal strings, never through the constants, by `flagger_canary_maps_the_literal_production_phase_strings` |
+| `H3` | `observedGeneration` was read as a JSON integer only, but Argo Rollouts publishes it as a **string**, so the stale-generation guard was dead | `values::int_or_numeric_string` accepts both forms for `status.observedGeneration` and `status.parents[].conditions[].observedGeneration`; absent (or unparsable) stays "not stale". Pinned by `a_string_observed_generation_still_guards_staleness` |
+| `M1` | `provider` vs `prometheusUrl` undocumented | This section; roadmap reconciliation assigned to `T20.5` |
+| `M2` | Gate fingerprint was a 64-bit FNV-1a, so a collision would silently credit a bake measured under different rules | Truncated SHA-256 (128 bits, length-prefixed parts, domain-separated); known-answer + collision sweep in `the_fingerprint_is_a_stable_truncated_sha256` |
+| `M3` | No admission-time CEL for a duplicate `afterWave` or a URL-shaped `provider` | `x-kubernetes-validations` on `spec.syncPolicy.metricGates` (`self.all(g, size(self.filter(h, h.afterWave == g.afterWave)) == 1)` and `self.all(g, !g.provider.contains('://'))`), pinned by `application_crd_carries_the_metric_gate_cel_rules` including render idempotence |
+| `M4` | A **config/provider** error (bad condition, `4xx`, non-JSON, unsupported `resultType`) honoured `failureAction: Rollback` | Only a measurement breach may roll back; the decided action is persisted in `MetricGateState::failureAction` so a resumed `Failed` cannot be upgraded. Pinned in `metric_gate` (`a_gate_that_cannot_be_evaluated_pauses_instead_of_rolling_back`) and end-to-end by `a_query_failure_pauses_instead_of_rolling_back` (zero Application patches) |
+| `M5` | The CRD text claimed a single-wave bundle is ungated | The `afterWave` doc now states the opposite (a gate forces the operation state machine, so the only boundary is gated); regenerated into all three vendored CRD copies |
+| `M6` | A gate matching no wave of the bundle was silent | `metric_gate::unmatched_gates` + a `warn!` on every pass that renders a non-matching bundle; pinned by `a_gate_that_matches_no_wave_is_reported` |
+| `M7` | `gatePhase` had no serde default, so a `/status` without it failed to decode the whole `operationState` | `#[serde(default)]` on `gate_phase` (and on the new `failure_action`); pinned by `a_gate_record_without_a_phase_or_action_still_decodes` |
+| Nits | char-vs-byte provider bound; no loopback/link-local deny-list on a provider URL; `…` truncation landed one character over the `/status` budget; the version-independence test varied nothing; `==`/`!=` used an absolute `f64::EPSILON` | `chars().count()`; `denied_host` refuses loopback/unspecified/IPv4-and-IPv6 link-local; `bounded` puts the ellipsis inside the budget; `the_verdict_is_version_independent_for_every_progressive_kind` builds real `v1`/`v1beta1`/`v1alpha1` objects; `approx_eq` scales the tolerance with magnitude |
+
+Trap guards asserted hermetically: the gate never sleeps (a hold is a requeue hint in `/status`), the
+provider URL is unreachable from `ApplicationSpec` (a name, refused at admission by CEL and at runtime
+by the allowlist), a provider that cannot be sampled never promotes, and a remediation pass never
+samples at all.

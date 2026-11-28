@@ -13,7 +13,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::application::{
-    DEFAULT_TARGET_REVISION, MAX_REVISION_HISTORY_LIMIT, RendererSpec, SourceSpec,
+    DEFAULT_TARGET_REVISION, MAX_REVISION_HISTORY_LIMIT, MetricGateFailureAction, RendererSpec,
+    SourceSpec,
 };
 
 /// Hard cap on `status.history` entries.
@@ -422,6 +423,122 @@ impl ActiveHook {
     }
 }
 
+/// Phase of a metric gate (`T20.3`).
+///
+/// The gate is a separate axis from [`OperationPhase`]: an operation is `Running` while its gate is
+/// `Sampling`, and a gate that never passed is what turned a `Running` operation into a `Failed`
+/// one. Keeping the phase in `/status` is what makes a metric-gated rollout resumable: a controller
+/// restart mid-bake reads `consecutiveSuccesses` back instead of starting the bake over.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema, Default)]
+pub enum MetricGatePhase {
+    /// The gate has not sampled yet.
+    #[default]
+    Pending,
+    /// At least one sample was taken; more are required before promotion.
+    Sampling,
+    /// The required number of consecutive samples succeeded: promotion may continue.
+    Passed,
+    /// The gate refused promotion (a failing sample, or a provider that could not be sampled).
+    Failed,
+}
+
+/// Persisted progress of one metric gate (`T20.3`).
+///
+/// Written into [`OperationState::metric_gate`] on every pass that touches the gate, so the state
+/// machine is re-entrant: nothing is held in a worker, and nothing ever sleeps. Every string is
+/// bounded by [`MAX_STATUS_MESSAGE_CHARS`], so the record cannot grow `/status` towards the `etcd`
+/// budget (trap T9). Every field is `#[serde(default)]`, so a status that omits one (an older build,
+/// a hand patch, a newer controller) still decodes instead of wedging the operation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricGateState {
+    /// Stable identity of the gate that produced this state.
+    ///
+    /// A truncated SHA-256 over the gate's decision inputs (wave, provider, query, condition, count),
+    /// computed by the controller. A spec edit that changes any of them makes the persisted progress
+    /// unusable, and the controller restarts the bake instead of crediting samples taken under
+    /// different rules.
+    pub fingerprint: String,
+
+    /// The wave this gate guards promotion off.
+    #[serde(default)]
+    pub after_wave: i32,
+
+    /// Where the gate is in its lifecycle.
+    ///
+    /// `default` is load-bearing on the wire (`T20.3` finding M7): a `/status` that omits the field
+    /// — hand-patched by an operator, written by an older build, or produced by a tool that only
+    /// touches the documented top-level phase — would otherwise fail to deserialize the *whole*
+    /// `operationState`, and an operation state this controller cannot read is a rollout it cannot
+    /// resume. An absent phase reads as [`MetricGatePhase::Pending`], which is exactly "no sample
+    /// has been taken yet".
+    #[serde(default)]
+    pub gate_phase: MetricGatePhase,
+
+    /// The action this gate decided on when it failed (`T20.3` finding M4).
+    ///
+    /// Recorded instead of re-derived from `spec`, because the two are deliberately **not** the same
+    /// value: a measurement breach honours `failureAction`, while a gate that could not be *evaluated*
+    /// (an unparsable `successCondition`, a `4xx`, a non-JSON body, an unsupported result type)
+    /// always pauses — a broken query is not evidence that the rollout regressed, so it must never
+    /// trigger an automatic rollback. Persisting the decision is what keeps a resumed `Failed`
+    /// verdict (a controller restart, or a re-plan of the same operating state) honest.
+    ///
+    /// Additive on the wire: absent reads as `Pause`, the safe direction.
+    #[serde(default)]
+    pub failure_action: MetricGateFailureAction,
+
+    /// How many consecutive passing samples have been recorded.
+    #[serde(default)]
+    pub consecutive_successes: u32,
+
+    /// How many consecutive passing samples are required (the spec's `count`, captured at the first
+    /// sample so an operator can see the progress as `1/3`).
+    #[serde(default)]
+    pub required_successes: u32,
+
+    /// How many consecutive **query** failures have been recorded since the last usable sample.
+    ///
+    /// A provider that cannot be queried must not hold a rollout open forever, so the controller
+    /// fails the gate closed after a bounded number of these.
+    #[serde(default)]
+    pub consecutive_errors: u32,
+
+    /// When the last sample (or sample attempt) was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<Time>,
+
+    /// Bounded, secret-free explanation (the failing measurement, the provider error class).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl MetricGatePhase {
+    /// Whether the gate has finished deciding (either way).
+    ///
+    /// A terminal phase is never re-sampled: re-querying a `Failed` gate would let a flapping
+    /// provider promote the rollout it just aborted, and re-querying a `Passed` one is pure load.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Passed | Self::Failed)
+    }
+}
+
+impl MetricGateState {
+    /// Whether the gate has finished deciding (either way).
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        self.gate_phase.is_terminal()
+    }
+
+    /// How many samples are still required before the gate passes.
+    #[must_use]
+    pub fn remaining_successes(&self) -> u32 {
+        self.required_successes
+            .saturating_sub(self.consecutive_successes)
+    }
+}
+
 /// Re-entrant operation state, persisted so requeues never restart a multi-wave sync.
 ///
 /// `v1alpha1` keeps only cross-requeue progress (phase, wave, revision, timestamps).
@@ -463,6 +580,14 @@ pub struct OperationState {
     /// It is bounded by [`MAX_ACTIVE_HOOKS`] and additive on the wire (`[]`/absent in older states).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_hooks: Vec<ActiveHook>,
+
+    /// Progress of the metric gate holding this operation between waves (`T20.3`).
+    ///
+    /// Additive on the wire: `None` for every operation that does not use
+    /// `spec.syncPolicy.metricGates`, so a `v1.0`-shaped `operationState` round-trips byte-identically
+    /// and a state written before Phase 20 still deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric_gate: Option<MetricGateState>,
 
     /// Bounded human-readable progress/error message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1213,6 +1338,7 @@ mod tests {
             phase_started_at: Some(ts("2026-11-24T12:00:00Z")),
             revision: Some("8f3a1c2e9d4b5a60718293a4b5c6d7e8f9012345".to_owned()),
             active_hooks: Vec::new(),
+            metric_gate: None,
             message: None,
             started_at: ts("2026-11-24T12:00:00Z"),
             finished_at: None,
@@ -1433,5 +1559,135 @@ mod tests {
         assert_eq!(oci_summary.path, "charts");
         assert_eq!(oci_summary.target_revision, "1.4.2");
         assert!(serde_json::to_value(&oci_summary).is_ok());
+    }
+
+    /// `T20.3`: the metric-gate record is additive on the wire. A state written before Phase 20
+    /// still deserializes, an operation without a gate emits no `metricGate` key, and a gate state
+    /// round-trips (that round-trip is what makes a controller restart mid-bake resumable).
+    #[test]
+    fn metric_gate_state_is_additive_and_round_trips() {
+        let legacy = serde_json::json!({
+            "phase": "Running",
+            "syncPhase": "Sync",
+            "currentWave": 1,
+            "revision": "8f3a1c2e9d4b5a60718293a4b5c6d7e8f9012345",
+            "startedAt": "2026-11-24T12:00:00Z",
+        });
+        let mut state: OperationState =
+            serde_json::from_value(legacy.clone()).expect("a pre-Phase-20 state must deserialize");
+        assert_eq!(state.metric_gate, None);
+        let serialized = serde_json::to_value(&state).expect("state must serialize");
+        assert!(
+            serialized.get("metricGate").is_none(),
+            "an operation without a gate must not emit metricGate: {serialized}"
+        );
+        assert_eq!(
+            serde_json::from_value::<OperationState>(serialized).expect("must deserialize"),
+            state,
+            "an untouched state round-trips byte-identically"
+        );
+
+        // A gated operation records where the bake is, which is what a restart resumes from.
+        let gate = MetricGateState {
+            fingerprint: "0123456789abcdef".to_owned(),
+            after_wave: -1,
+            gate_phase: MetricGatePhase::Sampling,
+            failure_action: MetricGateFailureAction::Rollback,
+            consecutive_successes: 2,
+            required_successes: 3,
+            consecutive_errors: 1,
+            last_checked_at: Some(ts("2026-11-24T12:01:00Z")),
+            message: Some("metric gate after wave -1: 2/3 sample(s) satisfied".to_owned()),
+        };
+        state.metric_gate = Some(gate.clone());
+        let value = serde_json::to_value(&state).expect("state must serialize");
+        let record = &value["metricGate"];
+        assert_eq!(record["afterWave"], json!(-1));
+        assert_eq!(record["gatePhase"], json!("Sampling"));
+        assert_eq!(record["failureAction"], json!("Rollback"));
+        assert_eq!(record["consecutiveSuccesses"], json!(2));
+        assert_eq!(record["requiredSuccesses"], json!(3));
+        assert_eq!(record["consecutiveErrors"], json!(1));
+        assert_eq!(record["lastCheckedAt"], json!("2026-11-24T12:01:00Z"));
+        assert_eq!(record["fingerprint"], json!("0123456789abcdef"));
+        assert_eq!(
+            serde_json::from_value::<OperationState>(value.clone()).expect("must deserialize"),
+            state
+        );
+
+        // The record stays small: `/status` is a budgeted object (trap T9).
+        assert!(
+            value.to_string().len() < 1024,
+            "a gate record must stay tiny: {} bytes",
+            value.to_string().len()
+        );
+
+        // Every phase is a stable wire word.
+        for (phase, wire) in [
+            (MetricGatePhase::Pending, "Pending"),
+            (MetricGatePhase::Sampling, "Sampling"),
+            (MetricGatePhase::Passed, "Passed"),
+            (MetricGatePhase::Failed, "Failed"),
+        ] {
+            assert_eq!(serde_json::to_value(phase).expect("phase"), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<MetricGatePhase>(json!(wire)).expect("phase"),
+                phase
+            );
+        }
+        assert_eq!(MetricGatePhase::default(), MetricGatePhase::Pending);
+
+        // Accessors the controller's gate fold relies on.
+        assert!(MetricGatePhase::Passed.is_terminal());
+        assert!(MetricGatePhase::Failed.is_terminal());
+        assert!(!MetricGatePhase::Sampling.is_terminal());
+        assert_eq!(gate.remaining_successes(), 1);
+        assert_eq!(
+            MetricGateState {
+                consecutive_successes: 5,
+                ..gate
+            }
+            .remaining_successes(),
+            0
+        );
+    }
+
+    /// `T20.3` finding M7: a persisted gate record that omits `gatePhase` (or `failureAction`) must
+    /// still decode, so a hand-patched `/status` or an older build cannot wedge the operation.
+    #[test]
+    fn a_gate_record_without_a_phase_or_action_still_decodes() {
+        let record = serde_json::json!({
+            "fingerprint": "0123456789abcdef",
+            "afterWave": 2,
+            "consecutiveSuccesses": 1,
+            "requiredSuccesses": 3,
+        });
+        let gate: MetricGateState =
+            serde_json::from_value(record).expect("an absent gatePhase must default, not fail");
+        assert_eq!(gate.gate_phase, MetricGatePhase::Pending);
+        assert_eq!(
+            gate.failure_action,
+            MetricGateFailureAction::Pause,
+            "an absent failureAction must read as the safe (non-rollback) direction"
+        );
+        assert_eq!(gate.after_wave, 2);
+        assert_eq!(gate.consecutive_successes, 1);
+        assert_eq!(gate.required_successes, 3);
+        assert_eq!(gate.consecutive_errors, 0);
+        assert!(gate.last_checked_at.is_none());
+        assert!(gate.message.is_none());
+        assert!(!gate.is_terminal(), "a defaulted phase is not terminal");
+
+        // The same, one level up: the whole `operationState` decodes and is resumable.
+        let operation: OperationState = serde_json::from_value(serde_json::json!({
+            "phase": "Running",
+            "currentWave": 2,
+            "startedAt": "2026-11-24T12:00:00Z",
+            "metricGate": { "fingerprint": "0123456789abcdef" },
+        }))
+        .expect("an operation with a partial gate record must deserialize");
+        let gate = operation.metric_gate.expect("the gate record survives");
+        assert_eq!(gate.gate_phase, MetricGatePhase::Pending);
+        assert_eq!(gate.fingerprint, "0123456789abcdef");
     }
 }

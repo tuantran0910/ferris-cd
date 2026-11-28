@@ -667,6 +667,7 @@ fn chaos_application(prune: bool) -> Application {
             }),
             sync_options: None,
             retry: None,
+            metric_gates: Vec::new(),
         }),
         ignore_differences: Vec::new(),
         requeue_after_seconds: DEFAULT_REQUEUE_AFTER_SECONDS,

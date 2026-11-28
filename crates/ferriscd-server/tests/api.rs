@@ -709,6 +709,7 @@ async fn one_application_is_readable_with_its_history_and_operation() {
             phase_started_at: None,
             revision: Some("8f3a1c2".to_owned()),
             active_hooks: Vec::new(),
+            metric_gate: None,
             message: None,
             started_at: now(),
             finished_at: Some(now()),

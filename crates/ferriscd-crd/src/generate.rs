@@ -131,6 +131,33 @@ pub const MULTI_SOURCE_EXCLUSIVE_RULE: &str = "!self.?sources.hasValue() || self
 pub const MULTI_SOURCE_EXCLUSIVE_MESSAGE: &str =
     "each spec.sources entry must set exactly one of git or oci";
 
+/// CEL rule (`T20.3`): no two `spec.syncPolicy.metricGates` entries guard the same wave.
+///
+/// Two gates on one boundary would leave one of them silently unevaluated — `gate_after_wave` picks
+/// the first match — so "which sample decides this promotion" would be ambiguous. The rule is the
+/// server-side twin of [`crate::SpecValidationError::InvalidMetricGate`]'s duplicate-wave arm, and it
+/// is expressed over the rendered `afterWave` values (at most 8 entries, so the nested `filter` is
+/// bounded work).
+pub const METRIC_GATES_UNIQUE_WAVE_RULE: &str =
+    "self.all(g, size(self.filter(h, h.afterWave == g.afterWave)) == 1)";
+
+/// Message reported when [`METRIC_GATES_UNIQUE_WAVE_RULE`] fails.
+pub const METRIC_GATES_UNIQUE_WAVE_MESSAGE: &str =
+    "each spec.syncPolicy.metricGates entry must guard a distinct afterWave";
+
+/// CEL rule (`T20.3`): a metric-gate `provider` is a `ConfigMap` key, never a URL.
+///
+/// The `T20.3` SSRF trap guard restated at admission time: `provider` names an entry of the
+/// admin-authored `ConfigMap/ferriscd-metrics-providers-cm`, so a value shaped like `scheme://…` is
+/// refused before it is ever stored. `provider` is a required, non-nullable string, so the field is
+/// addressed directly (no optional chaining); the check is a plain `contains`, which Kubernetes CEL
+/// has supported since v1.27.
+pub const METRIC_GATE_PROVIDER_RULE: &str = "self.all(g, !g.provider.contains('://'))";
+
+/// Message reported when [`METRIC_GATE_PROVIDER_RULE`] fails.
+pub const METRIC_GATE_PROVIDER_MESSAGE: &str = "spec.syncPolicy.metricGates[].provider must name an admin-allowlisted Prometheus provider of \
+     ConfigMap/ferriscd-metrics-providers-cm, never a URL";
+
 /// One generated manifest, ready to be written to `<dir>/<file_name>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrdDocument {
@@ -211,6 +238,23 @@ fn inject_validation_rules(crd: &mut CustomResourceDefinition) {
                 (MULTI_SOURCE_EXCLUSIVE_RULE, MULTI_SOURCE_EXCLUSIVE_MESSAGE),
             ],
         );
+        // `T20.3`: the metric gates carry the server-side twin of `ApplicationSpec::validate`'s
+        // duplicate-wave refusal and the SSRF guard on `provider`. Both live on the **array**, so a
+        // stored object the API server accepted always has two distinct boundaries and no URL.
+        if let Some(sync_policy) = field_mut(spec, "syncPolicy")
+            && let Some(metric_gates) = field_mut(sync_policy, "metricGates")
+        {
+            set_rule_list(
+                metric_gates,
+                &[
+                    (
+                        METRIC_GATES_UNIQUE_WAVE_RULE,
+                        METRIC_GATES_UNIQUE_WAVE_MESSAGE,
+                    ),
+                    (METRIC_GATE_PROVIDER_RULE, METRIC_GATE_PROVIDER_MESSAGE),
+                ],
+            );
+        }
         let Some(source) = field_mut(spec, "source") else {
             continue;
         };
@@ -522,6 +566,72 @@ mod tests {
             render_crd(APPLICATION_CRD_FILE_NAME, &twice).expect("render must succeed"),
             manifest,
             "injecting the rules twice must be a no-op"
+        );
+    }
+
+    /// `T20.3` finding M3: the rendered CRD carries the metric-gate CEL rules (duplicate `afterWave`
+    /// and a URL-shaped `provider`), exactly once each, and injecting twice does not duplicate them.
+    #[test]
+    fn application_crd_carries_the_metric_gate_cel_rules() {
+        let value = serde_json::to_value(application_crd()).expect("crd must serialize");
+        let gates = &value["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["syncPolicy"]["properties"]["metricGates"];
+
+        let rules = gates["x-kubernetes-validations"]
+            .as_array()
+            .expect("spec.syncPolicy.metricGates must carry x-kubernetes-validations");
+        assert_eq!(rules.len(), 2, "exactly two rules: {rules:?}");
+        assert_eq!(
+            rules[0]["rule"],
+            serde_json::json!(METRIC_GATES_UNIQUE_WAVE_RULE)
+        );
+        assert_eq!(
+            rules[0]["message"],
+            serde_json::json!(METRIC_GATES_UNIQUE_WAVE_MESSAGE)
+        );
+        assert_eq!(
+            rules[1]["rule"],
+            serde_json::json!(METRIC_GATE_PROVIDER_RULE)
+        );
+        assert_eq!(
+            rules[1]["message"],
+            serde_json::json!(METRIC_GATE_PROVIDER_MESSAGE)
+        );
+
+        // The shape the API server can actually compile: a list macro over a structured array, no
+        // `null` comparison on a non-nullable field, and no CEL extension function (`contains` is
+        // standard, `distinct`/`sets` are not available in every supported Kubernetes version).
+        let unique = METRIC_GATES_UNIQUE_WAVE_RULE;
+        assert!(unique.contains("self.all("), "{unique}");
+        assert!(unique.contains("size(self.filter("), "{unique}");
+        assert!(!unique.contains("null"), "{unique}");
+        assert!(!unique.contains("distinct("), "{unique}");
+        assert!(
+            !METRIC_GATE_PROVIDER_RULE.contains("!= null"),
+            "provider is a required, non-nullable string: {}",
+            METRIC_GATE_PROVIDER_RULE
+        );
+        // The rule is the mirror of the offline check, so a value `validate()` refuses cannot be
+        // stored either.
+        assert!(
+            METRIC_GATE_PROVIDER_RULE.contains("://"),
+            "{METRIC_GATE_PROVIDER_RULE}"
+        );
+        assert!(
+            METRIC_GATE_PROVIDER_MESSAGE.contains("metricGates[].provider"),
+            "{METRIC_GATE_PROVIDER_MESSAGE}"
+        );
+
+        // Idempotent: a second injection renders byte-identically (a duplicated rule would show up
+        // as permanent drift in `make gate`).
+        let manifest =
+            render_crd(APPLICATION_CRD_FILE_NAME, &application_crd()).expect("render must succeed");
+        let mut twice = application_crd();
+        inject_validation_rules(&mut twice);
+        assert_eq!(
+            render_crd(APPLICATION_CRD_FILE_NAME, &twice).expect("render must succeed"),
+            manifest,
+            "injecting the metric-gate rules twice must be a no-op"
         );
     }
 

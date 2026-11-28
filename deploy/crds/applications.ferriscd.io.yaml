@@ -447,6 +447,107 @@ spec:
                         description: Re-apply live drift automatically.
                         type: boolean
                     type: object
+                  metricGates:
+                    description: |-
+                      Opt-in Prometheus metric gates that guard promotion **between** sync waves (`T20.3`).
+
+                      An entry holds the rollout after wave `afterWave` until `count` consecutive evaluations of
+                      `query` satisfy `successCondition`. A gate can only name a provider that a cluster
+                      administrator allowlisted in `ConfigMap/ferriscd-metrics-providers-cm`: the endpoint itself
+                      is never part of `ApplicationSpec`, so a tenant cannot make the controller dial an arbitrary
+                      URL (the `T20.3` SSRF trap guard).
+
+                      Additive on the wire: absent (never `[]`) when no gate is configured, so every stored
+                      `v1alpha1` object round-trips byte-identically.
+                    items:
+                      description: |-
+                        One metric gate guarding promotion *after* a sync wave (`T20.3`).
+
+                        # Why there is no `prometheusUrl` field
+
+                        The roadmap spells the field as `prometheusUrl`, "referenced via the control-plane allowlisted
+                        `ConfigMap/ferriscd-metrics-providers-cm`". That reference is modelled as an opaque **provider
+                        name** instead of a URL: `provider` is a key of that `ConfigMap`, and the controller resolves it
+                        there, one scoped read per reconcile. An arbitrary URL is therefore not representable in
+                        `ApplicationSpec` at all — the strongest possible form of the SSRF guard, since there is no field
+                        whose validation could be bypassed. `ApplicationSpec::validate` additionally rejects a value that
+                        looks like a URL (`scheme://...`) with an explicit message, so a tenant who copies a URL from a
+                        dashboard gets a terminal, actionable error instead of a gate that silently never resolves.
+                      properties:
+                        afterWave:
+                          description: |-
+                            Sync wave this gate guards: promotion **off** this wave (to the next one) waits for the gate.
+
+                            Matched against the rendered `ferriscd.io/sync-wave` numbers. A gate **on the last wave of a
+                            bundle is still gated** (`T20.3` finding M5): declaring any gate puts the operation state
+                            machine in charge of the rollout, so the gate guards the promotion out of that wave — to
+                            `PostSync`, and with it to the prune and to `Synced`. A single-wave bundle is therefore *not*
+                            ungated; it is gated on the only boundary it has.
+
+                            A gate naming a wave the bundle never renders cannot fire, because there is no boundary after
+                            it. The controller never treats that as a bypass: it logs a `Warning` naming the gate on every
+                            pass that renders a bundle the gate does not match, so the mistake is visible instead of
+                            silent.
+                          format: int32
+                          type: integer
+                        count:
+                          default: 1
+                          description: |-
+                            How many consecutive passing samples promote the rollout (default
+                            [`DEFAULT_METRIC_GATE_COUNT`]).
+                          format: uint32
+                          maximum: 10.0
+                          minimum: 1.0
+                          type: integer
+                        failureAction:
+                          default: Pause
+                          description: What a failing sample does (default [`MetricGateFailureAction::Pause`]).
+                          enum:
+                          - Pause
+                          - Rollback
+                          type: string
+                        intervalSeconds:
+                          default: 30
+                          description: |-
+                            How long to wait between two samples (default [`DEFAULT_METRIC_GATE_INTERVAL_SECONDS`]).
+
+                            The wait is always a requeue: no reconcile worker ever sleeps on a bake window.
+                          format: uint32
+                          maximum: 3600.0
+                          minimum: 1.0
+                          type: integer
+                        provider:
+                          description: |-
+                            Key of `ConfigMap/ferriscd-metrics-providers-cm` naming the Prometheus provider to query.
+
+                            Never a URL: the endpoint is configured exclusively by a cluster administrator in the
+                            control-plane namespace (`T20.3` trap guard).
+                          type: string
+                        query:
+                          description: >-
+                            PromQL query returning the measurement the gate judges (an instant vector or
+                            scalar).
+                          type: string
+                        successCondition:
+                          description: >-
+                            Condition the measurement must satisfy, e.g. `result[0] < 0.01` or `len(result)
+                            > 0`.
+                          type: string
+                      required:
+                      - afterWave
+                      - provider
+                      - query
+                      - successCondition
+                      type: object
+                    maxItems: 8
+                    type: array
+                    x-kubernetes-validations:
+                    - message: each spec.syncPolicy.metricGates entry must guard a distinct afterWave
+                      rule: self.all(g, size(self.filter(h, h.afterWave == g.afterWave)) == 1)
+                    - message: >-
+                        spec.syncPolicy.metricGates[].provider must name an admin-allowlisted
+                        Prometheus provider of ConfigMap/ferriscd-metrics-providers-cm, never a URL
+                      rule: self.all(g, !g.provider.contains('://'))
                   retry:
                     description: Bounded retry policy for failed sync operations.
                     nullable: true
@@ -821,6 +922,101 @@ spec:
                     description: Bounded human-readable progress/error message.
                     nullable: true
                     type: string
+                  metricGate:
+                    description: |-
+                      Progress of the metric gate holding this operation between waves (`T20.3`).
+
+                      Additive on the wire: `None` for every operation that does not use
+                      `spec.syncPolicy.metricGates`, so a `v1.0`-shaped `operationState` round-trips byte-identically
+                      and a state written before Phase 20 still deserializes.
+                    nullable: true
+                    properties:
+                      afterWave:
+                        default: 0
+                        description: The wave this gate guards promotion off.
+                        format: int32
+                        type: integer
+                      consecutiveErrors:
+                        default: 0
+                        description: |-
+                          How many consecutive **query** failures have been recorded since the last usable sample.
+
+                          A provider that cannot be queried must not hold a rollout open forever, so the controller
+                          fails the gate closed after a bounded number of these.
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      consecutiveSuccesses:
+                        default: 0
+                        description: How many consecutive passing samples have been recorded.
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                      failureAction:
+                        default: Pause
+                        description: |-
+                          The action this gate decided on when it failed (`T20.3` finding M4).
+
+                          Recorded instead of re-derived from `spec`, because the two are deliberately **not** the same
+                          value: a measurement breach honours `failureAction`, while a gate that could not be *evaluated*
+                          (an unparsable `successCondition`, a `4xx`, a non-JSON body, an unsupported result type)
+                          always pauses — a broken query is not evidence that the rollout regressed, so it must never
+                          trigger an automatic rollback. Persisting the decision is what keeps a resumed `Failed`
+                          verdict (a controller restart, or a re-plan of the same operating state) honest.
+
+                          Additive on the wire: absent reads as `Pause`, the safe direction.
+                        enum:
+                        - Pause
+                        - Rollback
+                        type: string
+                      fingerprint:
+                        description: |-
+                          Stable identity of the gate that produced this state.
+
+                          A truncated SHA-256 over the gate's decision inputs (wave, provider, query, condition, count),
+                          computed by the controller. A spec edit that changes any of them makes the persisted progress
+                          unusable, and the controller restarts the bake instead of crediting samples taken under
+                          different rules.
+                        type: string
+                      gatePhase:
+                        default: Pending
+                        description: |-
+                          Where the gate is in its lifecycle.
+
+                          `default` is load-bearing on the wire (`T20.3` finding M7): a `/status` that omits the field
+                          — hand-patched by an operator, written by an older build, or produced by a tool that only
+                          touches the documented top-level phase — would otherwise fail to deserialize the *whole*
+                          `operationState`, and an operation state this controller cannot read is a rollout it cannot
+                          resume. An absent phase reads as [`MetricGatePhase::Pending`], which is exactly "no sample
+                          has been taken yet".
+                        enum:
+                        - Pending
+                        - Sampling
+                        - Passed
+                        - Failed
+                        type: string
+                      lastCheckedAt:
+                        description: When the last sample (or sample attempt) was taken.
+                        format: date-time
+                        nullable: true
+                        type: string
+                      message:
+                        description: >-
+                          Bounded, secret-free explanation (the failing measurement, the provider error
+                          class).
+                        nullable: true
+                        type: string
+                      requiredSuccesses:
+                        default: 0
+                        description: |-
+                          How many consecutive passing samples are required (the spec's `count`, captured at the first
+                          sample so an operator can see the progress as `1/3`).
+                        format: uint32
+                        minimum: 0.0
+                        type: integer
+                    required:
+                    - fingerprint
+                    type: object
                   phase:
                     description: Current phase.
                     enum:

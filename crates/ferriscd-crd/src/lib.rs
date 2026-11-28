@@ -10,11 +10,14 @@ pub mod status;
 pub mod sync_window;
 
 pub use application::{
-    Application, ApplicationSpec, AutoRenderer, AutomatedSyncPolicy, DestinationSpec,
-    GitSourceSpec, HelmRenderer, IgnoreDifference, KustomizeRenderer, MAX_OCI_TAG_LEN,
-    MAX_SOURCE_REF_LEN, MAX_SOURCES, MultiSourceEntry, OCI_DIGEST_HEX_LEN, OCI_DIGEST_PREFIX,
-    OciSourceSpec, PlainYamlRenderer, RendererSpec, RetryBackoff, RetryPolicy, SourceSpec,
-    SpecValidationError, SyncOptions, SyncPolicy,
+    Application, ApplicationSpec, AutoRenderer, AutomatedSyncPolicy, DEFAULT_METRIC_GATE_COUNT,
+    DEFAULT_METRIC_GATE_INTERVAL_SECONDS, DestinationSpec, GitSourceSpec, HelmRenderer,
+    IgnoreDifference, KustomizeRenderer, MAX_METRIC_CONDITION_CHARS,
+    MAX_METRIC_GATE_INTERVAL_SECONDS, MAX_METRIC_GATE_SAMPLES, MAX_METRIC_GATES,
+    MAX_METRIC_PROVIDER_CHARS, MAX_METRIC_QUERY_CHARS, MAX_OCI_TAG_LEN, MAX_SOURCE_REF_LEN,
+    MAX_SOURCES, MetricGate, MetricGateFailureAction, MultiSourceEntry, OCI_DIGEST_HEX_LEN,
+    OCI_DIGEST_PREFIX, OciSourceSpec, PlainYamlRenderer, RendererSpec, RetryBackoff, RetryPolicy,
+    SourceSpec, SpecValidationError, SyncOptions, SyncPolicy,
 };
 pub use applicationset::{
     APPLICATIONSET_FINALIZER, APPLICATIONSET_LABEL, ApplicationSet, ApplicationSetGenerator,
@@ -29,8 +32,8 @@ pub use project::{
 };
 pub use status::{
     ActiveHook, ApplicationStatus, Condition, ConditionStatus, HealthState, HealthStatus,
-    InventoryEntry, OperationPhase, OperationState, ResourceStatus, RevisionHistoryEntry,
-    SourceSummary, SyncPhase, SyncState, SyncStatus,
+    InventoryEntry, MetricGatePhase, MetricGateState, OperationPhase, OperationState,
+    ResourceStatus, RevisionHistoryEntry, SourceSummary, SyncPhase, SyncState, SyncStatus,
 };
 pub use sync_window::{
     CompiledSchedule, CronSchedule, MAX_SEARCH_DAYS, MAX_SYNC_WINDOW_SECONDS, SyncWindow,
