@@ -749,9 +749,80 @@ mod tests {
         assert_ne!(before_hash, after_hash);
     }
 
+    /// **`T18.4` acceptance criterion.** Editing `spec.source.oci.tag`, `.digest`, or `.path`
+    /// changes `source_spec_hash`, so under `selfHeal: false` the pass executes even though the
+    /// resolved digest is unchanged (the tag→digest resolution is *not* what the gate keys on).
+    #[test]
+    fn an_oci_tag_digest_or_path_edit_changes_the_spec_hash_and_triggers_a_sync() {
+        const DIGEST: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let oci_spec = || {
+            let mut spec = spec();
+            spec.source.git = None;
+            spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+                url: "oci://ghcr.io/example/payments".to_owned(),
+                tag: Some("1.4.2".to_owned()),
+                digest: None,
+                path: "charts/api".to_owned(),
+            });
+            spec
+        };
+        let base = source_spec_hash(&oci_spec()).expect("hash");
+
+        // A `fn` pointer (not `Box<dyn Fn>`) so the table stays a plain array of non-capturing
+        // mutators — `DIGEST` is a `const`, so nothing is captured.
+        type Mutator = fn(&mut ferriscd_crd::OciSourceSpec);
+        let mutations: Vec<(&str, Mutator)> = vec![
+            ("tag", |oci| oci.tag = Some("1.5.0".to_owned())),
+            ("digest", |oci| oci.digest = Some(DIGEST.to_owned())),
+            ("path", |oci| oci.path = "charts/web".to_owned()),
+            ("url", |oci| {
+                oci.url = "oci://ghcr.io/example/billing".to_owned()
+            }),
+        ];
+        for (field, mutate) in mutations {
+            let mut mutated = oci_spec();
+            mutate(mutated.source.oci.as_mut().expect("oci source"));
+            assert_ne!(
+                source_spec_hash(&mutated).expect("hash"),
+                base,
+                "the hash must cover spec.source.oci.{field}"
+            );
+        }
+
+        // Deterministic, like the Git half.
+        assert_eq!(source_spec_hash(&oci_spec()).expect("hash"), base);
+
+        // The gate: an unchanged revision with an edited tag executes under `selfHeal: false`.
+        let mut app = app_with(Some(policy(false, false)), None);
+        app.spec.source = oci_spec().source;
+        let mut edited = app.clone();
+        edited.spec.source.oci.as_mut().expect("oci").tag = Some("1.5.0".to_owned());
+        let edited_hash = source_spec_hash(&edited.spec).expect("hash");
+
+        app.status = Some(ApplicationStatus {
+            sync: Some({
+                let mut sync = SyncState::new(SyncStatus::Synced, Some(DIGEST.to_owned()));
+                sync.last_synced_revision = Some(DIGEST.to_owned());
+                sync.last_synced_spec_hash = Some(base.clone());
+                sync
+            }),
+            ..ApplicationStatus::default()
+        });
+        assert_eq!(
+            should_sync(&app, DIGEST, &base, &summary(0, 0, 0), false),
+            SyncDecision::Skip(SkipReason::SelfHealDisabled),
+            "an unchanged digest and an unchanged spec must not re-sync"
+        );
+        assert_eq!(
+            should_sync(&app, DIGEST, &edited_hash, &summary(0, 0, 0), false),
+            SyncDecision::Execute(SyncTrigger::SourceChanged),
+            "editing the tag must trigger a sync even though no manifest moved yet"
+        );
+    }
+
     #[test]
     fn a_status_predating_the_spec_hash_triggers_one_sync() {
-        // An Application synced by `v0.2` has `lastSyncedRevision` but no `lastSyncedSpecHash`.
         // Treating the missing hash as "unchanged" would silently ignore the next spec edit, so
         // the gate must sync once and persist the hash.
         let mut app = app_with(Some(policy(false, false)), None);

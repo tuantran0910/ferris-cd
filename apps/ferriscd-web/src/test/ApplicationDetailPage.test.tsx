@@ -13,6 +13,7 @@ import {
   overridableSyncWindow,
   sampleAppDetail,
   sampleApps,
+  sampleOciAppDetail,
 } from "./fixtures";
 
 function renderDetailPage(overrides: Partial<FerrisApiClient> = {}) {
@@ -83,6 +84,9 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
     const summarySection = screen.getByLabelText(
       "Source and destination summary",
     );
+    expect(within(summarySection).getByTestId("source-kind")).toHaveTextContent(
+      "Git",
+    );
     expect(
       within(summarySection).getByText(
         "https://github.com/acme/gitops-payments.git",
@@ -107,6 +111,33 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
     expect(
       await screen.findByText("***REDACTED(sha256:9f86d081)***"),
     ).toBeInTheDocument();
+  });
+
+  it("surfaces an OCI source kind, tag and pinned digest from the API (T18.4)", async () => {
+    renderDetailPage({ getApplication: async () => sampleOciAppDetail });
+
+    expect(
+      await screen.findByRole("heading", { name: "ledger-artifact" }),
+    ).toBeInTheDocument();
+
+    const summarySection = screen.getByLabelText(
+      "Source and destination summary",
+    );
+    expect(within(summarySection).getByTestId("source-kind")).toHaveTextContent(
+      "OCI",
+    );
+    expect(within(summarySection).getByTestId("source-tag")).toHaveTextContent(
+      "1.4.2",
+    );
+    expect(within(summarySection).getByTestId("source-digest")).toHaveTextContent(
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    );
+    // The registry reference is not a Git web link, and the collapsed revision
+    // row is replaced by the two OCI facts above.
+    expect(within(summarySection).queryByRole("link")).not.toBeInTheDocument();
+    expect(
+      within(summarySection).queryByText("Target Revision"),
+    ).not.toBeInTheDocument();
   });
 
   it("explains a blocking sync window before the dialog submits (T17.4)", async () => {

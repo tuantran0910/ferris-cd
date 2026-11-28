@@ -564,12 +564,14 @@ impl RevisionHistoryEntry {
 /// Field-for-field mirror of the parts of `spec.source` that change what a revision renders
 /// (`repoURL`, `path`, `renderer`, `targetRevision`), so a history entry can explain *why* two
 /// deployments of the same repository differ. It never contains rendered manifests or bulky data.
-/// It is **not** credential-free: see [`SourceSummary::from_source`] — a Git `repoURL` that embeds
-/// userinfo is copied verbatim today.
+///
+/// An OCI source (`T18.3`) reports `oci.url` as `repoURL`, `oci.path` as `path`, and its tag (else
+/// the pinned digest) as `targetRevision`, so the schema is unchanged across the two source kinds
+/// and an operator can still tell the two deployments apart.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceSummary {
-    /// Repository clone URL (Kubernetes spelling: `repoURL`, as in `spec.source.git.repoURL`).
+    /// Repository/registry URL, as recorded by the controller (credential-free).
     #[serde(rename = "repoURL", default, skip_serializing_if = "String::is_empty")]
     pub repo_url: String,
 
@@ -597,34 +599,16 @@ impl SourceSummary {
     /// `git.repoURL`/`git.path`/`git.targetRevision` exactly as before, and an OCI application
     /// reports `oci.url`/`oci.path`/`oci.tag` (else the pinned digest) through the same three
     /// fields, so `status.history` stays metadata-only and its schema stays unchanged.
+    ///
+    /// **This constructor does not redact.** It lives in the CRD crate, which has no Git URL
+    /// grammar (the SCP-style `git@host:org/repo.git` login must survive, while a registry
+    /// reference's every `@` is userinfo), and it is a pure mapping that tests and callers use to
+    /// compare summaries. The one production site that builds a history entry —
+    /// `ferriscd_engine::sync::history::record_sync_success` — redacts the effective URL per source
+    /// kind before persisting it (finding M-D, `T18.4`).
     #[must_use]
     pub fn from_source(source: &SourceSpec) -> Self {
         Self {
-            // Exactly what `spec.source` said — **including** a Git remote's userinfo, so
-            // `status.history[].sourceSummary.repoURL` can carry `https://user:token@host/repo.git`
-            // as written (finding M-D). Redaction is deliberately *not* done here.
-            //
-            // The OCI half is clean because of the *offline* gate that runs today: the controller
-            // validates `spec` (`ApplicationSpec::validate` -> `OciSourceSpec::validate` ->
-            // `validate_oci_reference_url`) on every pass before an operation can succeed, and that
-            // rule refuses `@` in the URL authority. `OciSourceSpec::validate` is not an admission
-            // check — there is no validating webhook, only the injected CEL rules run at admission
-            // — so a stored spec may still carry userinfo; it is refused at reconcile. In this
-            // build the engine never runs for an OCI source (it is refused terminally before any
-            // fetch); `T18.4` installs `OciSource::validate` as the second gate for the real fetch
-            // path.
-            //
-            // Entries are appended by the controller through `record_operation_success`, which
-            // refuses a non-`Succeeded` operation; `record_sync_success` itself does not check the
-            // phase.
-            //
-            // TODO(T18.4): redact `repoURL` for good. `record_sync_success`
-            // (`ferriscd-engine/src/sync/history.rs`) is the one production site that builds a
-            // history entry from a `SourceSpec`, and it sits next to `redact_repo_url`; flipping it
-            // there is the minimal fix. The durable place is this constructor, but `from_source`
-            // cannot reuse `redact_url_userinfo` from `application.rs`: that OCI-shaped rule
-            // redacts every `@`, while the Git rule must keep the SCP-style
-            // `git@host:org/repo.git` form, so a Git-aware rule would have to be duplicated here.
             repo_url: source.repo_url().to_owned(),
             path: source.source_path().to_owned(),
             renderer: source.renderer.clone(),

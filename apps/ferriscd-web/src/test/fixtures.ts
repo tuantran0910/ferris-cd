@@ -40,6 +40,7 @@ export const sampleApps: ApplicationSummary[] = [
     resourceCount: 15,
     observedGeneration: 4,
     source: {
+      sourceType: "git",
       repoUrl: "https://github.com/acme/gitops-payments.git",
       path: "deploy/prod",
       targetRevision: "main",
@@ -85,6 +86,7 @@ export const sampleApps: ApplicationSummary[] = [
     resourceCount: 8,
     observedGeneration: 2,
     source: {
+      sourceType: "git",
       repoUrl: "https://github.com/acme/gitops-storefront.git",
       path: "charts/checkout",
       targetRevision: "v2.4.0",
@@ -113,6 +115,7 @@ export const sampleApps: ApplicationSummary[] = [
     resourceCount: 22,
     observedGeneration: 7,
     source: {
+      sourceType: "git",
       repoUrl: "https://github.com/acme/gitops-platform.git",
       path: "monitoring",
       targetRevision: "HEAD",
@@ -135,6 +138,73 @@ export const sampleApps: ApplicationSummary[] = [
     conditions: [],
   },
 ];
+
+/**
+ * An OCI-sourced `Application` (`T18.4`): `sourceType: "oci"` with a tag to
+ * resolve *and* the digest the operator pinned, which are the two facts the
+ * source panel has to render separately.
+ */
+export const sampleOciApp: ApplicationSummary = {
+  namespace: "ferriscd-system",
+  name: "ledger-artifact",
+  project: "payments",
+  resourceCount: 4,
+  observedGeneration: 1,
+  source: {
+    sourceType: "oci",
+    repoUrl: "oci://registry.ferriscd-system.svc:5000/payments/ledger",
+    path: "charts/ledger",
+    targetRevision: "1.4.2",
+    tag: "1.4.2",
+    digest:
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    renderer: "helm",
+  },
+  destination: {
+    cluster: "in-cluster",
+    namespace: "payments",
+  },
+  sync: {
+    status: "Synced",
+    revision:
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    lastSyncedRevision:
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    lastSyncedAt: "2026-11-25T20:10:00Z",
+  },
+  health: {
+    status: "Healthy",
+    message: null,
+  },
+  conditions: [],
+};
+
+export const sampleOciAppDetail: ApplicationDetailView = {
+  application: sampleOciApp,
+  history: [
+    {
+      id: 1,
+      revision:
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      deployedAt: "2026-11-24T09:00:00Z",
+    },
+    {
+      id: 2,
+      revision:
+        "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+      deployedAt: "2026-11-25T20:10:00Z",
+    },
+  ],
+  operation: {
+    phase: "Succeeded",
+    currentWave: 0,
+    startedAt: "2026-11-25T20:09:50Z",
+    finishedAt: "2026-11-25T20:10:00Z",
+    revision:
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    message: "Applied wave 0 cleanly",
+  },
+};
 
 export const sampleAppDetail: ApplicationDetailView = {
   application: sampleApps[0]!,

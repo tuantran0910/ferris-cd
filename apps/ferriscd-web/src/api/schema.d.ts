@@ -839,15 +839,44 @@ export interface components {
              */
             id: number;
         };
-        /** @description `spec.source` summary. */
+        /**
+         * @description `spec.source` summary.
+         *
+         *     `T18.4` added the source **kind** and, for an OCI artifact, its `tag` and pinned `digest`. The
+         *     fields are additive: a Git `Application` keeps `sourceType: "git"` with no `tag`/`digest` key at
+         *     all, so an existing client sees exactly the payload it saw before.
+         *
+         *     **Client/server skew (finding M6).** `sourceType` is *new*, so a `v1.1` server does not send it.
+         *     Deserializing therefore defaults to `"git"` (the only source kind that version could serve)
+         *     instead of failing the whole response, while the **response** schema keeps the field required
+         *     (`#[schema(required = true)]`) — a `v1.2` server always fills it in, and the generated
+         *     TypeScript client must keep treating it as present.
+         */
         SourceView: {
-            /** @description Path inside the repository. */
+            /**
+             * @description Pinned OCI manifest digest (`spec.source.oci.digest`, `sha256:<64-hex>`); never set by a
+             *     resolution — this is what the `Application` *pinned*, not what the registry answered.
+             */
+            digest?: string | null;
+            /** @description Path inside the repository (`""` for its root). */
             path: string;
             /** @description Selected renderer (`auto`, `plainYaml`, `kustomize`, `helm`). */
             renderer: string;
-            /** @description Repository URL, redacted (a remote URL may carry a token). */
+            /** @description Repository or registry URL, redacted (a remote URL may carry a token). */
             repoUrl: string;
-            /** @description Requested revision (branch, tag, or `HEAD`). */
+            /**
+             * @description Source kind (`git` or `oci`).
+             *
+             *     Defaults to `git` when absent: an older server has no OCI support, so every source it can
+             *     report *is* a Git source.
+             */
+            sourceType: string;
+            /**
+             * @description OCI tag to resolve (`spec.source.oci.tag`); absent for a Git source and for a digest-only
+             *     reference.
+             */
+            tag?: string | null;
+            /** @description Requested revision (`spec.source.git.targetRevision`, else `oci.tag`, else `oci.digest`). */
             targetRevision: string;
         };
         /** @description `POST .../sync` request body. */

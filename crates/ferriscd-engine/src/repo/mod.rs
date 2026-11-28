@@ -11,6 +11,7 @@ pub mod fake;
 pub mod gix_client;
 pub(crate) mod mirror;
 pub mod oci;
+pub mod registry;
 pub mod sanitize;
 pub mod types;
 
@@ -27,11 +28,14 @@ pub use oci::{
     DIGEST_HEX_LEN, DIGEST_PREFIX, FLUX_BUNDLE_MEDIA_TYPE, HELM_CHART_MEDIA_TYPE,
     MAX_MANIFEST_BYTES, OCI_IMAGE_LAYER_MEDIA_TYPE, OciClient, OciDescriptor, OciFuture,
     OciManifest, OciSource, OciUrlPolicy, ResolvedDigest, extract_artifact, extract_layer,
-    is_supported_layer_media_type, sha256_digest, validate_digest, verify_digest,
+    extract_spooled_layer, is_supported_layer_media_type, sha256_digest, validate_digest,
+    verify_digest,
 };
 #[cfg(any(test, feature = "test-utils"))]
-pub use oci::{FakeOciClient, FakeOciClientConfig};
+pub use oci::{FakeOciClient, FakeOciClientConfig, artifact_manifest, tar_gzip_layer};
+pub use registry::{RegistryOciClient, RegistryOciClientConfig};
 pub use sanitize::{WorktreeLimits, sanitize_worktree};
+pub(crate) use types::redact_oci_url_credentials;
 pub use types::{
     GitSource, RepoCheckout, RepoCredentials, RepoUrlPolicy, ResolvedRevision, validate_commit_sha,
     validate_repo_url,

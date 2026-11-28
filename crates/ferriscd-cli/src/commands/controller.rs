@@ -52,10 +52,15 @@ pub struct ControllerArgs {
     #[arg(long = "application-namespaces", value_name = "NAMESPACES")]
     pub application_namespaces: Option<String>,
 
-    /// Allow `file://` URLs and local filesystem paths as Git sources.
+    /// Allow `file://` URLs and local filesystem paths as Git sources, **and** plaintext
+    /// `http://` OCI registries.
     ///
-    /// Off by default: production only accepts `https://`, `ssh://` and SCP-style SSH remotes.
-    /// Enable this only for local `kind` demos and integration tests.
+    /// Off by default: production accepts only `https://`, `ssh://` and SCP-style SSH Git remotes,
+    /// and only HTTPS (or `oci://`, which is HTTPS) registry transports. One flag governs both
+    /// source kinds, because both relaxations exist for the same reason — a local `kind` demo with
+    /// `file://` fixtures and an in-cluster `registry:2`. Each relaxation logs a startup `warn!`.
+    /// Never use this in production: a plaintext registry or repository can be read and rewritten
+    /// by anything on the path.
     #[arg(long = "allow-local-repos")]
     pub allow_local_repos: bool,
 
@@ -73,6 +78,21 @@ pub struct ControllerArgs {
     /// Only use this on a throwaway local cluster.
     #[arg(long = "allow-insecure-cluster-tls")]
     pub allow_insecure_cluster_tls: bool,
+
+    /// Accept an OCI registry's token service on an additional host (`host` or `host:port`).
+    ///
+    /// A registry answers `401` with `WWW-Authenticate: Bearer realm="…"`, and answering it is the
+    /// one place FerrisCD sends a repository `Secret`'s credential to a host the *registry* chose.
+    /// The realm must therefore be the registry's own authority; this flag names the exceptions
+    /// (a Harbor deployment with an external token service, a corporate proxy in front of ECR/GAR).
+    /// Docker Hub's `auth.docker.io` is accepted without it. Repeat the flag or pass a
+    /// comma-separated list — never a wildcard.
+    #[arg(
+        long = "oci-token-service-hosts",
+        value_name = "HOST",
+        value_delimiter = ','
+    )]
+    pub oci_token_service_hosts: Vec<String>,
 
     /// Stamp `ferriscd.io/managed-by` and `ferriscd.io/app-hash` labels on managed resources.
     ///
@@ -462,6 +482,9 @@ pub(crate) fn run_options(args: ControllerArgs) -> ferriscd_controller::RunOptio
         allow_local_repos: args.allow_local_repos,
         work_root: args.work_root,
         allow_insecure_clusters: args.allow_insecure_cluster_tls,
+        // `T18.4` (finding M5): the named exceptions to "a registry's token service is on the
+        // registry's own authority". Empty by default; never widened implicitly.
+        oci_token_service_hosts: args.oci_token_service_hosts,
         // `T18.1`: `--enable-drift-watcher` / `FERRISCD_ENABLE_DRIFT_WATCHER`. Off means the apply
         // body keeps only the `ferriscd.io/tracking-id` annotation, exactly as before `v1.2`.
         enable_drift_watcher: args.enable_drift_watcher,
@@ -818,6 +841,36 @@ mod tests {
         assert_eq!(args.namespace.as_deref(), Some("apps"));
         assert!(args.allow_local_repos);
         assert_eq!(args.work_root, Some(PathBuf::from("/var/run/ferriscd")));
+    }
+
+    /// `T18.4` (finding M5): the token-service allow-list is opt-in, empty by default, and accepts
+    /// either spelling (repeated flag or comma-separated list) — with nothing being widened
+    /// implicitly.
+    #[test]
+    fn controller_parses_the_oci_token_service_hosts_flag() {
+        let unset = parse(&["ferriscd", "controller"]);
+        assert!(
+            unset.oci_token_service_hosts.is_empty(),
+            "no host may be allowed implicitly: {:?}",
+            unset.oci_token_service_hosts
+        );
+
+        let listed = parse(&[
+            "ferriscd",
+            "controller",
+            "--oci-token-service-hosts",
+            "auth.example.com,127.0.0.1:5001",
+            "--oci-token-service-hosts",
+            "auth.example.net",
+        ]);
+        assert_eq!(
+            listed.oci_token_service_hosts,
+            vec![
+                "auth.example.com".to_owned(),
+                "127.0.0.1:5001".to_owned(),
+                "auth.example.net".to_owned(),
+            ]
+        );
     }
 
     #[test]

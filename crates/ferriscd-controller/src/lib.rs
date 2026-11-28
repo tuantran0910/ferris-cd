@@ -212,11 +212,17 @@ pub struct RunOptions {
     /// namespace; the control-plane namespace is always watched.
     pub application_namespaces: Option<String>,
 
-    /// Accept `file://` URLs and local filesystem paths as Git sources.
+    /// Accept `file://` URLs and local filesystem paths as Git sources, **and** plaintext `http://`
+    /// OCI registries.
     ///
-    /// Off by default: production only allows `https://`/`ssh://`/SCP-style remotes, so an
-    /// `Application` can never read the controller pod's filesystem. Tests and local `kind`
-    /// demos must opt in explicitly (see `docs/lessons/06-inventory-tracking-and-live-state.md`).
+    /// Off by default: production only allows `https://`/`ssh://`/SCP-style Git remotes and
+    /// HTTPS-only registry transports (`oci://`/`https://`), so an `Application` can never read the
+    /// controller pod's filesystem or dial a registry in the clear. One flag relaxes both source
+    /// kinds because both exist for the same local-development reason (a `kind` demo with
+    /// `file://` fixtures and an in-cluster `registry:2`), and each relaxation is logged at
+    /// `warn!` on startup. Tests and local demos must opt in explicitly (see
+    /// `docs/lessons/06-inventory-tracking-and-live-state.md` and
+    /// `docs/lessons/18-drift-watchers-and-oci-gitops-sources.md`).
     pub allow_local_repos: bool,
 
     /// Directory holding the Git mirror cache and materialized worktrees.
@@ -230,6 +236,17 @@ pub struct RunOptions {
     /// Off by default: a remote cluster's manifests and credentials would otherwise cross an
     /// unverified connection, where anything on the path can read and rewrite them.
     pub allow_insecure_clusters: bool,
+
+    /// Extra hosts (as `host` or `host:port`) allowed to act as an OCI registry's **token service**
+    /// (`T18.4`, finding M5).
+    ///
+    /// Empty by default, which means "the registry's own authority only". A `401` challenge names
+    /// the token endpoint (`WWW-Authenticate: Bearer realm=…`), and answering it is the one place a
+    /// `Secret`'s registry credential is sent to a host the registry chose — so a realm on another
+    /// authority is refused unless it is listed here. Docker Hub (`auth.docker.io`) is allowed
+    /// out of the box; anything else (a corporate proxy in front of ECR/GAR, a Harbor deployment
+    /// with an external token service) has to be named by the operator.
+    pub oci_token_service_hosts: Vec<String>,
 
     /// Stamp the `ferriscd.io/managed-by` / `ferriscd.io/app-hash` ownership labels (`T18.1`).
     ///
@@ -1083,15 +1100,61 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     } else {
         ferriscd_engine::repo::RepoUrlPolicy::Production
     };
+    // `T18.4`: one policy governs both source kinds. The flag is a *local-development* opt-in —
+    // plaintext Git remotes and plaintext OCI registries — because that is what a `kind` demo needs
+    // (`file://` fixtures and an in-cluster `registry:2`); in production both stay HTTPS-only, so
+    // an `Application` can never make the controller dial a plaintext endpoint it does not own.
+    let oci_url_policy = if options.allow_local_repos {
+        tracing::warn!(
+            "allowing plaintext http:// OCI registries (--allow-local-repos) for OCI artifact \
+             sources (spec.source.oci); never use this in production"
+        );
+        ferriscd_engine::repo::OciUrlPolicy::AllowLocal
+    } else {
+        ferriscd_engine::repo::OciUrlPolicy::Production
+    };
     let git = ferriscd_engine::repo::GixGitClient::new(
         ferriscd_engine::repo::GixGitClientConfig::new()
             .with_url_policy(url_policy)
             .with_work_root(&work_root),
     );
+    // One `RepoCacheConfig` for both sources: the OCI client extracts into the same work root and
+    // charges the same `WorktreeLimits`, so a deployment that sized its `emptyDir` (and any future
+    // `--worktree-*` flag) covers Git worktrees and OCI extractions with one number.
+    let repo_config = ferriscd_engine::repo::RepoCacheConfig::new(&work_root);
     let repos = Arc::new(ferriscd_engine::repo::RepoCache::new(
         Arc::new(git),
-        ferriscd_engine::repo::RepoCacheConfig::new(&work_root),
+        repo_config.clone(),
     ));
+    // `T18.4`: the live registry transport. Built eagerly so a broken TLS configuration is a
+    // startup failure instead of an `Application` that fails forever, and bounded by the same work
+    // root and budgets as the Git cache.
+    let oci = Arc::new(
+        ferriscd_engine::repo::RegistryOciClient::new(
+            ferriscd_engine::repo::RegistryOciClientConfig::new(&work_root)
+                .with_url_policy(oci_url_policy)
+                .with_worktree_limits(repo_config.worktree_limits)
+                // `T18.4`, finding M5: a token service on another authority is refused unless the
+                // operator named it. Never a wildcard — this is where the registry credential goes.
+                .with_token_service_hosts(options.oci_token_service_hosts.iter().cloned()),
+        )
+        .context("failed to build the OCI registry client for spec.source.oci")?,
+    );
+    if !options.oci_token_service_hosts.is_empty() {
+        tracing::warn!(
+            token_service_hosts = ?options.oci_token_service_hosts,
+            "accepting OCI token services on additional hosts (--oci-token-service-hosts): \
+             registry credentials may be sent to them when a registry advertises them"
+        );
+    }
+    tracing::info!(
+        work_root = %work_root.display(),
+        max_files = repo_config.worktree_limits.max_files,
+        max_bytes = repo_config.worktree_limits.max_bytes,
+        allow_local = oci_url_policy == ferriscd_engine::repo::OciUrlPolicy::AllowLocal,
+        token_service_hosts = options.oci_token_service_hosts.len(),
+        "OCI artifact sources (spec.source.oci): digest-pinned, HTTPS-only registry transport"
+    );
 
     // `T12.3`: ONE shared HTTP/TLS connector for every impersonated identity, built once from the
     // controller's own `kube::Config` (see `impersonation::ImpersonationPool`). It is created
@@ -1279,6 +1342,10 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     // `T13.1`: `spec.destination.cluster` is resolved through the registry. Without this every
     // non-`in-cluster` destination is a terminal error, which is the pre-Phase-13 behaviour.
     .with_cluster_source(clusters.clone())
+    // `T18.4`: `spec.source.oci` is materialized through the bounded registry transport, under the
+    // same local-development opt-in that governs the Git remote policy.
+    .with_oci_client(oci)
+    .with_oci_url_policy(oci_url_policy)
     // `T15.1`: Git fetch latency and the render-cache hit/miss bridge.
     .with_metrics(metrics.clone())
     // `T17.2`: compliance audit emission for ServiceAccount impersonation resolutions.

@@ -1,8 +1,14 @@
-import { FolderGit2, Server } from "lucide-react";
+import { Boxes, FolderGit2, Server } from "lucide-react";
 import type { ApplicationSummary } from "../../../api/types";
+import { Badge } from "../../../ui/Badge";
 import { Card } from "../../../ui/Card";
 import { repoWebUrl } from "../../../utils/format";
 import { SyncMetadata } from "./SyncMetadata";
+
+/** The two source kinds the API reports (`SourceView.sourceType`, `T18.4`). */
+function isOciSource(app: ApplicationSummary): boolean {
+  return app.source.sourceType === "oci";
+}
 
 /**
  * Source / Destination / Sync Metadata summary.
@@ -13,19 +19,34 @@ import { SyncMetadata } from "./SyncMetadata";
  * screen-reader users navigate by.
  */
 export function SourcePanel({ app }: { app: ApplicationSummary }) {
+  const oci = isOciSource(app);
   return (
     <section
       aria-label="Source and destination summary"
       className="grid grid-cols-1 gap-4 md:grid-cols-3"
     >
-      <Card className="text-xs">
+      <Card className="text-xs" data-testid="source-card">
         <p className="flex items-center gap-1.5 font-semibold uppercase tracking-wider text-slate-400">
-          <FolderGit2 className="h-3.5 w-3.5 text-indigo-400" />
+          {oci ? (
+            <Boxes className="h-3.5 w-3.5 text-fuchsia-400" />
+          ) : (
+            <FolderGit2 className="h-3.5 w-3.5 text-indigo-400" />
+          )}
           Source
+          <Badge
+            data-testid="source-kind"
+            tone={oci ? "fuchsia" : "neutral"}
+            size="sm"
+            className="ml-1 tracking-normal"
+          >
+            {oci ? "OCI" : "Git"}
+          </Badge>
         </p>
         <dl className="mt-3 space-y-1.5">
           <div>
-            <dt className="text-slate-500">Repository</dt>
+            <dt className="text-slate-500">
+              {oci ? "Registry" : "Repository"}
+            </dt>
             <dd
               className="break-all font-mono text-slate-200"
               title={app.source.repoUrl}
@@ -53,15 +74,61 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
               {app.source.path}
             </dd>
           </div>
-          <div className="flex justify-between gap-3">
-            <dt className="shrink-0 text-slate-500">Target Revision</dt>
-            <dd
-              className="min-w-0 break-all text-right font-mono text-slate-200"
-              title={app.source.targetRevision}
-            >
-              {app.source.targetRevision}
-            </dd>
-          </div>
+          {/*
+            `T18.4`: an OCI source reports the *tag it resolves* and the
+            *digest it pinned* separately — those are different facts, and
+            "Target Revision" (which collapses them into one string) would hide
+            the pin. A Git source keeps the row it always had.
+          */}
+          {oci ? (
+            <>
+              {app.source.tag ? (
+                <div className="flex justify-between gap-3">
+                  <dt className="shrink-0 text-slate-500">Tag</dt>
+                  <dd
+                    data-testid="source-tag"
+                    className="min-w-0 break-all text-right font-mono text-slate-200"
+                    title={app.source.tag}
+                  >
+                    {app.source.tag}
+                  </dd>
+                </div>
+              ) : null}
+              {app.source.digest ? (
+                <div className="flex justify-between gap-3">
+                  <dt className="shrink-0 text-slate-500">Digest</dt>
+                  <dd
+                    data-testid="source-digest"
+                    className="min-w-0 break-all text-right font-mono text-slate-200"
+                    title={app.source.digest}
+                  >
+                    {app.source.digest}
+                  </dd>
+                </div>
+              ) : null}
+              {!app.source.tag && !app.source.digest ? (
+                <div className="flex justify-between gap-3">
+                  <dt className="shrink-0 text-slate-500">Target Revision</dt>
+                  <dd
+                    className="min-w-0 break-all text-right font-mono text-slate-200"
+                    title={app.source.targetRevision}
+                  >
+                    {app.source.targetRevision}
+                  </dd>
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <div className="flex justify-between gap-3">
+              <dt className="shrink-0 text-slate-500">Target Revision</dt>
+              <dd
+                className="min-w-0 break-all text-right font-mono text-slate-200"
+                title={app.source.targetRevision}
+              >
+                {app.source.targetRevision}
+              </dd>
+            </div>
+          )}
           <div className="flex justify-between gap-3">
             <dt className="shrink-0 text-slate-500">Renderer</dt>
             <dd className="min-w-0 break-all text-right font-mono text-slate-200">

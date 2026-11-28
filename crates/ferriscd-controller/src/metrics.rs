@@ -24,6 +24,7 @@
 //! | `ferriscd_app_sync_status` | gauge | `app_namespace`, `app_name`, `status` | apps × 3 |
 //! | `ferriscd_app_health_status` | gauge | `app_namespace`, `app_name`, `status` | apps × 6 |
 //! | `ferriscd_git_fetch_duration_seconds` | histogram | — | 1 |
+//! | `ferriscd_source_fetch_duration_seconds` | histogram | `source_kind` | 2 |
 //! | `ferriscd_render_cache_total` | counter | `outcome` | 2 |
 //! | `ferriscd_active_reconciles` | gauge | — | 1 |
 //! | `ferriscd_drift_watcher_fallback_total` | counter | `reason` | 3 |
@@ -118,7 +119,20 @@ pub const APP_SYNC_STATUS: &str = "ferriscd_app_sync_status";
 pub const APP_HEALTH_STATUS: &str = "ferriscd_app_health_status";
 
 /// Scraped name of the Git fetch latency histogram.
+///
+/// `T18.4` added the labelled [`SOURCE_FETCH_DURATION_SECONDS`] family for both source kinds; this
+/// unlabelled one is kept so the dashboards and alerts written against `T15.1` keep working.
 pub const GIT_FETCH_DURATION_SECONDS: &str = "ferriscd_git_fetch_duration_seconds";
+
+/// Scraped name of the source-fetch latency histogram, labelled by `source_kind` (`T18.4`).
+pub const SOURCE_FETCH_DURATION_SECONDS: &str = "ferriscd_source_fetch_duration_seconds";
+
+/// The `source_kind` label values (`T18.4`).
+///
+/// A **closed enum rendered as `&'static str`**, exactly like the other bounded labels: the registry
+/// host, the repository, the tag and the digest are all high-cardinality (and the digest is
+/// attacker-influenced), so none of them may ever become a label (`T18.4` trap guard).
+pub const SOURCE_KINDS: [&str; 2] = ["git", "oci"];
 
 /// Registered name of the render-cache counter (see [`RECONCILE_COUNTER`] for the `_total` suffix).
 pub const RENDER_CACHE_COUNTER: &str = "ferriscd_render_cache";
@@ -306,6 +320,44 @@ impl CacheOutcome {
         match self {
             Self::Hit => CACHE_OUTCOMES[0],
             Self::Miss => CACHE_OUTCOMES[1],
+        }
+    }
+}
+
+/// Which kind of source a fetch resolved (`T18.4`).
+///
+/// The `source_kind` label set ([`SOURCE_KINDS`]). Deliberately a two-variant enum: a registry host,
+/// a repository, a tag or a digest would each be an unbounded series, and a digest is directly
+/// attacker-influenced (`T18.4` trap guard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// A Git repository (`spec.source.git`).
+    Git,
+    /// An OCI artifact (`spec.source.oci`).
+    Oci,
+}
+
+impl SourceKind {
+    /// The label value. Always one of [`SOURCE_KINDS`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Git => SOURCE_KINDS[0],
+            Self::Oci => SOURCE_KINDS[1],
+        }
+    }
+}
+
+/// `source_kind` label set for [`SOURCE_FETCH_DURATION_SECONDS`] (`T18.4`).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct SourceKindLabels {
+    source_kind: &'static str,
+}
+
+impl SourceKindLabels {
+    fn of(source_kind: SourceKind) -> Self {
+        Self {
+            source_kind: source_kind.as_str(),
         }
     }
 }
@@ -581,6 +633,7 @@ pub struct Metrics {
     app_sync_status: Family<AppStatusLabels, Gauge>,
     app_health_status: Family<AppStatusLabels, Gauge>,
     git_fetch_duration: Histogram,
+    source_fetch_duration: Family<SourceKindLabels, Histogram>,
     render_cache_total: Family<OutcomeLabels, Counter>,
     active_reconciles: Gauge,
     rbac_reload_total: Family<OutcomeLabels, Counter>,
@@ -611,12 +664,13 @@ impl std::fmt::Debug for Metrics {
 /// **Advisory only:** it is hand-maintained documentation of the registry, not the source of truth
 /// — the registration in [`Metrics::new`] and the `T15.1` tests are. A family added there without a
 /// row here does not break anything (and is caught by the tests), it just reads as an omission.
-const FAMILY_DESCRIPTIONS: [(&str, &str); 16] = [
+const FAMILY_DESCRIPTIONS: [(&str, &str); 17] = [
     (RECONCILE_DURATION_SECONDS, "histogram"),
     (RECONCILE_TOTAL, "counter"),
     (APP_SYNC_STATUS, "gauge"),
     (APP_HEALTH_STATUS, "gauge"),
     (GIT_FETCH_DURATION_SECONDS, "histogram"),
+    (SOURCE_FETCH_DURATION_SECONDS, "histogram"),
     (RENDER_CACHE_TOTAL, "counter"),
     (ACTIVE_RECONCILES, "gauge"),
     (RBAC_RELOAD_TOTAL, "counter"),
@@ -649,6 +703,8 @@ impl Metrics {
         let app_sync_status = Family::<AppStatusLabels, Gauge>::default();
         let app_health_status = Family::<AppStatusLabels, Gauge>::default();
         let git_fetch_duration = latency_histogram();
+        let source_fetch_duration =
+            Family::<SourceKindLabels, Histogram>::new_with_constructor(latency_histogram);
         let render_cache_total = Family::<OutcomeLabels, Counter>::default();
         let active_reconciles = Gauge::default();
         let rbac_reload_total = Family::<OutcomeLabels, Counter>::default();
@@ -685,6 +741,11 @@ impl Metrics {
             GIT_FETCH_DURATION_SECONDS,
             "Wall-clock duration of the Git resolve/checkout of one Application",
             git_fetch_duration.clone(),
+        );
+        registry.register(
+            SOURCE_FETCH_DURATION_SECONDS,
+            "Wall-clock duration of resolving and materializing one Application source, by source kind",
+            source_fetch_duration.clone(),
         );
         registry.register(
             RENDER_CACHE_COUNTER,
@@ -749,6 +810,7 @@ impl Metrics {
             app_sync_status,
             app_health_status,
             git_fetch_duration,
+            source_fetch_duration,
             render_cache_total,
             active_reconciles,
             rbac_reload_total,
@@ -793,6 +855,13 @@ impl Metrics {
             metrics
                 .render_cache_total
                 .get_or_create_owned(&OutcomeLabels::of(outcome));
+        }
+        // `T18.4`: both source kinds are zero-instantiated, so a fresh replica exposes
+        // `source_kind="git"` and `source_kind="oci"` before its first fetch.
+        for source_kind in [SourceKind::Git, SourceKind::Oci] {
+            metrics
+                .source_fetch_duration
+                .get_or_create_owned(&SourceKindLabels::of(source_kind));
         }
         for outcome in [
             RbacReloadOutcome::Ok,
@@ -1004,8 +1073,23 @@ impl Metrics {
     }
 
     /// Records one Git resolve/checkout duration in seconds.
+    ///
+    /// Writes both the historical unlabelled `ferriscd_git_fetch_duration_seconds` family and the
+    /// `T18.4` labelled one, so existing dashboards keep working while `source_kind` becomes
+    /// queryable.
     pub fn record_git_fetch(&self, duration: Duration) {
         self.git_fetch_duration.observe(duration.as_secs_f64());
+        self.record_source_fetch(SourceKind::Git, duration);
+    }
+
+    /// Records one source resolve/materialize duration, by `source_kind` (`T18.4`).
+    ///
+    /// The only label is the closed [`SourceKind`] enum, so the registry host, the repository, the
+    /// tag and the digest can never widen the series count.
+    pub fn record_source_fetch(&self, source_kind: SourceKind, duration: Duration) {
+        self.source_fetch_duration
+            .get_or_create_owned(&SourceKindLabels::of(source_kind))
+            .observe(duration.as_secs_f64());
     }
 
     /// Bridges the engine's cumulative [`RenderCache`](ferriscd_engine::manifest::RenderCache)
@@ -1590,6 +1674,68 @@ mod tests {
         assert_eq!(exposition::samples_of(&samples, APP_HEALTH_STATUS).len(), 6);
     }
 
+    /// **Finding H1.** One Git fetch is **one** observation of each family.
+    ///
+    /// `record_git_fetch` writes the historical unlabelled
+    /// `ferriscd_git_fetch_duration_seconds` family *and* forwards to
+    /// `record_source_fetch(SourceKind::Git, …)`. A caller that also calls `record_source_fetch`
+    /// itself therefore doubles the `source_kind="git"` series — which is exactly what the Git
+    /// path in `sync.rs` used to do, making a dashboard that sums both families report two fetches
+    /// per fetch. The assertion is on the observation counts, not on the presence of a series: a
+    /// double-recorded observation still "has" the series.
+    #[test]
+    fn one_git_fetch_records_exactly_one_observation_per_family() {
+        let metrics = Metrics::new();
+        metrics.record_git_fetch(Duration::from_millis(20));
+
+        let (body, samples) = scrape(&metrics);
+        assert_eq!(
+            exposition::value_of(
+                &samples,
+                &count_series(GIT_FETCH_DURATION_SECONDS),
+                &[],
+                &body
+            ),
+            "1",
+            "the historical unlabelled family carries one observation:\n{body}"
+        );
+        assert_eq!(
+            exposition::value_of(
+                &samples,
+                &count_series(SOURCE_FETCH_DURATION_SECONDS),
+                &[("source_kind", "git")],
+                &body
+            ),
+            "1",
+            "`record_git_fetch` already forwards to the labelled family; recording it twice would \
+             read `2` here:\n{body}"
+        );
+        // Non-vacuity: the very same family still counts a *second* source kind, so the `git` value
+        // above is not the whole family's total.
+        metrics.record_source_fetch(SourceKind::Oci, Duration::from_millis(30));
+        let (body, samples) = scrape(&metrics);
+        assert_eq!(
+            exposition::value_of(
+                &samples,
+                &count_series(SOURCE_FETCH_DURATION_SECONDS),
+                &[("source_kind", "oci")],
+                &body
+            ),
+            "1",
+            "{body}"
+        );
+        assert_eq!(
+            exposition::value_of(
+                &samples,
+                &count_series(SOURCE_FETCH_DURATION_SECONDS),
+                &[("source_kind", "git")],
+                &body
+            ),
+            "1",
+            "an OCI fetch must not advance the `git` series:\n{body}"
+        );
+    }
+
     /// **Verification bullet:** after a (fake) reconcile the scraped values are the ones the pass
     /// produced — the in-flight gauge, the result counter/histogram, the two status gauges, the Git
     /// fetch histogram and the render-cache counter.
@@ -1628,6 +1774,7 @@ mod tests {
             &status(SyncStatus::Synced, HealthStatus::Healthy),
         );
         metrics.record_git_fetch(Duration::from_millis(20));
+        metrics.record_source_fetch(SourceKind::Oci, Duration::from_millis(30));
         metrics.record_render_cache(RenderCacheStats {
             hits: 1,
             misses: 1,
@@ -1743,6 +1890,9 @@ mod tests {
             entries: 1,
             capacity: 1,
         });
+        // `T18.4`: both `source_kind` values, so the assertion below cannot pass vacuously.
+        metrics.record_git_fetch(Duration::from_millis(5));
+        metrics.record_source_fetch(SourceKind::Oci, Duration::from_millis(7));
         metrics.record_render_cache(RenderCacheStats {
             hits: 1,
             misses: 1,
@@ -1791,6 +1941,13 @@ mod tests {
         assert_eq!(
             exposition::label_values(&samples, RENDER_CACHE_TOTAL, "outcome"),
             CACHE_OUTCOMES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+        );
+        assert_eq!(
+            exposition::label_values(&samples, SOURCE_FETCH_DURATION_SECONDS, "source_kind"),
+            SOURCE_KINDS
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect()
@@ -1880,12 +2037,15 @@ mod tests {
 
         let (body, samples) = scrape(&metrics);
         let families = exposition::label_names(&samples);
-        let expected: [(&str, &[&str]); 16] = [
+        let expected: [(&str, &[&str]); 17] = [
             (RECONCILE_DURATION_SECONDS, &["result", "le"]),
             (RECONCILE_TOTAL, &["result"]),
             (APP_SYNC_STATUS, &["app_namespace", "app_name", "status"]),
             (APP_HEALTH_STATUS, &["app_namespace", "app_name", "status"]),
             (GIT_FETCH_DURATION_SECONDS, &["le"]),
+            // `T18.4`: the source-fetch histogram is labelled by the closed `source_kind` enum only
+            // — never by a registry host, a repository, a tag or a digest.
+            (SOURCE_FETCH_DURATION_SECONDS, &["source_kind", "le"]),
             (RENDER_CACHE_TOTAL, &["outcome"]),
             (ACTIVE_RECONCILES, &[]),
             (RBAC_RELOAD_TOTAL, &["outcome"]),
@@ -2240,6 +2400,9 @@ mod tests {
             RECONCILE_DURATION_SECONDS,
             RECONCILE_TOTAL,
             GIT_FETCH_DURATION_SECONDS,
+            // `T18.4`: both source kinds are zero-instantiated, so `source_kind="git"` and
+            // `source_kind="oci"` exist before the first fetch.
+            SOURCE_FETCH_DURATION_SECONDS,
             RENDER_CACHE_TOTAL,
             ACTIVE_RECONCILES,
             RBAC_RELOAD_TOTAL,
@@ -2277,6 +2440,13 @@ mod tests {
         assert_eq!(
             exposition::label_values(&samples, RENDER_CACHE_TOTAL, "outcome"),
             CACHE_OUTCOMES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+        );
+        assert_eq!(
+            exposition::label_values(&samples, SOURCE_FETCH_DURATION_SECONDS, "source_kind"),
+            SOURCE_KINDS
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect()

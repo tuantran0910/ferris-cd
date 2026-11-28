@@ -2329,6 +2329,9 @@ mod tests {
             // `T19.4`: the notification families are pre-created too (a replica that has delivered
             // nothing still exposes them, as zeros).
             crate::metrics::NOTIFICATIONS_TOTAL,
+            // `T18.4`: the source-fetch histogram is pre-created with a zero series per source kind,
+            // so a replica that has fetched nothing still states which kinds it can fetch.
+            crate::metrics::SOURCE_FETCH_DURATION_SECONDS,
         ]
         .into_iter()
         .collect();
