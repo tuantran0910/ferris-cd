@@ -238,9 +238,12 @@ describe("FleetOverviewPage (T20.5)", () => {
 
     const triage = await screen.findByTestId("overview-triage");
     expect(within(triage).getAllByRole("listitem")).toHaveLength(TRIAGE_LIMIT);
+    // The queue mixes degraded, out-of-sync, missing and policy-blocked applications,
+    // so the link must not narrow the list to `health=Degraded` (that would hide the
+    // other entries the operator was just shown).
     expect(
-      screen.getByRole("link", { name: "Review every degraded application" }),
-    ).toHaveAttribute("href", "/?health=Degraded");
+      screen.getByRole("link", { name: "Review every application" }),
+    ).toHaveAttribute("href", "/");
   });
 
   it("is reachable from the primary navigation and marks itself current", async () => {

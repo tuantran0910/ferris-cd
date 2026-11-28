@@ -32,7 +32,17 @@ import {
  * replica's `/metrics` listener.
  */
 
-/** `status.conditions[].reason` the controller writes when a `T20.2` `Enforce` rule blocks a sync. */
+/**
+ * `status.conditions[].reason` the controller writes when a `T20.2` `Enforce` rule blocks a sync.
+ *
+ * `crates/ferriscd-controller/src/reconcile.rs` spells it `PolicyGateViolation` — the policy
+ * *gate* sentence — and keeps `PolicyViolation` for the different `AppProject` allow-list verdict.
+ * Counting only one of the two would either miss an `Enforce` block or mislabel an authorization
+ * failure as a policy-rule block.
+ */
+export const POLICY_GATE_VIOLATION_REASON = "PolicyGateViolation";
+
+/** `status.conditions[].reason` for the `AppProject` allow-list verdict (repo/destination denied). */
 export const POLICY_VIOLATION_REASON = "PolicyViolation";
 
 /** Counts of one slice of the fleet (the whole visible set, one cluster, or one project). */
@@ -109,13 +119,17 @@ export interface FleetRollup {
 }
 
 /**
- * Whether the application's latest `Ready` condition reports a blocking policy violation.
+ * Whether the application's latest `Ready` condition reports a blocking policy verdict.
  *
- * The controller patches `Ready=False, reason=PolicyViolation` when the `T20.2` gate refuses a
- * bundle, so this is the only policy signal a *list* response carries: `Warn` (advisory) rules do
- * not fail a sync and therefore produce no condition. Advisory violations are shown per application
- * in the diff view, which is where the rule-level detail already lives — the dashboard deliberately
- * does not fetch a diff per application to count them.
+ * Two distinct reasons block a sync and both are counted here:
+ *
+ * * `PolicyGateViolation` — the `T20.2` policy gate (CEL/OPA) refused the bundle;
+ * * `PolicyViolation` — the `AppProject` allow-list refused the repository/destination/kind.
+ *
+ * They are different failures with the same operator-facing consequence (nothing was applied), so
+ * the dashboard counts them together and the per-application view keeps the sentence. `Warn`
+ * advisory rules fail no sync and produce no condition; they are shown per application in the diff
+ * view, which is where the rule-level detail already lives.
  */
 export function hasBlockingPolicyViolation(app: ApplicationSummary): boolean {
   const conditions = app.conditions ?? [];
@@ -123,7 +137,10 @@ export function hasBlockingPolicyViolation(app: ApplicationSummary): boolean {
   for (let index = conditions.length - 1; index >= 0; index -= 1) {
     const condition = conditions[index];
     if (condition && condition.type === "Ready") {
-      return condition.reason === POLICY_VIOLATION_REASON;
+      return (
+        condition.reason === POLICY_GATE_VIOLATION_REASON ||
+        condition.reason === POLICY_VIOLATION_REASON
+      );
     }
   }
   return false;

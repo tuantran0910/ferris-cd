@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { ApplicationSummary } from "../api/types";
 import {
   EMPTY_COUNTS,
+  POLICY_GATE_VIOLATION_REASON,
   POLICY_VIOLATION_REASON,
   addApplicationCounts,
   buildFleetRollup,
@@ -126,6 +127,30 @@ describe("fleet rollup (T20.5)", () => {
       ),
     ).toBe(false);
     expect(hasBlockingPolicyViolation(app({ conditions: [] }))).toBe(false);
+  });
+
+  it("counts the policy gate verdict and the AppProject verdict, but not an unrelated failure", () => {
+    // The controller writes `PolicyGateViolation` when the `T20.2` gate refuses a bundle, and
+    // `PolicyViolation` when the `AppProject` allow-list does. Both block the sync.
+    for (const reason of [POLICY_GATE_VIOLATION_REASON, POLICY_VIOLATION_REASON]) {
+      expect(
+        hasBlockingPolicyViolation(
+          app({
+            conditions: [
+              {
+                type: "Ready",
+                status: "False",
+                reason,
+                message: "refused",
+                lastTransitionTime: "2026-11-28T09:00:00Z",
+              },
+            ],
+          }),
+        ),
+      ).toBe(true);
+    }
+    expect(POLICY_GATE_VIOLATION_REASON).toBe("PolicyGateViolation");
+    expect(POLICY_VIOLATION_REASON).toBe("PolicyViolation");
   });
 
   it("triages policy violations before degraded, missing and out-of-sync", () => {

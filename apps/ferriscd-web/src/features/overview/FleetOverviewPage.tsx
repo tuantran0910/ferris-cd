@@ -78,9 +78,14 @@ export function FleetOverviewPage() {
   );
 
   const { totals } = rollup;
-  const attention = totals.outOfSync + totals.degraded + totals.missing;
+  // The KPI must agree with the queue rendered below it: `triage` is the one place
+  // that decides what "needs attention" means, so reuse its count instead of
+  // re-deriving a narrower sum (which silently dropped policy-blocked and
+  // never-reconciled applications).
+  const attention = rollup.triage.length;
   const isLoading = applicationsQuery.isLoading;
-  const error = applicationsQuery.error;
+  const error =
+    applicationsQuery.error ?? clustersQuery.error ?? projectsQuery.error;
 
   return (
     <div className="space-y-6">
@@ -234,7 +239,9 @@ export function FleetOverviewPage() {
             keyHeader="Cluster"
             linkFor={(bucket) => ({
               pathname: "/",
-              search: `?${new URLSearchParams({ q: bucket.key }).toString()}`,
+              // Exact cluster filter: `q` is a substring search, so a cluster named
+              // `prod` would also list `prod-us` applications.
+              search: `?${new URLSearchParams({ cluster: bucket.key }).toString()}`,
             })}
             buckets={rollup.byCluster}
             emptyMessage="No destination clusters are visible to your identity."
@@ -324,10 +331,10 @@ export function FleetOverviewPage() {
                       Showing the {TRIAGE_LIMIT} most urgent of{" "}
                       {rollup.triage.length}.{" "}
                       <Link
-                        to="/?health=Degraded"
+                        to="/"
                         className="font-medium text-accent hover:underline"
                       >
-                        Review every degraded application
+                        Review every application
                       </Link>
                     </p>
                   )}

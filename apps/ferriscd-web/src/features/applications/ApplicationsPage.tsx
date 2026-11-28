@@ -47,6 +47,7 @@ const FILTER_PARAMS = {
   view: "view",
   search: "q",
   project: "project",
+  cluster: "cluster",
   sync: "sync",
   health: "health",
 } as const;
@@ -65,6 +66,8 @@ export function ApplicationsPage() {
     searchParams.get(FILTER_PARAMS.view) === "table" ? "table" : "grid";
   const search = searchParams.get(FILTER_PARAMS.search) ?? "";
   const projectFilter = searchParams.get(FILTER_PARAMS.project) ?? ALL;
+  // Exact, not a search substring: a cluster named `prod` must not also list `prod-us`.
+  const clusterFilter = searchParams.get(FILTER_PARAMS.cluster) ?? ALL;
   const syncFilter = searchParams.get(FILTER_PARAMS.sync) ?? ALL;
   const healthFilter = searchParams.get(FILTER_PARAMS.health) ?? ALL;
 
@@ -146,6 +149,9 @@ export function ApplicationsPage() {
       if (projectFilter !== ALL && app.project !== projectFilter) {
         return false;
       }
+      if (clusterFilter !== ALL && app.destination.cluster !== clusterFilter) {
+        return false;
+      }
       if (
         syncFilter !== ALL &&
         normalizeSyncStatus(app.sync?.status) !== syncFilter
@@ -170,10 +176,11 @@ export function ApplicationsPage() {
         app.destination.namespace.toLowerCase().includes(q)
       );
     });
-  }, [apps, projectFilter, syncFilter, healthFilter, search]);
+  }, [apps, projectFilter, clusterFilter, syncFilter, healthFilter, search]);
 
   const filtersActive =
     search.trim().length > 0 ||
+    clusterFilter !== ALL ||
     projectFilter !== ALL ||
     syncFilter !== ALL ||
     healthFilter !== ALL;
