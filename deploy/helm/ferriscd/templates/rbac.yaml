@@ -161,6 +161,43 @@ rules:
   {{- with .Values.rbac.workloadRules }}
   {{- toYaml . | nindent 2 }}
   {{- end }}
+  {{- if .Values.driftWatcher.enabled }}
+  # Opt-in drift watcher (`T18.2`): the metadata watches are cluster-wide (`Api::all_with`), so the
+  # read verbs must be granted here rather than per namespace. They are listed explicitly — and
+  # separately from `rbac.workloadRules` — so that narrowing `workloadRules` cannot silently turn
+  # every drift watch into a `403`. The requests are metadata-only
+  # (`application/json;as=PartialObjectMetadata`) and label-scoped
+  # (`ferriscd.io/managed-by=ferriscd`), so no `.spec`, `.status` or `Secret.data` is ever returned;
+  # `secrets` stays excluded on purpose (the watcher never needs it and the ClusterRole must not
+  # grant it). Keep this list in step with `driftWatcher.kinds`: a kind without a grant parks its
+  # watch for 15 minutes and falls back to Model 1 polling, with one warning and
+  # `ferriscd_drift_watcher_fallback_total{reason="forbidden"}`.
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - services
+      - serviceaccounts
+      - persistentvolumeclaims
+      - namespaces
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - networkpolicies
+    verbs: ["get", "list", "watch"]
+  {{- end }}
   {{- with .Values.rbac.extraClusterRules }}
   {{- toYaml . | nindent 2 }}
   {{- end }}

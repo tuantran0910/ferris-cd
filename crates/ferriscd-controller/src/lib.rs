@@ -13,6 +13,7 @@ pub mod cluster_manager;
 pub mod controller;
 pub mod credentials;
 pub mod discovery;
+pub mod drift_watcher;
 pub mod dry_run;
 pub mod events;
 pub mod hooks;
@@ -61,6 +62,15 @@ pub use credentials::{
     templates_from_secrets,
 };
 pub use discovery::{CachedDiscovery, DiscoveryCache, DiscoveryError, ScopeLookup};
+pub use drift_watcher::{
+    AppHashIndex, DRIFT_DEBOUNCE, DRIFT_MAX_DEBOUNCE, DRIFT_TRIGGER_CAPACITY,
+    DRIFT_WATCHER_KINDS_ENV, DriftClock, DriftConfigError, DriftDebouncer, DriftDecision,
+    DriftKindFilter, DriftRouter, DriftRuntime, DriftStreamOutcome, DriftTriggerChannels,
+    DriftWatcher, DriftWatcherConfig, FALLBACK_COOLDOWN, GroupKind, MAX_DRIFT_WATCHES,
+    ObservedResource, SELF_ECHO_CAPACITY, SELF_ECHO_TTL, SWEEP_INTERVAL, SelfEcho, SelfEchoCache,
+    SystemDriftClock, TriggerDelivery, WATCH_REFRESH_INTERVAL, WatchPlan, WatchRequest,
+    WatchTarget, label_selector, plan_watch_requests, resolve_watch_targets,
+};
 pub use dry_run::{
     DRY_RUN_CONCURRENCY, DryRunApi, DryRunError, DryRunEvaluator, DryRunFuture, DryRunOutcome,
     DryRunTarget, DynamicDryRunApi, MAX_FIELD_CONFLICTS, parse_conflict_status,
@@ -102,6 +112,10 @@ pub use metrics::{
     RBAC_RELOAD_OUTCOMES, RBAC_RELOAD_TOTAL, RECONCILE_DURATION_SECONDS, RECONCILE_RESULTS,
     RECONCILE_TOTAL, RENDER_CACHE_TOTAL, RbacReloadOutcome, ReconcileGuard, ReconcileResult,
     SYNC_STATUS_VALUES,
+};
+pub use metrics::{
+    DRIFT_ACTIVE_WATCHES, DRIFT_EVENT_OUTCOMES, DRIFT_EVENTS_TOTAL, DRIFT_FALLBACK_REASONS,
+    DRIFT_FALLBACK_TOTAL, DRIFT_TRIGGERS_TOTAL, DriftFallbackReason, DriftWatchOutcome,
 };
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
 pub use project::{ApiProjectSource, ProjectSource};
@@ -205,6 +219,13 @@ pub struct RunOptions {
     /// so toggling the flag costs exactly one no-op diff per resource — never a drift loop.
     pub enable_drift_watcher: bool,
 
+    /// Restrict the drift watcher to these kinds (`--drift-watcher-kinds`, `T18.2`).
+    ///
+    /// A comma-separated list of `Kind` or `group/Kind`; `None` (the default) watches every kind the
+    /// fleet reports in `status.inventory`. Only meaningful with [`Self::enable_drift_watcher`]: an
+    /// allow-list without the watcher is ignored (and warned about), never an error.
+    pub drift_watcher_kinds: Option<String>,
+
     /// Run `coordination.k8s.io/v1` `Lease` leader election (`T13.2`).
     ///
     /// `None` (the default) keeps the pre-Phase-13 single-replica behaviour: exactly one controller
@@ -248,6 +269,7 @@ impl std::fmt::Debug for RunOptions {
             .field("work_root", &self.work_root)
             .field("allow_insecure_clusters", &self.allow_insecure_clusters)
             .field("enable_drift_watcher", &self.enable_drift_watcher)
+            .field("drift_watcher_kinds", &self.drift_watcher_kinds)
             .field("leader_election", &self.leader_election)
             .field("shard", &self.shard)
             .field("metrics_addr", &self.metrics_addr)
@@ -467,6 +489,8 @@ pub struct ControlPlane {
     /// `T17.2`: external audit sinks whose queued records are flushed on shutdown.
     audit_file: Option<Arc<audit::JsonlFileAuditSink>>,
     audit_webhook: Option<Arc<audit::WebhookAuditSink>>,
+    /// `T18.2`: the opt-in drift watcher's collaborators, or `None` when it is disabled.
+    drift: Option<drift_watcher::DriftRuntime>,
     cluster_stop: tokio_util::sync::CancellationToken,
     cluster_watch: tokio::task::JoinHandle<()>,
     audit: audit::AuditLogger,
@@ -612,12 +636,13 @@ impl ControlPlane {
         let result: anyhow::Result<()> = match self.leader_election.clone() {
             // The non-leader path reuses the public per-term driver: it treats the token as its only
             // shutdown input, which is precisely the contract this method promises.
-            None => controller::run_as_leader_with_readiness(
+            None => controller::run_as_leader_with_readiness_and_drift(
                 self.client.clone(),
                 self.config.clone(),
                 self.ctx.clone(),
                 stop.clone(),
                 self.readiness.clone(),
+                self.drift.clone(),
             )
             .await
             .map_err(anyhow::Error::from),
@@ -630,6 +655,7 @@ impl ControlPlane {
                     self.readiness.clone(),
                     self.cluster_stop.clone(),
                     stop.clone(),
+                    self.drift.clone(),
                 )
                 .await
             }
@@ -805,10 +831,25 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     let plan = options.ha_plan(&namespace)?;
     let leader_election = plan.leader_election;
     let shard = plan.shard;
+    // `T18.2`: the opt-in drift watcher. A malformed `--drift-watcher-kinds` value is a startup
+    // error, exactly like a malformed `--application-namespaces`: a typo must never silently watch
+    // a different set of kinds than the operator asked for.
+    let drift_kinds = drift_watcher::DriftKindFilter::parse(options.drift_watcher_kinds.as_deref())
+        .context("--drift-watcher-kinds is malformed")?;
+    if !options.enable_drift_watcher && drift_kinds.kinds().is_some() {
+        tracing::warn!(
+            kinds = ?drift_kinds.kinds(),
+            "`--drift-watcher-kinds` is set but `--enable-drift-watcher` is off; the allow-list is \
+             ignored and only Model 1 periodic polling runs"
+        );
+    }
+    let drift_watcher = drift_watcher::DriftWatcherConfig::from_flag(options.enable_drift_watcher)
+        .with_kinds(drift_kinds);
     let config = ControllerConfig {
         namespace,
         application_namespaces,
         shard,
+        drift_watcher,
         ..ControllerConfig::default()
     };
     if let Some(shard) = shard {
@@ -960,51 +1001,61 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     let impersonation_source: Arc<dyn impersonation::ImpersonationSource> =
         Arc::new(impersonation::ImpersonatingAccess::new(pool.clone()));
 
+    // `T18.2`: the self-echo cache is created only when the drift watcher is enabled, and shared
+    // between the pipeline (which records every confirmed write) and the watcher (which suppresses
+    // the resulting metadata event). Disabled means no cache and no recording at all.
+    let self_echo = options
+        .enable_drift_watcher
+        .then(|| Arc::new(config.drift_watcher.echo_cache()));
     // `T14.1`: the pipeline is held as `Arc<dyn SyncPipeline>` so the API server can compute a live
     // diff through the *same* object the controller reconciles with (`SyncPipeline::diff`).
-    let pipeline: Arc<dyn SyncPipeline> = Arc::new(
-        sync::InventorySyncPipeline::new(
-            repos,
-            DiscoveryCache::new(client.clone()),
-            Arc::new(DynamicApiSource::new(client.clone())),
-            Arc::new(DynamicApiApplier::new(client.clone())),
-            // The dry-run half of drift detection (T07.1): `dryRun=All` PATCHes per resource.
-            Arc::new(DynamicDryRunApi::new(client.clone())),
-        )
-        .with_url_policy(url_policy)
-        // `T12.1`: every `Application` is validated against its `AppProject`, which is read from
-        // the control-plane namespace (never from the `Application`'s own namespace).
-        .with_project_source(Arc::new(ApiProjectSource::new(
-            client.clone(),
-            &config.namespace,
-        )))
-        // `T12.2`: the same scope the watcher uses, so a tenant `Application` is refused here even
-        // if it somehow reaches a reconcile.
-        .with_application_scope(config.application_scope())
-        // `T12.3`: one pooled connector for every impersonated ServiceAccount. Building it reads
-        // the CA bundle, so it is moved off the async workers; it happens exactly once.
-        .with_impersonation_source(impersonation_source)
-        // `T12.4`: Git credentials come from `ferriscd.io/secret-type=repository` Secrets in the
-        // control-plane namespace only. The store holds a *namespaced* `Api<Secret>`, so no code
-        // path can ask for a cluster-wide `Secret` read (trap guard for `T12.4`); no match means
-        // anonymous, which keeps public repositories working unchanged.
-        .with_credential_source(Arc::new(credentials::SecretCredentialStore::new(
-            client.clone(),
-            &config.namespace,
-        )))
-        // `T13.1`: `spec.destination.cluster` is resolved through the registry. Without this every
-        // non-`in-cluster` destination is a terminal error, which is the pre-Phase-13 behaviour.
-        .with_cluster_source(clusters.clone())
-        // `T15.1`: Git fetch latency and the render-cache hit/miss bridge.
-        .with_metrics(metrics.clone())
-        // `T17.2`: compliance audit emission for ServiceAccount impersonation resolutions.
-        .with_audit(audit.clone())
-        // `T18.1`: the opt-in ownership label pair (`--enable-drift-watcher`). Default off keeps the
-        // `v1.0` body byte-for-byte identical (annotation only).
-        .with_stamp_options(ferriscd_engine::inventory::StampOptions::from_flag(
-            options.enable_drift_watcher,
-        )),
-    );
+    let mut pipeline = sync::InventorySyncPipeline::new(
+        repos,
+        DiscoveryCache::new(client.clone()),
+        Arc::new(DynamicApiSource::new(client.clone())),
+        Arc::new(DynamicApiApplier::new(client.clone())),
+        // The dry-run half of drift detection (T07.1): `dryRun=All` PATCHes per resource.
+        Arc::new(DynamicDryRunApi::new(client.clone())),
+    )
+    .with_url_policy(url_policy)
+    // `T12.1`: every `Application` is validated against its `AppProject`, which is read from
+    // the control-plane namespace (never from the `Application`'s own namespace).
+    .with_project_source(Arc::new(ApiProjectSource::new(
+        client.clone(),
+        &config.namespace,
+    )))
+    // `T12.2`: the same scope the watcher uses, so a tenant `Application` is refused here even
+    // if it somehow reaches a reconcile.
+    .with_application_scope(config.application_scope())
+    // `T12.3`: one pooled connector for every impersonated ServiceAccount. Building it reads
+    // the CA bundle, so it is moved off the async workers; it happens exactly once.
+    .with_impersonation_source(impersonation_source)
+    // `T12.4`: Git credentials come from `ferriscd.io/secret-type=repository` Secrets in the
+    // control-plane namespace only. The store holds a *namespaced* `Api<Secret>`, so no code
+    // path can ask for a cluster-wide `Secret` read (trap guard for `T12.4`); no match means
+    // anonymous, which keeps public repositories working unchanged.
+    .with_credential_source(Arc::new(credentials::SecretCredentialStore::new(
+        client.clone(),
+        &config.namespace,
+    )))
+    // `T13.1`: `spec.destination.cluster` is resolved through the registry. Without this every
+    // non-`in-cluster` destination is a terminal error, which is the pre-Phase-13 behaviour.
+    .with_cluster_source(clusters.clone())
+    // `T15.1`: Git fetch latency and the render-cache hit/miss bridge.
+    .with_metrics(metrics.clone())
+    // `T17.2`: compliance audit emission for ServiceAccount impersonation resolutions.
+    .with_audit(audit.clone())
+    // `T18.1`: the opt-in ownership label pair (`--enable-drift-watcher`). Default off keeps the
+    // `v1.0` body byte-for-byte identical (annotation only).
+    .with_stamp_options(ferriscd_engine::inventory::StampOptions::from_flag(
+        options.enable_drift_watcher,
+    ));
+    // `T18.2`: record every confirmed apply/prune so the watcher can drop its own echo. Wired only
+    // when the flag is on, so the disabled path stays exactly as it was.
+    if let Some(echo) = self_echo.clone() {
+        pipeline = pipeline.with_self_echo(echo);
+    }
+    let pipeline: Arc<dyn SyncPipeline> = Arc::new(pipeline);
     // `T15.2`: rate-limited Kubernetes Events on `Application` CRs (deduplicates identical
     // consecutive `Warning` reasons within 5 minutes before calling `Recorder::publish`).
     let events = events::EventRecorder::for_client(client.clone());
@@ -1019,6 +1070,14 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
             .with_events(events),
     );
 
+    // `T18.2`: only a replica that opted in carries the supervisor's collaborators; the `T18.1`
+    // labels and this runtime are turned on by the same flag, so a watched label can never exist
+    // without the watcher that selects on it.
+    let drift = self_echo.map(|echo| drift_watcher::DriftRuntime {
+        clusters: clusters.clone(),
+        echo,
+        metrics: Some(metrics.clone()),
+    });
     Ok(ControlPlane {
         client,
         config,
@@ -1035,6 +1094,10 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         cluster_watch,
         audit_file,
         audit_webhook,
+        // `T18.2`: only a replica that opted in carries the supervisor's collaborators; the
+        // `T18.1` labels and this runtime are turned on by the same flag, so a watched label can
+        // never exist without the watcher that selects on it.
+        drift,
         audit,
     })
 }
@@ -1161,6 +1224,7 @@ impl AuditSinkHandles {
 /// The standby waits for the `Lease`; the leader runs the controller set until the lease is lost
 /// (then it becomes a standby again) or the process is asked to stop (then it releases the lease
 /// voluntarily, so the standby takes over at once).
+#[allow(clippy::too_many_arguments)]
 async fn run_as_leader(
     client: Client,
     config: ControllerConfig,
@@ -1169,7 +1233,11 @@ async fn run_as_leader(
     readiness: ControlPlaneReadiness,
     cluster_stop: tokio_util::sync::CancellationToken,
     stop: tokio_util::sync::CancellationToken,
+    drift: Option<drift_watcher::DriftRuntime>,
 ) -> anyhow::Result<()> {
+    // Eight arguments, one over clippy's soft limit: every one of them is an independent process
+    // collaborator (client, config, context, lease, readiness, two tokens, drift). Bundling them
+    // into a struct would only move the list to the call site.
     use anyhow::Context as _;
 
     let election = LeaderElection::from_client(client.clone(), leader)?;
@@ -1203,12 +1271,13 @@ async fn run_as_leader(
         let token = term.token();
         // Boxed so one `select!` can poll both halves without moving either: the controller set has
         // to be awaited *after* the term ends, so in-flight passes drain like a `SIGTERM`.
-        let mut controllers = Box::pin(controller::run_as_leader_with_readiness(
+        let mut controllers = Box::pin(controller::run_as_leader_with_readiness_and_drift(
             client.clone(),
             config.clone(),
             ctx.clone(),
             token.clone(),
             readiness.clone(),
+            drift.clone(),
         ));
         let mut hold = Box::pin(term.hold(&stop));
         let outcome = match race_term(&mut controllers, &mut hold, &token).await {

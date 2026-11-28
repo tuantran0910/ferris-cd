@@ -519,10 +519,9 @@ Operational notes:
 * **The env value is exactly `true` or `false`.** `FERRISCD_ENABLE_DRIFT_WATCHER` is parsed as a
   bool, not tested for truthiness: unset (or the flag absent) means **off**, and any other value —
   including the empty string and `1`/`yes`/`True` — is a **usage error** that stops the controller at
-  startup instead of silently leaving the labels off. In the Helm chart there is no dedicated value;
-  wire it through `server.extraArgs: ["--enable-drift-watcher"]` or
-  `server.extraEnv: [{name: FERRISCD_ENABLE_DRIFT_WATCHER, value: "true"}]`, which
-  `templates/deployment.yaml` passes straight to the `ferriscd` container.
+  startup instead of silently leaving the labels off. In the Helm chart this is
+  `driftWatcher.enabled: true` (which renders `--enable-drift-watcher`); `server.extraArgs` and
+  `server.extraEnv` remain the escape hatch for anything the chart has no value for.
 * **Off by default, and additive when on.** With the flag off the apply body is unchanged (the
   annotation only). Turning it on adds the pair; turning it back off removes nothing from the
   desired body and the next sync's Server-Side Apply converges the two labels away — one no-op diff
@@ -534,13 +533,71 @@ Operational notes:
 * **Lifecycle hooks are never stamped.** A stamped hook would look prunable to the pruner even
   though its lifetime belongs to its `ferriscd.io/hook-delete-policy`.
 * **No extra RBAC is needed for the labels themselves** — they ride on objects the controller
-  already applies. (The metadata watch a future `DriftWatcher` runs needs
-  `get`/`list`/`watch` on the resource kinds it watches; that is its own opt-in grant.)
+  already applies. The metadata *watch* needs its own read grant; see
+  [Opt-in drift watcher (`T18.2`)](#opt-in-drift-watcher-t182) below.
 * **Cluster lifecycle is broadcast internally.** `ClusterManager` publishes `Added`, `Rebuilt` and
   `Removed` events on a bounded (64) channel for `ferriscd.io/secret-type=cluster` secrets —
   including a cluster whose `Secret` vanished while the watch was reconnecting, which Kubernetes
   never reports as a delete. A subscriber that falls behind is told so (`Lagged`) and resynchronises
   against the registry's live name set; the registry never waits for a consumer.
+
+### Opt-in drift watcher (`T18.2`)
+
+Under Model 1 an out-of-band `kubectl edit` / `kubectl delete` is noticed on the next periodic
+reconcile (`spec.requeueAfterSeconds`, default `180s`). `--enable-drift-watcher`
+(`FERRISCD_ENABLE_DRIFT_WATCHER`, default `false`) adds an **opt-in trigger source**: a
+label-scoped, metadata-only watch of the kinds the fleet actually owns, which enqueues a reconcile
+of the owning `Application` within about **2 s** (`2 s` trailing debounce, `5 s` maximum wait).
+Model 1 keeps running underneath, so the watcher is a latency optimisation, never a dependency.
+
+| Flag / env | Default | Meaning |
+|---|---|---|
+| `--enable-drift-watcher` / `FERRISCD_ENABLE_DRIFT_WATCHER` | `false` | turns the watcher (and the `T18.1` ownership labels it selects on) on |
+| `--drift-watcher-kinds` / `FERRISCD_DRIFT_WATCHER_KINDS` | empty (all) | comma-separated allow-list of `Kind` or `group/Kind`; `/Kind` restricts to the core group |
+
+Operational notes:
+
+* **What is watched.** Strictly what the fleet reports in `Application.status.inventory`, resolved
+  through the discovery cache, deduplicated per `(cluster, group, kind)` and capped at
+  `MAX_DRIFT_WATCHES = 64` per cluster (the excess stays on Model 1 polling, with one warning).
+  Nothing is watched before an `Application` has reported an inventory, and nothing is watched
+  cluster-wide beyond those kinds.
+* **Metadata only, label scoped.** Every request asks for
+  `Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1` (the list asks for
+  `as=PartialObjectMetadataList`) with `labelSelector=ferriscd.io/managed-by=ferriscd`, so the API
+  server never sends `.spec`, `.status` or `Secret.data`, and objects FerrisCD does not manage never
+  cross the wire.
+* **`--drift-watcher-kinds` is an RBAC and blast-radius lever.** Restrict it to the kinds you grant
+  below (e.g. `Deployment,/ConfigMap`) if the cluster's watch budget or your RBAC policy cannot
+  afford all of them. A malformed list is a **startup error**, never a silent "watch everything" —
+  and that is true whether or not the watcher itself is on: the value is parsed and validated at
+  startup unconditionally, so a typo stops the controller even when `--enable-drift-watcher=false`.
+  Only a **well-formed** list is tolerated while the watcher is off, where it is ignored with a
+  warning (`--drift-watcher-kinds` set, `--enable-drift-watcher` off: only Model 1 periodic polling
+  runs).
+* **Required RBAC (cluster-wide reads).** The watches are cluster-scoped
+  (`Api::all_with`), so grants must come from the controller's `ClusterRole`:
+  `apiGroups: [""]` (`configmaps`, `services`, `serviceaccounts`, `persistentvolumeclaims`,
+  `namespaces`), `apps` (`deployments`, `statefulsets`, `daemonsets`, `replicasets`), `batch`
+  (`jobs`, `cronjobs`) and `networking.k8s.io` (`ingresses`, `networkpolicies`) all need
+  `get`, `list`, `watch`. **`secrets` is deliberately not included**: the watcher never needs it
+  and a `ClusterRole` must not grant it. The Helm chart adds exactly these rules when
+  `driftWatcher.enabled=true`; the shipped `ClusterRole` already covers them through its workload
+  rules, so a manifest-based install needs no change unless it narrows `rbac.workloadRules`.
+* **`403`/`404`/`405` is a fallback, not an outage.** A watch the API server refuses permanently
+  logs **one** structured warning, increments
+  `ferriscd_drift_watcher_fallback_total{reason="forbidden|not_found|method_not_allowed"}`, and
+  parks that `(cluster, kind)` on a `15m` cooldown — Model 1 polling detects the drift the whole
+  time. Nothing is marked `Ready=False`, nothing panics, and one refused kind never disables the
+  others. Transient errors (`429`, `500`, `410 Gone`, a dropped connection) are retried by the
+  client and never park a watcher.
+* **Metrics.** `ferriscd_drift_watcher_events_total{outcome}` (`suppressed`, `unmapped`,
+  `filtered`, `debounced`, `ignored`, `dropped`), `ferriscd_drift_watcher_triggers_total`
+  (reconciles a drift trigger actually enqueued), `ferriscd_drift_watcher_fallback_total{reason}`
+  and `ferriscd_drift_watcher_active_watches`. All label sets are fixed: never a cluster name, a
+  GVK, an object name or an error message. `active_watches` is **sampled** at the end of each
+  supervisor refresh (a lifecycle event or the `30s` plan refresh), so a watch that starts or dies
+  in between shows up one interval later: treat it as a capacity signal, not a per-event counter.
 
 ### Multi-tenancy RBAC matrix
 

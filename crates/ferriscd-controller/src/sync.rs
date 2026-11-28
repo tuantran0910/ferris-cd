@@ -680,6 +680,10 @@ pub struct InventorySyncPipeline {
     /// `--enable-drift-watcher` adds the `ferriscd.io/managed-by` / `ferriscd.io/app-hash` label
     /// pair a label-scoped `DriftWatcher` selects on (`T18.2`).
     stamp: ferriscd_engine::inventory::StampOptions,
+    /// `T18.2`: where every confirmed apply/prune records its `metadata.resourceVersion`, so the
+    /// opt-in drift watcher can suppress the watch event FerrisCD's own write produces. `None`
+    /// (the default) records nothing, which is exactly the pre-`v1.2` behaviour.
+    self_echo: Option<Arc<crate::drift_watcher::SelfEchoCache>>,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -738,6 +742,7 @@ impl InventorySyncPipeline {
             metrics: None,
             audit: None,
             stamp: ferriscd_engine::inventory::StampOptions::tracking_id_only(),
+            self_echo: None,
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -776,6 +781,24 @@ impl InventorySyncPipeline {
     #[must_use]
     pub fn stamp_options(&self) -> ferriscd_engine::inventory::StampOptions {
         self.stamp
+    }
+
+    /// Wires the `T18.2` self-echo cache: every confirmed apply/prune records the write it made, so
+    /// the opt-in drift watcher can drop the watch event that write produces (without it, a
+    /// generation-less `ConfigMap`/`Secret` would loop apply → watch → apply forever).
+    ///
+    /// Not wired by default, matching `--enable-drift-watcher=false`: a deployment that did not opt
+    /// in pays nothing.
+    #[must_use]
+    pub fn with_self_echo(mut self, echo: Arc<crate::drift_watcher::SelfEchoCache>) -> Self {
+        self.self_echo = Some(echo);
+        self
+    }
+
+    /// The wired self-echo cache, if any (`T18.2`).
+    #[must_use]
+    pub fn self_echo(&self) -> Option<&Arc<crate::drift_watcher::SelfEchoCache>> {
+        self.self_echo.as_ref()
     }
 
     /// Number of mutating Server-Side Apply calls this pipeline has issued so far.
@@ -1601,6 +1624,7 @@ impl InventorySyncPipeline {
         let (plan, execution) = self
             .execute_plan(
                 &request.access,
+                request.app.spec.destination.cluster.as_str(),
                 request.discovery,
                 request.bundle.hooks.permanent(),
                 request.decision,
@@ -1813,6 +1837,7 @@ impl InventorySyncPipeline {
             let (plan, execution) = self
                 .execute_plan(
                     &request.access,
+                    request.app.spec.destination.cluster.as_str(),
                     request.discovery,
                     &wave.resources,
                     forced_execute(request.decision),
@@ -1865,6 +1890,7 @@ impl InventorySyncPipeline {
             let (plan, execution) = self
                 .execute_plan(
                     &request.access,
+                    request.app.spec.destination.cluster.as_str(),
                     request.discovery,
                     &[],
                     SyncDecision::Execute(SyncTrigger::PruneRequired),
@@ -1895,6 +1921,7 @@ impl InventorySyncPipeline {
     async fn execute_plan(
         &self,
         access: &ClusterAccess,
+        cluster: &str,
         discovery: &DiscoveryCache,
         desired: &[DesiredResource],
         decision: SyncDecision,
@@ -1933,6 +1960,11 @@ impl InventorySyncPipeline {
             owner,
             &policy,
         )
+        // `T18.2`: record every confirmed write so the opt-in drift watcher can tell FerrisCD's own
+        // echo from an out-of-band edit. `None` when the watcher is off. The destination cluster is
+        // part of the record's identity (finding M-1), so a write in one cluster never suppresses an
+        // event from another.
+        .with_self_echo_option(self.self_echo.clone(), cluster)
         .execute(&plan, desired, prev_inventory)
         .await;
         (plan, execution)

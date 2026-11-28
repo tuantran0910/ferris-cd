@@ -96,6 +96,18 @@ pub struct ControllerArgs {
     )]
     pub enable_drift_watcher: bool,
 
+    /// Restrict the drift watcher to a comma-separated list of `Kind` or `group/Kind`.
+    ///
+    /// Only meaningful with `--enable-drift-watcher`: without it the controller keeps using Model 1
+    /// periodic polling (and warns that this list is ignored). The default watches every kind in the
+    /// fleet's `status.inventory`, capped at 64 watches per cluster; this flag is the lever for a
+    /// cluster whose API-server watch budget cannot afford that many.
+    #[arg(
+        long = "drift-watcher-kinds",
+        env = ferriscd_controller::DRIFT_WATCHER_KINDS_ENV
+    )]
+    pub drift_watcher_kinds: Option<String>,
+
     /// Elect one active replica with a `coordination.k8s.io/v1` Lease (active/standby HA).
     ///
     /// Without it, run exactly ONE controller replica: two replicas both reconcile, which can
@@ -246,6 +258,7 @@ impl std::fmt::Debug for ControllerArgs {
                 &self.allow_insecure_cluster_tls,
             )
             .field("enable_drift_watcher", &self.enable_drift_watcher)
+            .field("drift_watcher_kinds", &self.drift_watcher_kinds)
             .field("leader_election", &self.leader_election)
             .field(
                 "leader_election_lease_name",
@@ -313,6 +326,9 @@ pub(crate) fn run_options(args: ControllerArgs) -> ferriscd_controller::RunOptio
         // `T18.1`: `--enable-drift-watcher` / `FERRISCD_ENABLE_DRIFT_WATCHER`. Off means the apply
         // body keeps only the `ferriscd.io/tracking-id` annotation, exactly as before `v1.2`.
         enable_drift_watcher: args.enable_drift_watcher,
+        // `T18.2`: the optional kind allow-list. Parsed by the controller (a malformed value is a
+        // startup error, never a silent "watch everything").
+        drift_watcher_kinds: args.drift_watcher_kinds,
         leader_election,
         // `T13.3`: the raw flag pair; the controller validates it and refuses sharding without
         // `--leader-election` (or with a lease name other than the per-shard one). Both unset — the
