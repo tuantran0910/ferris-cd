@@ -41,6 +41,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Constant-time comparison for the `T14.2` webhook signature/token checks. Already in the lock file
 # (`rustls` and `ring` depend on it): comparing a MAC with `==` leaks how much of it matched.
 subtle = "2"
+# `T17.4`: IANA time-zone rules for `AppProject.spec.syncWindows`. `jiff` is already in the
+# dependency graph (`k8s-openapi` re-exports it), but with `alloc` only — i.e. with no tzdb at all,
+# so `TimeZone::get("America/New_York")` would fail at runtime. The bundled database keeps window
+# evaluation independent of the host's `/usr/share/zoneinfo`, which `debian:bookworm-slim` does not
+# ship. Enabling the feature adds no package: `jiff-tzdb` and `jiff-static` are already in
+# `Cargo.lock`.
+jiff = { version = "0.2", default-features = false, features = [
+    "std",
+    "tzdb-bundle-always",
+] }
 tower = { version = "0.5", features = ["retry", "util"] }
 # `utoipa` generates the OpenAPI 3.1 contract `GET /api/v1/openapi.json` serves and
 # `docs/api/openapi.json` freezes (`T14.1`); the TypeScript web UI is typed from it (`T16.1`).

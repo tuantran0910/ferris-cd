@@ -333,6 +333,7 @@ export interface components {
             /** @description Last `status.history` entries, oldest first. */
             history?: components["schemas"]["HistoryView"][];
             operation?: null | components["schemas"]["OperationView"];
+            syncWindow?: null | components["schemas"]["SyncWindowGateView"];
         };
         /** @description `GET /api/v1/applications/{namespace}/{name}/events` body (`T17.3`). */
         ApplicationEventListView: {
@@ -556,6 +557,35 @@ export interface components {
             /** @description Every `AppProject` of the control-plane namespace. */
             items: components["schemas"]["ProjectView"][];
         };
+        /** @description One `spec.syncWindows[]` entry with its state at the moment of the response (`T17.4`). */
+        ProjectSyncWindowView: {
+            /** @description Whether the window is open right now. */
+            active: boolean;
+            /** @description Glob patterns for `Application.metadata.name` (empty = every application). */
+            applications?: string[];
+            /** @description Glob patterns for `spec.destination.cluster` (empty = every cluster). */
+            clusters?: string[];
+            /** @description The duration, verbatim (`30m`, `2h`, `7d`). */
+            duration: string;
+            /** @description When the currently open occurrence ends (RFC 3339). */
+            endsAt?: string | null;
+            /** @description Why this entry cannot be evaluated. The project is deny-all while it is set (fail closed). */
+            error?: string | null;
+            /** @description `allow` or `deny` (deny wins over allow). */
+            kind: string;
+            /** @description Whether a manual sync may override this window. */
+            manualSync: boolean;
+            /** @description Glob patterns for `Application.metadata.namespace` (empty = every namespace). */
+            namespaces?: string[];
+            /** @description The next occurrence that starts after now (RFC 3339), within a year. */
+            nextStart?: string | null;
+            /** @description The 5-field cron expression, verbatim. */
+            schedule: string;
+            /** @description When the currently open occurrence started (RFC 3339). */
+            startsAt?: string | null;
+            /** @description The effective IANA time zone (`UTC` when `spec.syncWindows[].timeZone` is absent). */
+            timeZone: string;
+        };
         /** @description One `AppProject`, reduced to its boundary facts. */
         ProjectView: {
             /** @description `spec.allowedServiceAccounts`. */
@@ -566,10 +596,19 @@ export interface components {
             destinations?: string[];
             /** @description `metadata.name`. */
             name: string;
+            /** @description When the next window starts or stops (RFC 3339), across every configured window. */
+            nextSyncWindowTransition?: string | null;
             /** @description `spec.sourceNamespaces`. */
             sourceNamespaces?: string[];
             /** @description `spec.sourceRepos`. */
             sourceRepos?: string[];
+            /**
+             * @description `spec.syncWindows`, each with its state at the moment of the response (`T17.4`).
+             *
+             *     Empty (and omitted) for a project that configures no window, so the pre-`T17.4` payload is
+             *     byte-identical for every such project.
+             */
+            syncWindows?: components["schemas"]["ProjectSyncWindowView"][];
         };
         /** @description Readiness answer. */
         ReadyResponse: {
@@ -657,6 +696,30 @@ export interface components {
             revision?: string | null;
             /** @description `Synced` or `OutOfSync`. */
             status: string;
+        };
+        /**
+         * @description The sync-window verdict for one `Application` right now (`T17.4`).
+         *
+         *     The UI needs this to explain a blocked `POST .../sync` *before* the operator clicks: a window is
+         *     a time-based refusal, and "nothing happened" is indistinguishable from a controller stall
+         *     otherwise. `manualOverride` says whether a manual sync would be honoured anyway
+         *     (`manualSync: true` on every blocking window).
+         *
+         *     A blocked manual sync is **deferred, not rejected**: the controller pauses the requested
+         *     operation and runs it when the window lifts, without asking again (finding N-c), so the modal
+         *     tells the operator *when* it will happen rather than to come back and click twice.
+         */
+        SyncWindowGateView: {
+            /** @description Whether a manual sync would be skipped right now. */
+            blocked: boolean;
+            /** @description Whether `manualSync: true` makes a manual sync still executable. */
+            manualOverride: boolean;
+            /** @description Human-readable explanation, including the next window transition. */
+            message: string;
+            /** @description When the verdict could change (RFC 3339). */
+            nextTransition?: string | null;
+            /** @description `denyWindowActive`, `outsideAllowWindow`, or `invalidWindow`; absent when not blocked. */
+            reason?: string | null;
         };
         /** @description The `ferriscd.io/refresh` request a webhook reports back. */
         WebhookResponse: {

@@ -455,6 +455,11 @@ pub struct OperationState {
     pub message: Option<String>,
 
     /// When the operation started.
+    ///
+    /// `T17.4`: this clock is paused by a blocked sync window. A pass that `spec.syncWindows`
+    /// denies leaves the operation `Running` but moves `startedAt` (and `phaseStartedAt`) to that
+    /// pass's own `now`, so a change freeze never counts against the operation/wave timeouts: the
+    /// resumed operation gets its full budget measured from the moment the window lifted.
     pub started_at: Time,
 
     /// When the operation finished (`None` while `phase` is `Running`).

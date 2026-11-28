@@ -232,6 +232,21 @@ impl ProjectCatalog for KubeProjectCatalog {
             Ok(items)
         })
     }
+
+    /// Finding M-4: one scoped `get`, not a catalogue listing.
+    ///
+    /// The application-detail handler resolves a single project by name; listing the control-plane
+    /// namespace to find it turned one object read into a list of every project (and every window on
+    /// each of them) on a page the UI opens constantly.
+    fn get(&self, name: &str) -> SeamFuture<'_, Option<AppProject>> {
+        let name = name.to_owned();
+        Box::pin(async move {
+            self.api
+                .get_opt(&name)
+                .await
+                .map_err(|err| ApiError::backend(&err))
+        })
+    }
 }
 
 /// Reads the Kubernetes `Event`s that regard one `Application` (`GET .../events`, `T17.3`).

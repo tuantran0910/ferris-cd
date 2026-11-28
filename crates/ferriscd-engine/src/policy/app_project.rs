@@ -22,7 +22,7 @@
 //! repository, and ServiceAccount patterns. Kubernetes is case-sensitive here, so matching is too.
 
 use ferriscd_crd::project::{AppProjectSpec, GroupKind, WILDCARD};
-use ferriscd_crd::{AppProject, Application};
+use ferriscd_crd::{AppProject, AppProjectStatus, Application};
 use kube::ResourceExt;
 
 use crate::manifest::{DesiredResource, redact_repo_url};
@@ -272,6 +272,16 @@ impl PolicyError {
 pub struct AppProjectPolicy {
     name: String,
     spec: AppProjectSpec,
+    /// Whether the fetched project's `/status` currently records a
+    /// `Ready=False/SyncWindowInvalid` condition (finding `H-A`).
+    ///
+    /// The snapshot has to remember this because the *spec* cannot: once an operator empties
+    /// `spec.syncWindows`, `has_sync_windows()` is `false` and nothing in the spec says a report was
+    /// ever written. Without the recorded flag the sync pipeline would stop asking for a clearing
+    /// write the moment the operator fixed the project, and `kubectl describe appproject` would keep
+    /// announcing a change freeze that no longer exists. A project that never declared windows
+    /// records no such condition, so it still costs no `/status` write at all.
+    records_sync_window_invalid: bool,
 }
 
 impl AppProjectPolicy {
@@ -281,6 +291,7 @@ impl AppProjectPolicy {
         Self {
             name: name.into(),
             spec,
+            records_sync_window_invalid: false,
         }
     }
 
@@ -290,7 +301,22 @@ impl AppProjectPolicy {
         Self {
             name: project.name_any(),
             spec: project.spec.clone(),
+            records_sync_window_invalid: project
+                .status
+                .as_ref()
+                .is_some_and(AppProjectStatus::records_sync_window_invalid),
         }
+    }
+
+    /// Whether the fetched project's `/status` records the `Ready=False/SyncWindowInvalid`
+    /// condition (finding `H-A`).
+    ///
+    /// `true` means a report was written for this project and has not been cleared yet — including
+    /// after the operator emptied `spec.syncWindows`, which is exactly when the clearing write
+    /// still has to happen.
+    #[must_use]
+    pub fn records_sync_window_invalid(&self) -> bool {
+        self.records_sync_window_invalid
     }
 
     /// The `AppProject` name, used in every violation message.
@@ -721,6 +747,44 @@ spec:
 
     fn scope() -> ApplicationScope {
         ApplicationScope::default()
+    }
+
+    /// **Finding H-A:** the policy snapshot carries the project's recorded
+    /// `Ready=False/SyncWindowInvalid` condition, because the spec alone cannot say whether the sync
+    /// pipeline still owes the project a clearing write.
+    #[test]
+    fn the_policy_snapshot_records_a_stored_invalid_window_condition() {
+        // A `v1.0` project: no windows, no status at all -> nothing to clear.
+        let plain = project(PAYMENTS_PROJECT);
+        assert!(!plain.records_sync_window_invalid());
+        assert!(!plain.spec().has_sync_windows());
+
+        // `from_project` reads the status the controller wrote on a previous pass; `new` (a
+        // hand-built policy) has no project object, so it records nothing.
+        let mut fetched: AppProject =
+            serde_saphyr::from_str(PAYMENTS_PROJECT).expect("test project must parse");
+        fetched.status = Some(ferriscd_crd::AppProjectStatus {
+            observed_generation: Some(4),
+            conditions: vec![ferriscd_crd::Condition::new(
+                ferriscd_crd::status::CONDITION_READY,
+                ferriscd_crd::ConditionStatus::False,
+                ferriscd_crd::project::REASON_SYNC_WINDOW_INVALID,
+                "spec.syncWindows cannot be evaluated",
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    "2026-01-07T12:00:00Z".parse().expect("a valid timestamp"),
+                ),
+            )],
+        });
+        let recorded = AppProjectPolicy::from_project(&fetched);
+        assert!(recorded.records_sync_window_invalid());
+        assert!(
+            !AppProjectPolicy::new("payments", fetched.spec.clone()).records_sync_window_invalid()
+        );
+
+        // Any other `Ready` condition is not the window report.
+        let mut ready = fetched.clone();
+        ready.status = Some(ferriscd_crd::AppProjectStatus::default());
+        assert!(!AppProjectPolicy::from_project(&ready).records_sync_window_invalid());
     }
 
     #[test]

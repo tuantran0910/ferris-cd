@@ -417,7 +417,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::diff::decision::{SkipReason, SyncDecision, SyncTrigger, should_sync};
+    use crate::diff::decision::{
+        SkipReason, SyncDecision, SyncTrigger, SyncWindowGate, should_sync,
+    };
     use crate::diff::types::DiffSummary;
 
     const SHA_V1: &str = "1111111111111111111111111111111111111111";
@@ -697,7 +699,7 @@ mod tests {
 
         // Baseline: the source is unchanged, so self-heal re-applies HEAD on every pass.
         assert_eq!(
-            should_sync(&app, head, SPEC_HASH, &drift, false),
+            should_sync(&app, head, SPEC_HASH, &drift, false, SyncWindowGate::Allow),
             SyncDecision::Execute(SyncTrigger::DriftDetected)
         );
 
@@ -712,7 +714,14 @@ mod tests {
         let mut rolled_back = app.clone();
         assert!(decision.apply_to_spec(&mut rolled_back.spec));
         assert_eq!(
-            should_sync(&rolled_back, head, SPEC_HASH, &drift, false),
+            should_sync(
+                &rolled_back,
+                head,
+                SPEC_HASH,
+                &drift,
+                false,
+                SyncWindowGate::Allow
+            ),
             SyncDecision::Skip(SkipReason::AutomatedDisabled),
             "the pinned revision must survive subsequent requeues"
         );
@@ -724,7 +733,8 @@ mod tests {
                 decision.pinned_revision(),
                 SPEC_HASH,
                 &drift,
-                true
+                true,
+                SyncWindowGate::Allow
             )
             .is_execute()
         );
