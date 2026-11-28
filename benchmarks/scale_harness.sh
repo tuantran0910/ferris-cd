@@ -1687,4 +1687,12 @@ main() {
   esac
 }
 
-main "$@"
+# `T20.5`: the 250-app / 3-shard harness (`benchmarks/scale_250_sharded.sh`) **sources** this file to
+# reuse the `kind` safety guard, the manifest generator/validator, the Prometheus histogram-quantile
+# math and the RSS/FD flatness evaluator instead of forking them. Sourcing must therefore define the
+# helpers without running the CLI: this guard is the only change the sharded harness needed here, and
+# `bash benchmarks/scale_harness.sh ...` keeps behaving exactly as before (the `--self-test` case
+# below still proves the whole v1.0 path).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
