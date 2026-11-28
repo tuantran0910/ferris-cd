@@ -35,7 +35,8 @@ gate:
 	cargo check -p ferriscd-cli --features opa-policy
 	# The sharded fleet harness (`T20.5`) has no Rust test target: its offline
 	# self-test and fixture dry-run are what keep the partition math, the YAML and
-	# the cardinality bound from rotting silently.
+	# the cardinality bound from rotting silently. They need `bash`, `git`, `ruby`
+	# and `sed` (already required by the v1.0 harness and the release checks).
 	./benchmarks/scale_250_sharded.sh --self-test
 	@tmp=$$(mktemp -d); ./benchmarks/scale_250_sharded.sh --dry-run --apps 10 --results-dir "$$tmp"; rc=$$?; rm -rf "$$tmp"; exit $$rc
 

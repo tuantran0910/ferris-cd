@@ -400,7 +400,9 @@ soak_commit() {
     bucket=$(( (i - 1) / BUCKET_SIZE ))
     local cm="${work_dir}/repo/apps/bucket-${bucket}/bench-app-${idx}/05-configmaps.yaml"
     [[ -f "$cm" ]] || continue
-    # Touch only one ConfigMap per commit so the write volume stays bounded.
+    # Touch one fixture file per commit (5 of the 250 applications), so the write
+    # volume stays bounded. That file holds 6 ConfigMap documents, so a commit moves
+    # 30 objects — still bounded, and every one of them is a real revision change.
     if [[ $((i % 50)) -eq 0 ]]; then
       # Rewrite an **existing** key: appending a new one on every commit creates a
       # duplicate mapping key, which the guarded YAML parser correctly refuses (the
@@ -432,10 +434,10 @@ soak_drift() {
 
   # Candidate applications: one per 50, rotated by `skip` so every interval touches
   # a different object (the same one would measure the same reconcile).
-  local candidates=() i idx bucket
+  local candidates=() i idx
   for ((i = 1; i <= APP_COUNT; i++)); do
     idx="$(printf '%02d' "$i")"
-    bucket=$(( (i - 1) / BUCKET_SIZE ))
+    local bucket=$(( (i - 1) / BUCKET_SIZE ))
     local cm="${work_dir}/repo/apps/bucket-${bucket}/bench-app-${idx}/05-configmaps.yaml"
     [[ -f "$cm" ]] || continue
     if [[ $((i % 50)) -eq 0 ]]; then
@@ -445,10 +447,19 @@ soak_drift() {
   local count="${#candidates[@]}"
   [[ "$count" -gt 0 ]] || return 0
   idx="${candidates[$(( skip % count ))]}"
-  kubectl delete "configmap/bench-app-${idx}-cm-01" \
-    -n "ferriscd-bench-app-${idx}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
-  printf 'apps/bench-app-%s\n' "$idx"
-  return 0
+  # Synchronous delete: the heal clock must start only once the object is really
+  # gone. An async `--wait=false` delete that has not landed yet would make the
+  # next probe read the intact object and record a 0-second "heal".
+  if kubectl delete "configmap/bench-app-${idx}-cm-01" \
+      -n "ferriscd-bench-app-${idx}" --ignore-not-found=false \
+      --wait=true --timeout=30s >/dev/null 2>&1 \
+    && ! kubectl get "configmap/bench-app-${idx}-cm-01" \
+      -n "ferriscd-bench-app-${idx}" >/dev/null 2>&1; then
+    printf 'apps/bench-app-%s\n' "$idx"
+    return 0
+  fi
+  log_err "Out-of-band drift injection on bench-app-${idx} failed; it is not counted as a measurement."
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -572,6 +583,10 @@ run_self_test() {
     ruby -ryaml -e \"d=YAML.load_stream(File.read('${test_dir}/dryrun/dryrun/applicationsets/bench-set-1.yaml')).compact.first; abort unless d['kind']=='ApplicationSet'; abort unless d.dig('spec','template','spec','project')=='bench-scale'\""
   check "the histogram quantile math is reused unchanged from the v1.0 harness" bash -c "
     grep -q 'compute_histogram_quantile' '${SCRIPT_DIR}/scale_250_sharded.sh'"
+  check "the soak-commit rewrite keeps the fixture YAML valid and changes every copy" bash -c "
+    f='${test_dir}/dryrun/dryrun/repo/apps/bucket-0/bench-app-01/05-configmaps.yaml'
+    sed -i.bak 's|^  BENCHMARK_SUITE: .*|  BENCHMARK_SUITE: \"scale-v1-commit-test\"|' \"\$f\" && rm -f \"\$f.bak\"
+    ruby -ryaml -e 'd=YAML.load_stream(File.read(ARGV[0])).compact; abort unless d.length == 6; abort unless d.all? { |x| x[\"data\"][\"BENCHMARK_SUITE\"] == \"scale-v1-commit-test\" }' \"\$f\""
 
   printf '\nself-test: %d passed, %d failed\n' "$passed" "$failed"
   [[ "$failed" -eq 0 ]]
@@ -580,9 +595,11 @@ run_self_test() {
 run_dry_run() {
   local work_dir
   if [[ -n "$RESULTS_DIR" ]]; then
-    work_dir="${RESULTS_DIR}/dryrun"
-    rm -rf "$work_dir"
-    mkdir -p "$work_dir"
+    mkdir -p "$RESULTS_DIR/dryrun"
+    # Absolute for consistency with the live path: a `file://` URL built from a
+    # relative directory has a host and would be refused by the Git client.
+    work_dir="$(cd "$RESULTS_DIR/dryrun" && pwd)"
+    rm -rf "${work_dir:?}"/*
   else
     work_dir="$(make_temp_dir "ferriscd-scale250-dryrun")"
     CLEANUP_TEMP_DIRS+=("$work_dir")
@@ -606,6 +623,9 @@ run_dry_run() {
 
 delete_benchmark_fleet() {
   local with_namespaces="${1:-yes}"
+  # Destructive and cluster-wide (`-A`), and reachable from the EXIT trap: the
+  # safety guard is asserted here, not only on the paths that call it by design.
+  require_kind_context
   # The `ApplicationSet` cleanup finalizer (and the `Application` finalizers) only run
   # while a controller with the matching feature enabled is running. The benchmark
   # stops its controllers on exit, so the finalizers are removed explicitly here —
@@ -697,7 +717,14 @@ delete_benchmark_fleet() {
 
 run_cleanup() {
   require_kind_context
-  delete_benchmark_fleet
+  delete_benchmark_fleet yes
+
+  local leftovers
+  leftovers="$(kubectl get applications.ferriscd.io,applicationsets.ferriscd.io     -n "$CONTROL_PLANE_NS" -l "${BENCHMARK_LABEL_KEY}=${BENCHMARK_LABEL_VAL}"     -o name 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "$leftovers" -ne 0 ]]; then
+    log_err "Benchmark cleanup incomplete: ${leftovers} object(s) still present in '${CONTROL_PLANE_NS}'."
+    return 1
+  fi
   log_pass "Benchmark cleanup complete."
 }
 
@@ -730,7 +757,8 @@ run_live_benchmark() {
     mkdir -p "$RESULTS_DIR/fixture"
     work_dir="$(cd "$RESULTS_DIR/fixture" && pwd)"
     rm -rf "$work_dir"/*
-    CLEANUP_TEMP_DIRS+=("$work_dir")
+    # Not registered for temp cleanup: `fixture/` is a documented artifact (the
+    # repository, the ApplicationSets and the per-shard controller logs).
   else
     work_dir="$(make_temp_dir "ferriscd-scale250-live")"
     CLEANUP_TEMP_DIRS+=("$work_dir")
@@ -856,15 +884,17 @@ run_live_benchmark() {
       app_idx="$(printf '%s' "$drift_app" | sed -n 's#.*/bench-app-\([0-9]*\).*#\1#p')"
       if [[ -n "$app_idx" ]]; then
         drift_app_idx="$app_idx"
-        drift_started="$now"
+        drift_started="$(date +%s)"
         drift_injected_count=$((drift_injected_count + 1))
         log_info "Injected out-of-band drift on bench-app-${app_idx} (t=${elapsed}s)."
       fi
     fi
 
     # The heal is measured without blocking the sampling loop: the value is expected
-    # back within `DRIFT_HEAL_TIMEOUT_SECS`.
-    if [[ -n "$drift_app_idx" ]]; then
+    # back within `DRIFT_HEAL_TIMEOUT_SECS`. The probe is skipped in the injection's
+    # own iteration — the delete is synchronous, so a same-second probe could only
+    # ever report a meaningless 0.
+    if [[ -n "$drift_app_idx" ]] && [[ $(( now - drift_started )) -ge 1 ]]; then
       local current
       current="$(kubectl get configmap "bench-app-${drift_app_idx}-cm-01" \
         -n "ferriscd-bench-app-${drift_app_idx}" \
@@ -987,15 +1017,17 @@ run_live_benchmark() {
         last = b[int((q - 1) / 2)]
         print last - first
       }' "$csv_file")"
-    local shard_samples
-    shard_samples="$(awk -F, -v s="$shard" -v w="$warmup_secs" 'NR>1 && $3==s && $2>=w && $5 ~ /^[0-9]+$/ { n++ } END { print (n == "" ? 0 : n) }' "$csv_file")"
+    local fd_samples rss_samples
+    fd_samples="$(awk -F, -v s="$shard" -v w="$warmup_secs" 'NR>1 && $3==s && $2>=w && $5 ~ /^[0-9]+$/ { n++ } END { print (n == "" ? 0 : n) }' "$csv_file")"
+    rss_samples="$(awk -F, -v s="$shard" -v w="$warmup_secs" 'NR>1 && $3==s && $2>=w && $4 ~ /^[0-9]+$/ { n++ } END { print (n == "" ? 0 : n) }' "$csv_file")"
     {
       printf 'shard_%d_max_rss_kb: %s\n' "$shard" "$shard_max_rss"
-      printf 'shard_%d_post_warmup_samples: %s\n' "$shard" "$shard_samples"
-      if [[ "$shard_samples" -ge "$MIN_LEAK_SAMPLES" ]]; then
+      printf 'shard_%d_post_warmup_fd_samples: %s\n' "$shard" "$fd_samples"
+      printf 'shard_%d_post_warmup_rss_samples: %s\n' "$shard" "$rss_samples"
+      if [[ "$fd_samples" -ge "$MIN_LEAK_SAMPLES" ]]; then
         printf 'shard_%d_fd_delta: %s\n' "$shard" "$shard_fd_delta"
       else
-        printf 'shard_%d_fd_delta: not evaluated (%s samples < %s)\n' "$shard" "$shard_samples" "$MIN_LEAK_SAMPLES"
+        printf 'shard_%d_fd_delta: not evaluated (%s samples < %s)\n' "$shard" "$fd_samples" "$MIN_LEAK_SAMPLES"
       fi
     } >> "$summary"
     if [[ "$shard_max_rss" -lt 0 ]]; then
@@ -1005,10 +1037,16 @@ run_live_benchmark() {
       verdict="FAIL"
       violations+=("shard ${shard} peak RSS ${shard_max_rss} KiB > ${MAX_RSS_KB} KiB")
     fi
+    # No FD telemetry at all is a failure, not a skipped check: `lsof` missing or
+    # denied would otherwise retire the zero-leak SLO silently.
+    if [[ "$fd_samples" -eq 0 ]]; then
+      verdict="FAIL"
+      violations+=("shard ${shard} has no file-descriptor telemetry")
+    fi
     # An FD/RSS *leak* needs a long enough window to tell a trend from connection
     # churn; a short smoke run reports the delta but does not judge it. The
     # acceptance run (60 min, 30 s samples) has ~110 samples per shard.
-    if [[ "$shard_samples" -ge "$MIN_LEAK_SAMPLES" && "$shard_fd_delta" -gt "$MAX_FD_GROWTH" ]]; then
+    if [[ "$fd_samples" -ge "$MIN_LEAK_SAMPLES" && "$shard_fd_delta" -gt "$MAX_FD_GROWTH" ]]; then
       verdict="FAIL"
       violations+=("shard ${shard} leaked file descriptors (+${shard_fd_delta} > ${MAX_FD_GROWTH})")
     fi
@@ -1022,7 +1060,7 @@ run_live_benchmark() {
       'NR>1 && $3==s && $2>=lo && $4 ~ /^[0-9]+$/ { if ($4 > m) m=$4 } END { print (m == "" ? 0 : m) }' "$csv_file")"
     printf 'shard_%d_rss_first_half_peak_kb: %s\n' "$shard" "$first_half_peak" >> "$summary"
     printf 'shard_%d_rss_second_half_peak_kb: %s\n' "$shard" "$second_half_peak" >> "$summary"
-    if [[ "$shard_samples" -ge "$MIN_LEAK_SAMPLES" && "$first_half_peak" -gt 0 ]] \
+    if [[ "$rss_samples" -ge "$MIN_LEAK_SAMPLES" && "$first_half_peak" -gt 0 ]] \
         && awk -v a="$first_half_peak" -v b="$second_half_peak" -v pct="$MAX_RSS_GROWTH_PCT" \
         'BEGIN { exit !(((b - a) / a) * 100.0 > pct) }'; then
       verdict="FAIL"
@@ -1068,7 +1106,11 @@ run_live_benchmark() {
   local panic_lines=0 shard
   for ((shard = 0; shard < SHARD_COUNT; shard++)); do
     local log_file="${work_dir}/shard-${shard}.log"
-    [[ -f "$log_file" ]] || continue
+    if [[ ! -f "$log_file" ]]; then
+      verdict="FAIL"
+      violations+=("shard ${shard} produced no log to scan for panics")
+      continue
+    fi
     panic_lines=$(( panic_lines + $(grep -ciE 'panicked at|fatal runtime error' "$log_file" || true) ))
   done
   printf 'panic_lines: %s\n' "$panic_lines" >> "$summary"
@@ -1126,9 +1168,11 @@ cleanup_all() {
   if [[ -n "$SERVER_PID" ]]; then
     kill -TERM "$SERVER_PID" 2>/dev/null || true
   fi
-  # A live run must not leave 3 ApplicationSets, 250 Applications, 250 namespaces
-  # and 2,500 objects behind. The controllers are already stopped, so the
-  # finalizers are stripped by `delete_benchmark_fleet`.
+  # A live run must not leave 3 ApplicationSets, 250 Applications and 2,500 rendered
+  # objects behind (the controllers are already stopped, so `delete_benchmark_fleet`
+  # strips the finalizers). The 250 destination **namespaces** are deliberately kept
+  # — they are reused by the next run, and deleting them costs minutes of namespace
+  # finalization; `--cleanup` removes them.
   if [[ "$MODE" == "live" && "$FLEET_STARTED" -eq 1 && "$KEEP_FLEET" -eq 0 ]]; then
     delete_benchmark_fleet no >/dev/null 2>&1 || true
   fi

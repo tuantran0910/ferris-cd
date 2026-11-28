@@ -165,9 +165,11 @@ generates the fleet with `ApplicationSet`s, enables the drift watcher, and soaks
 Git and editing the cluster out-of-band. The measured numbers and the SLO table live in
 [`docs/benchmarks/v2.0.md`](../benchmarks/v2.0.md).
 
-The harness refuses to touch anything but a `kind-*` context, and it cleans up the fleet, the
-namespaces and the controller processes on exit — including on `SIGINT` (`--keep-fleet` opts out so
-the objects can be inspected).
+The harness refuses to touch anything but a `kind-*` context, and on exit — including on `SIGINT` —
+it deletes the fleet it created (ApplicationSets, Applications, the rendered objects) and stops the
+controller processes. The destination namespaces are deliberately left for reuse; `--cleanup`
+removes them, and verifies nothing is left behind. `--keep-fleet` opts out of the exit cleanup so the
+objects can be inspected.
 
 ### 5.2 The fleet overview must not leak
 
