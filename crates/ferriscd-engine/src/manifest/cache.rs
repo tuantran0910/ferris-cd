@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 
 use super::error::ManifestError;
 use super::renderer::{
-    RedactedUrl, RenderContext, RendererBinaries, encode_fields, render_desired,
+    RedactedUrl, RenderContext, RendererBinaries, SourceIdentity, encode_fields, render_desired,
 };
 use super::types::DesiredResource;
 use crate::graph::sort_by_tier;
@@ -72,6 +72,15 @@ pub struct RenderCacheKey {
     /// Canonical form of the renderer configuration
     /// ([`super::renderer::RendererConfig::canonical`]): the hash pre-image, never printed.
     renderer_config: String,
+    /// `T20.1`: identity of every declared source of a multi-source `Application`, in declaration
+    /// order.
+    ///
+    /// Empty for a single-source `Application` — deliberately, so its pre-`T20.1` digest is
+    /// unchanged. When non-empty it is appended to the pre-image as the roadmap requires: "hash the
+    /// length-prefixed canonical list of all `(source_url, resolved_revision, path, ref_alias)`
+    /// tuples". Without it, editing a values repository at an unchanged chart commit would be a
+    /// cache hit and the new values would never render.
+    pub sources: Vec<SourceIdentity>,
 }
 
 impl fmt::Debug for RenderCacheKey {
@@ -87,6 +96,7 @@ impl fmt::Debug for RenderCacheKey {
             .field("destination_namespace", &self.destination_namespace)
             .field("cluster_kube_version", &self.cluster_kube_version)
             .field("renderer_config_digest", &self.renderer_config_digest())
+            .field("sources", &self.sources)
             .finish()
     }
 }
@@ -104,6 +114,7 @@ impl RenderCacheKey {
             destination_namespace: ctx.destination_namespace.clone(),
             cluster_kube_version: ctx.cluster_kube_version.clone(),
             renderer_config: ctx.renderer.canonical(),
+            sources: ctx.sources.clone(),
         }
     }
 
@@ -133,6 +144,21 @@ impl RenderCacheKey {
                 &self.renderer_config,
             ],
         );
+        // `T20.1`: a multi-source render additionally depends on every declared source. The list is
+        // length-prefixed twice (once per tuple field, once for the count) so a `path` containing a
+        // delimiter cannot forge a different tuple list. A single-source render appends nothing and
+        // keeps its pre-`T20.1` digest.
+        if !self.sources.is_empty() {
+            let mut fields = vec![self.sources.len().to_string()];
+            for source in &self.sources {
+                fields.push(source.url.clone());
+                fields.push(source.revision.clone());
+                fields.push(source.path.clone());
+                fields.push(source.alias.clone());
+            }
+            let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
+            encode_fields(&mut input, &borrowed);
+        }
         input
     }
 
@@ -730,6 +756,7 @@ mod tests {
             destination_namespace: destination_namespace.to_owned(),
             cluster_kube_version: "1.35.0".to_owned(),
             renderer_config: RendererConfig::Auto.canonical(),
+            sources: Vec::new(),
         }
     }
 
@@ -1253,6 +1280,130 @@ mod tests {
             .collect();
         assert_eq!(cached_kinds, kinds, "a cache hit keeps the apply order");
         assert_eq!(pipeline.cache().stats().hits, 1);
+    }
+
+    /// **`T20.1` acceptance criterion.** The key hashes every declared source, so a moved values
+    /// repository is a *different* key (and therefore re-renders) even when the chart commit, the
+    /// path, and the renderer configuration are identical.
+    #[test]
+    fn the_cache_key_covers_every_declared_source() {
+        let identity = |url: &str, revision: &str, path: &str, alias: &str| SourceIdentity {
+            url: url.to_owned(),
+            revision: revision.to_owned(),
+            path: path.to_owned(),
+            alias: alias.to_owned(),
+        };
+        let chart = identity(
+            "https://example.com/charts.git",
+            "chart-sha",
+            "charts/api",
+            "chart",
+        );
+        let values = identity("https://example.com/values.git", "values-sha", "", "values");
+
+        let build = |sources: Vec<SourceIdentity>| RenderCacheKey {
+            repo_url: chart.url.clone(),
+            commit_sha: chart.revision.clone(),
+            source_path: chart.path.clone(),
+            sources,
+            ..key("charts/api", "payments")
+        };
+        let base = build(vec![chart.clone(), values.clone()]);
+        assert_eq!(
+            base.digest(),
+            build(vec![chart.clone(), values.clone()]).digest()
+        );
+
+        // Every tuple field of every source moves the digest.
+        for variant in [
+            build(vec![
+                identity(
+                    "https://example.com/other.git",
+                    "chart-sha",
+                    "charts/api",
+                    "chart",
+                ),
+                values.clone(),
+            ]),
+            build(vec![
+                chart.clone(),
+                identity(
+                    "https://example.com/values.git",
+                    "values-sha-2",
+                    "",
+                    "values",
+                ),
+            ]),
+            build(vec![
+                chart.clone(),
+                identity(
+                    "https://example.com/values.git",
+                    "values-sha",
+                    "envs",
+                    "values",
+                ),
+            ]),
+            build(vec![
+                chart.clone(),
+                identity("https://example.com/values.git", "values-sha", "", "envs"),
+            ]),
+            // Order is part of the identity: `status.sync.revisions` is declaration-ordered, and a
+            // reordered list means a different composition.
+            build(vec![values.clone(), chart.clone()]),
+        ] {
+            assert_ne!(
+                variant.digest(),
+                base.digest(),
+                "the multi-source key must distinguish {variant:?}"
+            );
+        }
+
+        // A single-source render appends nothing, so its digest is exactly the pre-`T20.1` formula —
+        // which is what keeps an already-rendered bundle valid across the upgrade. The expectation is
+        // recomputed here from that formula rather than from another `RenderCacheKey`, so a change
+        // that silently appended an empty list to the pre-image would fail this test.
+        let single = build(Vec::new());
+        let mut legacy = String::new();
+        encode_fields(
+            &mut legacy,
+            &[
+                &single.repo_url,
+                &single.commit_sha,
+                &single.source_path,
+                &single.app_namespace,
+                &single.app_name,
+                &single.destination_namespace,
+                &single.cluster_kube_version,
+                &single.renderer_config,
+            ],
+        );
+        assert_eq!(single.digest(), sha256_hex(legacy.as_bytes()));
+        // ...and the list cannot be forged by embedding a delimiter in a field.
+        let forged = build(vec![
+            chart.clone(),
+            identity(
+                "https://example.com/values.git",
+                "values-sha\u{1}",
+                "",
+                "values",
+            ),
+        ]);
+        assert_ne!(forged.digest(), base.digest());
+
+        // `Debug` redacts the URLs and the renderer pre-image, exactly like the single-source key.
+        let mut credentialed = build(vec![
+            identity(
+                "https://oauth2:s3cr3t-token@example.com/charts.git",
+                "chart-sha",
+                "charts/api",
+                "chart",
+            ),
+            values,
+        ]);
+        credentialed.repo_url = "https://oauth2:s3cr3t-token@example.com/charts.git".to_owned();
+        let rendered = format!("{credentialed:?}");
+        assert!(!rendered.contains("s3cr3t-token"), "{rendered}");
+        assert!(rendered.contains("chart-sha"), "{rendered}");
     }
 
     /// The binary override is an operator/test seam: it reaches an *auto-detected* renderer and is

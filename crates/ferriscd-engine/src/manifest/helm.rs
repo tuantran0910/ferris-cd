@@ -52,6 +52,7 @@ use super::renderer::{
     contained_file, is_remote_reference, relative_display, resolve_relative_inside,
     resolve_source_path, task_failed,
 };
+use super::sources::SourceRoots;
 
 /// Renderer name used in errors and logs.
 const RENDERER: &str = "helm";
@@ -154,11 +155,14 @@ impl ManifestRenderer for HelmRenderer {
             let root = ctx.root_dir.clone();
             let source_path = ctx.source_path.clone();
             let options = self.options.clone();
+            // `T20.1`: the sibling worktrees a `$ref/...` values reference may point into.
+            let source_roots = ctx.source_roots.clone();
 
-            let prepared =
-                tokio::task::spawn_blocking(move || prepare(&root, &source_path, &options))
-                    .await
-                    .map_err(|join_err| task_failed(RendererKind::Helm, join_err))??;
+            let prepared = tokio::task::spawn_blocking(move || {
+                prepare(&root, &source_path, &options, &source_roots)
+            })
+            .await
+            .map_err(|join_err| task_failed(RendererKind::Helm, join_err))??;
 
             let args = template_args(ctx, &self.options, &prepared)?;
 
@@ -201,6 +205,7 @@ fn prepare(
     root: &Path,
     source_path: &str,
     options: &HelmOptions,
+    source_roots: &SourceRoots,
 ) -> Result<PreparedHelm, ManifestError> {
     let canonical = canonical_root(root)?;
     let chart_dir = resolve_source_path(&canonical, source_path)?;
@@ -234,7 +239,12 @@ fn prepare(
     // Every value file must be a real file inside the checkout (Trap T11).
     let mut value_files = Vec::with_capacity(options.value_files.len());
     for value_file in &options.value_files {
-        value_files.push(validate_value_file(&canonical, &chart_dir, value_file)?);
+        value_files.push(validate_value_file(
+            &canonical,
+            &chart_dir,
+            value_file,
+            source_roots,
+        )?);
     }
 
     let inline_values_file = match options.inline_values.as_deref() {
@@ -260,11 +270,36 @@ fn prepare(
 }
 
 /// Rejects remote, escaping, or missing `valueFiles` entries.
+///
+/// `T20.1`: a `$ref/...` entry is resolved inside the **referenced** source's worktree instead
+/// (`SourceRoots::resolve`), which is what lets a chart and its per-environment values live in two
+/// different repositories. The jail is the referenced root, not the chart's: `$values/../..` and a
+/// symlink out of the values checkout are both refused, so a chart can never read a file the
+/// `Application` did not declare a source for.
 fn validate_value_file(
     root: &Path,
     chart_dir: &Path,
     value_file: &str,
+    source_roots: &SourceRoots,
 ) -> Result<PathBuf, ManifestError> {
+    if SourceRoots::is_reference(value_file) {
+        let resolved =
+            source_roots
+                .resolve(value_file)?
+                .ok_or_else(|| ManifestError::UnsafeReference {
+                    file: relative_display(root, chart_dir),
+                    field: "valueFiles".to_owned(),
+                    reference: value_file.to_owned(),
+                    reason: "the reference did not resolve to a source".to_owned(),
+                })?;
+        if !resolved.is_file() {
+            return Err(ManifestError::RendererRejected {
+                renderer: RENDERER.to_owned(),
+                message: format!("values file '{value_file}' is not a regular file"),
+            });
+        }
+        return Ok(resolved);
+    }
     if is_remote_reference(value_file) {
         return Err(ManifestError::UnsafeReference {
             file: relative_display(root, chart_dir),
@@ -870,6 +905,7 @@ mod tests {
                 inline_values: Some("password: hunter2\n".to_owned()),
                 ..HelmOptions::default()
             },
+            &SourceRoots::default(),
         )
         .expect("prepare");
         let values_file = prepared
@@ -909,8 +945,13 @@ mod tests {
             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n",
         );
 
-        let err = prepare(root, "manifests", &HelmOptions::default())
-            .expect_err("missing Chart.yaml must fail");
+        let err = prepare(
+            root,
+            "manifests",
+            &HelmOptions::default(),
+            &SourceRoots::default(),
+        )
+        .expect_err("missing Chart.yaml must fail");
         assert!(err.to_string().contains("Chart.yaml"), "{err}");
     }
 
@@ -927,9 +968,186 @@ mod tests {
                 value_files: vec!["values-missing.yaml".to_owned()],
                 ..HelmOptions::default()
             },
+            &SourceRoots::default(),
         )
         .expect_err("missing values file must fail");
         assert!(matches!(err, ManifestError::NotFound { .. }), "{err:?}");
+    }
+
+    /// The one `--values` path on a recorded argv.
+    fn values_arg(args: &[String]) -> Option<PathBuf> {
+        args.iter()
+            .enumerate()
+            .find(|(index, _)| {
+                index
+                    .checked_sub(1)
+                    .and_then(|index| args.get(index))
+                    .map(String::as_str)
+                    == Some("--values")
+            })
+            .map(|(_, value)| PathBuf::from(value))
+    }
+
+    /// **`T20.1` acceptance criterion, at the seam that matters.** A `valueFiles` entry naming a
+    /// sibling source (`$values/envs/prod/values.yaml`) is resolved **inside that source's own
+    /// worktree** and helm is handed that path — the file is never copied into, or read through, the
+    /// chart's checkout.
+    #[tokio::test]
+    async fn a_source_reference_value_file_resolves_inside_the_referenced_worktree() {
+        let chart = TempDir::new().expect("chart tempdir");
+        let values = TempDir::new().expect("values tempdir");
+        fixture(chart.path());
+        write(values.path(), "envs/prod/values.yaml", "replicaCount: 3\n");
+
+        let fake = FakeBinary::new(
+            "helm",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: queued\n",
+        );
+        let roots = SourceRoots::new(vec![("values".to_owned(), values.path().to_path_buf())])
+            .expect("source roots");
+        let options = HelmOptions {
+            binary: Some(fake.path().to_path_buf()),
+            value_files: vec!["$values/envs/prod/values.yaml".to_owned()],
+            ..HelmOptions::default()
+        };
+        let ctx = context(chart.path(), options.clone()).with_source_roots(roots);
+        let files = HelmRenderer::new(options)
+            .render(&ctx)
+            .await
+            .expect("a reference to a declared source must render");
+        assert_eq!(files.len(), 1);
+
+        let args = fake.recorded_args();
+        let value = values_arg(&args).expect("the referenced values file must be on the argv");
+        let values_root = fs::canonicalize(values.path()).expect("canonical values root");
+        let chart_root = fs::canonicalize(chart.path()).expect("canonical chart root");
+        assert!(
+            value.starts_with(&values_root),
+            "the value file must resolve inside the referenced worktree, got {} (args: {args:?})",
+            value.display()
+        );
+        assert!(
+            !value.starts_with(&chart_root),
+            "the referenced file must not be reachable through the chart checkout: {}",
+            value.display()
+        );
+        assert_eq!(
+            fs::read_to_string(&value).expect("read the resolved value file"),
+            "replicaCount: 3\n",
+            "helm must be handed the referenced file itself, not a rewrite of it"
+        );
+    }
+
+    /// **`T20.1` trap guard.** A reference that leaves the referenced worktree — lexically, through an
+    /// absolute path, or through an alias nobody declared — is refused *before* helm runs, so a chart
+    /// can never read a file the `Application` did not declare a source for.
+    #[tokio::test]
+    async fn a_source_reference_escaping_or_unknown_is_rejected_before_helm_runs() {
+        let chart = TempDir::new().expect("chart tempdir");
+        let values = TempDir::new().expect("values tempdir");
+        fixture(chart.path());
+        write(values.path(), "envs/prod/values.yaml", "replicaCount: 3\n");
+        write(values.path(), "secret.yaml", "password: hunter2\n");
+
+        let fake = FakeBinary::new(
+            "helm",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: queued\n",
+        );
+        let roots = SourceRoots::new(vec![("values".to_owned(), values.path().to_path_buf())])
+            .expect("source roots");
+
+        for reference in [
+            // `..` out of the referenced root.
+            "$values/../../etc/passwd",
+            "$values/envs/../../../secret.yaml",
+            // An absolute path is not relative to the referenced root.
+            "$values/../secret.yaml",
+            "$values//etc/passwd",
+            // An alias no source answered to.
+            "$secrets/envs/prod/values.yaml",
+            // A reference that names no file at all.
+            "$values",
+        ] {
+            let options = HelmOptions {
+                binary: Some(fake.path().to_path_buf()),
+                value_files: vec![reference.to_owned()],
+                ..HelmOptions::default()
+            };
+            let ctx = context(chart.path(), options.clone()).with_source_roots(roots.clone());
+            let err = HelmRenderer::new(options)
+                .render(&ctx)
+                .await
+                .expect_err("an escaping reference must be refused");
+            match &err {
+                ManifestError::UnsafeReference {
+                    field,
+                    reference: got,
+                    ..
+                } => {
+                    assert_eq!(field, "valueFiles");
+                    assert_eq!(got, reference);
+                }
+                other => panic!("{reference} must be an UnsafeReference, got {other:?}"),
+            }
+            assert!(!err.to_string().contains("hunter2"), "{err}");
+            assert!(!err.is_retryable(), "{err}");
+        }
+        // A path that *is* inside the reference but does not exist is a plain `NotFound`.
+        let options = HelmOptions {
+            binary: Some(fake.path().to_path_buf()),
+            value_files: vec!["$values/envs/missing.yaml".to_owned()],
+            ..HelmOptions::default()
+        };
+        let ctx = context(chart.path(), options.clone()).with_source_roots(roots);
+        let err = HelmRenderer::new(options)
+            .render(&ctx)
+            .await
+            .expect_err("a missing value file must fail");
+        assert!(matches!(err, ManifestError::NotFound { .. }), "{err:?}");
+
+        assert_eq!(
+            fake.invocations(),
+            0,
+            "helm must never be spawned for a reference that does not resolve"
+        );
+    }
+
+    /// The jail is on the **resolved** path: a symlink inside the referenced worktree that points
+    /// outside it is refused, exactly like the chart's own `valueFiles` jail (`T11`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_escaping_the_referenced_worktree_is_rejected() {
+        let chart = TempDir::new().expect("chart tempdir");
+        let values = TempDir::new().expect("values tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        fixture(chart.path());
+        let secret = outside.path().join("secret.yaml");
+        fs::write(&secret, "password: hunter2\n").expect("write the outside file");
+        std::os::unix::fs::symlink(&secret, values.path().join("linked.yaml"))
+            .expect("create the escaping symlink");
+
+        let fake = FakeBinary::new(
+            "helm",
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: queued\n",
+        );
+        let roots = SourceRoots::new(vec![("values".to_owned(), values.path().to_path_buf())])
+            .expect("source roots");
+        let options = HelmOptions {
+            binary: Some(fake.path().to_path_buf()),
+            value_files: vec!["$values/linked.yaml".to_owned()],
+            ..HelmOptions::default()
+        };
+        let ctx = context(chart.path(), options.clone()).with_source_roots(roots);
+        let err = HelmRenderer::new(options)
+            .render(&ctx)
+            .await
+            .expect_err("a symlink out of the referenced worktree must be refused");
+        assert!(
+            matches!(err, ManifestError::UnsafeReference { .. }),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+        assert_eq!(fake.invocations(), 0, "helm must never be spawned");
     }
 
     #[test]

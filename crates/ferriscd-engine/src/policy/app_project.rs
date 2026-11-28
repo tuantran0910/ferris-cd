@@ -492,16 +492,28 @@ impl AppProjectPolicy {
                 project: self.name.clone(),
             });
         }
-        // `T18.3`: whichever source the `Application` names — a Git remote or an `oci://`
-        // reference — is matched against `spec.sourceRepos`. An OCI reference therefore has to be
-        // granted explicitly (e.g. `oci://ghcr.io/payments/*`); it is never implied by a Git glob,
-        // so evolving the schema cannot widen an existing project's tenancy.
-        if !self.allows_source_repo(app.spec.source.repo_url()) {
-            return Err(PolicyError::SourceRepoNotAllowed {
-                application,
-                project: self.name.clone(),
-                repo_url: redact_repo_url(app.spec.source.repo_url()),
-            });
+        // `T18.3`/`T20.1`: **every** source the `Application` declares — a Git remote or an
+        // `oci://` reference, in `spec.source` or in any `spec.sources` entry — is matched against
+        // `spec.sourceRepos`. An OCI reference therefore has to be granted explicitly (e.g.
+        // `oci://ghcr.io/payments/*`); it is never implied by a Git glob, so evolving the schema
+        // cannot widen an existing project's tenancy. A multi-source `Application` cannot smuggle an
+        // unauthorized second repository past the policy by making it the values-only source: the
+        // check runs over the declared list, before anything is fetched (trap guard `T20.1`).
+        for source in crate::manifest::declared_sources(&app.spec) {
+            // Finding M4: the URL is redacted before it reaches `Application.status`/Events/logs.
+            let repo_url = source.spec.repo_url();
+            let redacted = if source.spec.oci_source().is_some() {
+                crate::repo::redact_oci_url_credentials(repo_url)
+            } else {
+                redact_repo_url(repo_url)
+            };
+            if !self.allows_source_repo(repo_url) {
+                return Err(PolicyError::SourceRepoNotAllowed {
+                    application,
+                    project: self.name.clone(),
+                    repo_url: redacted,
+                });
+            }
         }
         if !self.allows_destination(
             &app.spec.destination.cluster,
@@ -946,8 +958,9 @@ spec: {}
     fn an_oci_source_is_checked_against_source_repos() {
         let policy = payments_project();
         let mut app = application(APPLICATION);
-        app.spec.source.git = None;
-        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+        let source = app.spec.source.as_mut().expect("spec.source");
+        source.git = None;
+        source.oci = Some(ferriscd_crd::OciSourceSpec {
             url: "oci://ghcr.io/example/payments".to_owned(),
             tag: Some("1.4.2".to_owned()),
             digest: None,
@@ -996,7 +1009,7 @@ spec:
             "an explicit oci:// allow-list entry must authorize the artifact"
         );
         // ...and a lookalike registry path is still denied.
-        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+        app.spec.source.as_mut().expect("spec.source").oci = Some(ferriscd_crd::OciSourceSpec {
             url: "oci://ghcr.io/evil/payments".to_owned(),
             tag: Some("1.4.2".to_owned()),
             digest: None,
@@ -1012,8 +1025,14 @@ spec:
     fn a_source_repository_mismatch_is_rejected_and_credentials_are_redacted() {
         let policy = payments_project();
         let mut app = application(APPLICATION);
-        app.spec.source.git.as_mut().expect("git source").repo_url =
-            "https://oauth2:s3cr3t-token@github.com/evil/payments.git".to_owned();
+        app.spec
+            .source
+            .as_mut()
+            .expect("spec.source")
+            .git
+            .as_mut()
+            .expect("git source")
+            .repo_url = "https://oauth2:s3cr3t-token@github.com/evil/payments.git".to_owned();
 
         let err = policy
             .check_application(&app, &scope())
@@ -1033,6 +1052,124 @@ spec:
         assert!(
             message.contains("oauth2:***@"),
             "the account name stays readable, the password never does: {message}"
+        );
+    }
+
+    /// A split chart + values `Application` (`T20.1`): the chart repository is the one
+    /// `PAYMENTS_PROJECT` lists, the values repository is anything the project has **not** granted.
+    const MULTI_SOURCE_APPLICATION: &str = r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: Application
+metadata:
+  name: payments-api
+  namespace: ferriscd-system
+spec:
+  project: payments
+  sources:
+    - ref: chart
+      git:
+        repoURL: https://github.com/example/payments.git
+        targetRevision: main
+        path: charts/api
+      renderer:
+        helm:
+          valueFiles:
+            - $values/envs/prod/values.yaml
+    - ref: values
+      git:
+        repoURL: https://oauth2:s3cr3t-token@github.com/evil/values.git
+        targetRevision: main
+  destination:
+    cluster: in-cluster
+    namespace: payments
+"#;
+
+    /// **`T20.1` trap guard.** `check_application` authorizes **every** declared source, so a
+    /// multi-source `Application` cannot smuggle an unauthorized second repository past the project
+    /// by making it the values-only source — and the refusal carries the redacted URL, because it
+    /// reaches `Application.status` and Events.
+    #[test]
+    fn an_unauthorized_second_source_is_refused_with_a_redacted_url() {
+        let app = application(MULTI_SOURCE_APPLICATION);
+        assert!(app.spec.is_multi_source());
+        assert_eq!(
+            app.spec.validate(),
+            Ok(()),
+            "the fixture must be a valid spec"
+        );
+
+        // The chart repository is listed, the values repository is not: the *second* entry is what
+        // has to be refused, and it is refused before anything is fetched.
+        let err = payments_project()
+            .check_application(&app, &scope())
+            .expect_err("an unlisted values repository must be refused");
+        match &err {
+            PolicyError::SourceRepoNotAllowed {
+                application,
+                project,
+                repo_url,
+            } => {
+                assert_eq!(application, "ferriscd-system/payments-api");
+                assert_eq!(project, "payments");
+                assert_eq!(repo_url, "https://oauth2:***@github.com/evil/values.git");
+            }
+            other => panic!("expected SourceRepoNotAllowed, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(!message.contains("s3cr3t-token"), "{message}");
+        assert!(message.contains("github.com/evil/values.git"), "{message}");
+
+        // The same failure when the *chart* is the unlisted one: the check is over the whole list,
+        // not only over the values-only entries (so it cannot be satisfied by ordering).
+        let mut chart_denied = app.clone();
+        chart_denied.spec.sources[0]
+            .git
+            .as_mut()
+            .expect("chart source")
+            .repo_url = "https://github.com/evil/charts.git".to_owned();
+        let err = payments_project()
+            .check_application(&chart_denied, &scope())
+            .expect_err("an unlisted chart repository must be refused");
+        assert!(
+            err.to_string().contains("github.com/evil/charts.git"),
+            "{err}"
+        );
+
+        // Listing the values repository is what makes the composition allowed. The grant is matched
+        // against the URL as written, so the positive case uses the credential-free spelling the
+        // `AppProject` would list (a project never lists a token).
+        let mut plain = app.clone();
+        plain.spec.sources[1]
+            .git
+            .as_mut()
+            .expect("values source")
+            .repo_url = "https://github.com/evil/values.git".to_owned();
+        let allowed = project(&PAYMENTS_PROJECT.replace(
+            "    - https://github.com/example/payments.git",
+            "    - https://github.com/example/payments.git\n    - https://github.com/evil/values.git",
+        ));
+        assert_eq!(allowed.check_application(&plain, &scope()), Ok(()));
+        // ...and a wildcard entry grants it just like an exact one, so the verdict does not depend
+        // on how the operator spelled the grant.
+        let wildcard = project(&PAYMENTS_PROJECT.replace(
+            "    - https://github.com/example/payments.git",
+            "    - https://github.com/example/payments.git\n    - https://github.com/evil/*",
+        ));
+        assert_eq!(
+            wildcard.check_application(&plain, &scope()),
+            Ok(()),
+            "a wildcard source repo entry is still a grant"
+        );
+        // A project that grants the values repository but drops the chart one refuses the chart,
+        // so "the list is checked" is not the same claim as "the second entry is checked".
+        let chart_dropped = project(
+            &PAYMENTS_PROJECT.replace("    - https://github.com/example/payments.git\n", ""),
+        );
+        assert_eq!(
+            chart_dropped
+                .check_application(&plain, &scope())
+                .map_err(|err| matches!(err, PolicyError::SourceRepoNotAllowed { .. })),
+            Err(true)
         );
     }
 

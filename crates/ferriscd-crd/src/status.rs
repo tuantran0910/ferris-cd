@@ -226,6 +226,19 @@ pub struct SyncState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_synced_spec_hash: Option<String>,
 
+    /// Resolved revision of **every** declared source, in `spec.sources` declaration order
+    /// (`T20.1`).
+    ///
+    /// A single-source `Application` leaves this empty and keeps reporting its one revision through
+    /// [`Self::revision`] exactly as `v1.0` did (trap guard `T20.1`). A multi-source `Application`
+    /// reports one entry per source, which is what makes "the values repo moved, the chart did not"
+    /// visible: [`Self::revision`] is then the composite digest over this list.
+    ///
+    /// Additive on the wire: absent (never `[]`) for a single-source `Application`, so stored
+    /// objects round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<String>,
+
     /// When the last successful sync finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_synced_at: Option<Time>,
@@ -240,6 +253,7 @@ impl SyncState {
             revision,
             last_synced_revision: None,
             last_synced_spec_hash: None,
+            revisions: Vec::new(),
             last_synced_at: None,
         }
     }
@@ -537,6 +551,15 @@ pub struct RevisionHistoryEntry {
     /// moved to another path or renderer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_summary: Option<SourceSummary>,
+
+    /// Resolved revision of every declared source for a multi-source `Application` (`T20.1`).
+    ///
+    /// `revision` stays the (composite) deployment identity the rollback path pins — this list is
+    /// what a rollback needs to re-deploy *the same* per-source revisions, and what an operator
+    /// reads to see which values repository produced a deployment. Absent for a single-source
+    /// entry, so `v1.0` history entries are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<String>,
 }
 
 impl RevisionHistoryEntry {
@@ -548,6 +571,7 @@ impl RevisionHistoryEntry {
             revision,
             deployed_at,
             source_summary: None,
+            revisions: Vec::new(),
         }
     }
 
@@ -555,6 +579,13 @@ impl RevisionHistoryEntry {
     #[must_use]
     pub fn with_source_summary(mut self, source_summary: Option<SourceSummary>) -> Self {
         self.source_summary = source_summary;
+        self
+    }
+
+    /// Records the per-source revisions of a multi-source deployment (builder style, `T20.1`).
+    #[must_use]
+    pub fn with_revisions(mut self, revisions: Vec<String>) -> Self {
+        self.revisions = revisions;
         self
     }
 }
@@ -867,6 +898,7 @@ mod tests {
             revision: Some("8f3a1c2e9d4b5a60718293a4b5c6d7e8f9012345".to_owned()),
             last_synced_revision: Some("8f3a1c2e9d4b5a60718293a4b5c6d7e8f9012345".to_owned()),
             last_synced_spec_hash: Some("a1b2c3d4e5f6".to_owned()),
+            revisions: Vec::new(),
             last_synced_at: Some(ts("2026-11-24T12:00:00Z")),
         });
         status.health = Some(HealthState {

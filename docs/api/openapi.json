@@ -1993,6 +1993,13 @@
               "null"
             ],
             "description": "The commit that was deployed."
+          },
+          "revisions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Per-source revisions of that deployment (`T20.1`); empty for a single-source deployment."
           }
         }
       },
@@ -2417,6 +2424,62 @@
           }
         }
       },
+      "SourceEntryView": {
+        "type": "object",
+        "description": "One `spec.sources` entry (`T20.1`).",
+        "required": [
+          "sourceType",
+          "repoUrl",
+          "path",
+          "targetRevision"
+        ],
+        "properties": {
+          "digest": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pinned OCI manifest digest, when the entry pins one."
+          },
+          "path": {
+            "type": "string",
+            "description": "Path inside the source (`\"\"` for its root)."
+          },
+          "ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`ref` alias other sources address this one by (`$<ref>/...`); absent when it has none.\n\nSpelled `ref` on the wire, exactly like `spec.sources[].ref` in the CRD, so a client can map\nthe view back onto the spec without a rename."
+          },
+          "renderer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Renderer for this entry; absent means \"support source only\" (values, no manifests)."
+          },
+          "repoUrl": {
+            "type": "string",
+            "description": "Repository or registry URL, redacted."
+          },
+          "sourceType": {
+            "type": "string",
+            "description": "Source kind (`git` or `oci`)."
+          },
+          "tag": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "OCI tag to resolve, when the entry is an OCI artifact."
+          },
+          "targetRevision": {
+            "type": "string",
+            "description": "Requested revision (`git.targetRevision`, else `oci.tag`, else `oci.digest`)."
+          }
+        }
+      },
       "SourceView": {
         "type": "object",
         "description": "`spec.source` summary.\n\n`T18.4` added the source **kind** and, for an OCI artifact, its `tag` and pinned `digest`. The\nfields are additive: a Git `Application` keeps `sourceType: \"git\"` with no `tag`/`digest` key at\nall, so an existing client sees exactly the payload it saw before.\n\n**Client/server skew (finding M6).** `sourceType` is *new*, so a `v1.1` server does not send it.\nDeserializing therefore defaults to `\"git\"` (the only source kind that version could serve)\ninstead of failing the whole response, while the **response** schema keeps the field required\n(`#[schema(required = true)]`) — a `v1.2` server always fills it in, and the generated\nTypeScript client must keep treating it as present.",
@@ -2435,6 +2498,10 @@
             ],
             "description": "Pinned OCI manifest digest (`spec.source.oci.digest`, `sha256:<64-hex>`); never set by a\nresolution — this is what the `Application` *pinned*, not what the registry answered."
           },
+          "multiSource": {
+            "type": "boolean",
+            "description": "Whether the `Application` declares `spec.sources` (`T20.1`).\n\nA single-source `Application` omits the key entirely and `sources` below is empty, so its\npayload stays byte-identical to the `v1.1` one. It defaults to `false` when absent, which\ncovers both an older server's payload and that omitted-key case."
+          },
           "path": {
             "type": "string",
             "description": "Path inside the repository (`\"\"` for its root)."
@@ -2450,6 +2517,13 @@
           "sourceType": {
             "type": "string",
             "description": "Source kind (`git` or `oci`).\n\nDefaults to `git` when absent: an older server has no OCI support, so every source it can\nreport *is* a Git source."
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceEntryView"
+            },
+            "description": "Every declared source, in declaration order (`T20.1`).\n\n`source` above always describes the **rendered** source (the first entry that contributes\nmanifests), so a pre-`T20.1` client keeps working; this list is what carries the values\nrepository and its alias. Empty for a single-source `Application`."
           },
           "tag": {
             "type": [
@@ -2518,6 +2592,13 @@
               "null"
             ],
             "description": "Revision the last pass rendered."
+          },
+          "revisions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Resolved revision of every declared source, in declaration order (`T20.1`).\n\nEmpty for a single-source `Application`, whose one revision is `revision` above."
           },
           "status": {
             "type": "string",

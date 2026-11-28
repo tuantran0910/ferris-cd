@@ -25,7 +25,7 @@ use ferriscd_crd::status::{
     OperationState, REASON_SYNC_ERROR, REASON_SYNC_SUCCEEDED, ResourceStatus, RevisionHistoryEntry,
     SyncState, SyncStatus,
 };
-use ferriscd_crd::{Application, annotations};
+use ferriscd_crd::{Application, ApplicationSpec, annotations};
 use ferriscd_engine::diff::{DiffSummary, ResourceDiff};
 use ferriscd_engine::inventory::Inventory;
 use ferriscd_engine::manifest::{ManifestError, ResourceKey};
@@ -332,6 +332,10 @@ pub enum ReconcileError {
         inventory: Inventory,
         /// The revision that could not be synced.
         revision: Option<String>,
+        /// Per-source revisions the refusing pass had already resolved (`T20.1` finding M1).
+        ///
+        /// Same contract as [`Self::PartialSync::revisions`]: the list that belongs to `revision`.
+        revisions: Vec<String>,
     },
 
     /// The referenced `AppProject` does not permit this `Application` (`T12.1`, `T12.2`).
@@ -403,6 +407,13 @@ pub enum ReconcileError {
         inventory: Inventory,
         /// The revision that was being synced.
         revision: Option<String>,
+        /// Per-source revisions the failed pass had already resolved (`T20.1` finding M1).
+        ///
+        /// The list that belongs to `revision`: `revision` is the composite digest over exactly these
+        /// entries, so publishing one without the other would show an operator a deployment identity
+        /// the per-source rows cannot describe. Empty for a `v1.0` `spec.source` `Application`, whose
+        /// one revision lives in `revision` alone (trap guard `T20.1`).
+        revisions: Vec<String>,
         /// The wave/hook operation state the failed pass produced (`T10.3`, finding M4).
         ///
         /// A pass that failed *after* creating hooks must still persist their tracking records:
@@ -428,6 +439,11 @@ pub enum ReconcileError {
         inventory: Inventory,
         /// The revision that could not be fully synced.
         revision: Option<String>,
+        /// Per-source revisions the failed pass had already resolved (`T20.1` finding M1).
+        ///
+        /// Same contract as [`Self::PartialSync::revisions`]: a terminal failure reports the composite
+        /// `revision` *and* the list it is the digest of, never one without the other.
+        revisions: Vec<String>,
         /// The wave/hook operation state the failed pass produced (finding H-A).
         ///
         /// A **terminal** failure inside an operation (a rejected hook create, an immutable field)
@@ -623,6 +639,29 @@ impl ReconcileError {
             // `lastSynced*` markers (they are `None` here on purpose).
             Self::PolicyGate(refusal) => Some((&refusal.inventory, refusal.revision.as_ref())),
             _ => None,
+        }
+    }
+
+    /// The per-source revisions a failure already determines (`T20.1` finding M1).
+    ///
+    /// **The rule this pins:** `status.sync.revision` and `status.sync.revisions` describe the *same*
+    /// deployment. A pass that resolved its sources and then failed (a partial apply, a terminal
+    /// policy conflict, a foreign owner) reports the composite identity it was syncing, so it has to
+    /// publish the per-source list that digest is computed from. Reporting the new composite and
+    /// letting [`merge_sync_state`] keep the previous list would show an operator source revisions
+    /// that describe a different commit set than the revision printed next to them.
+    ///
+    /// So the failure path **carries** what the pass resolved; the "an empty incoming list keeps the
+    /// previous one" rule in [`merge_sync_state`] then only covers passes that genuinely resolved
+    /// nothing, which report no revision either. Empty for a `v1.0` `spec.source` `Application`, so
+    /// its `/status` stays byte-identical (trap guard `T20.1`).
+    #[must_use]
+    pub fn partial_revisions(&self) -> &[String] {
+        match self {
+            Self::PartialSync { revisions, .. }
+            | Self::SyncConflict { revisions, .. }
+            | Self::OwnershipConflict { revisions, .. } => revisions,
+            _ => &[],
         }
     }
 
@@ -1321,7 +1360,7 @@ pub async fn apply_once_with_events(
     match pipeline.apply(app).await {
         Ok(outcome) => {
             record_success(&mut status, generation, &outcome, now());
-            apply_outcome_status(&mut status, &outcome);
+            apply_outcome_status(&mut status, &app.spec, &outcome);
             // Re-enabling `spec.syncPolicy.automated` is exactly what the rollback warning asks the
             // operator to do, so the warning is cleared on the first pass that sees automation back
             // on (finding M-4: a stale warning trains operators to ignore warnings).
@@ -1369,11 +1408,18 @@ pub async fn apply_once_with_events(
                 status.set_inventory(ferriscd_engine::inventory::to_status_entries(inventory));
                 merge_sync_state(
                     &mut status,
+                    &app.spec,
                     SyncState {
                         status: SyncStatus::OutOfSync,
                         revision: revision.cloned(),
                         last_synced_revision: None,
                         last_synced_spec_hash: None,
+                        // `T20.1` finding M1: the failure reports the composite identity it was
+                        // syncing *and* the per-source list that identity is computed from, so the
+                        // two can never disagree. A pass that resolved nothing reports an empty list
+                        // (and no revision), which `merge_sync_state` still fills from the previous
+                        // deployment.
+                        revisions: err.partial_revisions().to_vec(),
                         last_synced_at: None,
                     },
                 );
@@ -1411,12 +1457,16 @@ pub async fn apply_once_with_events(
 /// desired set, so a resource that was removed from Git (or from the cluster) must not keep a stale
 /// summary in `status.resources` forever. The list is bounded by
 /// [`ApplicationStatus::record_resource_status`], which also counts the overflow.
-pub fn apply_outcome_status(status: &mut ApplicationStatus, outcome: &ApplyOutcome) {
+pub fn apply_outcome_status(
+    status: &mut ApplicationStatus,
+    spec: &ApplicationSpec,
+    outcome: &ApplyOutcome,
+) {
     if let Some(inventory) = &outcome.inventory {
         status.set_inventory(ferriscd_engine::inventory::to_status_entries(inventory));
     }
     if let Some(sync) = &outcome.sync {
-        merge_sync_state(status, sync.clone());
+        merge_sync_state(status, spec, sync.clone());
     }
     if let Some(health) = &outcome.health {
         status.health = Some(health.clone());
@@ -1455,7 +1505,21 @@ pub fn apply_outcome_status(status: &mut ApplicationStatus, outcome: &ApplyOutco
 /// A reconcile that reports "still out of sync" reports only the revision it just read; the
 /// last successful sync markers belong to an earlier (successful) pass and must survive, or
 /// `selfHeal: false` drift detection would forget what it already deployed (finding H7).
-pub fn merge_sync_state(status: &mut ApplicationStatus, next: SyncState) {
+///
+/// `T20.1` finding H3: the same rule covers the per-source `revisions` list. A pass that resolved
+/// nothing reports an **empty** list, and wiping the published one would leave
+/// `status.sync.revision` (the composite digest) describing sources the API/UI/CLI can no longer
+/// name. An empty incoming list therefore keeps the previous one *while `spec` still declares
+/// `spec.sources`*, which is the same predicate that decides whether the list is published at all: a
+/// spec edit back to `spec.source` clears it instead of resurrecting a stale multi-source list.
+///
+/// `T20.1` finding M1: that preservation is only safe for a pass that resolved nothing, because such
+/// a pass reports no `revision` either. The one rule that keeps `revision` and `revisions` in
+/// agreement is therefore *carry-forward*: every sync path that resolves sources reports the
+/// composite identity **and** [`ReconcileError::partial_revisions`] of the same pass (through
+/// [`apply_outcome_status`] on success, through this function from the failure path), so an empty
+/// incoming list never sits next to a *new* composite.
+pub fn merge_sync_state(status: &mut ApplicationStatus, spec: &ApplicationSpec, next: SyncState) {
     let previous = status.sync.take();
     let mut merged = next;
     if merged.last_synced_revision.is_none() {
@@ -1472,6 +1536,18 @@ pub fn merge_sync_state(status: &mut ApplicationStatus, next: SyncState) {
         merged.last_synced_at = previous
             .as_ref()
             .and_then(|previous| previous.last_synced_at.clone());
+    }
+    if merged.revisions.is_empty() {
+        merged.revisions = if spec.is_multi_source() {
+            previous
+                .as_ref()
+                .map(|previous| previous.revisions.clone())
+                .unwrap_or_default()
+        } else {
+            // A `v1.0` `spec.source` `Application` publishes no list at all, so a list left behind by
+            // a spec edit from `spec.sources` back to `spec.source` must be dropped, not preserved.
+            Vec::new()
+        };
     }
     status.sync = Some(merged);
 }
@@ -1729,7 +1805,7 @@ mod tests {
         let spec = ApplicationSpec {
             project: DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
-            source: SourceSpec {
+            source: Some(SourceSpec {
                 git: Some(GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "HEAD".to_owned(),
@@ -1737,7 +1813,8 @@ mod tests {
                 }),
                 oci: None,
                 renderer: RendererSpec::default(),
-            },
+            }),
+            sources: Vec::new(),
             destination: DestinationSpec {
                 cluster: "in-cluster".to_owned(),
                 namespace: "payments".to_owned(),
@@ -2046,6 +2123,7 @@ mod tests {
                     message: "owned by ferriscd-system/other".to_owned(),
                     inventory: Inventory::new(),
                     revision: Some("deadbeef".to_owned()),
+                    revisions: Vec::new(),
                 },
                 FailureClass::Terminal,
             ),
@@ -2994,6 +3072,27 @@ mod tests {
         inventory
     }
 
+    /// A spec that declares `spec.sources` (the `T20.1` shape), so it publishes `status.sync.revisions`.
+    fn multi_source_spec() -> ApplicationSpec {
+        serde_json::from_value(serde_json::json!({
+            "sources": [
+                {"ref": "chart", "git": {"repoURL": "https://example.com/charts.git"}},
+                {"ref": "values", "git": {"repoURL": "https://example.com/values.git"}},
+            ],
+            "destination": {"namespace": "payments"},
+        }))
+        .expect("a valid multi-source spec")
+    }
+
+    /// A `v1.0` single-source spec, which never publishes `status.sync.revisions`.
+    fn v1_spec() -> ApplicationSpec {
+        serde_json::from_value(serde_json::json!({
+            "source": {"git": {"repoURL": "https://example.com/repo.git"}},
+            "destination": {"namespace": "payments"},
+        }))
+        .expect("a valid v1.0 spec")
+    }
+
     fn inventory_status() -> ApplicationStatus {
         ApplicationStatus {
             inventory: vec![ferriscd_crd::InventoryEntry::new(
@@ -3005,6 +3104,7 @@ mod tests {
                 revision: Some("oldsha".to_owned()),
                 last_synced_revision: Some("oldsha".to_owned()),
                 last_synced_spec_hash: Some("spec-hash".to_owned()),
+                revisions: Vec::new(),
                 last_synced_at: Some(now()),
             }),
             health: Some(HealthState::new(HealthStatus::Healthy)),
@@ -3030,6 +3130,7 @@ mod tests {
                 // The pipeline did not set the markers; the previous pass owns them.
                 last_synced_revision: None,
                 last_synced_spec_hash: None,
+                revisions: Vec::new(),
                 last_synced_at: None,
             });
         let pipeline = FakePipeline {
@@ -3188,6 +3289,7 @@ mod tests {
             message: "applying apps/Deployment/payments/api failed".to_owned(),
             inventory: sample_inventory(),
             revision: Some("newsha".to_owned()),
+            revisions: Vec::new(),
             operation: Some(Box::new(running_operation("newsha"))),
         });
         let writer = RecordingStatusWriter::default();
@@ -3298,6 +3400,7 @@ mod tests {
             revision: Some(revision.to_owned()),
             last_synced_revision: Some(revision.to_owned()),
             last_synced_spec_hash: Some("spec-hash".to_owned()),
+            revisions: Vec::new(),
             last_synced_at: Some(now()),
         })
         .with_operation_state(Some(operation))
@@ -3463,11 +3566,13 @@ mod tests {
         let mut status = inventory_status();
         merge_sync_state(
             &mut status,
+            &multi_source_spec(),
             SyncState {
                 status: SyncStatus::Synced,
                 revision: Some("newsha".to_owned()),
                 last_synced_revision: Some("newsha".to_owned()),
                 last_synced_spec_hash: None,
+                revisions: Vec::new(),
                 last_synced_at: None,
             },
         );
@@ -3481,8 +3586,232 @@ mod tests {
 
         // No previous sync at all: nothing to preserve, no panic.
         let mut empty = ApplicationStatus::default();
-        merge_sync_state(&mut empty, SyncState::new(SyncStatus::Synced, None));
+        merge_sync_state(
+            &mut empty,
+            &multi_source_spec(),
+            SyncState::new(SyncStatus::Synced, None),
+        );
         assert!(empty.sync.expect("merged").last_synced_revision.is_none());
+    }
+
+    /// **`T20.1` finding H3.** A failed pass reports no per-source resolution
+    /// (`revisions: Vec::new()`); merging must not wipe the list the last successful multi-source
+    /// pass published, or the API/UI/CLI would show the composite `revision` with no sources while
+    /// `lastSyncedRevision` still points at them.
+    #[test]
+    fn sync_state_merge_keeps_the_published_per_source_revisions() {
+        let mut status = ApplicationStatus::default();
+        merge_sync_state(
+            &mut status,
+            &multi_source_spec(),
+            SyncState {
+                status: SyncStatus::Synced,
+                revision: Some("sha256:composite".to_owned()),
+                last_synced_revision: Some("sha256:composite".to_owned()),
+                last_synced_spec_hash: Some("spec-hash".to_owned()),
+                revisions: vec!["chart-sha".to_owned(), "values-sha".to_owned()],
+                last_synced_at: Some(now()),
+            },
+        );
+
+        // A failed pass: the marker survives, so the per-source list has to survive with it.
+        merge_sync_state(
+            &mut status,
+            &multi_source_spec(),
+            SyncState {
+                status: SyncStatus::OutOfSync,
+                revision: Some("sha256:composite".to_owned()),
+                last_synced_revision: None,
+                last_synced_spec_hash: None,
+                revisions: Vec::new(),
+                last_synced_at: None,
+            },
+        );
+        let sync = status.sync.clone().expect("merged");
+        assert_eq!(
+            sync.revisions,
+            vec!["chart-sha".to_owned(), "values-sha".to_owned()],
+            "an empty list is 'this pass resolved nothing', not 'this Application has no sources'"
+        );
+        assert_eq!(
+            sync.last_synced_revision.as_deref(),
+            Some("sha256:composite"),
+            "the composite identity and the sources describing it must not diverge"
+        );
+
+        // A pass that *does* report sources replaces the list, so a values-repo move is visible and
+        // a stale list can never outlive the deployment it described.
+        merge_sync_state(
+            &mut status,
+            &multi_source_spec(),
+            SyncState {
+                status: SyncStatus::Synced,
+                revision: Some("sha256:next".to_owned()),
+                last_synced_revision: Some("sha256:next".to_owned()),
+                last_synced_spec_hash: Some("spec-hash-2".to_owned()),
+                revisions: vec!["chart-sha".to_owned(), "values-sha-2".to_owned()],
+                last_synced_at: Some(now()),
+            },
+        );
+        // The flip check below starts from the same published status.
+        let mut flipped = status.clone();
+        assert_eq!(
+            status.sync.expect("merged").revisions,
+            vec!["chart-sha".to_owned(), "values-sha-2".to_owned()]
+        );
+
+        // A spec edit from `spec.sources` back to `spec.source` **clears** the published list
+        // instead of resurrecting it: the spec no longer declares sources, so the previous list
+        // describes repositories this `Application` no longer fetches. Preservation is predicated
+        // on `spec.is_multi_source()`, so the same empty incoming list that keeps the list above
+        // drops it here.
+        merge_sync_state(
+            &mut flipped,
+            &v1_spec(),
+            SyncState {
+                status: SyncStatus::OutOfSync,
+                revision: Some("sha".to_owned()),
+                last_synced_revision: None,
+                last_synced_spec_hash: None,
+                revisions: Vec::new(),
+                last_synced_at: None,
+            },
+        );
+        let flipped_sync = flipped.sync.expect("merged");
+        assert!(
+            flipped_sync.revisions.is_empty(),
+            "a `sources -> source` edit must clear the stale per-source list: {:?}",
+            flipped_sync.revisions
+        );
+        assert_eq!(
+            flipped_sync.last_synced_revision.as_deref(),
+            Some("sha256:next"),
+            "the `lastSynced*` markers are not spec-shaped and must still survive the edit"
+        );
+
+        // **Finding M1**: a failed pass that *did* resolve its sources carries them, so the very same
+        // empty-incoming-list rule above cannot leave a new composite next to an old list: the
+        // incoming list is not empty. The published pair therefore always describes one deployment.
+        let mut failed = ApplicationStatus::default();
+        merge_sync_state(
+            &mut failed,
+            &multi_source_spec(),
+            SyncState {
+                status: SyncStatus::Synced,
+                revision: Some("sha256:v1".to_owned()),
+                last_synced_revision: Some("sha256:v1".to_owned()),
+                last_synced_spec_hash: Some("spec-hash".to_owned()),
+                revisions: vec!["chart-v1".to_owned(), "values-v1".to_owned()],
+                last_synced_at: Some(now()),
+            },
+        );
+        merge_sync_state(
+            &mut failed,
+            &multi_source_spec(),
+            SyncState {
+                status: SyncStatus::OutOfSync,
+                revision: Some("sha256:v2".to_owned()),
+                last_synced_revision: None,
+                last_synced_spec_hash: None,
+                // What `ReconcileError::partial_revisions` hands over for a failed apply.
+                revisions: vec!["chart-v2".to_owned(), "values-v2".to_owned()],
+                last_synced_at: None,
+            },
+        );
+        let failed_sync = failed.sync.expect("merged");
+        assert_eq!(
+            failed_sync.revisions,
+            vec!["chart-v2".to_owned(), "values-v2".to_owned()],
+            "the failed pass's own resolution replaces the previous list"
+        );
+        assert_eq!(
+            failed_sync.revision.as_deref(),
+            Some("sha256:v2"),
+            "and `revision` is the identity that list belongs to"
+        );
+        assert_eq!(
+            failed_sync.last_synced_revision.as_deref(),
+            Some("sha256:v1"),
+            "`lastSynced*` still names the last *successful* deployment"
+        );
+
+        // A `v1.0` single-source Application must still gain no `revisions` key at all.
+        let mut single = ApplicationStatus::default();
+        merge_sync_state(
+            &mut single,
+            &v1_spec(),
+            SyncState {
+                status: SyncStatus::Synced,
+                revision: Some("sha".to_owned()),
+                last_synced_revision: Some("sha".to_owned()),
+                last_synced_spec_hash: Some("spec-hash".to_owned()),
+                revisions: Vec::new(),
+                last_synced_at: Some(now()),
+            },
+        );
+        let serialized = serde_json::to_value(single.sync.expect("merged")).expect("serializes");
+        assert!(serialized.get("revisions").is_none(), "{serialized}");
+    }
+
+    /// **`T20.1` finding M1.** A failed pass that resolved its sources publishes the composite
+    /// identity **and** the per-source list that identity is the digest of.
+    ///
+    /// The invariant is that `status.sync.revision` describes `status.sync.revisions` (and
+    /// `status.history[].revisions`), so the failure path carries what the pass resolved instead of
+    /// reporting a new composite next to the *previous* deployment's list.
+    #[tokio::test]
+    async fn a_failed_pass_publishes_the_sources_its_composite_describes() {
+        let mut app = application(&[]);
+        app.spec = multi_source_spec();
+        // The published deployment is a different, older commit set.
+        let mut status = inventory_status();
+        if let Some(sync) = status.sync.as_mut() {
+            sync.revision = Some("sha256:previous".to_owned());
+            sync.revisions = vec!["old-chart-sha".to_owned(), "old-values-sha".to_owned()];
+        }
+        app.status = Some(status);
+
+        let revisions = vec!["chart-sha".to_owned(), "values-sha".to_owned()];
+        let composite =
+            ferriscd_engine::manifest::SourceRevisions::new(revisions.clone()).composite();
+        let carried = revisions.clone();
+        let reported = composite.clone();
+        let pipeline = FakePipeline::failing(move || ReconcileError::PartialSync {
+            message: "applying apps/Deployment/payments/api failed".to_owned(),
+            inventory: sample_inventory(),
+            revision: Some(reported.clone()),
+            revisions: carried.clone(),
+            operation: None,
+        });
+        let writer = RecordingStatusWriter::default();
+        apply_once(&app, &pipeline, &writer)
+            .await
+            .expect_err("a partial sync is still a failure");
+
+        let sync = writer.patches()[0]
+            .sync
+            .clone()
+            .expect("the failure still patches /status.sync");
+        assert_eq!(
+            sync.revision.as_deref(),
+            Some(composite.as_str()),
+            "the failed pass reports the identity it was syncing"
+        );
+        assert_eq!(
+            sync.revisions, revisions,
+            "the per-source rows must be the ones that composite is computed from, not the \
+             previous deployment's"
+        );
+        assert_eq!(
+            ferriscd_engine::manifest::SourceRevisions::new(sync.revisions.clone()).composite(),
+            sync.revision.clone().expect("revision"),
+            "the published list and the published identity must agree"
+        );
+        assert_eq!(
+            sync.last_synced_revision.as_deref(),
+            Some("oldsha"),
+            "the last successful marker still belongs to the earlier pass"
+        );
     }
 
     #[test]
@@ -3491,11 +3820,16 @@ mod tests {
             message: "boom".to_owned(),
             inventory: sample_inventory(),
             revision: Some("sha".to_owned()),
+            revisions: Vec::new(),
             operation: None,
         };
         let (inventory, revision) = partial.partial_status().expect("partial status");
         assert_eq!(inventory.len(), 1);
         assert_eq!(revision.map(String::as_str), Some("sha"));
+        assert!(
+            partial.partial_revisions().is_empty(),
+            "a pass that resolved no sources publishes no per-source list"
+        );
         assert!(!partial.is_already_deleted());
         assert_eq!(failure_reason(&partial), REASON_SYNC_ERROR);
 

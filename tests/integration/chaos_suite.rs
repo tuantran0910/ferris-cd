@@ -646,7 +646,7 @@ fn chaos_application(prune: bool) -> Application {
     let spec = ApplicationSpec {
         project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
         service_account_name: None,
-        source: SourceSpec {
+        source: Some(SourceSpec {
             git: Some(GitSourceSpec {
                 repo_url: FAKE_REPO_URL.to_owned(),
                 target_revision: "main".to_owned(),
@@ -654,7 +654,8 @@ fn chaos_application(prune: bool) -> Application {
             }),
             oci: None,
             renderer: RendererSpec::default(),
-        },
+        }),
+        sources: Vec::new(),
         destination: DestinationSpec {
             cluster: IN_CLUSTER.to_owned(),
             namespace: DEST_NAMESPACE.to_owned(),

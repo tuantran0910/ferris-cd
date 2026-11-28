@@ -208,6 +208,49 @@ pub struct SourceView {
     pub digest: Option<String>,
     /// Selected renderer (`auto`, `plainYaml`, `kustomize`, `helm`).
     pub renderer: String,
+    /// Whether the `Application` declares `spec.sources` (`T20.1`).
+    ///
+    /// A single-source `Application` omits the key entirely and `sources` below is empty, so its
+    /// payload stays byte-identical to the `v1.1` one. It defaults to `false` when absent, which
+    /// covers both an older server's payload and that omitted-key case.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi_source: bool,
+    /// Every declared source, in declaration order (`T20.1`).
+    ///
+    /// `source` above always describes the **rendered** source (the first entry that contributes
+    /// manifests), so a pre-`T20.1` client keeps working; this list is what carries the values
+    /// repository and its alias. Empty for a single-source `Application`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceEntryView>,
+}
+
+/// One `spec.sources` entry (`T20.1`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceEntryView {
+    /// `ref` alias other sources address this one by (`$<ref>/...`); absent when it has none.
+    ///
+    /// Spelled `ref` on the wire, exactly like `spec.sources[].ref` in the CRD, so a client can map
+    /// the view back onto the spec without a rename.
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub ref_name: Option<String>,
+    /// Source kind (`git` or `oci`).
+    pub source_type: String,
+    /// Repository or registry URL, redacted.
+    pub repo_url: String,
+    /// Path inside the source (`""` for its root).
+    pub path: String,
+    /// Requested revision (`git.targetRevision`, else `oci.tag`, else `oci.digest`).
+    pub target_revision: String,
+    /// OCI tag to resolve, when the entry is an OCI artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// Pinned OCI manifest digest, when the entry pins one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Renderer for this entry; absent means "support source only" (values, no manifests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<String>,
 }
 
 /// `spec.destination`.
@@ -235,6 +278,11 @@ pub struct SyncView {
     /// When that settled sync happened (RFC 3339).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_synced_at: Option<String>,
+    /// Resolved revision of every declared source, in declaration order (`T20.1`).
+    ///
+    /// Empty for a single-source `Application`, whose one revision is `revision` above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<String>,
 }
 
 /// `status.health`.
@@ -279,6 +327,9 @@ pub struct HistoryView {
     pub revision: Option<String>,
     /// When it was deployed (RFC 3339).
     pub deployed_at: String,
+    /// Per-source revisions of that deployment (`T20.1`); empty for a single-source deployment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<String>,
 }
 
 /// `status.operationState`.
@@ -2325,6 +2376,21 @@ fn child_generator_label(generator: &ferriscd_crd::MatrixChildGenerator) -> &'st
 /// Maps an `Application` to its list representation.
 fn application_summary(app: &Application) -> ApplicationSummary {
     let status = app.status.as_ref();
+    // `T20.1`: the source the `source` view describes. A multi-source `Application` prefers the
+    // first entry that declares a renderer (the chart), mirroring the controller's composition rule;
+    // a `v1.0` `Application` reports its `spec.source` exactly as before.
+    let rendered_source = app
+        .spec
+        .primary_source()
+        .cloned()
+        .or_else(|| {
+            ferriscd_engine::manifest::declared_sources(&app.spec)
+                .into_iter()
+                .find(|source| source.renders)
+                .map(|source| source.spec)
+        })
+        .or_else(|| app.spec.sources.first().map(|entry| entry.to_source_spec()))
+        .unwrap_or_default();
     ApplicationSummary {
         namespace: app.namespace().unwrap_or_default(),
         name: app.name_any(),
@@ -2332,24 +2398,53 @@ fn application_summary(app: &Application) -> ApplicationSummary {
         source: SourceView {
             // `T18.4`: an OCI source reports `oci`, and its tag/digest, through the same view — the
             // URL goes through the same redaction rule either way.
-            source_type: if app.spec.source.oci.is_some() {
+            //
+            // `T20.1`: for a multi-source `Application` this view describes the **rendered** source
+            // (the first entry that contributes manifests), so a client that knows nothing about
+            // `spec.sources` still shows the chart that produced the bundle. Every source, values
+            // repositories included, is listed in `sources` below.
+            source_type: if rendered_source.oci.is_some() {
                 "oci".to_owned()
             } else {
                 "git".to_owned()
             },
             // A Git remote routinely carries a personal access token (`https://oauth2:ghp_...@...`);
             // the same rule covers an `oci://` reference.
-            repo_url: ferriscd_engine::manifest::redact_repo_url(app.spec.source.repo_url()),
-            path: app.spec.source.source_path().to_owned(),
-            target_revision: app.spec.source.requested_revision().to_owned(),
-            tag: app.spec.source.oci.as_ref().and_then(|oci| oci.tag.clone()),
-            digest: app
-                .spec
-                .source
+            repo_url: ferriscd_engine::manifest::redact_repo_url(rendered_source.repo_url()),
+            path: rendered_source.source_path().to_owned(),
+            target_revision: rendered_source.requested_revision().to_owned(),
+            tag: rendered_source.oci.as_ref().and_then(|oci| oci.tag.clone()),
+            digest: rendered_source
                 .oci
                 .as_ref()
                 .and_then(|oci| oci.digest.clone()),
-            renderer: renderer_label(&app.spec.source.renderer).to_owned(),
+            renderer: renderer_label(&rendered_source.renderer).to_owned(),
+            multi_source: app.spec.is_multi_source(),
+            sources: if app.spec.is_multi_source() {
+                app.spec
+                    .sources
+                    .iter()
+                    .map(|entry| SourceEntryView {
+                        ref_name: entry.alias().map(str::to_owned),
+                        source_type: if entry.oci.is_some() {
+                            "oci".to_owned()
+                        } else {
+                            "git".to_owned()
+                        },
+                        repo_url: ferriscd_engine::manifest::redact_repo_url(entry.repo_url()),
+                        path: entry.source_path().to_owned(),
+                        target_revision: entry.requested_revision().to_owned(),
+                        tag: entry.oci.as_ref().and_then(|oci| oci.tag.clone()),
+                        digest: entry.oci.as_ref().and_then(|oci| oci.digest.clone()),
+                        renderer: entry
+                            .renderer
+                            .as_ref()
+                            .map(|renderer| renderer_label(renderer).to_owned()),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         },
         destination: DestinationView {
             cluster: app.spec.destination.cluster.clone(),
@@ -2362,6 +2457,7 @@ fn application_summary(app: &Application) -> ApplicationSummary {
                 revision: sync.revision.clone(),
                 last_synced_revision: sync.last_synced_revision.clone(),
                 last_synced_at: sync.last_synced_at.as_ref().and_then(time_string),
+                revisions: sync.revisions.clone(),
             }),
         health: status
             .and_then(|status| status.health.as_ref())
@@ -2425,6 +2521,7 @@ fn history_view(entry: &RevisionHistoryEntry) -> HistoryView {
         id: entry.id,
         revision: entry.revision.clone(),
         deployed_at: time_string(&entry.deployed_at).unwrap_or_default(),
+        revisions: entry.revisions.clone(),
     }
 }
 

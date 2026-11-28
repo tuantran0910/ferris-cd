@@ -180,6 +180,72 @@ export const sampleOciApp: ApplicationSummary = {
   conditions: [],
 };
 
+/**
+ * A split OCI chart + Git values `Application` (`T20.1`): the panel has to name
+ * every declared source, which one renders, and the revision each one resolved
+ * to — the composite `sync.revision` alone cannot say whether the values
+ * repository moved.
+ */
+export const sampleMultiSourceApp: ApplicationSummary = {
+  namespace: "ferriscd-system",
+  name: "payments-multi",
+  project: "payments",
+  resourceCount: 6,
+  observedGeneration: 3,
+  source: {
+    sourceType: "oci",
+    repoUrl: "oci://registry.ferriscd-system.svc:5000/charts/payments",
+    path: "",
+    targetRevision: "1.4.2",
+    tag: "1.4.2",
+    digest:
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    renderer: "helm",
+    multiSource: true,
+    sources: [
+      {
+        ref: "chart",
+        sourceType: "oci",
+        repoUrl: "oci://registry.ferriscd-system.svc:5000/charts/payments",
+        path: "",
+        targetRevision: "1.4.2",
+        tag: "1.4.2",
+        digest:
+          "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+        renderer: "helm",
+      },
+      {
+        ref: "values",
+        sourceType: "git",
+        repoUrl: "https://github.com/acme/payments-values.git",
+        path: "",
+        targetRevision: "main",
+      },
+    ],
+  },
+  destination: {
+    cluster: "in-cluster",
+    namespace: "payments",
+  },
+  sync: {
+    status: "Synced",
+    revision:
+      "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    lastSyncedRevision:
+      "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    lastSyncedAt: "2026-11-27T09:15:00Z",
+    revisions: [
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+      "2222222222222222222222222222222222222222",
+    ],
+  },
+  health: {
+    status: "Healthy",
+    message: null,
+  },
+  conditions: [],
+};
+
 export const sampleOciAppDetail: ApplicationDetailView = {
   application: sampleOciApp,
   history: [

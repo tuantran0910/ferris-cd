@@ -145,6 +145,7 @@ pub fn record_sync_success(
     status: &mut ApplicationStatus,
     revision: Option<String>,
     source: Option<&SourceSpec>,
+    revisions: &[String],
     revision_history_limit: i32,
     deployed_at: Time,
 ) -> SyncRecording {
@@ -162,7 +163,11 @@ pub fn record_sync_success(
         .max()
         .map_or(1, |id| id.saturating_add(1));
     let entry = RevisionHistoryEntry::new(next_id, revision, deployed_at)
-        .with_source_summary(source.map(redacted_source_summary));
+        .with_source_summary(source.map(redacted_source_summary))
+        // `T20.1`: a multi-source deployment records **every** source's revision here (and only
+        // here — a single-source deployment leaves the field absent, so a `v1.0` history entry is
+        // byte-identical). A rollback reads it back to re-pin the same per-source revisions.
+        .with_revisions(revisions.to_vec());
     // `push_history` inserts newest-first and truncates to `clamp(1, MAX_HISTORY_ENTRIES)`.
     status.push_history(entry.clone(), revision_history_limit.max(1));
     SyncRecording::Appended(entry)
@@ -179,6 +184,7 @@ pub fn record_operation_success(
     status: &mut ApplicationStatus,
     operation: &OperationState,
     source: Option<&SourceSpec>,
+    revisions: &[String],
     revision_history_limit: i32,
 ) -> SyncRecording {
     if operation.phase != OperationPhase::Succeeded {
@@ -192,9 +198,33 @@ pub fn record_operation_success(
         status,
         operation.revision.clone(),
         source,
+        revisions,
         revision_history_limit,
         deployed_at,
     )
+}
+
+/// The per-source revisions to re-pin when `pinned` names an existing history entry (`T20.1`).
+///
+/// A rollback of a multi-source `Application` cannot be honoured by pinning one string: the
+/// deployment identity is the composite digest (`sha256:<64 hex>` over the ordered list), which no
+/// resolver can turn back into per-source revisions. The history entry that identity came from also
+/// carries every source's revision (`status.history[].revisions`), so the caller re-pins each source
+/// from the recorded list.
+///
+/// Returns `None` when no entry matches `pinned`, **or** when the matching entry recorded no
+/// per-source list (a `v1.0` single-source entry, or one written before `T20.1`). The caller must
+/// treat the two cases as it sees fit — a single-source pass can still pin `pinned` directly, while
+/// a multi-source one has to refuse rather than hand a composite digest to a Git/OCI resolver
+/// (finding H2) — which is why this function reports "not recorded" instead of guessing.
+#[must_use]
+pub fn recorded_revisions(status: &ApplicationStatus, pinned: &str) -> Option<Vec<String>> {
+    status
+        .history
+        .iter()
+        .find(|entry| entry.revision.as_deref() == Some(pinned))
+        .filter(|entry| !entry.revisions.is_empty())
+        .map(|entry| entry.revisions.clone())
 }
 
 /// A parsed rollback request (`{"rollback":{"id":N}}`).
@@ -457,7 +487,7 @@ mod tests {
         let spec = ApplicationSpec {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
-            source: SourceSpec {
+            source: Some(SourceSpec {
                 git: Some(GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "main".to_owned(),
@@ -465,7 +495,8 @@ mod tests {
                 }),
                 oci: None,
                 renderer: RendererSpec::default(),
-            },
+            }),
+            sources: Vec::new(),
             destination: DestinationSpec {
                 cluster: "in-cluster".to_owned(),
                 namespace: "payments".to_owned(),
@@ -519,6 +550,7 @@ mod tests {
                 &mut status,
                 Some(revision.clone()),
                 None,
+                &[],
                 limit,
                 at("2026-11-24T12:00:00Z"),
             );
@@ -557,6 +589,7 @@ mod tests {
                     &mut status,
                     Some(format!("rev-{index}")),
                     None,
+                    &[],
                     limit,
                     at("2026-11-24T12:00:00Z"),
                 );
@@ -573,7 +606,8 @@ mod tests {
     #[test]
     fn an_entry_without_a_revision_still_occupies_a_bounded_slot() {
         let mut status = ApplicationStatus::default();
-        let recorded = record_sync_success(&mut status, None, None, 3, at("2026-11-24T12:00:00Z"));
+        let recorded =
+            record_sync_success(&mut status, None, None, &[], 3, at("2026-11-24T12:00:00Z"));
         let recorded = recorded
             .entry()
             .expect("an unknown revision is still a deployment");
@@ -593,6 +627,7 @@ mod tests {
                 &mut status,
                 Some(format!("rev-{index}")),
                 None,
+                &[],
                 2,
                 at("2026-11-24T12:00:00Z"),
             );
@@ -840,7 +875,10 @@ mod tests {
     }
 
     fn source() -> SourceSpec {
-        app_with_automated(false).spec.source
+        app_with_automated(false)
+            .spec
+            .source
+            .expect("a single-source Application")
     }
 
     fn record_and_status() -> ApplicationStatus {
@@ -849,6 +887,7 @@ mod tests {
             &mut status,
             Some(SHA_V1.to_owned()),
             None,
+            &[],
             10,
             at("2026-11-24T12:00:00Z"),
         );
@@ -864,6 +903,7 @@ mod tests {
             &mut status,
             Some(SHA_V2.to_owned()),
             None,
+            &[],
             10,
             at("2026-11-24T12:30:00Z"),
         );
@@ -884,6 +924,7 @@ mod tests {
             &mut status,
             Some(SHA_V1.to_owned()),
             Some(&source()),
+            &[],
             10,
             at("2026-11-24T12:00:00Z"),
         );
@@ -915,10 +956,83 @@ mod tests {
             &mut anonymous,
             Some(SHA_V2.to_owned()),
             None,
+            &[],
             10,
             at("2026-11-24T12:00:00Z"),
         );
         assert!(recorded.entry().expect("appended").source_summary.is_none());
+    }
+
+    /// **`T20.1` finding H2.** The per-source revisions a multi-source rollback re-pins come from
+    /// the history entry the composite identity was recorded with — and only from there.
+    #[test]
+    fn recorded_revisions_are_read_back_from_the_matching_history_entry() {
+        const COMPOSITE: &str =
+            "sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92";
+        let multi = status_with(vec![
+            RevisionHistoryEntry::new(2, Some(SHA_V2.to_owned()), at("2026-11-24T13:00:00Z"))
+                .with_revisions(vec!["chart-sha-v2".to_owned(), "values-sha-v2".to_owned()]),
+            RevisionHistoryEntry::new(1, Some(COMPOSITE.to_owned()), at("2026-11-24T12:00:00Z"))
+                .with_revisions(vec!["chart-sha".to_owned(), "values-sha".to_owned()]),
+        ]);
+
+        assert_eq!(
+            recorded_revisions(&multi, COMPOSITE),
+            Some(vec!["chart-sha".to_owned(), "values-sha".to_owned()]),
+            "the entry is addressed by the identity it recorded, in declaration order"
+        );
+        assert_eq!(
+            recorded_revisions(&multi, SHA_V2),
+            Some(vec!["chart-sha-v2".to_owned(), "values-sha-v2".to_owned()])
+        );
+
+        // An entry that recorded no per-source list (a `v1.0` single-source deployment, or one
+        // written before `T20.1`) answers `None`: the caller must not guess the per-source split.
+        let legacy = status_with(vec![RevisionHistoryEntry::new(
+            1,
+            Some(SHA_V1.to_owned()),
+            at("2026-11-24T12:00:00Z"),
+        )]);
+        assert_eq!(recorded_revisions(&legacy, SHA_V1), None);
+
+        // A revision no entry names (`HEAD~1`-style pinning, or a rewritten history) answers `None`.
+        assert_eq!(recorded_revisions(&multi, "an-unknown-revision"), None);
+        assert_eq!(
+            recorded_revisions(&ApplicationStatus::default(), COMPOSITE),
+            None
+        );
+
+        // The recorded list is what a settle actually writes: a multi-source deployment records it
+        // in `history[]` and nowhere else, so this round-trips through the same call.
+        let mut status = ApplicationStatus::default();
+        let recorded = record_sync_success(
+            &mut status,
+            Some(COMPOSITE.to_owned()),
+            None,
+            &["chart-sha".to_owned(), "values-sha".to_owned()],
+            10,
+            at("2026-11-24T12:00:00Z"),
+        );
+        assert_eq!(
+            recorded.entry().expect("appended").revisions,
+            vec!["chart-sha".to_owned(), "values-sha".to_owned()]
+        );
+        assert_eq!(
+            recorded_revisions(&status, COMPOSITE),
+            Some(vec!["chart-sha".to_owned(), "values-sha".to_owned()])
+        );
+        // A single-source deployment records no list at all (the `v1.0` shape stays byte-identical).
+        let mut single = ApplicationStatus::default();
+        let recorded = record_sync_success(
+            &mut single,
+            Some(SHA_V1.to_owned()),
+            None,
+            &[],
+            10,
+            at("2026-11-24T12:00:00Z"),
+        );
+        assert!(recorded.entry().expect("appended").revisions.is_empty());
+        assert_eq!(recorded_revisions(&single, SHA_V1), None);
     }
 
     /// **Finding M-D (`T18.4`).** `status.history[].sourceSummary.repoURL` is shipped in `/status`
@@ -941,6 +1055,7 @@ mod tests {
             &mut status,
             Some(SHA_V1.to_owned()),
             Some(&source),
+            &[],
             10,
             at("2026-11-24T12:00:00Z"),
         );
@@ -973,6 +1088,7 @@ mod tests {
             &mut status,
             Some(SHA_V1.to_owned()),
             Some(&scp),
+            &[],
             10,
             at("2026-11-24T12:00:00Z"),
         );
@@ -1000,6 +1116,7 @@ mod tests {
             &mut status,
             Some("sha256:".to_owned() + &"a".repeat(64)),
             Some(&oci),
+            &[],
             10,
             at("2026-11-24T12:00:00Z"),
         );
@@ -1047,7 +1164,7 @@ mod tests {
         );
         let mut status = ApplicationStatus::default();
 
-        let first = record_operation_success(&mut status, &operation, Some(&source()), 10);
+        let first = record_operation_success(&mut status, &operation, Some(&source()), &[], 10);
         let entry = first
             .entry()
             .expect("the transition into Succeeded appends")
@@ -1059,7 +1176,7 @@ mod tests {
 
         // Every subsequent `Finished` pass is a no-op, byte for byte.
         for _ in 0..3 {
-            let again = record_operation_success(&mut status, &operation, Some(&source()), 10);
+            let again = record_operation_success(&mut status, &operation, Some(&source()), &[], 10);
             assert_eq!(again, SyncRecording::AlreadyRecorded { id: 1 });
             assert!(!again.is_first());
             assert!(again.entry().is_none());
@@ -1075,7 +1192,7 @@ mod tests {
             at("2026-11-24T12:29:00Z"),
             at("2026-11-24T12:30:00Z"),
         );
-        let third = record_operation_success(&mut status, &next, Some(&source()), 10);
+        let third = record_operation_success(&mut status, &next, Some(&source()), &[], 10);
         assert_eq!(third.entry().expect("appended").id, 2);
         assert_eq!(status.history.len(), 2);
 
@@ -1085,7 +1202,7 @@ mod tests {
             at("2026-11-24T12:39:00Z"),
             at("2026-11-24T12:40:00Z"),
         );
-        let fourth = record_operation_success(&mut status, &resync, Some(&source()), 10);
+        let fourth = record_operation_success(&mut status, &resync, Some(&source()), &[], 10);
         assert_eq!(fourth.entry().expect("appended").id, 3);
 
         // A running (or failed) operation is never recorded.
@@ -1093,7 +1210,7 @@ mod tests {
         running.phase = OperationPhase::Running;
         running.revision = Some("sha-running".to_owned());
         assert_eq!(
-            record_operation_success(&mut status, &running, Some(&source()), 10),
+            record_operation_success(&mut status, &running, Some(&source()), &[], 10),
             SyncRecording::NotSucceeded
         );
         assert_eq!(status.history.len(), 3);

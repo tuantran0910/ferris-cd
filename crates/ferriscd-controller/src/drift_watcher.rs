@@ -2472,7 +2472,7 @@ mod tests {
         let spec = ferriscd_crd::ApplicationSpec {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
-            source: ferriscd_crd::SourceSpec {
+            source: Some(ferriscd_crd::SourceSpec {
                 git: Some(ferriscd_crd::GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "main".to_owned(),
@@ -2480,7 +2480,8 @@ mod tests {
                 }),
                 oci: None,
                 renderer: ferriscd_crd::RendererSpec::default(),
-            },
+            }),
+            sources: Vec::new(),
             destination: ferriscd_crd::DestinationSpec {
                 cluster: "in-cluster".to_owned(),
                 namespace: "payments".to_owned(),

@@ -465,6 +465,23 @@ pub fn detail_table(detail: &ApplicationDetailView) -> String {
     if let Some(digest) = app.source.digest.as_deref() {
         rendered.push_str(&format!("OCI digest    {digest}\n"));
     }
+    // `T20.1`: a split chart + values layout names every declared source, the alias a sibling
+    // addresses it by, and whether it contributes manifests — the "which repository produced these
+    // values?" question a single `Source` row cannot answer.
+    for (index, source) in app.source.sources.iter().enumerate() {
+        let alias = source
+            .ref_name
+            .as_deref()
+            .map_or_else(String::new, |alias| format!("ref: {alias}"));
+        let role = source
+            .renderer
+            .as_deref()
+            .map_or("values", |renderer| renderer);
+        rendered.push_str(&format!(
+            "Sources[{index}]    {} ({}, {}) [{}, {role}, {alias}]\n",
+            source.repo_url, source.path, source.target_revision, source.source_type
+        ));
+    }
     rendered.push_str(&format!(
         "Destination   {}/{}\n",
         app.destination.cluster, app.destination.namespace
@@ -487,6 +504,12 @@ pub fn detail_table(detail: &ApplicationDetailView) -> String {
         .and_then(|sync| sync.last_synced_revision.clone())
     {
         rendered.push_str(&format!("Revision      {revision}\n"));
+    }
+    // `T20.1`: the per-source revisions, one line each so a moved values repository is obvious.
+    if let Some(sync) = app.sync.as_ref() {
+        for (index, revision) in sync.revisions.iter().enumerate() {
+            rendered.push_str(&format!("Revisions[{index}]  {revision}\n"));
+        }
     }
     rendered.push_str(&format!("Resources     {}\n", app.resource_count));
     if let Some(operation) = detail.operation.as_ref() {
@@ -757,7 +780,8 @@ mod tests {
     use ferriscd_crd::project::PolicyEnforcement;
     use ferriscd_server::api::{
         ApplicationDetailView, ApplicationSummary, DestinationView, DiffChangeView,
-        DiffConflictView, DiffSummaryView, HealthView, PolicyViolationView, SourceView, SyncView,
+        DiffConflictView, DiffSummaryView, HealthView, PolicyViolationView, SourceEntryView,
+        SourceView, SyncView,
     };
 
     fn summary() -> ApplicationSummary {
@@ -773,6 +797,8 @@ mod tests {
                 tag: None,
                 digest: None,
                 renderer: "plainYaml".to_owned(),
+                multi_source: false,
+                sources: Vec::new(),
             },
             destination: DestinationView {
                 cluster: "in-cluster".to_owned(),
@@ -783,6 +809,7 @@ mod tests {
                 revision: Some("8f3a1c2".to_owned()),
                 last_synced_revision: Some("8f3a1c2".to_owned()),
                 last_synced_at: None,
+                revisions: Vec::new(),
             }),
             health: Some(HealthView {
                 status: "Healthy".to_owned(),
@@ -950,6 +977,106 @@ mod tests {
         assert!(empty.contains("<no applications>"), "{empty}");
     }
 
+    /// `T20.1`: a two-source `Application` names every declared source (position, role, alias) and
+    /// prints one revision per source, so `ferriscd app get` answers "did the values repository
+    /// move?" — a question the composite `Revision` row alone cannot answer.
+    #[test]
+    fn a_multi_source_detail_names_every_source_and_every_per_source_revision() {
+        let chart_digest =
+            "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e";
+        let values_sha = "2222222222222222222222222222222222222222";
+        let composite = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let mut multi = summary();
+        multi.name = "payments-multi".to_owned();
+        multi.source = SourceView {
+            source_type: "oci".to_owned(),
+            repo_url: "oci://registry.ferriscd-system.svc:5000/charts/payments".to_owned(),
+            path: String::new(),
+            target_revision: "1.4.2".to_owned(),
+            tag: Some("1.4.2".to_owned()),
+            digest: Some(chart_digest.to_owned()),
+            renderer: "helm".to_owned(),
+            multi_source: true,
+            sources: vec![
+                SourceEntryView {
+                    ref_name: Some("chart".to_owned()),
+                    source_type: "oci".to_owned(),
+                    repo_url: "oci://registry.ferriscd-system.svc:5000/charts/payments".to_owned(),
+                    path: String::new(),
+                    target_revision: "1.4.2".to_owned(),
+                    tag: Some("1.4.2".to_owned()),
+                    digest: Some(chart_digest.to_owned()),
+                    renderer: Some("helm".to_owned()),
+                },
+                SourceEntryView {
+                    ref_name: Some("values".to_owned()),
+                    source_type: "git".to_owned(),
+                    repo_url: "https://github.com/acme/payments-values.git".to_owned(),
+                    path: String::new(),
+                    target_revision: "main".to_owned(),
+                    tag: None,
+                    digest: None,
+                    // No renderer: a values-only source contributes no manifests.
+                    renderer: None,
+                },
+            ],
+        };
+        multi.sync = Some(SyncView {
+            status: "Synced".to_owned(),
+            revision: Some(composite.to_owned()),
+            last_synced_revision: Some(composite.to_owned()),
+            last_synced_at: Some("2026-11-27T09:15:00Z".to_owned()),
+            revisions: vec![chart_digest.to_owned(), values_sha.to_owned()],
+        });
+        let detail = ApplicationDetailView {
+            sync_window: None,
+            application: multi,
+            history: Vec::new(),
+            operation: None,
+        };
+
+        let rendered = detail_table(&detail);
+
+        // Position, role and alias, in declaration order: `Sources[0]` renders, `Sources[1]` is
+        // values-only and addresses itself as `$values`.
+        assert!(
+            rendered.contains(
+                "Sources[0]    oci://registry.ferriscd-system.svc:5000/charts/payments (, 1.4.2) \
+                 [oci, helm, ref: chart]"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "Sources[1]    https://github.com/acme/payments-values.git (, main) \
+                 [git, values, ref: values]"
+            ),
+            "{rendered}"
+        );
+        // One revision row per source, indexed the way `Sources[i]` is.
+        assert!(
+            rendered.contains(&format!("Revisions[0]  {chart_digest}\n")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("Revisions[1]  {values_sha}\n")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("Revision      {composite}\n")),
+            "the composite identity above them is unchanged: {rendered}"
+        );
+        // The single-source view must not gain a `Sources[` row.
+        let single = detail_table(&ApplicationDetailView {
+            sync_window: None,
+            application: summary(),
+            history: Vec::new(),
+            operation: None,
+        });
+        assert!(!single.contains("Sources["), "{single}");
+        assert!(!single.contains("Revisions["), "{single}");
+    }
+
     #[test]
     fn the_detail_and_history_views_carry_the_server_values() {
         let detail = ApplicationDetailView {
@@ -959,6 +1086,7 @@ mod tests {
                 id: 7,
                 revision: Some("8f3a1c2".to_owned()),
                 deployed_at: "2027-01-15T10:30:00Z".to_owned(),
+                revisions: Vec::new(),
             }],
             operation: None,
         };
@@ -1017,6 +1145,7 @@ mod tests {
             revision: None,
             last_synced_revision: None,
             last_synced_at: None,
+            revisions: Vec::new(),
         });
         assert_eq!(settle(&detail), Settle::Running);
         detail.application.sync = None;

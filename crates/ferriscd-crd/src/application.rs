@@ -4,6 +4,8 @@
 //! [`SyncPolicy::automated`] is an `Option`, therefore `automated: false` combined with
 //! `selfHeal: true` cannot be expressed at all (review finding P1-06 / trap M5-class bug).
 
+use std::collections::BTreeSet;
+
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -99,7 +101,27 @@ pub struct ApplicationSpec {
     pub service_account_name: Option<String>,
 
     /// Where the desired manifests come from and how they are rendered.
-    pub source: SourceSpec,
+    ///
+    /// `T20.1` relaxed this from a required [`SourceSpec`] to `Option<SourceSpec>` so a
+    /// multi-source `Application` can declare [`Self::sources`] instead. The two are **mutually
+    /// exclusive**, enforced by the injected CEL rule ([`crate::generate::SOURCE_DECLARATION_RULE`])
+    /// and by [`Self::validate`] with identical verdicts. Everything a `v1.0` client writes is
+    /// unaffected: `source` is still serialized exactly where it always was, and a Git application
+    /// never gains a `sources` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceSpec>,
+
+    /// Additional sources for a split chart/values layout (`T20.1`).
+    ///
+    /// Each entry is an independent Git repository or OCI artifact. An entry that declares a
+    /// `renderer` contributes manifests; one that does not is a **values-only** source that can be
+    /// referenced by an aliased sibling (`ref: values` → `$values/envs/prod/values.yaml`).
+    ///
+    /// Capped at [`MAX_SOURCES`] so a single `Application` cannot fan out an unbounded number of
+    /// checkouts or overflow the `etcd` object limit with per-source revisions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
+    pub sources: Vec<MultiSourceEntry>,
 
     /// Target cluster and namespace.
     pub destination: DestinationSpec,
@@ -138,6 +160,202 @@ fn default_revision_history_limit() -> i32 {
     DEFAULT_REVISION_HISTORY_LIMIT
 }
 
+/// Highest number of accepted `spec.sources` entries (`T20.1`).
+///
+/// The cap bounds both the checkout fan-out of one pass and the size of the per-source revision
+/// list written back to `status`, so a single `Application` cannot bloat its `/status` subresource
+/// towards the 1.5 MiB `etcd` object limit. It is enforced twice: offline by
+/// [`ApplicationSpec::validate`] and server-side by
+/// [`crate::generate::SOURCES_LIMIT_RULE`].
+pub const MAX_SOURCES: usize = 16;
+
+/// Longest accepted `spec.sources[].ref` alias.
+pub const MAX_SOURCE_REF_LEN: usize = 63;
+
+/// One entry of `spec.sources` (`T20.1`).
+///
+/// Carries exactly one of `git`/`oci` (the mirrored CEL rule and
+/// [`ApplicationSpec::validate`] both refuse neither-set and both-set), an **optional**
+/// `renderer`, and an optional `ref` alias.
+///
+/// * An entry that declares a `renderer` is **rendered** and contributes its manifests to the
+///   bundle.
+/// * An entry without a `renderer` is a **support source**: it is still fetched into its own
+///   isolated, sanitized worktree (so its revision is tracked and its content can be referenced),
+///   but it contributes no manifests of its own. A Helm sibling addresses its files through the
+///   alias: `valueFiles: [$values/envs/prod/values.yaml]`.
+/// * When *no* entry declares a `renderer`, the first entry is rendered with the default
+///   (`renderer.auto`), which makes a one-entry `spec.sources` behave exactly like the equivalent
+///   `spec.source`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiSourceEntry {
+    /// Alias other sources use to reference this one (`$<ref>/<path>`, e.g. `ref: values`).
+    ///
+    /// Must be a DNS-1123 label and unique within `spec.sources`;
+    /// [`ApplicationSpec::validate`] rejects anything else so `$values/...` can never be ambiguous.
+    /// That check is offline-only — the CRD schema carries no CEL rule or `pattern` for it (see
+    /// [`validate_source_ref`]) — so the CLI and the controller are what enforce it, before any
+    /// source is fetched.
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    pub ref_name: Option<String>,
+
+    /// Git repository, revision, and manifest sub-path. Mutually exclusive with `oci`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitSourceSpec>,
+
+    /// OCI artifact (Helm chart or manifest bundle). Mutually exclusive with `git`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci: Option<OciSourceSpec>,
+
+    /// Renderer for this entry. Omitted means "support source only" (see the type docs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<RendererSpec>,
+}
+
+impl MultiSourceEntry {
+    /// The declared alias, trimmed (`None` when this entry cannot be referenced).
+    #[must_use]
+    pub fn alias(&self) -> Option<&str> {
+        self.ref_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+    }
+
+    /// Normalizes this entry into the single-source [`SourceSpec`] shape the renderer consumes.
+    #[must_use]
+    pub fn to_source_spec(&self) -> SourceSpec {
+        SourceSpec {
+            git: self.git.clone(),
+            oci: self.oci.clone(),
+            renderer: self.renderer.clone().unwrap_or_default(),
+        }
+    }
+
+    /// The source URL (`git.repoURL` or `oci.url`; `""` when neither is set).
+    ///
+    /// Callers that log or report this must still redact it — a remote routinely embeds a token.
+    #[must_use]
+    pub fn repo_url(&self) -> &str {
+        match (&self.git, &self.oci) {
+            (Some(git), _) => &git.repo_url,
+            (None, Some(oci)) => &oci.url,
+            (None, None) => "",
+        }
+    }
+
+    /// The manifest sub-path inside this entry's source (`""` means the source root).
+    #[must_use]
+    pub fn source_path(&self) -> &str {
+        match (&self.git, &self.oci) {
+            (Some(git), _) => &git.path,
+            (None, Some(oci)) => &oci.path,
+            (None, None) => "",
+        }
+    }
+
+    /// The revision the caller asked for (`git.targetRevision`, else `oci.tag`/`oci.digest`).
+    #[must_use]
+    pub fn requested_revision(&self) -> &str {
+        match (&self.git, &self.oci) {
+            (Some(git), _) => &git.target_revision,
+            (None, Some(oci)) => oci
+                .tag
+                .as_deref()
+                .or(oci.digest.as_deref())
+                .unwrap_or_default(),
+            (None, None) => "",
+        }
+    }
+
+    /// Validates this entry against the invariants the CRD schema enforces.
+    ///
+    /// `index` is reported in the error so a multi-source `Application` names the offending entry
+    /// instead of making the operator diff the whole list.
+    pub fn validate(&self, index: usize) -> Result<(), SpecValidationError> {
+        match (&self.git, &self.oci) {
+            (None, None) => {
+                return Err(SpecValidationError::MissingMultiSourceReference { index });
+            }
+            (Some(_), Some(_)) => {
+                return Err(SpecValidationError::AmbiguousMultiSourceReference { index });
+            }
+            (Some(git), None) => validate_git_source(git)?,
+            (None, Some(oci)) => oci.validate()?,
+        }
+        if let Some(alias) = self.alias() {
+            validate_source_ref(alias)?;
+        }
+        Ok(())
+    }
+}
+
+/// Validates `spec.sources[].ref` as a DNS-1123 label.
+///
+/// The alias is a path segment of a `$ref/...` reference, so anything that could confuse path
+/// resolution (`/`, `.`, `..`) or the reference syntax (`$`, whitespace) is refused outright.
+///
+/// # Why this is an offline check only
+///
+/// This verdict is not mirrored by a CEL `x-kubernetes-validations` rule or by an OpenAPI `pattern`,
+/// so the API server does **not** refuse a malformed or duplicated `ref`; only
+/// [`ApplicationSpec::validate`] (CLI, controller) does. That is deliberate:
+///
+/// * the exact rule is a *regex plus trim*, and CEL has no `trim`, so a CEL spelling would disagree
+///   with this one on `ref: "  values  "` (accepted here, refused there) — two sources of truth for
+///   one field is worse than one;
+/// * an OpenAPI `pattern` would refuse a blank/padded `ref` that this function accepts as "no
+///   alias", and a `pattern` cannot express "unique across the list" at all;
+/// * a CEL rule that fails to *compile* rejects every write to **every** `Application`, including
+///   stored `v1.0` objects (this already happened once, see [`crate::generate::OCI_REFERENCE_RULE`]).
+///
+/// Nothing unsafe follows from a malformed alias reaching `/status` or the renderer: an alias is
+/// only ever a *lookup key* for `$ref/...`, and the resolver is jailed on the referenced worktree
+/// regardless (`SourceRoots`), while a duplicate alias is refused there too (defence in depth). The
+/// alias that survives is at worst unusable, which is a usability bug rather than a security one.
+fn validate_source_ref(alias: &str) -> Result<(), SpecValidationError> {
+    let invalid = |reason: &str| SpecValidationError::InvalidSourceRef {
+        value: alias.to_owned(),
+        reason: reason.to_owned(),
+    };
+    if alias.len() > MAX_SOURCE_REF_LEN {
+        return Err(invalid("the ref must be at most 63 characters"));
+    }
+    if alias == "." || alias == ".." {
+        return Err(invalid("the ref must not be a path segment"));
+    }
+    let mut chars = alias.chars();
+    let Some(first) = chars.next() else {
+        return Err(invalid("the ref must not be empty"));
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err(invalid(
+            "the ref must start with a lowercase alphanumeric character",
+        ));
+    }
+    if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(invalid(
+            "the ref must contain only lowercase alphanumeric characters and '-'",
+        ));
+    }
+    if alias.ends_with('-') {
+        return Err(invalid("the ref must not end with '-'"));
+    }
+    Ok(())
+}
+
+/// Validates one `git` block (shared by `spec.source` and `spec.sources[]`).
+fn validate_git_source(git: &GitSourceSpec) -> Result<(), SpecValidationError> {
+    if git.repo_url.trim().is_empty() {
+        return Err(SpecValidationError::EmptyRepoUrl);
+    }
+    if git.target_revision.trim().is_empty() {
+        return Err(SpecValidationError::EmptyTargetRevision);
+    }
+    Ok(())
+}
+
 /// Source of the desired state: exactly one Git repository **or** one OCI artifact, plus its
 /// renderer.
 ///
@@ -147,7 +365,7 @@ fn default_revision_history_limit() -> i32 {
 /// application never gains an `oci` key). Exactly-one-of is enforced twice: server-side by the
 /// CEL rule this crate injects into the generated CRD (`x-kubernetes-validations`), and offline by
 /// [`ApplicationSpec::validate`] with the same verdicts.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceSpec {
     /// Git repository, revision, and manifest sub-path. Mutually exclusive with `oci`.
@@ -786,6 +1004,66 @@ pub enum SpecValidationError {
          artifact reference must name an immutable artifact"
     )]
     MissingOciReference,
+    /// Neither `spec.source` nor `spec.sources` was set.
+    ///
+    /// The CRD enforces the same rule with CEL ([`crate::generate::SOURCE_DECLARATION_RULE`]); this
+    /// variant is the offline half.
+    #[error(
+        "exactly one of spec.source or spec.sources must be specified: neither is set, so there is \
+         nothing to render"
+    )]
+    MissingSourceDeclaration,
+    /// Both `spec.source` and `spec.sources` were set.
+    #[error(
+        "exactly one of spec.source or spec.sources must be specified: both are set, and a \
+         multi-source Application must declare every source in spec.sources"
+    )]
+    ConflictingSourceDeclaration,
+    /// `spec.sources` had more than [`MAX_SOURCES`] entries.
+    #[error(
+        "spec.sources must contain at most {max} entries, got {count}: every entry is an \
+         independent checkout, and the per-source revisions land in status",
+        max = MAX_SOURCES
+    )]
+    TooManySources {
+        /// The rejected length.
+        count: usize,
+    },
+    /// A `spec.sources` entry set neither `git` nor `oci`.
+    #[error(
+        "spec.sources[{index}] must set exactly one of git or oci: neither is set, so there is \
+         nothing to fetch for that source"
+    )]
+    MissingMultiSourceReference {
+        /// Zero-based index of the offending entry.
+        index: usize,
+    },
+    /// A `spec.sources` entry set both `git` and `oci`.
+    #[error(
+        "spec.sources[{index}] must set exactly one of git or oci: both are set, and choosing one \
+         would silently ignore the other"
+    )]
+    AmbiguousMultiSourceReference {
+        /// Zero-based index of the offending entry.
+        index: usize,
+    },
+    /// Two `spec.sources` entries declared the same `ref` alias.
+    #[error(
+        "spec.sources declares the ref {name:?} more than once: a `$ref/...` reference would be \
+         ambiguous"
+    )]
+    DuplicateSourceRef {
+        /// The duplicated alias.
+        name: String,
+    },
+    /// A `spec.sources[].ref` alias was not a usable path segment.
+    #[error("spec.sources[].ref {value:?} is not a usable source alias: {reason}")]
+    InvalidSourceRef {
+        /// The rejected alias.
+        value: String,
+        /// Why it was rejected.
+        reason: String,
+    },
     /// `spec.requeueAfterSeconds` was zero.
     #[error("spec.requeueAfterSeconds must be greater than zero")]
     ZeroRequeueAfter,
@@ -801,7 +1079,13 @@ impl ApplicationSpec {
     /// Validates the spec against the invariants the CRD schema enforces.
     ///
     /// This mirrors the OpenAPI `minimum`/`maximum` bounds so a spec is rejected
-    /// identically offline (CLI/controller) and online (API server 422).
+    /// identically offline (CLI/controller) and online (API server 422) — with **one documented
+    /// exception** (`T20.1`): the `spec.sources[].ref` alias grammar
+    /// ([`SpecValidationError::InvalidSourceRef`]) and the duplicate-alias rule
+    /// ([`SpecValidationError::DuplicateSourceRef`]) are **offline-only**. The API server does not
+    /// enforce them (see [`validate_source_ref`]), so the CLI and the controller are what reject a
+    /// malformed or ambiguous alias — and they reject it *before* anything is fetched, because this
+    /// function runs first in the controller's pass.
     pub fn validate(&self) -> Result<(), SpecValidationError> {
         if self.project.trim().is_empty() {
             return Err(SpecValidationError::EmptyProject);
@@ -815,21 +1099,39 @@ impl ApplicationSpec {
         if self.destination.cluster.trim().is_empty() {
             return Err(SpecValidationError::EmptyDestinationCluster);
         }
-        // `T18.3`: exactly one source. This mirrors the CEL rule on `SourceSpec`, so an
-        // `Application` rejected by the API server (422) is rejected identically by the CLI and by
-        // the controller before anything is fetched.
-        match (&self.source.git, &self.source.oci) {
-            (None, None) => return Err(SpecValidationError::MissingSource),
-            (Some(_), Some(_)) => return Err(SpecValidationError::AmbiguousSource),
-            (Some(git), None) => {
-                if git.repo_url.trim().is_empty() {
-                    return Err(SpecValidationError::EmptyRepoUrl);
-                }
-                if git.target_revision.trim().is_empty() {
-                    return Err(SpecValidationError::EmptyTargetRevision);
+        // `T18.3`/`T20.1`: exactly one source *declaration*. This mirrors the CEL rule on `spec`,
+        // so an `Application` rejected by the API server (422) is rejected identically by the CLI
+        // and by the controller before anything is fetched.
+        match (&self.source, self.sources.is_empty()) {
+            (None, true) => return Err(SpecValidationError::MissingSourceDeclaration),
+            (Some(_), false) => return Err(SpecValidationError::ConflictingSourceDeclaration),
+            (Some(source), true) => {
+                // `T18.3`: exactly one source *arm*, mirroring the CEL rule on `SourceSpec`.
+                match (&source.git, &source.oci) {
+                    (None, None) => return Err(SpecValidationError::MissingSource),
+                    (Some(_), Some(_)) => return Err(SpecValidationError::AmbiguousSource),
+                    (Some(git), None) => validate_git_source(git)?,
+                    (None, Some(oci)) => oci.validate()?,
                 }
             }
-            (None, Some(oci)) => oci.validate()?,
+            (None, false) => {
+                if self.sources.len() > MAX_SOURCES {
+                    return Err(SpecValidationError::TooManySources {
+                        count: self.sources.len(),
+                    });
+                }
+                let mut aliases: BTreeSet<&str> = BTreeSet::new();
+                for (index, entry) in self.sources.iter().enumerate() {
+                    entry.validate(index)?;
+                    if let Some(alias) = entry.alias()
+                        && !aliases.insert(alias)
+                    {
+                        return Err(SpecValidationError::DuplicateSourceRef {
+                            name: alias.to_owned(),
+                        });
+                    }
+                }
+            }
         }
         if self.requeue_after_seconds == 0 {
             return Err(SpecValidationError::ZeroRequeueAfter);
@@ -851,6 +1153,55 @@ impl ApplicationSpec {
             .as_ref()
             .and_then(|policy| policy.sync_options.clone())
             .unwrap_or_default()
+    }
+
+    /// The single-source `spec.source` block, when this is a `v1.0`-shaped `Application`.
+    #[must_use]
+    pub fn primary_source(&self) -> Option<&SourceSpec> {
+        self.source.as_ref()
+    }
+
+    /// The Git arm of `spec.source` (a `v1.0` single-source `Application`), if any.
+    #[must_use]
+    pub fn primary_git_source(&self) -> Option<&GitSourceSpec> {
+        self.primary_source().and_then(SourceSpec::git_source)
+    }
+
+    /// The OCI arm of `spec.source` (a `v1.0` single-source `Application`), if any.
+    #[must_use]
+    pub fn primary_oci_source(&self) -> Option<&OciSourceSpec> {
+        self.primary_source().and_then(SourceSpec::oci_source)
+    }
+
+    /// **Every** declared Git source, in declaration order (`T20.1`).
+    ///
+    /// `spec.source.git` first (when this is a `v1.0`-shaped `Application`), then the `git` arm of
+    /// each `spec.sources` entry. An entry that carries `oci` therefore contributes nothing: it has
+    /// no Git identity, so nothing can push to it.
+    ///
+    /// This is the single "which repositories does this `Application` clone?" accessor. Anything
+    /// that maps a remote event (a webhook push, a repository mirror) onto an `Application` must ask
+    /// *this*, not [`Self::primary_git_source`]: a split chart/values `Application` has two
+    /// repositories, and reacting to only the first silently ignores every push to the values repo.
+    pub fn git_sources(&self) -> impl Iterator<Item = &GitSourceSpec> {
+        self.primary_git_source()
+            .into_iter()
+            .chain(self.sources.iter().filter_map(|entry| entry.git.as_ref()))
+    }
+
+    /// Whether this `Application` declares the `T20.1` `spec.sources` list.
+    #[must_use]
+    pub fn is_multi_source(&self) -> bool {
+        !self.sources.is_empty()
+    }
+
+    /// Number of declared sources (`1` for a `v1.0` single-source `Application`).
+    #[must_use]
+    pub fn source_count(&self) -> usize {
+        match (&self.source, self.sources.len()) {
+            (Some(_), _) => 1,
+            (None, len) => len,
+        }
     }
 }
 
@@ -940,14 +1291,23 @@ spec:
             app.spec.service_account_name.as_deref(),
             Some("payments-sa")
         );
-        let git = app.spec.source.git_source().expect("git source");
+        let git = app
+            .spec
+            .primary_source()
+            .expect("spec.source")
+            .git_source()
+            .expect("git source");
         assert_eq!(
             git.repo_url,
             "https://github.com/example/payment-service.git"
         );
         assert_eq!(git.target_revision, "main");
         assert!(
-            app.spec.source.oci_source().is_none(),
+            app.spec
+                .primary_source()
+                .expect("spec.source")
+                .oci_source()
+                .is_none(),
             "a Git application must never carry an OCI source"
         );
         assert_eq!(app.spec.revision_history_limit, 20);
@@ -992,18 +1352,36 @@ spec:
         assert_eq!(spec.project, DEFAULT_PROJECT_NAME);
         assert_eq!(spec.requeue_after_seconds, 180);
         assert_eq!(spec.revision_history_limit, 10);
-        let git = spec.source.git_source().expect("git source");
+        let git = spec
+            .primary_source()
+            .expect("spec.source")
+            .git_source()
+            .expect("git source");
         assert_eq!(git.target_revision, DEFAULT_TARGET_REVISION);
         assert_eq!(git.path, "");
-        assert_eq!(spec.source.renderer, RendererSpec::Auto(AutoRenderer {}));
+        assert_eq!(
+            spec.primary_source().expect("spec.source").renderer,
+            RendererSpec::Auto(AutoRenderer {})
+        );
         assert_eq!(spec.destination.cluster, DEFAULT_DESTINATION_CLUSTER);
         assert!(spec.sync_policy.is_none());
         assert!(spec.ignore_differences.is_empty());
         assert!(spec.validate().is_ok());
         // The accessors describe a Git application exactly as the fields do.
-        assert_eq!(spec.source.repo_url(), git.repo_url);
-        assert_eq!(spec.source.source_path(), "");
-        assert_eq!(spec.source.requested_revision(), DEFAULT_TARGET_REVISION);
+        assert_eq!(
+            spec.primary_source().expect("spec.source").repo_url(),
+            git.repo_url
+        );
+        assert_eq!(
+            spec.primary_source().expect("spec.source").source_path(),
+            ""
+        );
+        assert_eq!(
+            spec.primary_source()
+                .expect("spec.source")
+                .requested_revision(),
+            DEFAULT_TARGET_REVISION
+        );
 
         // Manual-only sync: no automation, no self-heal, no pruning.
         let policy = SyncPolicy::default();
@@ -1162,6 +1540,8 @@ spec:
         let mut empty_url = spec.clone();
         empty_url
             .source
+            .as_mut()
+            .expect("spec.source")
             .git
             .as_mut()
             .expect("git source")
@@ -1172,6 +1552,8 @@ spec:
         let mut empty_revision = spec.clone();
         empty_revision
             .source
+            .as_mut()
+            .expect("spec.source")
             .git
             .as_mut()
             .expect("git source")
@@ -1202,8 +1584,20 @@ spec:
     fn v1_git_application_round_trips_byte_identically() {
         let app: Application = serde_json::from_str(V1_GIT_JSON).expect("v1.0 JSON must parse");
         assert!(app.spec.validate().is_ok());
-        assert!(app.spec.source.git_source().is_some());
-        assert!(app.spec.source.oci_source().is_none());
+        assert!(
+            app.spec
+                .primary_source()
+                .expect("spec.source")
+                .git_source()
+                .is_some()
+        );
+        assert!(
+            app.spec
+                .primary_source()
+                .expect("spec.source")
+                .oci_source()
+                .is_none()
+        );
 
         let reserialized = serde_json::to_string(&app).expect("must serialize");
         assert_eq!(
@@ -1222,6 +1616,196 @@ spec:
             yaml,
             "YAML output must be stable across round-trips"
         );
+    }
+
+    /// The split chart + values layout the `T20.1` roadmap names: an OCI Helm chart plus an
+    /// aliased Git values repository addressed through `$values/...`.
+    const MULTI_SOURCE_APPLICATION: &str = r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: Application
+metadata:
+  name: payments
+  namespace: ferriscd-system
+spec:
+  project: payments
+  sources:
+    - ref: chart
+      oci:
+        url: oci://ghcr.io/example/payments
+        tag: 1.4.2
+        path: ""
+      renderer:
+        helm:
+          releaseName: payments
+          valueFiles:
+            - $values/envs/prod/values.yaml
+    - ref: values
+      git:
+        repoURL: https://github.com/example/values.git
+        targetRevision: main
+  destination:
+    cluster: in-cluster
+    namespace: payments
+"#;
+
+    /// **Acceptance criterion.** A multi-source `Application` round-trips through YAML **and** JSON
+    /// with the Kubernetes spellings (notably `ref`, never `ref_name`), keeps the alias/`renderer`
+    /// optionality, and never invents a `spec.source` key.
+    #[test]
+    fn a_multi_source_application_round_trips_through_yaml_and_json() {
+        let app = parse(MULTI_SOURCE_APPLICATION);
+        assert_eq!(
+            app.spec.validate(),
+            Ok(()),
+            "the fixture must be a valid spec"
+        );
+        assert!(
+            app.spec.source.is_none(),
+            "a multi-source Application must not carry spec.source"
+        );
+        assert!(app.spec.is_multi_source());
+        assert_eq!(app.spec.source_count(), 2);
+
+        let chart = &app.spec.sources[0];
+        assert_eq!(chart.alias(), Some("chart"));
+        assert_eq!(chart.repo_url(), "oci://ghcr.io/example/payments");
+        assert_eq!(chart.requested_revision(), "1.4.2");
+        assert_eq!(chart.source_path(), "");
+        assert_eq!(
+            chart.renderer,
+            Some(RendererSpec::Helm(HelmRenderer {
+                release_name: Some("payments".to_owned()),
+                value_files: vec!["$values/envs/prod/values.yaml".to_owned()],
+                include_crds: false,
+            }))
+        );
+
+        let values = &app.spec.sources[1];
+        assert_eq!(values.alias(), Some("values"));
+        assert_eq!(values.requested_revision(), "main");
+        assert_eq!(
+            values.renderer, None,
+            "a values-only source declares no renderer"
+        );
+        assert!(
+            values.oci.is_none(),
+            "a Git entry must never carry an `oci` arm"
+        );
+
+        // The JSON wire form: `sources[]` with the Kubernetes spellings, and no `source` key.
+        let value = serde_json::to_value(&app).expect("must serialize");
+        let spec = &value["spec"];
+        assert!(spec.get("source").is_none(), "{spec}");
+        assert!(spec.get("source_path").is_none(), "{spec}");
+        assert_eq!(spec["sources"][0]["ref"], json!("chart"));
+        assert_eq!(spec["sources"][1]["ref"], json!("values"));
+        assert!(
+            spec["sources"][0].get("ref_name").is_none(),
+            "the alias is spelled `ref` on the wire: {spec}"
+        );
+        assert_eq!(
+            spec["sources"][0]["renderer"]["helm"]["valueFiles"][0],
+            json!("$values/envs/prod/values.yaml")
+        );
+        assert_eq!(
+            spec["sources"][0]["oci"]["url"],
+            json!("oci://ghcr.io/example/payments")
+        );
+        assert!(
+            spec["sources"][0].get("git").is_none(),
+            "an OCI entry must not gain a `git` key: {spec}"
+        );
+        assert!(
+            spec["sources"][1].get("renderer").is_none(),
+            "an absent renderer must not be serialized: {spec}"
+        );
+        assert!(
+            spec["sources"][1].get("oci").is_none(),
+            "an absent oci arm must not be serialized: {spec}"
+        );
+
+        // JSON is stable across a round-trip: byte-identical, so a stored object can never drift.
+        let serialized = serde_json::to_string(&app).expect("must serialize to json");
+        let rehydrated: Application =
+            serde_json::from_str(&serialized).expect("the JSON must parse back");
+        assert_eq!(rehydrated, app);
+        assert_eq!(
+            serde_json::to_string(&rehydrated).expect("must serialize to json"),
+            serialized
+        );
+
+        // The same object through YAML: parse → serialize → parse is stable.
+        let yaml = serde_saphyr::to_string(&app).expect("must serialize to yaml");
+        assert!(!yaml.contains("source:"), "no `spec.source` key: {yaml}");
+        let reparsed = parse(&yaml);
+        assert_eq!(reparsed, app);
+        assert_eq!(
+            serde_saphyr::to_string(&reparsed).expect("must serialize"),
+            yaml,
+            "YAML output must be stable across round-trips"
+        );
+
+        // A single-source Application is unaffected by the multi-source shape: it keeps `source`
+        // and never gains a `sources` key.
+        let single: Application = serde_json::from_str(V1_GIT_JSON).expect("v1.0 JSON must parse");
+        let single_json = serde_json::to_value(&single).expect("must serialize");
+        assert!(
+            single_json["spec"].get("sources").is_none(),
+            "{single_json}"
+        );
+    }
+
+    /// **`T20.1`.** [`ApplicationSpec::git_sources`] answers with **every** declared Git repository
+    /// — a split chart/values `Application` clones two, so anything that maps a remote event onto an
+    /// `Application` (the `/webhook` push fan-out) must not stop at `spec.source`.
+    #[test]
+    fn git_sources_lists_every_declared_git_repository() {
+        // Two entries, one OCI (no Git identity at all) and one Git.
+        let multi = parse(MULTI_SOURCE_APPLICATION);
+        let git: Vec<&str> = multi
+            .spec
+            .git_sources()
+            .map(|source| source.repo_url.as_str())
+            .collect();
+        assert_eq!(
+            git,
+            vec!["https://github.com/example/values.git"],
+            "an OCI entry has no Git identity to report"
+        );
+
+        // Both entries Git-backed: declaration order is preserved.
+        let mut both = multi.clone();
+        both.spec.sources[0].oci = None;
+        both.spec.sources[0].git = Some(GitSourceSpec {
+            repo_url: "https://github.com/example/charts.git".to_owned(),
+            target_revision: "main".to_owned(),
+            path: "charts/api".to_owned(),
+        });
+        let git: Vec<(&str, &str)> = both
+            .spec
+            .git_sources()
+            .map(|source| (source.repo_url.as_str(), source.target_revision.as_str()))
+            .collect();
+        assert_eq!(
+            git,
+            vec![
+                ("https://github.com/example/charts.git", "main"),
+                ("https://github.com/example/values.git", "main"),
+            ]
+        );
+
+        // A `v1.0` single-source Application reports exactly its `spec.source.git`.
+        let single: Application = serde_json::from_str(V1_GIT_JSON).expect("v1.0 JSON must parse");
+        let git: Vec<&str> = single
+            .spec
+            .git_sources()
+            .map(|source| source.repo_url.as_str())
+            .collect();
+        assert_eq!(git, vec!["https://github.com/example/payment-service.git"]);
+
+        // An OCI-only `v1.0` Application declares no Git source, so a push can never wake it.
+        let oci = parse(OCI_APPLICATION);
+        assert_eq!(oci.spec.git_sources().count(), 0);
     }
 
     const OCI_APPLICATION: &str = r#"
@@ -1246,12 +1830,23 @@ spec:
     #[test]
     fn oci_application_parses_serializes_and_validates() {
         let app = parse(OCI_APPLICATION);
-        let oci = app.spec.source.oci_source().expect("oci source");
+        let oci = app
+            .spec
+            .primary_source()
+            .expect("spec.source")
+            .oci_source()
+            .expect("oci source");
         assert_eq!(oci.url, "oci://ghcr.io/example/payments");
         assert_eq!(oci.tag.as_deref(), Some("1.4.2"));
         assert_eq!(oci.digest, None);
         assert_eq!(oci.path, "");
-        assert!(app.spec.source.git_source().is_none());
+        assert!(
+            app.spec
+                .primary_source()
+                .expect("spec.source")
+                .git_source()
+                .is_none()
+        );
         assert!(app.spec.validate().is_ok());
 
         // The wire form keeps the Kubernetes spellings and never emits an empty `tag`/`digest`.
@@ -1263,9 +1858,24 @@ spec:
         assert!(value["spec"]["source"].get("git").is_none());
 
         // The accessors report the OCI source, so downstream code never has to branch on `git`.
-        assert_eq!(app.spec.source.repo_url(), "oci://ghcr.io/example/payments");
-        assert_eq!(app.spec.source.source_path(), "");
-        assert_eq!(app.spec.source.requested_revision(), "1.4.2");
+        assert_eq!(
+            app.spec.primary_source().expect("spec.source").repo_url(),
+            "oci://ghcr.io/example/payments"
+        );
+        assert_eq!(
+            app.spec
+                .primary_source()
+                .expect("spec.source")
+                .source_path(),
+            ""
+        );
+        assert_eq!(
+            app.spec
+                .primary_source()
+                .expect("spec.source")
+                .requested_revision(),
+            "1.4.2"
+        );
 
         // A digest pin wins over the tag for `requested_revision` only when no tag is set.
         let digest_pinned: Application = serde_json::from_value(json!({
@@ -1283,7 +1893,11 @@ spec:
         .expect("a digest-pinned OCI application must parse");
         assert!(digest_pinned.spec.validate().is_ok());
         assert_eq!(
-            digest_pinned.spec.source.requested_revision(),
+            digest_pinned
+                .spec
+                .primary_source()
+                .expect("spec.source")
+                .requested_revision(),
             format!("sha256:{}", "a".repeat(64))
         );
     }
@@ -1293,8 +1907,9 @@ spec:
     #[test]
     fn exactly_one_source_is_required() {
         let mut neither = parse(MINIMAL_APPLICATION).spec;
-        neither.source.git = None;
-        neither.source.oci = None;
+        let source = neither.source.as_mut().expect("spec.source");
+        source.git = None;
+        source.oci = None;
         let err = neither
             .validate()
             .expect_err("neither source must be refused");
@@ -1306,7 +1921,7 @@ spec:
         );
 
         let mut both = parse(OCI_APPLICATION).spec;
-        both.source.git = Some(GitSourceSpec {
+        both.source.as_mut().expect("spec.source").git = Some(GitSourceSpec {
             repo_url: "https://github.com/example/payment-service.git".to_owned(),
             target_revision: "main".to_owned(),
             path: String::new(),
@@ -1457,7 +2072,8 @@ spec:
                 );
                 let oci = parse(&document(source))
                     .spec
-                    .source
+                    .primary_source()
+                    .expect("spec.source")
                     .oci_source()
                     .cloned()
                     .expect("the oci source must parse");
@@ -1475,7 +2091,8 @@ spec:
         let base = parse(OCI_APPLICATION).spec;
         let oci_spec = |mutate: &dyn Fn(&mut OciSourceSpec)| {
             let mut spec = base.clone();
-            let oci = spec.source.oci.as_mut().expect("oci source");
+            let source = spec.source.as_mut().expect("spec.source");
+            let oci = source.oci.as_mut().expect("oci source");
             mutate(oci);
             spec.validate()
         };
@@ -1702,7 +2319,7 @@ spec:
     }
 
     #[test]
-    fn schema_bounds_revision_history_limit_and_requires_source_fields() {
+    fn schema_bounds_revision_history_limit_and_bounds_the_source_declaration() {
         let schema = serde_json::to_value(schemars::schema_for!(ApplicationSpec))
             .expect("schema must serialize");
         let limit = &schema["properties"]["revisionHistoryLimit"];
@@ -1714,9 +2331,41 @@ spec:
             .expect("required must be an array")
             .clone();
         let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
-        assert!(required.contains(&"source"));
+        // `T20.1`: `spec.source` is no longer required — a multi-source `Application` declares
+        // `spec.sources` instead, and the exactly-one-of rule is CEL's job (both are optional in the
+        // OpenAPI schema so a stored `v1.0` object and a `spec.sources` object can both validate).
+        assert!(!required.contains(&"source"), "{required:?}");
+        assert!(!required.contains(&"sources"), "{required:?}");
         assert!(required.contains(&"destination"));
         assert!(!required.contains(&"project"));
         assert!(!required.contains(&"revisionHistoryLimit"));
+
+        // The `MAX_SOURCES` cap is expressed in the schema as `maxItems`, so a client that reads the
+        // schema sees the bound before the API server's CEL rule fires.
+        let sources = &schema["properties"]["sources"];
+        assert_eq!(sources["type"], json!("array"), "{sources}");
+        assert_eq!(sources["maxItems"], json!(16), "{sources}");
+        let entry = &schema["$defs"]["MultiSourceEntry"];
+        assert!(entry["properties"].get("ref").is_some(), "{entry}");
+        assert!(entry["properties"].get("git").is_some(), "{entry}");
+        assert!(entry["properties"].get("oci").is_some(), "{entry}");
+        assert!(entry["properties"].get("renderer").is_some(), "{entry}");
+        // The alias is `ref` on the wire, never the Rust field name.
+        assert!(
+            entry["properties"].get("ref_name").is_none(),
+            "the `ref` alias must not leak its Rust field name: {entry}"
+        );
+        // `renderer` is optional per entry (a values-only source declares none).
+        let entry_required = entry
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for field in ["ref", "git", "oci", "renderer"] {
+            assert!(
+                !entry_required.iter().any(|value| value == field),
+                "{field} must not be required on a sources entry: {entry}"
+            );
+        }
     }
 }

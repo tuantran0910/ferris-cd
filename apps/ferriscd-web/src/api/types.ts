@@ -8,6 +8,7 @@ export type ApplicationSummary = components["schemas"]["ApplicationSummary"];
 export type ConditionView = components["schemas"]["ConditionView"];
 export type DestinationView = components["schemas"]["DestinationView"];
 export type SourceView = components["schemas"]["SourceView"];
+export type SourceEntryView = components["schemas"]["SourceEntryView"];
 export type SyncView = components["schemas"]["SyncView"];
 export type HealthView = components["schemas"]["HealthView"];
 export type HistoryView = components["schemas"]["HistoryView"];

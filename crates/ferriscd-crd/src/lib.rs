@@ -12,8 +12,9 @@ pub mod sync_window;
 pub use application::{
     Application, ApplicationSpec, AutoRenderer, AutomatedSyncPolicy, DestinationSpec,
     GitSourceSpec, HelmRenderer, IgnoreDifference, KustomizeRenderer, MAX_OCI_TAG_LEN,
-    OCI_DIGEST_HEX_LEN, OCI_DIGEST_PREFIX, OciSourceSpec, PlainYamlRenderer, RendererSpec,
-    RetryBackoff, RetryPolicy, SourceSpec, SpecValidationError, SyncOptions, SyncPolicy,
+    MAX_SOURCE_REF_LEN, MAX_SOURCES, MultiSourceEntry, OCI_DIGEST_HEX_LEN, OCI_DIGEST_PREFIX,
+    OciSourceSpec, PlainYamlRenderer, RendererSpec, RetryBackoff, RetryPolicy, SourceSpec,
+    SpecValidationError, SyncOptions, SyncPolicy,
 };
 pub use applicationset::{
     APPLICATIONSET_FINALIZER, APPLICATIONSET_LABEL, ApplicationSet, ApplicationSetGenerator,

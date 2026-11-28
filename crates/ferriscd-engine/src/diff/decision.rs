@@ -241,6 +241,17 @@ pub fn source_spec_hash(spec: &ApplicationSpec) -> Result<String, SourceSpecHash
     let mut root: BTreeMap<&str, Value> = BTreeMap::new();
     root.insert("destination", destination);
     root.insert("source", source);
+    // `T20.1`: a multi-source `Application` additionally hashes its `spec.sources` list, so editing
+    // a values repository's `targetRevision`/`path`/`tag` (or reordering the list) triggers a sync
+    // under `selfHeal: false` even before the source list resolves to different revisions. The key is
+    // **absent** for a single-source `Application`, which keeps every pre-`T20.1` spec hash — and
+    // therefore every stored `status.sync.lastSyncedSpecHash` — byte-identical across the upgrade.
+    if !spec.sources.is_empty() {
+        let sources = serde_json::to_value(&spec.sources).map_err(|err| SourceSpecHashError {
+            message: err.to_string(),
+        })?;
+        root.insert("sources", sources);
+    }
 
     let mut object = Map::new();
     for (key, value) in root {
@@ -425,7 +436,7 @@ mod tests {
         ApplicationSpec {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
-            source: SourceSpec {
+            source: Some(SourceSpec {
                 git: Some(GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "main".to_owned(),
@@ -433,7 +444,8 @@ mod tests {
                 }),
                 oci: None,
                 renderer: RendererSpec::default(),
-            },
+            }),
+            sources: Vec::new(),
             destination: DestinationSpec {
                 cluster: "in-cluster".to_owned(),
                 namespace: "payments".to_owned(),
@@ -715,7 +727,14 @@ mod tests {
     fn a_git_path_edit_with_an_unchanged_sha_triggers_a_sync() {
         let before = spec();
         let mut after = spec();
-        after.source.git.as_mut().expect("git source").path = "deploy/staging".to_owned();
+        after
+            .source
+            .as_mut()
+            .expect("source")
+            .git
+            .as_mut()
+            .expect("git source")
+            .path = "deploy/staging".to_owned();
 
         let before_hash = source_spec_hash(&before).expect("hash");
         let after_hash = source_spec_hash(&after).expect("hash");
@@ -758,8 +777,9 @@ mod tests {
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let oci_spec = || {
             let mut spec = spec();
-            spec.source.git = None;
-            spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+            let source = spec.source.as_mut().expect("spec.source");
+            source.git = None;
+            source.oci = Some(ferriscd_crd::OciSourceSpec {
                 url: "oci://ghcr.io/example/payments".to_owned(),
                 tag: Some("1.4.2".to_owned()),
                 digest: None,
@@ -782,7 +802,15 @@ mod tests {
         ];
         for (field, mutate) in mutations {
             let mut mutated = oci_spec();
-            mutate(mutated.source.oci.as_mut().expect("oci source"));
+            mutate(
+                mutated
+                    .source
+                    .as_mut()
+                    .expect("spec.source")
+                    .oci
+                    .as_mut()
+                    .expect("oci source"),
+            );
             assert_ne!(
                 source_spec_hash(&mutated).expect("hash"),
                 base,
@@ -797,7 +825,15 @@ mod tests {
         let mut app = app_with(Some(policy(false, false)), None);
         app.spec.source = oci_spec().source;
         let mut edited = app.clone();
-        edited.spec.source.oci.as_mut().expect("oci").tag = Some("1.5.0".to_owned());
+        edited
+            .spec
+            .source
+            .as_mut()
+            .expect("spec.source")
+            .oci
+            .as_mut()
+            .expect("oci")
+            .tag = Some("1.5.0".to_owned());
         let edited_hash = source_spec_hash(&edited.spec).expect("hash");
 
         app.status = Some(ApplicationStatus {
@@ -855,14 +891,21 @@ mod tests {
             (
                 "repoURL",
                 Box::new(|spec: &mut ApplicationSpec| {
-                    spec.source.git.as_mut().expect("git source").repo_url =
-                        "https://example.com/other.git".to_owned();
+                    spec.source
+                        .as_mut()
+                        .expect("spec.source")
+                        .git
+                        .as_mut()
+                        .expect("git source")
+                        .repo_url = "https://example.com/other.git".to_owned();
                 }),
             ),
             (
                 "targetRevision",
                 Box::new(|spec: &mut ApplicationSpec| {
                     spec.source
+                        .as_mut()
+                        .expect("spec.source")
                         .git
                         .as_mut()
                         .expect("git source")
@@ -872,13 +915,20 @@ mod tests {
             (
                 "path",
                 Box::new(|spec: &mut ApplicationSpec| {
-                    spec.source.git.as_mut().expect("git source").path = String::new();
+                    spec.source
+                        .as_mut()
+                        .expect("spec.source")
+                        .git
+                        .as_mut()
+                        .expect("git source")
+                        .path = String::new();
                 }),
             ),
             (
                 "renderer",
                 Box::new(|spec: &mut ApplicationSpec| {
-                    spec.source.renderer = RendererSpec::Kustomize(Default::default());
+                    spec.source.as_mut().expect("spec.source").renderer =
+                        RendererSpec::Kustomize(Default::default());
                 }),
             ),
             (

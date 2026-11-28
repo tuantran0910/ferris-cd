@@ -21,6 +21,7 @@ pub mod kustomize;
 pub mod loader;
 pub mod normalize;
 pub mod renderer;
+pub mod sources;
 pub mod types;
 pub mod yaml;
 
@@ -35,8 +36,12 @@ pub use loader::{ManifestFile, ManifestLoaderConfig, load};
 pub use normalize::{check_duplicate_keys, normalize};
 pub use renderer::{
     ManifestRenderer, PlainYamlOptions, PlainYamlRenderer, RenderContext, RendererBinaries,
-    RendererConfig, RendererKind, detect_renderer, parse_and_normalize, redact_repo_url, render,
-    render_desired,
+    RendererConfig, RendererKind, SourceIdentity, detect_renderer, parse_and_normalize,
+    redact_repo_url, render, render_desired,
+};
+pub use sources::{
+    COMPOSITE_PREFIX, DeclaredSource, SOURCE_REF_PREFIX, SourceRevisions, SourceRoots,
+    declared_sources,
 };
 pub use types::{DesiredResource, GroupVersionKind, ResourceKey};
 pub use yaml::{YamlGuardError, parse_document, parse_file};
