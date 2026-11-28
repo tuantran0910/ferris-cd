@@ -50,13 +50,16 @@ pub struct ServerArgs {
     /// How the bearer-protected `/api/v1/*` routes are authenticated.
     ///
     /// `token-review` (the default) validates `Authorization: Bearer <token>` with a Kubernetes
-    /// `TokenReview`, caching a successful review for 30 s. `pass-through` is an explicit
-    /// **development** escape hatch: every protected request is allowed and annotated anonymous, so
-    /// it must stay on a loopback address. `deny-all` is a lockdown that refuses every protected
-    /// request with `401` without calling the API server. Falls back to `FERRISCD_AUTH_POLICY`.
+    /// `TokenReview`, caching a successful review for 30 s. `oidc` validates an OIDC JWT locally
+    /// against the IdP's JWKS (`T19.1`) and `token-review-or-oidc` accepts either. `pass-through` is
+    /// an explicit **development** escape hatch: every protected request is allowed and annotated
+    /// anonymous, so it must stay on a loopback address. `deny-all` is a lockdown that refuses every
+    /// protected request with `401` without calling the API server. Falls back to
+    /// `FERRISCD_AUTH_POLICY`.
     ///
     /// A `token-review` server also needs the `ferriscd-rbac-cm` ConfigMap (project-scoped
     /// authorization, `T14.4`); without it every authenticated request is refused (default-deny).
+    /// `oidc` and `token-review-or-oidc` additionally need `--oidc-issuer` and `--oidc-client-id`.
     #[arg(
         long = "auth-policy",
         value_name = "POLICY",
@@ -64,6 +67,59 @@ pub struct ServerArgs {
         default_value = "token-review"
     )]
     pub auth_policy: AuthPolicy,
+
+    /// OIDC issuer URL, exactly as it appears in the token's `iss` claim.
+    ///
+    /// Required when `--auth-policy` is `oidc` or `token-review-or-oidc`; `https://` only (see
+    /// `--oidc-insecure-http` for a local IdP on `kind`). Falls back to `FERRISCD_OIDC_ISSUER`.
+    #[arg(long = "oidc-issuer", value_name = "URL", env = "FERRISCD_OIDC_ISSUER")]
+    pub oidc_issuer: Option<String>,
+
+    /// OAuth client id this server is registered as; the token's `aud` must contain it.
+    ///
+    /// Falls back to `FERRISCD_OIDC_CLIENT_ID`.
+    #[arg(
+        long = "oidc-client-id",
+        value_name = "ID",
+        env = "FERRISCD_OIDC_CLIENT_ID"
+    )]
+    pub oidc_client_id: Option<String>,
+
+    /// Mandatory prefix applied to the OIDC `sub` claim.
+    ///
+    /// Never empty: without it an IdP claim of `system:masters` would *be* the Kubernetes group.
+    #[arg(
+        long = "oidc-username-prefix",
+        value_name = "PREFIX",
+        env = "FERRISCD_OIDC_USERNAME_PREFIX",
+        default_value = ferriscd_server::oidc::DEFAULT_USERNAME_PREFIX
+    )]
+    pub oidc_username_prefix: String,
+
+    /// Mandatory prefix applied to every OIDC group claim.
+    #[arg(
+        long = "oidc-groups-prefix",
+        value_name = "PREFIX",
+        env = "FERRISCD_OIDC_GROUPS_PREFIX",
+        default_value = ferriscd_server::oidc::DEFAULT_GROUPS_PREFIX
+    )]
+    pub oidc_groups_prefix: String,
+
+    /// Comma-separated scopes `GET /api/v1/auth/config` advertises to the Web UI and the CLI.
+    #[arg(
+        long = "oidc-scopes",
+        value_name = "SCOPES",
+        env = "FERRISCD_OIDC_SCOPES",
+        default_value = "openid,profile,email"
+    )]
+    pub oidc_scopes: String,
+
+    /// Allow a plain-`http://` OIDC issuer.
+    ///
+    /// **Development only** (a Dex instance on a `kind` cluster): in production the issuer must be
+    /// `https://`, and the flag exists so a local experiment does not need a TLS IdP.
+    #[arg(long = "oidc-insecure-http")]
+    pub oidc_insecure_http: bool,
 
     /// GitHub webhook secret (HMAC-SHA256 key for `X-Hub-Signature-256`).
     ///
@@ -123,6 +179,12 @@ impl std::fmt::Debug for ServerArgs {
             .field("api_addr", &self.api_addr)
             .field("metrics_addr", &self.controller.metrics_addr)
             .field("auth_policy", &self.auth_policy)
+            .field("oidc_issuer", &self.oidc_issuer)
+            .field("oidc_client_id", &self.oidc_client_id)
+            .field("oidc_username_prefix", &self.oidc_username_prefix)
+            .field("oidc_groups_prefix", &self.oidc_groups_prefix)
+            .field("oidc_scopes", &self.oidc_scopes)
+            .field("oidc_insecure_http", &self.oidc_insecure_http)
             .field(
                 "github_webhook_secret",
                 &redacted(self.github_webhook_secret.is_some()),
@@ -261,6 +323,140 @@ fn ensure_metrics_addr_differs(api: SocketAddr, metrics_addr: &str) -> Result<()
     Ok(())
 }
 
+/// Builds the OIDC configuration from the flags, refusing an unusable one at startup (`T19.1`).
+///
+/// The three refusals that matter:
+///
+/// * a policy that authenticates with OIDC needs an issuer and a client id — starting without them
+///   would serve a policy that can never authenticate anybody (every request `401`);
+/// * `--oidc-issuer`/`--oidc-client-id` without such a policy is a configuration mistake, not an
+///   invitation to silently ignore the flags;
+/// * the configuration itself must validate ([`OidcConfig::validate`]): `https`-only issuer (unless
+///   the development flag), non-empty identity prefixes, a bounded clock skew.
+///
+/// # Errors
+///
+/// A human-readable message naming the flag that has to change.
+fn oidc_config(args: &ServerArgs) -> Result<Option<ferriscd_server::oidc::OidcConfig>> {
+    use ferriscd_server::oidc::{DEFAULT_SCOPES, OidcConfig};
+
+    let (issuer, client_id) = match (args.oidc_issuer.as_deref(), args.oidc_client_id.as_deref()) {
+        (None, None) if args.auth_policy.requires_oidc() => anyhow::bail!(
+            "--auth-policy {} requires --oidc-issuer and --oidc-client-id: without them no request \
+             could ever be authenticated",
+            args.auth_policy.as_str()
+        ),
+        (None, None) => return Ok(None),
+        (Some(_), None) => anyhow::bail!(
+            "--oidc-issuer was given without --oidc-client-id: the token `aud` cannot be validated"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "--oidc-client-id was given without --oidc-issuer: the token `iss` cannot be validated"
+        ),
+        (Some(_), Some(_)) if !args.auth_policy.requires_oidc() => anyhow::bail!(
+            "--oidc-issuer/--oidc-client-id require --auth-policy oidc or token-review-or-oidc \
+             (the current policy is {})",
+            args.auth_policy.as_str()
+        ),
+        (Some(issuer), Some(client_id)) => (issuer, client_id),
+    };
+
+    let scopes: Vec<String> = if args.oidc_scopes.trim().is_empty() {
+        DEFAULT_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .collect()
+    } else {
+        args.oidc_scopes
+            .split(',')
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+    let config = OidcConfig::new(issuer, client_id)
+        .with_username_prefix(args.oidc_username_prefix.clone())
+        .with_groups_prefix(args.oidc_groups_prefix.clone())
+        .with_scopes(scopes)
+        .with_allow_insecure_http(args.oidc_insecure_http)
+        // `OidcConfigError`'s message already names the flag that has to change, so it is the
+        // top-level error rather than a context wrapping it.
+        .validate()?;
+    Ok(Some(config))
+}
+
+/// Builds the bearer authenticator for the configured policy (`T19.1`).
+///
+/// `token-review` keeps the `TokenReview` the control plane was built with; `oidc` verifies JWTs
+/// locally; `token-review-or-oidc` composes them, OIDC first, so a token carrying our issuer never
+/// costs a `TokenReview`.
+async fn oidc_authenticator(
+    policy: AuthPolicy,
+    plane: &ferriscd_controller::ControlPlane,
+    config: ferriscd_server::oidc::OidcConfig,
+) -> Result<(
+    std::sync::Arc<dyn ferriscd_server::TokenAuthenticator>,
+    ferriscd_server::PublicAuthConfig,
+)> {
+    use std::sync::Arc;
+
+    use ferriscd_server::oidc::{
+        CompositeTokenAuthenticator, HttpsJwksSource, JwksCache, OidcTokenAuthenticator,
+    };
+
+    // The optional private CA for an internal IdP comes from the `ferriscd-oidc` Secret; its absence
+    // is the normal case (a public IdP is trusted by the system roots).
+    let config = config.with_ca_pem(ferriscd_server::kube::load_oidc_ca(plane).await);
+    let source = HttpsJwksSource::new(&config)?;
+    let keys = Arc::new(JwksCache::new(
+        Arc::new(source),
+        config.jwks_min_refresh_interval,
+    )?);
+    // Warm-up runs in the background: the first login should not pay for the discovery round trip,
+    // but a slow or unreachable IdP must not delay binding the API listener either. The cache logs
+    // the outcome and retries on demand.
+    let warming = Arc::clone(&keys);
+    tokio::spawn(async move {
+        let _ = warming.warm_up().await;
+    });
+
+    let oidc = Arc::new(OidcTokenAuthenticator::new(config.clone(), keys)?);
+    let public = ferriscd_server::PublicAuthConfig::oidc(
+        config.issuer.clone(),
+        config.client_id.clone(),
+        config.scopes.clone(),
+    );
+    tracing::info!(
+        issuer = %config.issuer,
+        client_id = %config.client_id,
+        scopes = ?config.scopes,
+        username_prefix = %config.username_prefix,
+        groups_prefix = %config.groups_prefix,
+        insecure_http = config.allow_insecure_http,
+        "OIDC bearer authentication is enabled: tokens are verified locally against the IdP's JWKS"
+    );
+    if config.allow_insecure_http {
+        tracing::warn!(
+            issuer = %config.issuer,
+            "--oidc-insecure-http is set: the OIDC issuer is trusted over plain HTTP. This is a \
+             development escape hatch for a local IdP, never a production configuration"
+        );
+    }
+
+    let authenticator: Arc<dyn ferriscd_server::TokenAuthenticator> =
+        if policy == AuthPolicy::TokenReviewOrOidc {
+            Arc::new(CompositeTokenAuthenticator::new(
+                oidc,
+                Arc::new(ferriscd_server::kube::KubeTokenAuthenticator::new(
+                    plane.client().clone(),
+                )),
+            ))
+        } else {
+            oidc
+        };
+    Ok((authenticator, public))
+}
+
 /// Builds the shared control plane and runs the controller and the API server together.
 async fn serve(args: ServerArgs) -> Result<()> {
     let address: SocketAddr = args
@@ -273,6 +469,9 @@ async fn serve(args: ServerArgs) -> Result<()> {
     // instead of surfacing as a confusing "address already in use" from whichever bind ran second.
     ensure_metrics_addr_differs(address, &args.controller.metrics_addr)?;
     let webhooks = webhook_config(&args)?;
+    // `T19.1`: refused before any listener is bound, so a misconfigured OIDC deployment cannot start
+    // into a state where every protected request answers `401`.
+    let oidc = oidc_config(&args)?;
 
     // The ONE control plane: the same caches, registry, pipeline and discovery every handler and
     // every reconcile uses (finding C9).
@@ -287,10 +486,19 @@ async fn serve(args: ServerArgs) -> Result<()> {
     if rbac_api_reachable {
         plane.readiness().mark_rbac_loaded();
     }
-    let state = ferriscd_server::kube::app_state(&plane, webhooks)
+    let mut state = ferriscd_server::kube::app_state(&plane, webhooks)
         .with_auth(args.auth_policy)
         .with_rbac_store(rbac_store.clone())
         .with_rbac_namespace(plane.namespace().to_owned());
+    // `T19.1`: the OIDC authenticator (and, for `token-review-or-oidc`, the composite that falls back
+    // to the `TokenReview` the state already holds). The public half of the configuration is what
+    // `GET /api/v1/auth/config` publishes to the Web UI and the CLI.
+    if let Some(config) = oidc {
+        let (authenticator, public) = oidc_authenticator(args.auth_policy, &plane, config).await?;
+        state = state
+            .with_token_authenticator(authenticator)
+            .with_auth_config(public);
+    }
     if let Some(metrics_addr) = plane.metrics_addr() {
         // `T15.1`: said out loud where the API address is decided, so a scrape that fails is not
         // diagnosed as a missing endpoint.
@@ -617,6 +825,185 @@ mod tests {
         let args = parse(&["ferriscd", "server", "--github-webhook-secret", "   "]);
         let error = webhook_config(&args).expect_err("an empty secret must be refused");
         assert!(error.to_string().contains("must not be empty"), "{error}");
+    }
+
+    /// **`T19.1`:** the OIDC flags parse, publish the documented defaults, and an unusable
+    /// configuration is refused at startup rather than serving a policy that can never authenticate.
+    #[test]
+    fn the_oidc_flags_validate_before_anything_is_served() {
+        let oidc = parse(&[
+            "ferriscd",
+            "server",
+            "--auth-policy",
+            "oidc",
+            "--oidc-issuer",
+            "https://dex.example.com",
+            "--oidc-client-id",
+            "ferriscd",
+        ]);
+        let config = oidc_config(&oidc)
+            .expect("a complete OIDC configuration")
+            .expect("OIDC is configured");
+        assert_eq!(config.issuer, "https://dex.example.com");
+        assert_eq!(config.client_id, "ferriscd");
+        assert_eq!(config.username_prefix, "oidc:");
+        assert_eq!(config.groups_prefix, "oidc:");
+        assert_eq!(config.scopes, vec!["openid", "profile", "email"]);
+        assert!(!config.allow_insecure_http);
+
+        // The composite policy builds the same configuration.
+        let composite = parse(&[
+            "ferriscd",
+            "server",
+            "--auth-policy",
+            "token-review-or-oidc",
+            "--oidc-issuer",
+            "https://dex.example.com",
+            "--oidc-client-id",
+            "ferriscd",
+            "--oidc-scopes",
+            "openid, groups",
+        ]);
+        let config = oidc_config(&composite)
+            .expect("a composite configuration")
+            .expect("OIDC is configured");
+        assert_eq!(config.scopes, vec!["openid", "groups"]);
+
+        // No OIDC flags and the default policy: nothing to configure, nothing to advertise.
+        assert!(
+            oidc_config(&parse(&["ferriscd", "server"]))
+                .expect("no OIDC")
+                .is_none()
+        );
+
+        // A policy that authenticates with OIDC cannot start without an issuer *and* a client id.
+        for args in [
+            parse(&["ferriscd", "server", "--auth-policy", "oidc"]),
+            parse(&[
+                "ferriscd",
+                "server",
+                "--auth-policy",
+                "oidc",
+                "--oidc-issuer",
+                "https://dex.example.com",
+            ]),
+            parse(&[
+                "ferriscd",
+                "server",
+                "--auth-policy",
+                "token-review-or-oidc",
+                "--oidc-client-id",
+                "ferriscd",
+            ]),
+        ] {
+            assert!(
+                oidc_config(&args).is_err(),
+                "an incomplete OIDC policy must not start"
+            );
+        }
+
+        // OIDC flags without an OIDC policy are a mistake, not silently ignored.
+        let unused = parse(&[
+            "ferriscd",
+            "server",
+            "--oidc-issuer",
+            "https://dex.example.com",
+            "--oidc-client-id",
+            "ferriscd",
+        ]);
+        let error = oidc_config(&unused).expect_err("the flags need the matching policy");
+        assert!(error.to_string().contains("--auth-policy"), "{error}");
+
+        // **Trap guard:** an empty identity prefix is refused, so an IdP claim can never become a
+        // Kubernetes identity.
+        let empty_prefix = parse(&[
+            "ferriscd",
+            "server",
+            "--auth-policy",
+            "oidc",
+            "--oidc-issuer",
+            "https://dex.example.com",
+            "--oidc-client-id",
+            "ferriscd",
+            "--oidc-username-prefix",
+            "",
+        ]);
+        let error = oidc_config(&empty_prefix).expect_err("an empty prefix must be refused");
+        assert!(
+            error.to_string().contains("oidc-username-prefix"),
+            "{error}"
+        );
+        let empty_groups = parse(&[
+            "ferriscd",
+            "server",
+            "--auth-policy",
+            "oidc",
+            "--oidc-issuer",
+            "https://dex.example.com",
+            "--oidc-client-id",
+            "ferriscd",
+            "--oidc-groups-prefix",
+            "",
+        ]);
+        assert!(oidc_config(&empty_groups).is_err());
+
+        // **Trap guard:** a plain-http issuer needs the explicit development flag.
+        let plain = parse(&[
+            "ferriscd",
+            "server",
+            "--auth-policy",
+            "oidc",
+            "--oidc-issuer",
+            "http://dex.ferriscd-system.svc:5556",
+            "--oidc-client-id",
+            "ferriscd",
+        ]);
+        let error = oidc_config(&plain).expect_err("http:// is refused by default");
+        assert!(error.to_string().contains("oidc-insecure-http"), "{error}");
+        let development = parse(&[
+            "ferriscd",
+            "server",
+            "--auth-policy",
+            "oidc",
+            "--oidc-issuer",
+            "http://dex.ferriscd-system.svc:5556",
+            "--oidc-client-id",
+            "ferriscd",
+            "--oidc-insecure-http",
+        ]);
+        assert!(
+            oidc_config(&development)
+                .expect("the development flag allows a local IdP")
+                .expect("configured")
+                .allow_insecure_http
+        );
+
+        // The new flags (and their env fallbacks) are documented.
+        let mut command = Harness::command();
+        let help = command
+            .find_subcommand_mut("server")
+            .expect("the server subcommand exists")
+            .render_long_help()
+            .to_string();
+        for expected in [
+            "--oidc-issuer",
+            "FERRISCD_OIDC_ISSUER",
+            "--oidc-client-id",
+            "FERRISCD_OIDC_CLIENT_ID",
+            "--oidc-username-prefix",
+            "FERRISCD_OIDC_USERNAME_PREFIX",
+            "--oidc-groups-prefix",
+            "FERRISCD_OIDC_GROUPS_PREFIX",
+            "--oidc-scopes",
+            "FERRISCD_OIDC_SCOPES",
+            "--oidc-insecure-http",
+            "token-review-or-oidc",
+        ] {
+            assert!(
+                help.contains(expected),
+                "the flag help must document {expected:?}: {help}"
+            );
+        }
     }
 
     #[test]

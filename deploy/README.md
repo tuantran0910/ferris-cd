@@ -296,6 +296,56 @@ the object has not been deleted yet.
 `spec.destination.cluster` is still checked against `AppProject.spec.destinations` **before** the
 registry is consulted, so a tenant cannot use an `Application` to probe which clusters exist.
 
+### OIDC / SSO sign-in (`T19.1`) — optional private CA Secret
+
+`ferriscd server` can authenticate the protected API with corporate IdP tokens instead of (or as well
+as) Kubernetes `ServiceAccount` tokens:
+
+```text
+ferriscd server \
+  --auth-policy oidc \
+  --oidc-issuer https://login.example.com \
+  --oidc-client-id ferriscd
+```
+
+* `--auth-policy oidc` accepts **only** OIDC JWTs; `--auth-policy token-review-or-oidc` accepts an
+  OIDC JWT **or** a `ServiceAccount` token (OIDC first, and a token carrying this server's issuer is
+  never forwarded to the API server). The default, `token-review`, is unchanged.
+* Verification is local against the IdP's published JWKS (RS256/ES256/ES384/EdDSA only), so there is
+  **no client secret** to store and no per-request round trip to the IdP. `--oidc-username-prefix`
+  and `--oidc-groups-prefix` (both default `oidc:`) are what keep an IdP claim from becoming a
+  Kubernetes identity such as `system:masters`.
+* `--oidc-insecure-http` exists for a local Dex on `kind` and nothing else.
+
+An internal IdP signed by a **private** CA is trusted through one optional `Secret` in the
+control-plane namespace (`--namespace`, default `ferriscd-system`):
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ferriscd-oidc
+  namespace: ferriscd-system
+  labels:
+    ferriscd.io/secret-type: oidc
+type: Opaque
+data:
+  # A PEM bundle: the CA that signed the IdP's TLS certificate (and its chain).
+  ca.crt: <base64 PEM>
+```
+
+* The file **must** be named `ca.crt`, and the label `ferriscd.io/secret-type: oidc` is the opt-in
+  (an unlabelled `ferriscd-oidc` is ignored with a warning, so an unrelated `Secret` of that name is
+  never trusted by accident).
+* **Fallback:** with no `ferriscd-oidc` `Secret`, the IdP's certificate must chain to the **system
+  roots** bundled in the image. A missing `Secret` is logged (`the OIDC Secret could not be read;
+  the IdP must be trusted by the system roots`) and is not a startup failure.
+* The bundle is read **once, at startup** — rotate it and restart the server. Its contents are never
+  logged, and `Debug` renders it as a byte count.
+* **No RBAC change is needed:** the control plane already reads `Secret`s in its own namespace for
+  repository credentials (see the namespaced `Role`/`RoleBinding` above), and this `Secret` is read
+  under that same namespaced grant — never cluster-wide.
+
 ### HA: `Lease` leader election (`T13.2`) — opt-in
 
 By default the controller runs as a single replica: run exactly one. Two replicas without leader

@@ -1,8 +1,12 @@
 # Least-privilege RBAC for FerrisCD.
 #
 # Control-plane namespace Role:
-# Strictly scopes `secrets` (`ferriscd.io/secret-type=repository` and `cluster`),
-# `configmaps` (`ferriscd-rbac-cm`), leader-election `leases`, `events`, and
+# A **namespace-scoped read** of `secrets` (`get`/`list`/`watch` on every `Secret` in
+# `ferriscd-system` — Kubernetes RBAC cannot select by label). The
+# `ferriscd.io/secret-type=repository|cluster|oidc` labels are a **client-side opt-in**: the control
+# plane ignores a `Secret` without them, but the Role itself grants the whole namespace, so keep
+# unrelated `Secret`s out of `ferriscd-system` (or grant a narrower rule of your own).
+# The rest: `configmaps` (`ferriscd-rbac-cm`), leader-election `leases`, `events`, and
 # control-plane `Application`/`AppProject` access to `ferriscd-system` only.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

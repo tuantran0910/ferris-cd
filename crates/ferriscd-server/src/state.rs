@@ -495,6 +495,40 @@ impl Readiness for NotReady {
     }
 }
 
+/// The secret-free facts `GET /api/v1/auth/config` publishes to the Web UI and the CLI (`T19.1`).
+///
+/// Deliberately not the [`crate::oidc::OidcConfig`]: this type is what an **unauthenticated** caller
+/// may learn, so it carries no CA bundle, no secret and no prefix that would let an IdP claim be
+/// forged offline. `bff_enabled` is published now and wired by `T19.2` (the cookie session flow).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublicAuthConfig {
+    /// The configured issuer, when OIDC is enabled.
+    pub issuer: Option<String>,
+    /// The configured OAuth client id, when OIDC is enabled.
+    pub client_id: Option<String>,
+    /// The scopes the SPA/CLI should request.
+    pub scopes: Vec<String>,
+    /// Whether the optional server-side (BFF cookie) session mode is available (`T19.2`).
+    pub bff_enabled: bool,
+}
+
+impl PublicAuthConfig {
+    /// The OIDC facts for `issuer` + `client_id`.
+    #[must_use]
+    pub fn oidc(
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+        scopes: Vec<String>,
+    ) -> Self {
+        Self {
+            issuer: Some(issuer.into()),
+            client_id: Some(client_id.into()),
+            scopes,
+            bff_enabled: false,
+        }
+    }
+}
+
 /// Everything the router needs.
 ///
 /// Deliberately a bag of seams: one `AppState` is built by [`crate::Server`] from the shared
@@ -528,6 +562,8 @@ pub struct AppState {
     pub tokens: Arc<dyn TokenAuthenticator>,
     /// `T14.3` positive-only `TokenReview` cache, keyed by token SHA-256.
     pub identities: Arc<IdentityCache>,
+    /// `T19.1` secret-free OIDC facts `GET /api/v1/auth/config` publishes.
+    pub auth_config: PublicAuthConfig,
     /// `T14.4` / `T17.1` live-reloading project-scoped authorization policy store (empty = deny
     /// every authenticated caller).
     pub rbac: RbacPolicyStore,
@@ -595,6 +631,7 @@ impl AppState {
             auth: AuthPolicy::default(),
             tokens: Arc::new(UnconfiguredTokenAuthenticator),
             identities: Arc::new(IdentityCache::default()),
+            auth_config: PublicAuthConfig::default(),
             rbac: RbacPolicyStore::empty(),
             rbac_namespace: crate::rbac::DEFAULT_RBAC_NAMESPACE.to_owned(),
             webhooks,
@@ -626,6 +663,17 @@ impl AppState {
     }
 
     /// Replaces the authentication seam.
+    ///
+    /// **Finding `N4a`:** an [`AuthPolicy::Oidc`] or [`AuthPolicy::TokenReviewOrOidc`] policy must be
+    /// paired with [`Self::with_auth_config`] (built by [`PublicAuthConfig::oidc`]). The policy is
+    /// what `GET /api/v1/auth/config` publishes as `authMode`, so an `oidc` policy with no issuer
+    /// and no client id tells every Web UI and CLI to start an SSO sign-in it cannot complete.
+    ///
+    /// The binary cannot reach that state — `--oidc-issuer` and `--oidc-client-id` are required for
+    /// an OIDC policy and the server refuses to start without them — but a library embedder builds
+    /// an `AppState` by hand. [`Self::auth_config_matches_policy`] is the predicate the discovery
+    /// handler `debug_assert!`s, so the mismatch fails in tests rather than in a browser; call
+    /// either builder in either order, but call both.
     #[must_use]
     pub fn with_auth(mut self, auth: AuthPolicy) -> Self {
         self.auth = auth;
@@ -644,6 +692,29 @@ impl AppState {
     pub fn with_identity_cache(mut self, identities: Arc<IdentityCache>) -> Self {
         self.identities = identities;
         self
+    }
+
+    /// Publishes the secret-free OIDC facts on `GET /api/v1/auth/config` (`T19.1`).
+    ///
+    /// Required whenever [`Self::with_auth`] selected an OIDC policy (finding `N4a`): see
+    /// [`Self::auth_config_matches_policy`].
+    #[must_use]
+    pub fn with_auth_config(mut self, auth_config: PublicAuthConfig) -> Self {
+        self.auth_config = auth_config;
+        self
+    }
+
+    /// Whether `GET /api/v1/auth/config` can publish an honest answer for the selected policy.
+    ///
+    /// `true` for every policy that does not require OIDC, and — for [`AuthPolicy::Oidc`] and
+    /// [`AuthPolicy::TokenReviewOrOidc`] — only once [`Self::with_auth_config`] supplied both the
+    /// issuer and the client id (`PublicAuthConfig::oidc`). Finding `N4a`: an embedder cannot
+    /// publish `authMode: "oidc"` with no issuer and no client id without this returning `false`,
+    /// which the discovery handler `debug_assert!`s.
+    #[must_use]
+    pub fn auth_config_matches_policy(&self) -> bool {
+        !self.auth.requires_oidc()
+            || (self.auth_config.issuer.is_some() && self.auth_config.client_id.is_some())
     }
 
     /// Replaces the project-scoped authorization policy (`T14.4`).

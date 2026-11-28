@@ -164,6 +164,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Publishes how a caller can authenticate, so the Web UI and the CLI can pick a sign-in flow
+         *     (`T19.1`; `T19.2` consumes it with PKCE).
+         * @description How to authenticate against this server: the auth mode (token-review, oidc, token-review-or-oidc, ...), plus the OIDC issuer, public client id and scopes when OIDC is enabled. Public by design — a client needs it before it has a credential.
+         */
+        get: operations["auth_config"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/clusters": {
         parameters: {
             query?: never;
@@ -393,6 +414,25 @@ export interface components {
             /** @description `spec.source` summary (the repository URL is redacted). */
             source: components["schemas"]["SourceView"];
             sync?: null | components["schemas"]["SyncView"];
+        };
+        /**
+         * @description `GET /api/v1/auth/config` body (`T19.1`).
+         *
+         *     Served from the **public** group: the SPA and `ferriscd login --oidc` must learn how to
+         *     authenticate before they have a token, so this carries only what a stranger may know — the auth
+         *     mode, the issuer, the public client id and the scopes (`T19.2` consumes it).
+         */
+        AuthConfigView: {
+            /** @description `token-review`, `oidc`, `token-review-or-oidc`, `pass-through` or `deny-all`. */
+            authMode: string;
+            /** @description Whether the optional server-side (BFF cookie) session mode is enabled (`T19.2`). */
+            bffEnabled: boolean;
+            /** @description The configured OAuth client id. **Absent** when OIDC is disabled; never `null`. */
+            clientId?: string;
+            /** @description The configured OIDC issuer. **Absent** when OIDC is disabled; never `null`. */
+            issuer?: string;
+            /** @description The scopes the client should request from the IdP. Always present (`[]` when OIDC is off). */
+            scopes: string[];
         };
         /** @description `GET /api/v1/clusters` body. */
         ClusterListView: {
@@ -1179,6 +1219,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    auth_config: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The authentication configuration */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthConfigView"];
                 };
             };
         };
