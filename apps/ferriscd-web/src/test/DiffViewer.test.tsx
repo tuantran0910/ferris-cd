@@ -2,7 +2,11 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { DiffViewer } from "../features/diff/DiffViewer";
-import { sampleDiffPayload } from "./fixtures";
+import { isBlockingEnforcement } from "../api/types";
+import {
+  sampleDiffPayload,
+  sampleDiffPayloadWithPolicyViolations,
+} from "./fixtures";
 
 describe("DiffViewer (T16.4)", () => {
   it("highlights OutOfSync, Missing, Orphaned, FieldConflict managers, and ***REDACTED(...)*** secret badges", async () => {
@@ -95,5 +99,59 @@ describe("DiffViewer (T16.4)", () => {
     const { resources: _omit, ...withoutResources } = emptyDiff;
     render(<DiffViewer diff={withoutResources} />);
     expect(screen.getByTestId("diff-empty-state")).toBeInTheDocument();
+  });
+
+  it("shows a blocking policy violation banner above the diff (T20.2)", () => {
+    render(<DiffViewer diff={sampleDiffPayloadWithPolicyViolations} />);
+
+    const banner = screen.getByTestId("policy-violations-banner");
+    expect(banner).toHaveTextContent(/policy violations/i);
+    expect(banner).toHaveTextContent(/1 blocking/i);
+    expect(banner).toHaveTextContent(/refused until these manifests comply/i);
+
+    const violations = within(banner).getAllByTestId("policy-violation");
+    expect(violations).toHaveLength(2);
+    // The guard the components branch on agrees with the server's wire value.
+    expect(
+      (
+        sampleDiffPayloadWithPolicyViolations.policyViolations ?? []
+      ).filter((violation) => isBlockingEnforcement(violation.enforcement)),
+    ).toHaveLength(1);
+    expect(violations[0]).toHaveTextContent("Enforce");
+    expect(violations[0]).toHaveTextContent("no-privileged");
+    expect(violations[0]).toHaveTextContent(
+      "apps/Deployment/payments/payments-api",
+    );
+    expect(violations[1]).toHaveTextContent("Warn");
+    expect(violations[1]).toHaveTextContent("prefer-approved-registry");
+
+    // The banner explains the refusal; the resource cards still render so the
+    // operator can see *what* would have been applied.
+    expect(
+      screen.getByTestId("diff-resource-apps/Deployment/payments/payments-api"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders advisories without claiming the sync is blocked (T20.2)", () => {
+    const advisoryOnly = {
+      ...sampleDiffPayloadWithPolicyViolations,
+      wouldSync: true,
+      policyViolations: (
+        sampleDiffPayloadWithPolicyViolations.policyViolations ?? []
+      ).filter((violation) => !isBlockingEnforcement(violation.enforcement)),
+    };
+    render(<DiffViewer diff={advisoryOnly} />);
+
+    const banner = screen.getByTestId("policy-violations-banner");
+    expect(banner).toHaveTextContent(/1 advisory/i);
+    expect(banner).toHaveTextContent(/sync proceeds/i);
+    expect(banner).not.toHaveTextContent(/blocking/i);
+  });
+
+  it("renders no policy banner when no rule fired (T20.2)", () => {
+    render(<DiffViewer diff={sampleDiffPayload} />);
+    expect(
+      screen.queryByTestId("policy-violations-banner"),
+    ).not.toBeInTheDocument();
   });
 });

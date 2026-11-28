@@ -394,6 +394,7 @@ pub(crate) mod tests_support {
                     summary: DiffSummary::default(),
                     desired: 0,
                     would_sync: false,
+                    policy_violations: Vec::new(),
                 })
             })
         }

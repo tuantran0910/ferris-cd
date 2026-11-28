@@ -96,6 +96,15 @@ reqwest = { version = "0.13", default-features = false, features = [
 # task adds; the exposition format (text 0.0.4) and the histogram/counter/gauge primitives all
 # come from it, so the label sets are typed (`EncodeLabelSet`) instead of formatted by hand.
 prometheus-client = "0.26"
+# `T20.2`: the optional embedded OPA/Rego engine behind the `opa-policy` feature (default off).
+# `regorus` is Microsoft's pure-Rust Rego interpreter: no C-ABI, no subprocess, no network.
+# `default-features = false` is the whole security story — every I/O builtin (`http.send`,
+# `net.lookup_ip_addr`, `time.now_ns`, `regex.*`, `opa.runtime`, `uuid.*`, `json.patch`, …) lives
+# behind one of those features, so the build simply does not contain them. `std` stays on because
+# it is what gives the interpreter a monotonic clock for its execution timer (the per-evaluation
+# CPU cap); `T17.5` re-audited the resulting tree (all MIT/Apache-2.0/BSD-3-Clause, already on the
+# `deny.toml` allowlist).
+regorus = { version = "0.15", default-features = false, features = ["std"] }
 # `T15.2`: optional OpenTelemetry OTLP trace export, enabled only when `OTEL_EXPORTER_OTLP_ENDPOINT`
 # is set. `reqwest-blocking-client` (not `reqwest-client`) is deliberate: `BatchSpanProcessor` runs
 # on its own background OS thread without a Tokio reactor, and `reqwest-rustls` shares the

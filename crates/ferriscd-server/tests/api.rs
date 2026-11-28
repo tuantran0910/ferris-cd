@@ -298,6 +298,7 @@ fn preview_of(diffs: Vec<ResourceDiff>) -> DiffPreview {
         summary: DiffSummary::from_diffs(&diffs),
         desired: diffs.len(),
         would_sync: !diffs.is_empty(),
+        policy_violations: Vec::new(),
         diffs,
     }
 }
@@ -858,6 +859,7 @@ async fn the_diff_endpoint_uses_the_controllers_pipeline() {
             },
             desired: 0,
             would_sync: false,
+            policy_violations: Vec::new(),
         }),
     });
     let diffs = Arc::new(ferriscd_server::kube::PipelineDiff::new(pipeline));
@@ -878,6 +880,71 @@ async fn the_diff_endpoint_uses_the_controllers_pipeline() {
         *asked.lock().expect("state"),
         vec!["ferriscd-system/payment-api".to_owned()]
     );
+}
+
+/// **`T20.2`:** the diff payload carries the policy gate's violations, so `ferriscd app diff` (exit
+/// code `3`) and the Web UI's banner can show *why* a sync is refused instead of an opaque error.
+#[tokio::test]
+async fn the_diff_payload_carries_policy_violations() {
+    let app = application("ferriscd-system", "payment-api");
+    let mut preview = preview_of(Vec::new());
+    preview.would_sync = false;
+    preview.policy_violations = vec![
+        ferriscd_engine::policy::PolicyViolation {
+            rule: "no-privileged".to_owned(),
+            enforcement: ferriscd_engine::policy::PolicyEnforcement::Enforce,
+            resource_key: "apps/Deployment/payments/api".to_owned(),
+            message: "privileged containers are forbidden (policy \"no-privileged\")".to_owned(),
+        },
+        ferriscd_engine::policy::PolicyViolation {
+            rule: "prefer-registry".to_owned(),
+            enforcement: ferriscd_engine::policy::PolicyEnforcement::Warn,
+            resource_key: "apps/Deployment/payments/api".to_owned(),
+            message: "prefer the approved registry (policy \"prefer-registry\")".to_owned(),
+        },
+    ];
+    let diffs = Arc::new(Diffs {
+        preview: Some(preview),
+        ..Diffs::default()
+    });
+    let state = state_with(vec![app], diffs, Arc::new(Sink::default()));
+    let (status, body) = get(
+        state,
+        "/api/v1/applications/ferriscd-system/payment-api/diff",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["wouldSync"], false,
+        "a blocking violation means the next sync is refused"
+    );
+    let violations = body["policyViolations"].as_array().expect("violations");
+    assert_eq!(violations.len(), 2, "{body}");
+    assert_eq!(violations[0]["rule"], "no-privileged");
+    assert_eq!(violations[0]["enforcement"], "Enforce");
+    assert_eq!(violations[0]["resourceKey"], "apps/Deployment/payments/api");
+    assert_eq!(violations[1]["enforcement"], "Warn");
+    assert!(
+        violations[1]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("prefer the approved registry")),
+        "{body}"
+    );
+
+    // No rule in force (or every rule passing) is an empty array, never an absent field: the Web UI
+    // and the CLI both read it directly.
+    let state = state_with(
+        vec![application("ferriscd-system", "payment-api")],
+        Arc::new(Diffs::default()),
+        Arc::new(Sink::default()),
+    );
+    let (status, body) = get(
+        state,
+        "/api/v1/applications/ferriscd-system/payment-api/diff",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["policyViolations"], json!([]), "{body}");
 }
 
 /// A pipeline that cannot preview must not answer "everything is synced": the trait's default

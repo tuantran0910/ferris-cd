@@ -83,8 +83,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferriscd_crd::status::{
-    ApplicationStatus, HealthState, OperationPhase, OperationState, REASON_SYNC_SUCCEEDED,
-    ResourceStatus, RevisionHistoryEntry, SyncPhase, SyncState, SyncStatus,
+    ApplicationStatus, Condition, HealthState, OperationPhase, OperationState,
+    REASON_SYNC_SUCCEEDED, ResourceStatus, RevisionHistoryEntry, SyncPhase, SyncState, SyncStatus,
 };
 use ferriscd_crd::{Application, SyncOptions, annotations};
 use ferriscd_engine::diff::{
@@ -101,8 +101,8 @@ use ferriscd_engine::manifest::{
     ResourceKey,
 };
 use ferriscd_engine::policy::{
-    AppProjectPolicy, ApplicationScope, PolicyError, SyncWindowSet, SyncWindowTarget,
-    SyncWindowVerdict,
+    AppProjectPolicy, ApplicationScope, MAX_POLICY_RULES, PolicyError, PolicyGate, PolicyGateInput,
+    PolicyGateOutcome, PolicyRule, SyncWindowSet, SyncWindowTarget, SyncWindowVerdict,
 };
 use ferriscd_engine::repo::{
     GitSource, OciClient, OciSource, OciUrlPolicy, RepoCache, RepoCredentials, RepoUrlPolicy,
@@ -133,8 +133,8 @@ use crate::live_state::{
 use crate::project::{ProjectSource, ProjectStatusSink, sync_window_condition};
 use crate::prune::{OwnershipVerifiedPruner, PruneResult};
 use crate::reconcile::{
-    ApplyOutcome, CleanupMode, CleanupOutcome, DiffPreview, REASON_PENDING, REASON_SYNC_SKIPPED,
-    REASON_SYNC_WINDOW_ACTIVE, ReconcileError, SyncPipeline, now,
+    ApplyOutcome, CleanupMode, CleanupOutcome, DiffPreview, PolicyGateRefusal, REASON_PENDING,
+    REASON_SYNC_SKIPPED, REASON_SYNC_WINDOW_ACTIVE, ReconcileError, SyncPipeline, now,
 };
 use crate::scope::{self, InBundleCrd};
 use crate::sync_executor::{
@@ -591,6 +591,12 @@ impl PassExecution {
 /// A rollback this pass must honour (`T10.5`).
 struct RollbackRequested {
     decision: RollbackDecision,
+    /// Whether `spec.syncPolicy.automated` still has to be cleared for the pin to hold.
+    ///
+    /// The write is **deferred** until the policy gate has accepted the bundle (finding M6): a
+    /// rollback whose historical manifests violate a policy must leave `spec` exactly as the
+    /// operator wrote it, instead of disabling automation for a pass that never applies anything.
+    spec_patch_required: bool,
 }
 
 /// Whether a prepared pass may write to the cluster (`T14.1`).
@@ -654,6 +660,8 @@ struct PreparedPass {
     prune_enabled: bool,
     desired_inventory: Inventory,
     invalid_ignore_pointers: usize,
+    /// `T20.2`: the pre-sync policy gate's verdict over the rendered bundle.
+    policy_gate: PolicyGateOutcome,
 }
 
 /// The wired [`SyncPipeline`].
@@ -715,6 +723,11 @@ pub struct InventorySyncPipeline {
     metrics: Option<crate::metrics::Metrics>,
     /// `T17.2`: optional compliance audit logger for `controller.impersonation` resolutions.
     audit: Option<crate::audit::AuditLogger>,
+    /// `T20.2`: cluster-wide policy rules (`ConfigMap/ferriscd-policies-cm`). `None` means the
+    /// cluster configures none, which leaves `AppProject.spec.policyRules[]` in force.
+    policy_rule_source: Option<Arc<dyn crate::policy_rules::PolicyRuleSource>>,
+    /// `T20.2`: the policy gate, held across passes so the compiled-program cache is reused.
+    policy_gate: PolicyGate,
     /// `T18.1`: what ownership stamp every permanent resource receives before the diff and the
     /// apply. The default (`StampOptions::tracking_id_only`) is the `v1.0` behaviour; the opt-in
     /// `--enable-drift-watcher` adds the `ferriscd.io/managed-by` / `ferriscd.io/app-hash` label
@@ -754,6 +767,7 @@ impl std::fmt::Debug for InventorySyncPipeline {
             .field("credentials", &self.credentials.is_some())
             .field("clusters", &self.clusters.is_some())
             .field("metrics", &self.metrics.is_some())
+            .field("policy_rule_source", &self.policy_rule_source.is_some())
             .field("oci", &self.oci.is_some())
             .field("oci_url_policy", &self.oci_url_policy)
             .finish_non_exhaustive()
@@ -797,6 +811,8 @@ impl InventorySyncPipeline {
             clusters: None,
             metrics: None,
             audit: None,
+            policy_rule_source: None,
+            policy_gate: default_policy_gate(),
             stamp: ferriscd_engine::inventory::StampOptions::tracking_id_only(),
             self_echo: None,
             oci: None,
@@ -934,6 +950,26 @@ impl InventorySyncPipeline {
     #[must_use]
     pub fn with_project_source(mut self, source: Arc<dyn ProjectSource>) -> Self {
         self.project_source = Some(source);
+        self
+    }
+
+    /// Wires the cluster-wide policy rule reader (`T20.2`).
+    ///
+    /// Without one only `AppProject.spec.policyRules[]` is enforced, which is the documented
+    /// behaviour of a cluster that configures no `ConfigMap/ferriscd-policies-cm`.
+    #[must_use]
+    pub fn with_policy_rule_source(
+        mut self,
+        source: Arc<dyn crate::policy_rules::PolicyRuleSource>,
+    ) -> Self {
+        self.policy_rule_source = Some(source);
+        self
+    }
+
+    /// Replaces the policy gate (bounds, or an injected OPA/Rego evaluator under `opa-policy`).
+    #[must_use]
+    pub fn with_policy_gate(mut self, gate: PolicyGate) -> Self {
+        self.policy_gate = gate;
         self
     }
 
@@ -1429,6 +1465,7 @@ impl InventorySyncPipeline {
             health = %health::status_label(assessment.status),
             "completed a reconcile pass"
         );
+        let policy_advisories = advisory_condition(&prepared.policy_gate, app);
         let outcome = build_outcome(
             app,
             GateVerdict {
@@ -1451,7 +1488,8 @@ impl InventorySyncPipeline {
         )
         .with_operation_state(operation)
         .with_history(history)
-        .with_pruned(pruned_ok);
+        .with_pruned(pruned_ok)
+        .with_policy_advisories(policy_advisories);
         Ok(match &prepared.rollback {
             Some(rollback) => outcome.with_warning(rollback.decision.condition.clone()),
             None => outcome,
@@ -1508,12 +1546,6 @@ impl InventorySyncPipeline {
         let prev_inventory = status_inventory(app)?;
         let previous_status = app.status.clone().unwrap_or_default();
         let pass_started = now();
-        // `T17.4`: the deployment-governance verdict, evaluated at `pass_started` against the
-        // project that was just fetched. The engine takes the instant as an argument (it never reads
-        // a clock), so a blocked pass is reproducible in a unit test.
-        let window = self
-            .evaluate_sync_windows(&policy, app, &pass_started, mode)
-            .await;
 
         // --- Phase 10: the rollback request decides *which commit* this pass sees ---------
         // Parsed before the diff gate and before `spec.source` is resolved: a rollback that first
@@ -1554,6 +1586,48 @@ impl InventorySyncPipeline {
         // dry-run diff, the apply, and the prune. Hooks are covered too: they are created
         // imperatively but they are still rendered resources.
         policy.check_resources(&app.spec.destination.cluster, &resources)?;
+
+        // --- Phase 20 (`T20.2`): pre-sync policy gate --------------------------------------
+        // Immediately after Stage-2 scope normalization — the resources are the very bodies the
+        // applier would receive, namespaces and kinds already resolved — and before the live read,
+        // the `dryRun=All` diff, every apply and every prune. An `Enforce` violation therefore
+        // costs the cluster nothing: no mutating call, no prune, and `status.inventory` /
+        // `lastSyncedRevision` stay exactly as they were.
+        //
+        // A *manual* sync reaches this same line: `manual_operation(app)` is only consulted later,
+        // by the diff gate, so an operator cannot bypass a policy by pressing "sync" in the UI.
+        let policy_gate = self.policy_gate_for(app, &policy, &resources).await?;
+        if !policy_gate.allowed() && mode == PassMode::Apply {
+            return Err(ReconcileError::PolicyGate(Box::new(PolicyGateRefusal {
+                message: policy_gate_message(&policy_gate),
+                violations: policy_gate.blocking().cloned().collect(),
+                advisories: policy_gate.advisories().cloned().collect(),
+                advisories_omitted: policy_gate.advisories_omitted,
+                rules: policy_gate.rules,
+                inventory: prev_inventory,
+                revision: Some(revision),
+            })));
+        }
+
+        // --- Phase 10: the rollback's spec edit, now that the bundle is allowed ------------
+        // Finding M6: `spec.syncPolicy.automated` is cleared *after* the policy gate, so a rollback
+        // the gate refuses leaves the operator's spec exactly as written — it applies nothing, so
+        // it must not silently stop following Git either. A preview never writes at all.
+        if let Some(rollback) = &rollback
+            && rollback.spec_patch_required
+        {
+            self.pin_automation_off(app, rollback).await?;
+        }
+
+        // --- Phase 17 (`T17.4`): the deployment-governance verdict -------------------------
+        // Evaluated after the pre-sync policy gate (a policy refusal is terminal and must cost the
+        // cluster nothing, not even the `AppProject` `/status` write this can emit) and before the
+        // live read, the `dryRun=All` diff, every apply and every prune. The engine takes the
+        // instant as an argument (it never reads a clock), so a blocked pass is reproducible in a
+        // unit test.
+        let window = self
+            .evaluate_sync_windows(&policy, app, &pass_started, mode)
+            .await;
 
         // --- Phase 10: hooks out of the desired state, permanent set into waves ------------
         // The partition is what keeps a hook out of `status.inventory`, the pruner's universe and
@@ -1704,6 +1778,7 @@ impl InventorySyncPipeline {
             prune_enabled,
             desired_inventory,
             invalid_ignore_pointers,
+            policy_gate,
         })
     }
 
@@ -1735,7 +1810,11 @@ impl InventorySyncPipeline {
             diffs: prepared.diffs,
             summary: prepared.summary,
             desired: prepared.desired_inventory.len(),
-            would_sync: prepared.decision.is_execute(),
+            // A blocking policy violation means the next reconcile would refuse this bundle, so a
+            // preview must not claim it is applicable (finding C9: the preview and the reconcile
+            // cannot disagree).
+            would_sync: prepared.decision.is_execute() && prepared.policy_gate.allowed(),
+            policy_violations: prepared.policy_gate.violations.clone(),
         })
     }
 
@@ -2124,12 +2203,18 @@ impl InventorySyncPipeline {
         (plan, execution)
     }
 
-    /// Resolves and applies a `{"rollback":{"id":N}}` request (`T10.5`).
+    /// Resolves a `{"rollback":{"id":N}}` request (`T10.5`).
     ///
-    /// Returns the decision when the annotation really is a rollback request. Pins
-    /// `spec.syncPolicy.automated` to disabled **before** the diff gate runs: with automation left
-    /// on, the very next reconcile compares live state against `HEAD` and self-heals the rollback
-    /// away — the classic GitOps rollback-vs-`selfHeal` fight loop.
+    /// Returns the decision when the annotation really is a rollback request, plus whether
+    /// `spec.syncPolicy.automated` still has to be cleared. Pinning automation off **before** the
+    /// diff gate is what stops the very next reconcile from comparing live state against `HEAD` and
+    /// self-healing the rollback away — the classic GitOps rollback-vs-`selfHeal` fight loop.
+    ///
+    /// The patch itself is deliberately **not** issued here (finding M6). This method runs before
+    /// the pre-sync policy gate, so patching here would disable automation for a bundle the gate is
+    /// about to refuse — a refused rollback would leave a spec change behind for nothing. The write
+    /// happens in [`Self::pin_automation_off`], which the pass calls once the gate has accepted the
+    /// bundle.
     async fn plan_rollback(
         &self,
         app: &Application,
@@ -2157,46 +2242,59 @@ impl InventorySyncPipeline {
 
         // Idempotent: a spec that is already manual-only is not patched again.
         let mut spec = app.spec.clone();
-        if decision.apply_to_spec(&mut spec) {
-            if mode == PassMode::Preview {
-                // A preview must not write: `GET .../diff` reports the pin and the warning the
-                // reconcile will produce, and the reconcile that redeploys it is what actually
-                // disables automation (`T14.1`).
-                tracing::debug!(
-                    app.namespace = %app.namespace().unwrap_or_default(),
-                    app.name = %app.name_any(),
-                    history_id = decision.target.history_id,
-                    revision = %decision.pinned_revision(),
-                    "diff preview: the reconcile this previews would disable \
-                     spec.syncPolicy.automated so self-heal cannot overwrite the pinned revision"
-                );
-                return Ok(Some(RollbackRequested { decision }));
-            }
-            let owner =
-                TrackingOwner::for_application(app).ok_or_else(|| ReconcileError::Invalid {
-                    message: "the Application has no metadata.namespace, so its spec cannot be \
-                          patched"
-                        .to_owned(),
-                })?;
-            self.applier
-                .patch_application(ApplicationPatch {
-                    namespace: &owner.namespace,
-                    name: &owner.name,
-                    patch: serde_json::json!({
-                        "spec": { "syncPolicy": { "automated": serde_json::Value::Null } }
-                    }),
-                })
-                .await?;
-            warn!(
-                app.namespace = %owner.namespace,
-                app.name = %owner.name,
+        let spec_patch_required = decision.apply_to_spec(&mut spec);
+        if spec_patch_required && mode == PassMode::Preview {
+            // A preview must not write: `GET .../diff` reports the pin and the warning the
+            // reconcile will produce, and the reconcile that redeploys it is what actually disables
+            // automation (`T14.1`).
+            tracing::debug!(
+                app.namespace = %app.namespace().unwrap_or_default(),
+                app.name = %app.name_any(),
                 history_id = decision.target.history_id,
                 revision = %decision.pinned_revision(),
-                "rollback: spec.syncPolicy.automated was removed so self-heal cannot overwrite the \
-                 pinned revision; revert the commit in Git and re-enable automation"
+                "diff preview: the reconcile this previews would disable \
+                 spec.syncPolicy.automated so self-heal cannot overwrite the pinned revision"
             );
         }
-        Ok(Some(RollbackRequested { decision }))
+        Ok(Some(RollbackRequested {
+            decision,
+            spec_patch_required: spec_patch_required && mode == PassMode::Apply,
+        }))
+    }
+
+    /// Clears `spec.syncPolicy.automated` so `selfHeal` cannot overwrite a rollback pin (`T10.5`).
+    ///
+    /// Called **after** the pre-sync policy gate accepted the bundle (finding M6): a refused
+    /// rollback leaves `spec` untouched, because it applies nothing and would otherwise silently
+    /// stop following Git for a revision it never deployed.
+    async fn pin_automation_off(
+        &self,
+        app: &Application,
+        rollback: &RollbackRequested,
+    ) -> Result<(), ReconcileError> {
+        let owner = TrackingOwner::for_application(app).ok_or_else(|| ReconcileError::Invalid {
+            message: "the Application has no metadata.namespace, so its spec cannot be \
+                          patched"
+                .to_owned(),
+        })?;
+        self.applier
+            .patch_application(ApplicationPatch {
+                namespace: &owner.namespace,
+                name: &owner.name,
+                patch: serde_json::json!({
+                    "spec": { "syncPolicy": { "automated": serde_json::Value::Null } }
+                }),
+            })
+            .await?;
+        warn!(
+            app.namespace = %owner.namespace,
+            app.name = %owner.name,
+            history_id = rollback.decision.target.history_id,
+            revision = %rollback.decision.pinned_revision(),
+            "rollback: spec.syncPolicy.automated was removed so self-heal cannot overwrite the \
+             pinned revision; revert the commit in Git and re-enable automation"
+        );
+        Ok(())
     }
 
     /// Consumes the `ferriscd.io/operation` annotation a settled pass has honoured.
@@ -2327,6 +2425,98 @@ impl InventorySyncPipeline {
             }));
         };
         Ok(AppProjectPolicy::from_project(&project))
+    }
+
+    /// Evaluates the pre-sync policy gate over the rendered bundle (`T20.2`).
+    ///
+    /// The rules in force are the union of `AppProject.spec.policyRules[]` and the cluster-wide
+    /// `ConfigMap/ferriscd-policies-cm`. Both are read per reconcile through a scoped seam (a
+    /// namespaced `GET`, never a cluster-wide informer), while the **evaluation** is the engine's
+    /// pure, bounded function: no cluster call, no clock, no process, no filesystem.
+    ///
+    /// # One `GET` per reconcile
+    ///
+    /// Reading the cluster-wide rules is exactly **one** namespaced `GET` of
+    /// `ConfigMap/ferriscd-policies-cm` per reconcile pass (a 404 means "none configured" and is
+    /// not an error). There is no watch and no cache: a policy edit takes effect on the next
+    /// reconcile, and the read costs one request against the control-plane namespace — the same
+    /// shape as the `AppProject` read above. It is skipped entirely when no rule source is wired
+    /// (a cluster that configures no cluster-wide rules).
+    ///
+    /// # One rule budget, for both sources
+    ///
+    /// There is exactly one limit — [`MAX_POLICY_RULES`] — and it applies to the **union**, not to
+    /// each source separately. Exceeding it is a refusal with a synthesized blocking `<rule-budget>`
+    /// violation (never a silently narrowed rule set, which would be a policy bypass):
+    ///
+    /// | Project rules | ConfigMap rules | Verdict |
+    /// |---|---|---|
+    /// | ≤ 32 | 0 | project rules are in force |
+    /// | 0 | ≤ 32 | the cluster-wide rules are in force |
+    /// | 20 | 12 | one union of 32, all in force |
+    /// | 33 | 0 | refused: the project alone is over the budget |
+    /// | 20 | 13 | refused: the union is over the budget |
+    ///
+    /// Violations are returned as data, not as errors — `GET .../diff` has to be able to *show* a
+    /// refused bundle — and only [`Self::prepare_pass`]'s `Apply` branch turns a blocking verdict
+    /// into the terminal [`ReconcileError::PolicyGate`].
+    ///
+    /// # Errors
+    ///
+    /// Only the rule *reads* fail: an unreadable `ConfigMap` is retried as an API error, and one
+    /// that does not parse is a terminal [`ReconcileError::Invalid`] — a policy the controller
+    /// cannot read is never treated as "no policy".
+    async fn policy_gate_for(
+        &self,
+        app: &Application,
+        policy: &AppProjectPolicy,
+        resources: &[DesiredResource],
+    ) -> Result<PolicyGateOutcome, ReconcileError> {
+        // Finding H1: the project list is capped *and* the overflow is reported, so the pass can
+        // refuse instead of evaluating the first 32 rules of 40.
+        let (mut rules, project_overflowed) =
+            PolicyRule::set_from_project_spec(&policy.spec().policy_rules);
+        if project_overflowed {
+            return Ok(rule_budget_outcome(
+                policy.spec().policy_rules.len(),
+                policy.project_name(),
+            ));
+        }
+        if let Some(source) = &self.policy_rule_source {
+            rules.extend(source.rules().await?);
+        }
+        if rules.is_empty() {
+            return Ok(PolicyGateOutcome::default());
+        }
+        // The union is what counts: a project at the cap plus a cluster-wide rule would otherwise
+        // silently drop the cluster rule the security team relies on.
+        if rules.len() > MAX_POLICY_RULES {
+            return Ok(rule_budget_outcome(rules.len(), policy.project_name()));
+        }
+        let span = tracing::info_span!(
+            "policy_gate",
+            project = %policy.project_name(),
+            rules = rules.len(),
+            resources = resources.len(),
+        );
+        // CPU-only and bounded (`MAX_POLICY_RULES` x `MAX_POLICY_RESOURCES` x a step budget), so it
+        // runs inline: there is no blocking I/O here to move onto a `spawn_blocking` worker.
+        let _guard = span.enter();
+        let outcome = self.policy_gate.evaluate(&PolicyGateInput {
+            app,
+            rules: &rules,
+            resources,
+        });
+        if !outcome.allowed() {
+            warn!(
+                app.namespace = %app.namespace().unwrap_or_default(),
+                app.name = %app.name_any(),
+                blocking = outcome.blocking_count(),
+                advisories = outcome.advisories().count(),
+                "the pre-sync policy gate refused this bundle: nothing was applied or pruned"
+            );
+        }
+        Ok(outcome)
     }
 
     /// Compiles and evaluates the project's `spec.syncWindows` for this `Application` (`T17.4`).
@@ -2918,6 +3108,102 @@ impl InventorySyncPipeline {
             },
         ))
     }
+}
+
+/// Builds the pre-sync policy gate a fresh pipeline starts with (`T20.2`).
+///
+/// A build **without** `opa-policy` gets the CEL-only gate, and a `Rego` rule is then a compile
+/// error (fail closed). A build **with** `opa-policy` wires the audited embedded engine so a `Rego`
+/// rule is reachable without any extra host wiring.
+///
+/// The feature is a property of the **build**, not of the command line: there is no
+/// `ferriscd controller --features opa-policy`, because Cargo resolves features when the binary is
+/// compiled. The shipped binary is built with `-p ferriscd-cli --features opa-policy` (forwarded
+/// through `ferriscd-cli`'s and this crate's `opa-policy` features, or the image's
+/// `FERRISCD_FEATURES` build arg); a build without it keeps a `Rego` rule a terminal compile error,
+/// so a `Rego` policy can never be silently skipped.
+fn default_policy_gate() -> PolicyGate {
+    #[cfg(feature = "opa-policy")]
+    {
+        PolicyGate::new().with_rego(std::sync::Arc::new(
+            ferriscd_engine::policy::RegorusEvaluator::new(),
+        ))
+    }
+    #[cfg(not(feature = "opa-policy"))]
+    {
+        PolicyGate::new()
+    }
+}
+
+/// The terminal message of a refused sync, built from the gate's blocking violations.
+///
+/// Bounded on purpose (the first few violations, then a count): the message reaches
+/// `Application.status`, whose budget is shared by the whole object (trap T9).
+fn policy_gate_message(outcome: &PolicyGateOutcome) -> String {
+    const MAX_LISTED: usize = 5;
+    let total = outcome.blocking_count();
+    let mut listed: Vec<String> = outcome
+        .blocking()
+        .take(MAX_LISTED)
+        .map(|violation| {
+            format!(
+                "{} on {}: {}",
+                violation.rule, violation.resource_key, violation.message
+            )
+        })
+        .collect();
+    if total > listed.len() {
+        listed.push(format!("and {} more", total - listed.len()));
+    }
+    format!("{}: {}", outcome.summary(), listed.join("; "))
+}
+
+/// The refusal for a rule set that will not fit in [`MAX_POLICY_RULES`] (`T20.2`, finding H1).
+///
+/// A synthesized **blocking** finding rather than a `ReconcileError`: the refusal then travels the
+/// same path as every other policy refusal — `GET .../diff` shows it, `ferriscd app diff` exits `3`,
+/// `/status` reports `PolicyGateViolation`, and nothing is applied or pruned. Silently evaluating
+/// the first 32 rules of 40 would be the bypass this exists to prevent.
+fn rule_budget_outcome(count: usize, project: &str) -> PolicyGateOutcome {
+    let message = format!(
+        "{count} policy rules are in force for project {project:?} (AppProject.spec.policyRules plus \
+         ConfigMap/ferriscd-policies-cm), over the {MAX_POLICY_RULES}-rule limit; narrow the rule \
+         set, or split the Application across projects"
+    );
+    PolicyGateOutcome {
+        violations: vec![ferriscd_engine::policy::PolicyViolation {
+            rule: "<rule-budget>".to_owned(),
+            enforcement: ferriscd_engine::policy::PolicyEnforcement::Enforce,
+            resource_key: "*".to_owned(),
+            message,
+        }],
+        // No rule was evaluated: the whole pass is refused before the first expression runs.
+        rules: 0,
+        ..PolicyGateOutcome::default()
+    }
+}
+
+/// The `PolicyAdvisory` condition for this pass (`T20.2`).
+///
+/// When rules *are* in force the condition is returned on every pass — `True` with the advisories,
+/// `False`/`PolicyCompliant` without — so a stale advisory is always cleared.
+///
+/// With **no** rule in force the pass usually touches nothing (an `Application` without policies
+/// must not gain a condition it did not have before `T20.2`) — but if a `PolicyAdvisory` is already
+/// on `/status` (the rules were removed, or the project changed), it is cleared instead of lingering
+/// forever: a stale warning trains operators to ignore warnings.
+fn advisory_condition(outcome: &PolicyGateOutcome, app: &Application) -> Option<Condition> {
+    if outcome.rules == 0 {
+        let stale = app.status.as_ref().is_some_and(|status| {
+            status
+                .condition(ferriscd_engine::policy::CONDITION_POLICY_ADVISORY)
+                .is_some()
+        });
+        if !stale {
+            return None;
+        }
+    }
+    Some(outcome.advisories_condition(app.metadata.generation, now()))
 }
 
 impl SyncPipeline for InventorySyncPipeline {
@@ -3833,6 +4119,8 @@ mod tests {
     use kube::discovery::{ApiCapabilities, Scope};
     use serde_json::json;
 
+    use ferriscd_engine::policy::PolicyEnforcement;
+
     use super::*;
     use crate::cluster_manager::ClusterError;
     use crate::credentials::CredentialError;
@@ -4367,6 +4655,9 @@ mod tests {
                 ("", "ConfigMap", Scope::Namespaced),
                 ("", "Namespace", Scope::Cluster),
                 ("", "Service", Scope::Namespaced),
+                // `T20.2`: the policy gate evaluates rendered `Secret`s (with redacted payloads),
+                // so scope normalization has to resolve the kind.
+                ("", "Secret", Scope::Namespaced),
                 ("apps", "Deployment", Scope::Namespaced),
                 // Lifecycle hooks (T10.3) are `Job`s: scope normalization has to resolve them.
                 ("batch", "Job", Scope::Namespaced),
@@ -9521,6 +9812,760 @@ spec:
             }
             other => panic!("force-delete must release the finalizer, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // `T20.2`: the pre-sync policy gate
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_stale_policy_advisory_is_cleared_when_no_rule_is_left_in_force() {
+        // An `Application` that never had a policy must not gain a condition...
+        let mut app = application("https://example.com/repo.git", ".", "payments");
+        app.status = None;
+        assert!(
+            advisory_condition(&PolicyGateOutcome::default(), &app).is_none(),
+            "no rule and no condition means nothing to write"
+        );
+
+        // ...but one that still carries an advisory does, even when the rules are gone: a stale
+        // warning teaches operators to ignore warnings.
+        let mut status = ApplicationStatus::default();
+        status.set_condition(Condition::new(
+            ferriscd_engine::policy::CONDITION_POLICY_ADVISORY,
+            ConditionStatus::True,
+            ferriscd_engine::policy::REASON_POLICY_ADVISORY,
+            "no-privileged: privileged containers are forbidden",
+            now(),
+        ));
+        app.status = Some(status);
+        let cleared = advisory_condition(&PolicyGateOutcome::default(), &app)
+            .expect("the stale advisory must be cleared");
+        assert_eq!(cleared.status, ConditionStatus::False);
+        assert_eq!(
+            cleared.reason,
+            ferriscd_engine::policy::REASON_POLICY_COMPLIANT
+        );
+    }
+
+    // ---------------------------------------------------------------------
+
+    /// A `payments` project with the `policyRules` entries `rules` inserted verbatim.
+    fn project_with_policy_rules(name: &str, rules: &str) -> AppProject {
+        serde_saphyr::from_str(&format!(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: {name}
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - "*"
+  sourceNamespaces:
+    - ferriscd-system
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: Secret
+  policyRules:
+{rules}
+"#
+        ))
+        .expect("test project with policy rules must parse")
+    }
+
+    /// A rule that forbids `privileged: true`, exactly as the roadmap writes it.
+    const NO_PRIVILEGED_EXPRESSION: &str = "!object.spec.template.spec.containers.exists(c, \
+                                            has(c.securityContext) && \
+                                            c.securityContext.privileged == true)";
+
+    /// A `Deployment` whose single container is `privileged` (the roadmap's own example).
+    const PRIVILEGED_DEPLOYMENT: &str = r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: app
+          image: docker.io/library/nginx:1.27
+          securityContext:
+            privileged: true
+"#;
+
+    /// The same `Deployment` with the violation removed.
+    const COMPLIANT_DEPLOYMENT: &str = r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/example/app:1.2.3
+          securityContext:
+            privileged: false
+"#;
+
+    /// A `policyRules` entry for [`NO_PRIVILEGED_EXPRESSION`].
+    fn no_privileged_rule_yaml(enforcement: &str) -> String {
+        format!(
+            "    - name: no-privileged\n      enforcement: {enforcement}\n      matchKinds: \
+             [\"apps/Deployment\"]\n      expression: \"{NO_PRIVILEGED_EXPRESSION}\"\n      \
+             message: privileged containers are forbidden\n"
+        )
+    }
+
+    /// Scripted `ConfigMap/ferriscd-policies-cm` store (the `T20.2` cluster-wide rule seam).
+    #[derive(Default)]
+    struct FakePolicyRuleSource {
+        rules: StdMutex<Vec<PolicyRule>>,
+        reads: StdMutex<usize>,
+    }
+
+    impl FakePolicyRuleSource {
+        fn with_rules(self, rules: Vec<PolicyRule>) -> Self {
+            *self.rules.lock().unwrap() = rules;
+            self
+        }
+
+        fn reads(&self) -> usize {
+            *self.reads.lock().unwrap()
+        }
+    }
+
+    impl crate::policy_rules::PolicyRuleSource for FakePolicyRuleSource {
+        fn rules(&self) -> BoxFuture<'_, Result<Vec<PolicyRule>, ReconcileError>> {
+            *self.reads.lock().unwrap() += 1;
+            let rules = self.rules.lock().unwrap().clone();
+            Box::pin(async move { Ok(rules) })
+        }
+    }
+
+    /// Returns `fixture` with the cluster-wide policy rule seam wired in (`T20.2`).
+    fn with_policy_rules(fixture: Fixture, source: Arc<FakePolicyRuleSource>) -> Fixture {
+        Fixture {
+            pipeline: fixture.pipeline.with_policy_rule_source(source),
+            git: fixture.git,
+            cluster: fixture.cluster,
+            discovery: fixture.discovery,
+            dry_run: fixture.dry_run,
+            projects: fixture.projects,
+            impersonation: fixture.impersonation,
+            repo_url: fixture.repo_url,
+            _temp: fixture._temp,
+        }
+    }
+
+    /// A rule that forbids `privileged: true` on a `Deployment`.
+    fn no_privileged_rule(enforcement: PolicyEnforcement) -> PolicyRule {
+        PolicyRule::new("no-privileged", enforcement, NO_PRIVILEGED_EXPRESSION)
+            .with_match_kinds(vec!["apps/Deployment".to_owned()])
+            .with_message("privileged containers are forbidden")
+    }
+
+    /// A fixture whose project (`payments`) carries one policy rule with `enforcement`.
+    fn fixture_with_policy_rules(enforcement: &str) -> Fixture {
+        fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(project_with_policy_rules(
+                "payments",
+                &no_privileged_rule_yaml(enforcement),
+            )),
+            ApplicationScope::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_enforce_policy_violation_refuses_the_sync_with_zero_mutations() {
+        // An `Enforce` rule rejects the Deployment. The pass must stop before the live read, the
+        // `dryRun=All` diff, the apply and the prune: the cluster is never touched, and the error
+        // carries the unchanged inventory so `/status` can report `OutOfSync`.
+        let owned_orphan = config_map(
+            "removed",
+            Some("ferriscd-system/payments:/ConfigMap:payments/removed"),
+        );
+        let fixture = fixture_with_policy(
+            FakeCluster::default()
+                .with_namespace("payments")
+                .with_object(owned_orphan),
+            FakeProjectSource::default().with_project(project_with_policy_rules(
+                "payments",
+                &no_privileged_rule_yaml("Enforce"),
+            )),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        let mut app = fixture.app(".");
+        app.spec.project = "payments".to_owned();
+        app.status = Some(status_with_inventory(&["/ConfigMap/payments/removed"]));
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("an Enforce violation must refuse the sync");
+
+        let ReconcileError::PolicyGate(refusal) = &err else {
+            panic!("expected a PolicyGate refusal, got {err:?}");
+        };
+        assert_eq!(refusal.violations.len(), 1, "{:?}", refusal.violations);
+        assert_eq!(refusal.violations[0].rule, "no-privileged");
+        assert!(
+            refusal
+                .message
+                .contains("privileged containers are forbidden"),
+            "{}",
+            refusal.message
+        );
+        assert!(
+            refusal.message.contains("Deployment/payments/api"),
+            "the refusal must name the resource: {}",
+            refusal.message
+        );
+        assert_eq!(
+            refusal.inventory.len(),
+            1,
+            "the inventory is the unchanged one"
+        );
+        assert!(
+            refusal.revision.is_some(),
+            "the refused revision must be reported"
+        );
+
+        // Terminal: retrying cannot change a manifest, so the backoff must stop churning.
+        assert_eq!(err.failure_class(), crate::FailureClass::Terminal);
+        assert_eq!(
+            crate::reconcile::failure_reason(&err),
+            crate::reconcile::REASON_POLICY_GATE_VIOLATION
+        );
+
+        // No side effects of any kind: no apply, no prune, and not even a `dryRun=All` PATCH.
+        assert_eq!(
+            fixture.pipeline.mutating_applies(),
+            0,
+            "a refused pass issues zero mutating applies"
+        );
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "{:?}",
+            fixture.cluster.applies()
+        );
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "a refused pass issues zero prunes"
+        );
+        assert!(
+            fixture.dry_run.calls().is_empty(),
+            "the gate runs before the diff: {:?}",
+            fixture.dry_run.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_warn_violation_permits_the_apply_and_surfaces_an_advisory_condition() {
+        let fixture = fixture_with_policy_rules("Warn");
+        fixture.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        let mut app = fixture.app(".");
+        app.spec.project = "payments".to_owned();
+
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a Warn violation must not block");
+
+        assert_eq!(outcome.reason, REASON_SYNC_SUCCEEDED);
+        assert_eq!(
+            fixture.cluster.applies(),
+            vec![DEPLOYMENT_KEY.to_owned()],
+            "a Warn violation still applies the bundle"
+        );
+        let advisory = outcome
+            .policy_advisories
+            .expect("the advisory condition must be reported");
+        assert_eq!(
+            advisory.type_,
+            ferriscd_engine::policy::CONDITION_POLICY_ADVISORY
+        );
+        assert_eq!(advisory.status, ferriscd_crd::status::ConditionStatus::True);
+        assert_eq!(
+            advisory.reason,
+            ferriscd_engine::policy::REASON_POLICY_ADVISORY
+        );
+        assert!(
+            advisory
+                .message
+                .contains("privileged containers are forbidden"),
+            "{advisory:?}"
+        );
+        // The advisory is *not* a rollback warning: the two lifecycles stay independent.
+        assert!(outcome.warnings.is_empty());
+
+        // The next pass over compliant manifests clears the advisory instead of leaving it behind.
+        fixture.commit(&[("deployment.yaml", COMPLIANT_DEPLOYMENT)]);
+        let cleared = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("the compliant bundle applies");
+        let advisory = cleared
+            .policy_advisories
+            .expect("the condition is refreshed on every pass");
+        assert_eq!(
+            advisory.status,
+            ferriscd_crd::status::ConditionStatus::False
+        );
+        assert_eq!(
+            advisory.reason,
+            ferriscd_engine::policy::REASON_POLICY_COMPLIANT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manual_sync_cannot_bypass_the_policy_gate() {
+        // A human pressing "sync" must never be able to apply a bundle the policy refuses: the gate
+        // runs before the diff gate, which is the only place `manual_operation` is consulted.
+        let fixture = fixture_with_policy_rules("Enforce");
+        fixture.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        let mut app = fixture.app(".");
+        app.spec.project = "payments".to_owned();
+        // `automated: None` would normally let a manual operation sync anyway.
+        app.spec.sync_policy = None;
+        app.metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new)
+            .insert(
+                annotations::OPERATION.to_owned(),
+                "{\"sync\":{}}".to_owned(),
+            );
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("a manual sync is still a policy-gated sync");
+        assert!(matches!(err, ReconcileError::PolicyGate(_)), "{err:?}");
+        assert!(fixture.cluster.applies().is_empty());
+        assert_eq!(fixture.pipeline.mutating_applies(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_diff_preview_reports_violations_as_data_instead_of_refusing() {
+        // `GET .../diff` (and therefore `ferriscd app diff`, exit code 3) has to *show* a refused
+        // bundle: the preview reports the violations and `wouldSync: false`, and still writes
+        // nothing.
+        let fixture = fixture_with_policy_rules("Enforce");
+        fixture.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        let mut app = fixture.app(".");
+        app.spec.project = "payments".to_owned();
+
+        let preview = fixture
+            .pipeline
+            .diff(&app)
+            .await
+            .expect("a preview must never be refused for a policy violation");
+        assert_eq!(preview.policy_violations.len(), 1);
+        assert_eq!(preview.policy_violations[0].rule, "no-privileged");
+        assert!(
+            !preview.would_sync,
+            "a blocking violation means the next reconcile would not sync"
+        );
+        assert!(fixture.cluster.applies().is_empty());
+        assert!(fixture.cluster.deletes().is_empty());
+        assert_eq!(fixture.pipeline.mutating_applies(), 0);
+    }
+
+    #[tokio::test]
+    async fn cluster_wide_configmap_rules_apply_without_any_project_rules() {
+        // The second rule source: a security team's `ConfigMap/ferriscd-policies-cm` is enforced
+        // alongside (or instead of) `AppProject.spec.policyRules[]`.
+        let rules = Arc::new(
+            FakePolicyRuleSource::default()
+                .with_rules(vec![no_privileged_rule(PolicyEnforcement::Enforce)]),
+        );
+        let fixture = with_policy_rules(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            rules.clone(),
+        );
+        fixture.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        let app = fixture.app(".");
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("the cluster-wide rule must refuse the bundle");
+        assert!(err.to_string().contains("no-privileged"), "{err}");
+        assert_eq!(rules.reads(), 1, "one scoped read per pass");
+        assert!(fixture.cluster.applies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_policy_message_never_carries_a_secret_payload() {
+        // Trap guard: raw `Secret` data never reaches the evaluator, so a violation message cannot
+        // quote it — neither the plaintext nor its base64 form.
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "hunter2");
+        let secret_manifest = format!(
+            "apiVersion: v1\nkind: Secret\nmetadata:\n  name: creds\ntype: Opaque\n\
+             data:\n  password: {encoded}\nstringData:\n  token: hunter2\n"
+        );
+        let rules = Arc::new(FakePolicyRuleSource::default().with_rules(vec![
+                PolicyRule::new(
+                    "secrets-must-not-leak",
+                    PolicyEnforcement::Enforce,
+                    // The policy reads the *redacted* view, so this invariant cannot hold and the
+                    // rule rejects the Secret — with a message that must still be scrubbed.
+                    "object.data.password != \"<redacted>\"",
+                )
+                .with_message(format!(
+                    "secret payloads ({encoded} / hunter2) must never appear in a message"
+                )),
+            ]));
+        let fixture = with_policy_rules(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            rules,
+        );
+        fixture.commit(&[("secret.yaml", secret_manifest.as_str())]);
+        let app = fixture.app(".");
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("the rule rejects the Secret");
+        let message = err.to_string();
+        assert!(!message.contains("hunter2"), "plaintext leaked: {message}");
+        assert!(
+            !message.contains(&encoded),
+            "base64 payload leaked: {message}"
+        );
+        assert!(message.contains("<redacted>"), "{message}");
+    }
+
+    /// A `payments` project with `count` no-op `Enforce` rules, plus the privileged-container rule
+    /// as the last one, so a truncated rule list would visibly lose the rule that matters.
+    fn project_with_many_policy_rules(count: usize) -> AppProject {
+        let mut rules = String::new();
+        for index in 0..count {
+            rules.push_str(&format!(
+                "    - name: filler-{index}\n      expression: \"true\"\n"
+            ));
+        }
+        rules.push_str(&no_privileged_rule_yaml("Enforce"));
+        project_with_policy_rules("payments", &rules)
+    }
+
+    /// **`T20.2` finding H1:** the rule budget is one limit over the **union** of
+    /// `AppProject.spec.policyRules[]` and `ConfigMap/ferriscd-policies-cm`. 33 rules must refuse
+    /// the pass — with a synthesized blocking `<rule-budget>` finding, zero mutating calls and zero
+    /// prunes — instead of silently evaluating the first 32 and dropping the rest.
+    #[tokio::test]
+    async fn a_rule_set_over_the_budget_refuses_the_pass_instead_of_truncating_it() {
+        // 32 filler rules + the privileged-container rule = 33.
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default()
+                .with_project(project_with_many_policy_rules(MAX_POLICY_RULES)),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        let mut app = fixture.app(".");
+        app.spec.project = "payments".to_owned();
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("a rule set over the budget must refuse the pass");
+        let ReconcileError::PolicyGate(refusal) = &err else {
+            panic!("expected a PolicyGate refusal, got {err:?}");
+        };
+        assert!(
+            refusal
+                .violations
+                .iter()
+                .any(|violation| violation.rule == "<rule-budget>"),
+            "the refusal must be the rule budget, not a truncated rule list: {:?}",
+            refusal.violations
+        );
+        assert!(
+            err.to_string().contains("over the 32-rule limit"),
+            "the message must name the budget: {err}"
+        );
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "a refused pass issues zero applies: {:?}",
+            fixture.cluster.applies()
+        );
+        assert!(fixture.cluster.deletes().is_empty(), "and zero prunes");
+        assert!(
+            fixture.dry_run.calls().is_empty(),
+            "the gate runs before the diff: {:?}",
+            fixture.dry_run.calls()
+        );
+
+        // Exactly at the budget it passes: the limit is not off by one.
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default()
+                .with_project(project_with_many_policy_rules(MAX_POLICY_RULES - 1)),
+            ApplicationScope::default(),
+        );
+        fixture.commit(&[("deployment.yaml", COMPLIANT_DEPLOYMENT)]);
+        let mut app = fixture.app(".");
+        app.spec.project = "payments".to_owned();
+        fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("32 rules are inside the budget");
+    }
+
+    /// The second half of `H1`: the project rules and the cluster-wide rules share the budget, so
+    /// "30 project rules + 3 cluster-wide rules" is a refusal too. Silently dropping the cluster
+    /// rule the security team relies on would be a policy bypass.
+    #[tokio::test]
+    async fn the_project_and_configmap_rule_totals_share_one_budget() {
+        let rules = Arc::new(FakePolicyRuleSource::default().with_rules(vec![
+            no_privileged_rule(PolicyEnforcement::Enforce),
+            PolicyRule::new("a", PolicyEnforcement::Enforce, "true"),
+            PolicyRule::new("b", PolicyEnforcement::Enforce, "true"),
+        ]));
+        let fixture = with_policy_rules(
+            fixture_with_policy(
+                FakeCluster::default().with_namespace("payments"),
+                FakeProjectSource::default()
+                    .with_project(project_with_many_policy_rules(MAX_POLICY_RULES - 2)),
+                ApplicationScope::default(),
+            ),
+            rules,
+        );
+        fixture.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        let mut app = fixture.app(".");
+        app.spec.project = "payments".to_owned();
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("project + cluster-wide rules must fit one budget");
+        assert!(
+            err.to_string().contains("<rule-budget>") || err.to_string().contains("rule-budget"),
+            "{err}"
+        );
+        assert!(fixture.cluster.applies().is_empty());
+
+        // The preview reports the same refusal as data (`ferriscd app diff` exits 3).
+        let preview = fixture
+            .pipeline
+            .diff(&app)
+            .await
+            .expect("a preview is never refused");
+        assert!(
+            preview
+                .policy_violations
+                .iter()
+                .any(|violation| violation.rule == "<rule-budget>"),
+            "{:?}",
+            preview.policy_violations
+        );
+        assert!(!preview.would_sync);
+    }
+
+    /// **`T20.2` finding M6:** a rollback whose historical manifests violate a policy must leave
+    /// `spec` exactly as the operator wrote it. The `spec.syncPolicy.automated` patch is deferred
+    /// until after the gate, so a refused rollback applies nothing *and* changes nothing.
+    #[tokio::test]
+    async fn a_policy_refused_rollback_leaves_the_spec_unchanged() {
+        // Two commits: `v1` (compliant) then a *privileged* one. The policy is added afterwards, so
+        // the rollback to `v1` is fine but `HEAD` is not — and we roll back to `HEAD`'s predecessor
+        // to model the real case: an operator rolling back into a policy violation.
+        let fixture = fixture_with_policy(
+            FakeCluster::default().with_namespace("payments"),
+            FakeProjectSource::default().with_project(project_with_policy_rules(
+                "payments",
+                &no_privileged_rule_yaml("Enforce"),
+            )),
+            ApplicationScope::default(),
+        );
+        let mut app = fixture.app(".");
+        app.spec.project = "payments".to_owned();
+        // A history of two deployments, the second of which is privileged and therefore refused.
+        let compliant = fixture.commit(&[("deployment.yaml", COMPLIANT_DEPLOYMENT)]);
+        let mut history = Vec::new();
+        history.push(ferriscd_crd::status::RevisionHistoryEntry::new(
+            1,
+            Some(compliant.clone()),
+            now(),
+        ));
+        let refused = fixture.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        history.insert(
+            0,
+            ferriscd_crd::status::RevisionHistoryEntry::new(2, Some(refused.clone()), now()),
+        );
+        let status = ApplicationStatus {
+            history,
+            ..ApplicationStatus::default()
+        };
+        app.status = Some(status);
+        app.spec.sync_policy = Some(self_heal_policy());
+        app.annotations_mut().insert(
+            annotations::OPERATION.to_owned(),
+            r#"{"rollback":{"id":2}}"#.to_owned(),
+        );
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("rolling back to a privileged manifest must be refused");
+        assert!(matches!(err, ReconcileError::PolicyGate(_)), "{err:?}");
+
+        assert!(
+            fixture.cluster.app_patches().is_empty(),
+            "a refused rollback must not patch spec.syncPolicy.automated: {:?}",
+            fixture.cluster.app_patches()
+        );
+        assert!(fixture.cluster.applies().is_empty(), "and applies nothing");
+        assert!(fixture.cluster.deletes().is_empty(), "and prunes nothing");
+    }
+
+    /// **`T20.2` finding M7:** the refusal path writes the `PolicyAdvisory` condition too, so a
+    /// stale one cannot survive a refusal and the advisories of the refused bundle are visible.
+    #[tokio::test]
+    async fn a_policy_refusal_refreshes_and_clears_the_advisory_condition() {
+        // A `Warn` rule that rejects the privileged Deployment *and* an `Enforce` rule that does
+        // the same: the pass is refused, and the advisory of the same pass is reported with it.
+        let rules = Arc::new(FakePolicyRuleSource::default().with_rules(vec![
+            no_privileged_rule(PolicyEnforcement::Warn),
+            PolicyRule::new(
+                "require-cost-center",
+                PolicyEnforcement::Enforce,
+                "has(object.metadata.labels) && object.metadata.labels.contains(\"cost-center\")",
+            )
+            .with_match_kinds(vec!["apps/Deployment".to_owned()])
+            .with_message("every Deployment must carry a cost-center label"),
+        ]));
+        let advised = with_policy_rules(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            rules,
+        );
+        advised.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        let mut app = advised.app(".");
+        // A stale advisory from an earlier pass.
+        let mut status = ApplicationStatus::default();
+        status.set_condition(Condition::new(
+            ferriscd_engine::policy::CONDITION_POLICY_ADVISORY,
+            ConditionStatus::True,
+            ferriscd_engine::policy::REASON_POLICY_ADVISORY,
+            "stale advisory from an earlier pass",
+            now(),
+        ));
+        app.status = Some(status);
+
+        let (err, persisted) = reconcile_pass(&advised, &mut app).await;
+        let err = err.expect("the Enforce rule refuses the bundle");
+        assert!(matches!(err, ReconcileError::PolicyGate(_)), "{err:?}");
+
+        let advisory = persisted
+            .as_ref()
+            .expect("the failed pass still patches /status")
+            .condition(ferriscd_engine::policy::CONDITION_POLICY_ADVISORY)
+            .expect("the advisory must be refreshed on the refusal path");
+        assert_eq!(advisory.status, ConditionStatus::True);
+        assert!(
+            advisory.message.contains("privileged"),
+            "the refusal's own advisories must be shown: {advisory:?}"
+        );
+        assert!(
+            !advisory.message.contains("stale advisory"),
+            "the stale advisory must be replaced: {advisory:?}"
+        );
+
+        // And a refusal with no advisory clears one that is still on `/status`.
+        let rules = Arc::new(
+            FakePolicyRuleSource::default()
+                .with_rules(vec![no_privileged_rule(PolicyEnforcement::Enforce)]),
+        );
+        let narrowed = with_policy_rules(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            rules.clone(),
+        );
+        narrowed.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        let mut app = narrowed.app(".");
+        let mut status = ApplicationStatus::default();
+        status.set_condition(Condition::new(
+            ferriscd_engine::policy::CONDITION_POLICY_ADVISORY,
+            ConditionStatus::True,
+            ferriscd_engine::policy::REASON_POLICY_ADVISORY,
+            "stale advisory from an earlier pass",
+            now(),
+        ));
+        app.status = Some(status);
+
+        let (err, persisted) = reconcile_pass(&narrowed, &mut app).await;
+        assert!(
+            matches!(err, Some(ReconcileError::PolicyGate(_))),
+            "{err:?}"
+        );
+        let advisory = persisted
+            .as_ref()
+            .expect("status")
+            .condition(ferriscd_engine::policy::CONDITION_POLICY_ADVISORY)
+            .expect("the stale advisory must be cleared, not left behind");
+        assert_eq!(advisory.status, ConditionStatus::False);
+        assert_eq!(
+            advisory.reason,
+            ferriscd_engine::policy::REASON_POLICY_COMPLIANT
+        );
+    }
+
+    /// A build with `opa-policy` wires the embedded Rego engine, so a `Rego` rule is *reachable*
+    /// from the controller rather than a compile error.
+    #[cfg(feature = "opa-policy")]
+    #[tokio::test]
+    async fn a_rego_rule_is_evaluated_by_the_default_pipeline_under_the_feature() {
+        let policy = "package ferriscd\n\nno_privileged if {\n  not \
+                      input.object.spec.template.spec.containers[_]\
+                      .securityContext.privileged\n}\n";
+        let rules = Arc::new(FakePolicyRuleSource::default().with_rules(vec![
+            PolicyRule::new("no-privileged", PolicyEnforcement::Enforce, policy)
+                .with_match_kinds(vec!["apps/Deployment".to_owned()])
+                .with_engine(ferriscd_crd::project::PolicyRuleEngine::Rego),
+        ]));
+        let fixture = with_policy_rules(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            rules,
+        );
+        fixture.commit(&[("deployment.yaml", PRIVILEGED_DEPLOYMENT)]);
+        let app = fixture.app(".");
+
+        let err = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("the Rego rule must refuse the privileged Deployment");
+        assert!(err.to_string().contains("no-privileged"), "{err}");
+        assert!(fixture.cluster.applies().is_empty());
+
+        fixture.commit(&[("deployment.yaml", COMPLIANT_DEPLOYMENT)]);
+        fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("the compliant bundle passes the same Rego rule");
     }
 
     // ---------------------------------------------------------------------
