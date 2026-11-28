@@ -143,9 +143,5 @@ ferriscd-server = { path = "crates/ferriscd-server" }
 unwrap_used = "deny"
 expect_used = "deny"
 
-# macOS: keep debug symbols in separate .o files instead of relinking one large
-# object per binary. This is the platform default, but state it explicitly so a
-# future `split-debuginfo` change elsewhere cannot silently reintroduce the
-# per-link copy of hundreds of MB of DWARF.
 [profile.dev]
 split-debuginfo = "unpacked"

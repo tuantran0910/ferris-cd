@@ -1,8 +1,2 @@
-# Local build defaults for this workspace.
-#
-# The full gate compiles the workspace several times (default, test-utils,
-# opa-policy) and the developer machine also runs Chrome/OrbStack. Capping the
-# job count keeps peak RSS below the swap threshold on a 16 GB machine; CI can
-# override it with CARGO_BUILD_JOBS when more workers are available.
 [build]
 jobs = 6
