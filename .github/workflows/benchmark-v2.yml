@@ -105,7 +105,7 @@ jobs:
             --commit-interval 600 \
             --drift-interval 300 \
             --convergence-timeout 1800 \
-            --drift-heal-timeout 300 \
+            --drift-heal-timeout 180 \
             --control-plane-namespace ferriscd-system \
             --results-dir benchmark-results
 
