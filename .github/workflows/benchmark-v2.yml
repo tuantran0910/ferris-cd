@@ -54,7 +54,7 @@ jobs:
       - name: Install kind and kubectl
         uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
         with:
-          tool: kind@v0.33.0,kubectl@v1.35.0
+          tool: kind@0.33.0,kubectl@1.35.0
 
       - name: Create the throwaway kind cluster
         run: |
