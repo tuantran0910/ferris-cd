@@ -46,6 +46,22 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # Constant-time comparison for the `T14.2` webhook signature/token checks. Already in the lock file
 # (`rustls` and `ring` depend on it): comparing a MAC with `==` leaks how much of it matched.
 subtle = "2"
+# `T17.4`: IANA time-zone rules for `AppProject.spec.syncWindows`. `jiff` is already in the
+# dependency graph (`k8s-openapi` re-exports it), but with `alloc` only — i.e. with no tzdb at all,
+# so `TimeZone::get("America/New_York")` would fail at runtime. The bundled database keeps window
+# evaluation independent of the host's `/usr/share/zoneinfo`, which `debian:bookworm-slim` does not
+# ship. Enabling the feature adds no package: `jiff-tzdb` and `jiff-static` are already in
+# `Cargo.lock`.
+jiff = { version = "0.2", default-features = false, features = [
+    "std",
+    "tzdb-bundle-always",
+] }
+# `T19.1`: JOSE signature verification (`RS256`, `ES256`, `ES384`, `EdDSA`) for OIDC access tokens.
+# Already in the lock file as the workspace's pinned `rustls` crypto provider (see below), so this
+# adds no package — and deliberately no `jsonwebtoken`-style JWT crate: the algorithm allowlist, the
+# `alg`/key-type pairing and the claim checks are the security boundary of this feature and are
+# written out where a reviewer can read them.
+ring = "0.17"
 tower = { version = "0.5", features = ["retry", "util"] }
 # `utoipa` generates the OpenAPI 3.1 contract `GET /api/v1/openapi.json` serves and
 # `docs/api/openapi.json` freezes (`T14.1`); the TypeScript web UI is typed from it (`T16.1`).
@@ -66,11 +82,15 @@ kube = { version = "5.1", features = ["runtime", "derive", "client", "rustls-tls
 # HTTP transport pulls it in), so this adds no new package; only the async rustls + JSON path is
 # enabled, and the workspace's process-level crypto provider (`ring`) is installed at startup so the
 # CLI and the controller use the same TLS stack.
+# `stream` lets `T19.1` read the JWKS response body through a size-capped byte stream instead of
+# `bytes()`: an IdP that answers with a 1 GiB body must not be able to allocate it. It adds one
+# wasm-only shim to the lock file (`wasm-streams`), which is not compiled for any native target.
 reqwest = { version = "0.13", default-features = false, features = [
     "charset",
     "http2",
     "json",
     "rustls",
+    "stream",
 ] }
 # `T15.1`: the low-cardinality Prometheus registry behind `/metrics`. The only new package this
 # task adds; the exposition format (text 0.0.4) and the histogram/counter/gauge primitives all

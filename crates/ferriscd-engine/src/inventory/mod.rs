@@ -36,7 +36,8 @@ use ferriscd_crd::status::InventoryEntry as StatusInventoryEntry;
 use crate::manifest::types::{DesiredResource, ResourceKey};
 
 pub use tracking::{
-    Ownership, TrackingId, TrackingIdError, classify_ownership, stamp_tracking_id, tracking_id_for,
+    APP_HASH_HEX_CHARS, Ownership, StampOptions, TrackingId, TrackingIdError, app_hash,
+    classify_ownership, stamp_tracking_id, tracking_id_for,
 };
 
 /// One inventory entry's payload.

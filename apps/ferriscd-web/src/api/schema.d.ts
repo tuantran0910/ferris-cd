@@ -164,6 +164,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Publishes how a caller can authenticate, so the Web UI and the CLI can pick a sign-in flow
+         *     (`T19.1`; `T19.2` consumes it with PKCE).
+         * @description How to authenticate against this server: the auth mode (token-review, oidc, token-review-or-oidc, ...), plus the OIDC issuer, public client id and scopes when OIDC is enabled. Public by design — a client needs it before it has a credential.
+         */
+        get: operations["auth_config"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/clusters": {
         parameters: {
             query?: never;
@@ -333,6 +354,7 @@ export interface components {
             /** @description Last `status.history` entries, oldest first. */
             history?: components["schemas"]["HistoryView"][];
             operation?: null | components["schemas"]["OperationView"];
+            syncWindow?: null | components["schemas"]["SyncWindowGateView"];
         };
         /** @description `GET /api/v1/applications/{namespace}/{name}/events` body (`T17.3`). */
         ApplicationEventListView: {
@@ -393,6 +415,25 @@ export interface components {
             /** @description `spec.source` summary (the repository URL is redacted). */
             source: components["schemas"]["SourceView"];
             sync?: null | components["schemas"]["SyncView"];
+        };
+        /**
+         * @description `GET /api/v1/auth/config` body (`T19.1`).
+         *
+         *     Served from the **public** group: the SPA and `ferriscd login --oidc` must learn how to
+         *     authenticate before they have a token, so this carries only what a stranger may know — the auth
+         *     mode, the issuer, the public client id and the scopes (`T19.2` consumes it).
+         */
+        AuthConfigView: {
+            /** @description `token-review`, `oidc`, `token-review-or-oidc`, `pass-through` or `deny-all`. */
+            authMode: string;
+            /** @description Whether the optional server-side (BFF cookie) session mode is enabled (`T19.2`). */
+            bffEnabled: boolean;
+            /** @description The configured OAuth client id. **Absent** when OIDC is disabled; never `null`. */
+            clientId?: string;
+            /** @description The configured OIDC issuer. **Absent** when OIDC is disabled; never `null`. */
+            issuer?: string;
+            /** @description The scopes the client should request from the IdP. Always present (`[]` when OIDC is off). */
+            scopes: string[];
         };
         /** @description `GET /api/v1/clusters` body. */
         ClusterListView: {
@@ -556,6 +597,35 @@ export interface components {
             /** @description Every `AppProject` of the control-plane namespace. */
             items: components["schemas"]["ProjectView"][];
         };
+        /** @description One `spec.syncWindows[]` entry with its state at the moment of the response (`T17.4`). */
+        ProjectSyncWindowView: {
+            /** @description Whether the window is open right now. */
+            active: boolean;
+            /** @description Glob patterns for `Application.metadata.name` (empty = every application). */
+            applications?: string[];
+            /** @description Glob patterns for `spec.destination.cluster` (empty = every cluster). */
+            clusters?: string[];
+            /** @description The duration, verbatim (`30m`, `2h`, `7d`). */
+            duration: string;
+            /** @description When the currently open occurrence ends (RFC 3339). */
+            endsAt?: string | null;
+            /** @description Why this entry cannot be evaluated. The project is deny-all while it is set (fail closed). */
+            error?: string | null;
+            /** @description `allow` or `deny` (deny wins over allow). */
+            kind: string;
+            /** @description Whether a manual sync may override this window. */
+            manualSync: boolean;
+            /** @description Glob patterns for `Application.metadata.namespace` (empty = every namespace). */
+            namespaces?: string[];
+            /** @description The next occurrence that starts after now (RFC 3339), within a year. */
+            nextStart?: string | null;
+            /** @description The 5-field cron expression, verbatim. */
+            schedule: string;
+            /** @description When the currently open occurrence started (RFC 3339). */
+            startsAt?: string | null;
+            /** @description The effective IANA time zone (`UTC` when `spec.syncWindows[].timeZone` is absent). */
+            timeZone: string;
+        };
         /** @description One `AppProject`, reduced to its boundary facts. */
         ProjectView: {
             /** @description `spec.allowedServiceAccounts`. */
@@ -566,10 +636,19 @@ export interface components {
             destinations?: string[];
             /** @description `metadata.name`. */
             name: string;
+            /** @description When the next window starts or stops (RFC 3339), across every configured window. */
+            nextSyncWindowTransition?: string | null;
             /** @description `spec.sourceNamespaces`. */
             sourceNamespaces?: string[];
             /** @description `spec.sourceRepos`. */
             sourceRepos?: string[];
+            /**
+             * @description `spec.syncWindows`, each with its state at the moment of the response (`T17.4`).
+             *
+             *     Empty (and omitted) for a project that configures no window, so the pre-`T17.4` payload is
+             *     byte-identical for every such project.
+             */
+            syncWindows?: components["schemas"]["ProjectSyncWindowView"][];
         };
         /** @description Readiness answer. */
         ReadyResponse: {
@@ -657,6 +736,30 @@ export interface components {
             revision?: string | null;
             /** @description `Synced` or `OutOfSync`. */
             status: string;
+        };
+        /**
+         * @description The sync-window verdict for one `Application` right now (`T17.4`).
+         *
+         *     The UI needs this to explain a blocked `POST .../sync` *before* the operator clicks: a window is
+         *     a time-based refusal, and "nothing happened" is indistinguishable from a controller stall
+         *     otherwise. `manualOverride` says whether a manual sync would be honoured anyway
+         *     (`manualSync: true` on every blocking window).
+         *
+         *     A blocked manual sync is **deferred, not rejected**: the controller pauses the requested
+         *     operation and runs it when the window lifts, without asking again (finding N-c), so the modal
+         *     tells the operator *when* it will happen rather than to come back and click twice.
+         */
+        SyncWindowGateView: {
+            /** @description Whether a manual sync would be skipped right now. */
+            blocked: boolean;
+            /** @description Whether `manualSync: true` makes a manual sync still executable. */
+            manualOverride: boolean;
+            /** @description Human-readable explanation, including the next window transition. */
+            message: string;
+            /** @description When the verdict could change (RFC 3339). */
+            nextTransition?: string | null;
+            /** @description `denyWindowActive`, `outsideAllowWindow`, or `invalidWindow`; absent when not blocked. */
+            reason?: string | null;
         };
         /** @description The `ferriscd.io/refresh` request a webhook reports back. */
         WebhookResponse: {
@@ -1179,6 +1282,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    auth_config: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The authentication configuration */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthConfigView"];
                 };
             };
         };

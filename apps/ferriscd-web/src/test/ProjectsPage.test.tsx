@@ -78,6 +78,37 @@ describe("ProjectsPage (T17.3)", () => {
     ).toHaveTextContent("none");
   });
 
+  it("shows each deployment-governance window with its live state (T17.4)", async () => {
+    const user = userEvent.setup();
+    renderProjectsPage();
+
+    const card = (await screen.findByText("payments")).closest("li");
+    const windows = within(card as HTMLElement).getByTestId(
+      "project-sync-windows-payments",
+    );
+    // The deny window is open right now: "active" is a fact from the server, not a guess.
+    expect(
+      within(windows).getByTestId("project-sync-windows-payments-0"),
+    ).toHaveAttribute("data-window-state", "active");
+    expect(windows).toHaveTextContent("0 9-17 * * MON-FRI");
+    expect(windows).toHaveTextContent("America/New_York");
+    expect(windows).toHaveTextContent("Open until 2026-11-25 22:00:00 UTC");
+    expect(
+      within(windows).getByTestId("project-sync-windows-payments-1"),
+    ).toHaveAttribute("data-window-state", "scheduled");
+    expect(windows).toHaveTextContent("Next transition 2026-11-25 22:00:00 UTC");
+
+    // A project with no window renders no panel at all (absence is not an empty box).
+    expect(
+      screen.queryByTestId("project-sync-windows-storefront"),
+    ).not.toBeInTheDocument();
+
+    // The schedule is searchable, like every other boundary fact on the card.
+    await user.type(screen.getByLabelText(/Search projects/i), "MON-FRI");
+    expect(screen.getByText("payments")).toBeInTheDocument();
+    expect(screen.queryByText("storefront")).not.toBeInTheDocument();
+  });
+
   it("rolls up the visible applications per project and announces the filtered count", async () => {
     renderProjectsPage();
 

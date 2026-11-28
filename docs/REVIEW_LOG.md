@@ -225,3 +225,18 @@ Executed all **26/26** ignored live Kubernetes integration & chaos suites agains
 as the red assertion T18.4 must flip; the durable redaction belongs in `from_source`, while
 `record_sync_success` (next to `redact_repo_url`) is the minimal engine-side fix. OCI URLs are
 already refused by the offline `validate` when they embed credentials.
+
+---
+
+## `v1.1` Sync Windows (`T17.4`)
+
+Hermetic proof only: `make gate` needs no cluster. Everything below is either asserted by a test
+that runs in it or explicitly marked pending.
+
+- **Live suite existence and status:** `tests/integration/v1_1_sync_windows.rs` (shim:
+  `crates/ferriscd-cli/tests/v1_1_sync_windows.rs`, `#[ignore]` + `kind-` context guard) is the live
+  `T17.4` acceptance run — deny window blocks a push (`status.sync.status` reports `OutOfSync`,
+  `Ready=True/SyncWindowActive`, `lastSyncedRevision` untouched, nothing pruned), and the sync
+  resumes on the window's own schedule. It has **not been run against a `kind` cluster yet**, so no
+  pass/fail and no output are recorded here; like the other live suites, its `kind` run is
+  **pending**.

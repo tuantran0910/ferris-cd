@@ -47,8 +47,8 @@ pub use compare::{
     MAX_FIELD_CHANGES, VOLATILE_METADATA_FIELDS, canonicalize, escape_token, strip_volatile,
 };
 pub use decision::{
-    SkipReason, SourceSpecHashError, SyncDecision, SyncTrigger, canonical_json, canonical_value,
-    should_sync, source_spec_hash,
+    SkipReason, SourceSpecHashError, SyncDecision, SyncTrigger, SyncWindowGate, canonical_json,
+    canonical_value, should_sync, source_spec_hash,
 };
 pub use ignore::{IgnoreRule, IgnoreRuleSet};
 pub use redact::{

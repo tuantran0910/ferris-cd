@@ -41,11 +41,12 @@ pub use audit::{
     WebhookAuditSink,
 };
 pub use cluster_manager::{
-    ClusterAuth, ClusterChange, ClusterError, ClusterHandle, ClusterHandleBuilder, ClusterManager,
-    ClusterName, ClusterOptions, ClusterSecret, ClusterSecretEvent, ClusterSecretSource,
-    ClusterSource, ClusterTarget, ClusterWatchError, IN_CLUSTER, KEY_BEARER_TOKEN, KEY_CA_CRT,
-    KEY_INSECURE_SKIP_TLS_VERIFY, KEY_KUBECONFIG, KEY_SERVER, KEY_TLS_CRT, KEY_TLS_KEY,
-    KubeClusterBuilder, SECRET_TYPE_CLUSTER, SecretClusterSource,
+    CLUSTER_EVENT_CAPACITY, ClusterAuth, ClusterChange, ClusterError, ClusterHandle,
+    ClusterHandleBuilder, ClusterLifecycleEvent, ClusterManager, ClusterName, ClusterOptions,
+    ClusterSecret, ClusterSecretEvent, ClusterSecretSource, ClusterSource, ClusterTarget,
+    ClusterWatchError, IN_CLUSTER, KEY_BEARER_TOKEN, KEY_CA_CRT, KEY_INSECURE_SKIP_TLS_VERIFY,
+    KEY_KUBECONFIG, KEY_SERVER, KEY_TLS_CRT, KEY_TLS_KEY, KubeClusterBuilder, SECRET_TYPE_CLUSTER,
+    SecretClusterSource,
 };
 pub use controller::{
     APPLICATION_NAMESPACES_ENV, ApplicationControllers, BackoffTracker, ConfigError,
@@ -103,7 +104,10 @@ pub use metrics::{
     SYNC_STATUS_VALUES,
 };
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
-pub use project::{ApiProjectSource, ProjectSource};
+pub use project::{
+    ApiProjectSource, ApiProjectStatusSink, ProjectSource, ProjectStatusSink,
+    REASON_SYNC_WINDOW_INVALID, sync_window_condition,
+};
 pub use prune::{
     OwnershipVerifiedPruner, PruneResult, ResourcePruner, RetainReason, prune_opted_out, prune_rail,
 };
@@ -143,6 +147,13 @@ pub use waves::{BundleWaves, merge_hook_records, step_health};
 
 /// Environment variable selecting the log format (`json` or `pretty`).
 pub const LOG_FORMAT_ENV: &str = "FERRISCD_LOG_FORMAT";
+
+/// Environment variable enabling the opt-in drift watcher and its ownership labels (`T18.1`).
+///
+/// The `--enable-drift-watcher` flag defaults to it, so a Deployment can opt in without changing
+/// argv (a flag is world-readable in `ps`, an environment variable is at least scoped to the pod
+/// spec). Default `false`: nothing about the `v1.0` apply body changes until an operator opts in.
+pub const DRIFT_WATCHER_ENV: &str = "FERRISCD_ENABLE_DRIFT_WATCHER";
 
 /// Returns the controller identifier string.
 #[must_use]
@@ -187,6 +198,16 @@ pub struct RunOptions {
     /// unverified connection, where anything on the path can read and rewrite them.
     pub allow_insecure_clusters: bool,
 
+    /// Stamp the `ferriscd.io/managed-by` / `ferriscd.io/app-hash` ownership labels (`T18.1`).
+    ///
+    /// Off by default. Enabling it (`--enable-drift-watcher`, `FERRISCD_ENABLE_DRIFT_WATCHER`) is
+    /// what makes every managed resource selectable by a Kubernetes **watch label selector**, which
+    /// the opt-in `DriftWatcher` (`T18.2`) needs in order to watch metadata only. The label pair is
+    /// additive and idempotent: turning the flag off removes nothing from the desired body, and the
+    /// next sync's Server-Side Apply converges the two labels away (they are fields FerrisCD owns),
+    /// so toggling the flag costs exactly one no-op diff per resource — never a drift loop.
+    pub enable_drift_watcher: bool,
+
     /// Run `coordination.k8s.io/v1` `Lease` leader election (`T13.2`).
     ///
     /// `None` (the default) keeps the pre-Phase-13 single-replica behaviour: exactly one controller
@@ -229,6 +250,7 @@ impl std::fmt::Debug for RunOptions {
             .field("allow_local_repos", &self.allow_local_repos)
             .field("work_root", &self.work_root)
             .field("allow_insecure_clusters", &self.allow_insecure_clusters)
+            .field("enable_drift_watcher", &self.enable_drift_watcher)
             .field("leader_election", &self.leader_election)
             .field("shard", &self.shard)
             .field("metrics_addr", &self.metrics_addr)
@@ -959,6 +981,12 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
             client.clone(),
             &config.namespace,
         )))
+        // `T17.4`: an unusable `spec.syncWindows` entry is deny-all at runtime; this is the one
+        // `AppProject` `/status` write that explains it (skipped unless the condition changed).
+        .with_project_status(Arc::new(ApiProjectStatusSink::new(
+            client.clone(),
+            &config.namespace,
+        )))
         // `T12.2`: the same scope the watcher uses, so a tenant `Application` is refused here even
         // if it somehow reaches a reconcile.
         .with_application_scope(config.application_scope())
@@ -979,7 +1007,12 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         // `T15.1`: Git fetch latency and the render-cache hit/miss bridge.
         .with_metrics(metrics.clone())
         // `T17.2`: compliance audit emission for ServiceAccount impersonation resolutions.
-        .with_audit(audit.clone()),
+        .with_audit(audit.clone())
+        // `T18.1`: the opt-in ownership label pair (`--enable-drift-watcher`). Default off keeps the
+        // `v1.0` body byte-for-byte identical (annotation only).
+        .with_stamp_options(ferriscd_engine::inventory::StampOptions::from_flag(
+            options.enable_drift_watcher,
+        )),
     );
     // `T15.2`: rate-limited Kubernetes Events on `Application` CRs (deduplicates identical
     // consecutive `Warning` reasons within 5 minutes before calling `Recorder::publish`).

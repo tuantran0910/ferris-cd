@@ -308,3 +308,31 @@ fn otlp_tracing_and_kubernetes_events_rbac_are_documented() {
         "the ClusterRole sample must grant create/patch/get/list on events.k8s.io/v1 events"
     );
 }
+
+/// **`T18.1`:** the ownership-label opt-in, its env fallback and the two labels it stamps must be
+/// documented where an operator decides to turn it on — including the immutability trap guard, so
+/// nobody "improves" the stamp by writing into `spec.selector.matchLabels`.
+#[test]
+fn the_ownership_labels_and_their_trap_guard_are_documented() {
+    for expected in [
+        "--enable-drift-watcher",
+        "FERRISCD_ENABLE_DRIFT_WATCHER",
+        "ferriscd.io/managed-by",
+        "ferriscd.io/app-hash",
+        "63-character",
+        "spec.selector.matchLabels",
+        "spec.template.metadata.labels",
+        "422 Immutable",
+        "Lifecycle hooks are never stamped",
+        "additive",
+        "Added",
+        "Rebuilt",
+        "Removed",
+        "Lagged",
+    ] {
+        assert!(
+            README.contains(expected),
+            "deploy/README.md must document {expected:?} for the opt-in ownership labels"
+        );
+    }
+}

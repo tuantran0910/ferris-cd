@@ -74,6 +74,28 @@ pub struct ControllerArgs {
     #[arg(long = "allow-insecure-cluster-tls")]
     pub allow_insecure_cluster_tls: bool,
 
+    /// Stamp `ferriscd.io/managed-by` and `ferriscd.io/app-hash` labels on managed resources.
+    ///
+    /// Off by default. This is the label half of the opt-in drift watcher (`T18.1`/`T18.2`): an
+    /// annotation cannot be used in a Kubernetes watch label selector, so these two bounded labels
+    /// are what let the controller filter `ferriscd.io/managed-by=ferriscd` **server-side** instead
+    /// of receiving every object in the cluster. The values are always 16 lowercase hex characters
+    /// (`SHA-256("<app-namespace>/<app-name>")` truncated), so they stay valid under the 63-character
+    /// label limit for any `Application` name.
+    ///
+    /// Additive and idempotent: turning it off does not rewrite any manifest body, and the next sync
+    /// converges the labels away, so toggling it is safe on a live fleet.
+    ///
+    /// The environment fallback `FERRISCD_ENABLE_DRIFT_WATCHER` must be exactly `true` or `false`
+    /// (lowercase; the parse is a bool parse, not a truthiness test). Unset means off — identical to
+    /// omitting the flag — and any other value, including the empty string, is a **usage error**
+    /// rather than a silent "off", so a typo cannot quietly leave the labels unset.
+    #[arg(
+        long = "enable-drift-watcher",
+        env = ferriscd_controller::DRIFT_WATCHER_ENV
+    )]
+    pub enable_drift_watcher: bool,
+
     /// Elect one active replica with a `coordination.k8s.io/v1` Lease (active/standby HA).
     ///
     /// Without it, run exactly ONE controller replica: two replicas both reconcile, which can
@@ -223,6 +245,7 @@ impl std::fmt::Debug for ControllerArgs {
                 "allow_insecure_cluster_tls",
                 &self.allow_insecure_cluster_tls,
             )
+            .field("enable_drift_watcher", &self.enable_drift_watcher)
             .field("leader_election", &self.leader_election)
             .field(
                 "leader_election_lease_name",
@@ -287,6 +310,9 @@ pub(crate) fn run_options(args: ControllerArgs) -> ferriscd_controller::RunOptio
         allow_local_repos: args.allow_local_repos,
         work_root: args.work_root,
         allow_insecure_clusters: args.allow_insecure_cluster_tls,
+        // `T18.1`: `--enable-drift-watcher` / `FERRISCD_ENABLE_DRIFT_WATCHER`. Off means the apply
+        // body keeps only the `ferriscd.io/tracking-id` annotation, exactly as before `v1.2`.
+        enable_drift_watcher: args.enable_drift_watcher,
         leader_election,
         // `T13.3`: the raw flag pair; the controller validates it and refuses sharding without
         // `--leader-election` (or with a lease name other than the per-shard one). Both unset — the
@@ -661,6 +687,61 @@ mod tests {
         assert_eq!(unusable.metrics_addr.as_deref(), Some("9090"));
     }
 
+    /// **`T18.1`:** `--enable-drift-watcher` is off by default, reaches `RunOptions`, and declares
+    /// its environment fallback. It is the only switch that adds the ownership label pair to every
+    /// applied object, so a mistaken default would rewrite the whole fleet's metadata.
+    #[test]
+    fn controller_parses_the_drift_watcher_flag_and_its_env_fallback() {
+        let args = parse(&["ferriscd", "controller"]);
+        assert!(
+            !args.enable_drift_watcher,
+            "the ownership labels must stay opt-in"
+        );
+        assert!(!run_options(parse(&["ferriscd", "controller"])).enable_drift_watcher);
+        assert!(
+            !ferriscd_controller::RunOptions::default().enable_drift_watcher,
+            "the library default is off too (hermetic tests and other embedders)"
+        );
+
+        let enabled = parse(&["ferriscd", "controller", "--enable-drift-watcher"]);
+        assert!(enabled.enable_drift_watcher);
+        assert!(
+            run_options(enabled).enable_drift_watcher,
+            "the flag must reach the controller's RunOptions, where the pipeline reads it"
+        );
+
+        // The env fallback is *declared* on the flag (clap reads it when the flag is absent);
+        // asserting the declaration avoids mutating the process environment.
+        let mut command = Harness::command();
+        let controller = command
+            .find_subcommand_mut("controller")
+            .expect("the controller subcommand exists");
+        let arg = controller
+            .get_arguments()
+            .find(|arg| arg.get_id() == "enable_drift_watcher")
+            .expect("the --enable-drift-watcher argument exists");
+        assert_eq!(
+            arg.get_env().and_then(|env| env.to_str()),
+            Some(ferriscd_controller::DRIFT_WATCHER_ENV),
+            "a Deployment must be able to opt in without changing argv"
+        );
+        assert_eq!(
+            arg.get_default_values().len(),
+            0,
+            "a bool flag with no default is `false`: the labels are additive and opt-in"
+        );
+        // **Finding M2:** the action is what pins the env semantics. `SetTrue` (not `Set`/`Count`)
+        // is why a value is optional on the command line yet each env/default value is parsed as a
+        // bool, so `FERRISCD_ENABLE_DRIFT_WATCHER=false` really means *off* and a non-`true`/`false`
+        // value is a usage error instead of a truthiness guess. (`ArgAction` is `Clone + Debug` only,
+        // so the pin is a `matches!`, not an `assert_eq!`.)
+        assert!(
+            matches!(arg.get_action(), clap::ArgAction::SetTrue),
+            "a `Set`/`Count` action would let any non-empty env value enable the labels, got {:?}",
+            arg.get_action()
+        );
+    }
+
     /// **Finding M1:** the RBAC an operator has to grant for multi-tenancy is in the flag help, not
     /// only in a doc file nobody reads before turning the flag on.
     #[test]
@@ -716,6 +797,11 @@ mod tests {
             "ferriscd_render_cache_total",
             "ferriscd_active_reconciles",
             "commit_sha",
+            // `T18.1`: the ownership-label opt-in and its env fallback.
+            "--enable-drift-watcher",
+            "FERRISCD_ENABLE_DRIFT_WATCHER",
+            "ferriscd.io/managed-by",
+            "ferriscd.io/app-hash",
         ] {
             assert!(
                 help.contains(expected),

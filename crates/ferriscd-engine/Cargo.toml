@@ -24,6 +24,9 @@ ferriscd-crd.workspace = true
 # decompresses an untrusted archive, and it does so behind a bounded streaming counter.
 flate2.workspace = true
 gix.workspace = true
+# `T17.4`: the injected-clock sync-window evaluator takes a `jiff::Timestamp` (`k8s-openapi`
+# re-exports the same crate, but without a tzdb; the workspace dependency enables it).
+jiff.workspace = true
 jsonptr.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true

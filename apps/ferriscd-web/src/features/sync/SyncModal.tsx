@@ -1,9 +1,14 @@
 import { AlertTriangle, Info, RefreshCw, ShieldOff } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { OperationResponse, SyncRequestBody } from "../../api/types";
+import type {
+  OperationResponse,
+  SyncRequestBody,
+  SyncWindowGateView,
+} from "../../api/types";
 import { Button } from "../../ui/Button";
 import { Modal, ModalBody, ModalFooter, ModalHeader } from "../../ui/Modal";
 import { describeOperationError } from "../../utils/apiErrorText";
+import { SyncWindowNotice } from "./SyncWindows";
 import { useModalBehavior } from "./useModalBehavior";
 
 export interface SyncModalProps {
@@ -12,6 +17,14 @@ export interface SyncModalProps {
   name: string;
   targetRevision: string;
   disabledByRbac?: boolean;
+  /**
+   * The `AppProject` sync-window verdict for this application (`T17.4`).
+   *
+   * The server evaluated it at request time, so the dialog explains exactly what the controller
+   * will do: a blocked window with `manualOverride: false` disables Confirm (the pass would be
+   * skipped), and a blocked window with `manualOverride: true` says so before the operator clicks.
+   */
+  syncWindow?: SyncWindowGateView | null;
   onClose: () => void;
   onConfirm: (body: SyncRequestBody) => Promise<OperationResponse>;
   onForbidden?: () => void;
@@ -24,6 +37,7 @@ export function SyncModal({
   name,
   targetRevision,
   disabledByRbac = false,
+  syncWindow = null,
   onClose,
   onConfirm,
   onForbidden,
@@ -58,6 +72,10 @@ export function SyncModal({
   }
 
   const isForbidden = forbidden || disabledByRbac;
+  // `T17.4`: a deny window the project did not opt out of makes a manual sync a no-op. Blocking
+  // the button is honest; the dry-run preview stays available, because a window never suppresses
+  // drift detection.
+  const blockedByWindow = Boolean(syncWindow?.blocked && !syncWindow.manualOverride);
 
   const handleSubmit = async () => {
     if (dryRun) {
@@ -65,7 +83,7 @@ export function SyncModal({
       onPreviewDiff?.();
       return;
     }
-    if (isForbidden || submitting) return;
+    if (isForbidden || blockedByWindow || submitting) return;
     setSubmitting(true);
     setError(null);
     try {
@@ -111,6 +129,8 @@ export function SyncModal({
           </code>
           .
         </p>
+
+        <SyncWindowNotice syncWindow={syncWindow} />
 
         <div className="space-y-2.5 rounded-xl border border-slate-800 bg-slate-950/60 p-3.5 text-xs">
           <label className="flex items-start gap-2.5 text-slate-400">
@@ -189,7 +209,7 @@ export function SyncModal({
           </div>
         )}
 
-        {!isForbidden && error && (
+        {!isForbidden && !blockedByWindow && error && (
           <div
             role="alert"
             data-testid="sync-error"
@@ -236,7 +256,9 @@ export function SyncModal({
             variant="primary"
             size="md"
             onClick={() => void handleSubmit()}
-            disabled={dryRun ? submitting : isForbidden || submitting}
+            disabled={
+              dryRun ? submitting : isForbidden || blockedByWindow || submitting
+            }
             isLoading={submitting}
             icon={<RefreshCw className="h-3.5 w-3.5" />}
           >
