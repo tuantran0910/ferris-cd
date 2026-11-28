@@ -47,7 +47,8 @@ export const TRIAGE_LIMIT = 8;
  * The page never fetches a per-application diff: counting `Warn` advisories would cost one diff
  * computation per application, which is not a dashboard's job. A **blocking** `Enforce` violation
  * does surface here, because the controller already writes it into `Ready=False,
- * reason=PolicyViolation`.
+ * reason=PolicyGateViolation` (`PolicyViolation` is the different `AppProject` allow-list
+ * verdict; both are counted).
  *
  * Accessibility (`WCAG 2.2 AA`): every figure is textual (a number plus its label, never a colour or
  * a bar alone), the two tables have captions and scoped headers, the KPIs are a description list,
@@ -140,7 +141,13 @@ export function FleetOverviewPage() {
       {error && (
         <ApiErrorAlert
           error={error}
-          onRetry={() => void applicationsQuery.refetch()}
+          onRetry={() => {
+            // `error` covers all three queries, so retrying only the application list
+            // would leave a clusters/projects failure on screen forever.
+            void applicationsQuery.refetch();
+            void clustersQuery.refetch();
+            void projectsQuery.refetch();
+          }}
         />
       )}
 
@@ -227,7 +234,7 @@ export function FleetOverviewPage() {
               <span className="text-xs text-ink-body">
                 {attention > 0
                   ? `${attention} of ${totals.total} applications need attention`
-                  : "every visible application is synced and healthy"}
+                  : "no visible application needs attention"}
               </span>
             </Card>
           </section>

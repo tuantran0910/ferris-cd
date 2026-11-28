@@ -121,6 +121,16 @@ export function ApplicationsPage() {
     return Array.from(set).sort();
   }, [apps, projectFilter]);
 
+  const clusters = useMemo(() => {
+    const set = new Set(apps.map((a) => a.destination.cluster));
+    if (clusterFilter !== ALL) {
+      // A cluster the caller linked to must stay selectable even when the current
+      // payload has no application in it (otherwise the filter is unclearable).
+      set.add(clusterFilter);
+    }
+    return Array.from(set).sort();
+  }, [apps, clusterFilter]);
+
   const syncStatuses = useMemo(() => {
     const set = new Set<string>(CANONICAL_SYNC_STATUSES);
     for (const a of apps) {
@@ -275,7 +285,7 @@ export function ApplicationsPage() {
 
       <section
         aria-label="Application filters"
-        className="grid grid-cols-1 gap-3 rounded-xl border border-line bg-surface p-4 sm:grid-cols-2 lg:grid-cols-5"
+        className="grid grid-cols-1 gap-3 rounded-xl border border-line bg-surface p-4 sm:grid-cols-2 lg:grid-cols-6"
       >
         <div className="relative lg:col-span-2">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-subtle" />
@@ -296,6 +306,16 @@ export function ApplicationsPage() {
           options={[
             { value: ALL, label: "All Projects" },
             ...projects.map((p) => ({ value: p, label: p })),
+          ]}
+        />
+
+        <Select
+          aria-label="Filter by cluster"
+          value={clusterFilter}
+          onChange={(value) => setParam(FILTER_PARAMS.cluster, value, ALL)}
+          options={[
+            { value: ALL, label: "All Clusters" },
+            ...clusters.map((c) => ({ value: c, label: c })),
           ]}
         />
 

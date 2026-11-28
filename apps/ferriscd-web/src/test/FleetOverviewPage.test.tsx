@@ -83,6 +83,11 @@ describe("FleetOverviewPage (T20.5)", () => {
     const clusters = screen.getByTestId("overview-clusters");
     const prodRow = within(clusters).getByTestId("overview-clusters-prod-us-east");
     expect(within(prodRow).getByRole("rowheader")).toHaveTextContent("prod-us-east");
+    // Exact cluster filter: a `q=` link would also list `prod-us-east*` siblings.
+    expect(within(prodRow).getByRole("link")).toHaveAttribute(
+      "href",
+      "/?cluster=prod-us-east",
+    );
     const prodCells = within(prodRow).getAllByRole("cell").map((cell) => cell.textContent);
     expect(prodCells).toEqual(["1", "1", "0", "0", "0"]);
 

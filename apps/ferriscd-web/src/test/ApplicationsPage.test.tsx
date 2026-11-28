@@ -147,6 +147,24 @@ describe("ApplicationsPage (T16.2 & Trap Guard T16.2)", () => {
     expect(screen.queryByText("payments-api")).not.toBeInTheDocument();
   });
 
+  it("filters by cluster exactly, never by substring (T20.5)", async () => {
+    renderApplicationsPage({}, "/?cluster=prod-us-east");
+    expect(await screen.findByText("payments-api")).toBeInTheDocument();
+    // `payments-api` is the only prod-us-east application; `checkout-web` is in-cluster.
+    expect(screen.queryByText("checkout-web")).not.toBeInTheDocument();
+
+  });
+
+  it("does not match a cluster by substring (T20.5)", async () => {
+    // No application is on a cluster named exactly `prod`; a substring filter would
+    // wrongly match every `prod-us-east` application.
+    renderApplicationsPage({}, "/?cluster=prod");
+    expect(
+      await screen.findByText(/No Applications match the current filters/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("payments-api")).not.toBeInTheDocument();
+  });
+
   it("keeps filters and layout in the URL so a filtered view survives navigation (H6)", async () => {
     const user = userEvent.setup();
     const { unmount } = renderApplicationsPage();
