@@ -51,10 +51,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
+      # Installed directly (with checksum verification) rather than through
+      # `install-action`: it resolves `kind` as a Cargo crate and fails.
       - name: Install kind and kubectl
-        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
-        with:
-          tool: kind@0.33.0,kubectl@1.35.0
+        run: |
+          set -euo pipefail
+          curl -fsSLo /tmp/kind "https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64"
+          kind_sha="$(curl -fsSL "https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64.sha256sum" | awk '{print $1}')"
+          echo "${kind_sha}  /tmp/kind" | sha256sum -c -
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+
+          curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl"
+          kubectl_sha="$(curl -fsSL "https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl.sha256")"
+          echo "${kubectl_sha}  /tmp/kubectl" | sha256sum -c -
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+
+          kind version
+          kubectl version --client
 
       - name: Create the throwaway kind cluster
         run: |
