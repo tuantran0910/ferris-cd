@@ -142,3 +142,6 @@ ferriscd-server = { path = "crates/ferriscd-server" }
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+[profile.dev]
+split-debuginfo = "unpacked"
