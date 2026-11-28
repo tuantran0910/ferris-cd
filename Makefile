@@ -33,6 +33,11 @@ gate:
 	K8S_OPENAPI_ENABLED_VERSION=1.35 cargo test -p ferriscd-engine --features opa-policy
 	cargo test -p ferriscd-controller --features opa-policy
 	cargo check -p ferriscd-cli --features opa-policy
+	# The sharded fleet harness (`T20.5`) has no Rust test target: its offline
+	# self-test and fixture dry-run are what keep the partition math, the YAML and
+	# the cardinality bound from rotting silently.
+	./benchmarks/scale_250_sharded.sh --self-test
+	@tmp=$$(mktemp -d); ./benchmarks/scale_250_sharded.sh --dry-run --apps 10 --results-dir "$$tmp"; rc=$$?; rm -rf "$$tmp"; exit $$rc
 
 # Fast inner-loop check: formatting + lints only (no test run).
 gate-fast:

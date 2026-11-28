@@ -629,13 +629,13 @@ Every task in Track E MUST preserve all hard FerrisCD invariants (`AGENTS.md`):
     - Extend `benchmarks/` with a 250-application / 2,500-resource sharded multi-replica benchmark harness (3 control-plane shards via `--total-shards 3` paired with `--shard-id <0|1|2>` and `--leader-election`, `ApplicationSet` generating the fleet, `DriftWatcher` enabled, and periodic Git commits + simulated out-of-band drift).
     - Measure and document in `docs/benchmarks/v2.0.md`: cold fleet convergence time, steady-state p50/p95/p99 reconcile latency, drift-detection latency, per-shard RSS memory over a 60-minute soak (confirming flat memory curve and zero FD leaks), and API `/api/v1/applications` p95 response latency.
     - Add a **Fleet Overview Dashboard** (`/overview` or summary bar on `apps/ferriscd-web`) aggregating cross-cluster health/sync KPIs, shard/cluster breakdown, policy-violation counts, and degraded-app triage queue (strictly scoped to the caller's RBAC-visible projects).
-    - Author `docs/lessons/20-progressive-delivery-policy-and-fleet-scale.md`, update `docs/lessons/README.md` to cover all 20 lessons, and execute full `v2.0` release verification (`make gate`, frontend gate, `cargo deny check`, Helm lint/template, live `kind` upgrade + E2E suites).
+    - Author the Phase 20 lesson (`docs/lessons/20-multi-source-policy-progressive-delivery-and-fleet-scale.md`, reconciled to cover T20.1–T20.5), update `docs/lessons/README.md` to cover all 20 lessons, and execute full `v2.0` release verification (`make gate`, frontend gate, `cargo deny check`, Helm lint/template, live `kind` upgrade + E2E suites).
   - **Non-Functional:**
     - Target SLOs on benchmark reference hardware: per-shard steady-state RSS `< 150 MiB` at 250 apps / 2,500 resources; steady-state p95 reconcile latency `< 1.5 s`; `0` panics, `0` dropped/corrupted inventory entries, `0` leaked file descriptors.
 - **Outputs:**
   - `benchmarks/scale_250_sharded.sh` (or Rust harness) & `docs/benchmarks/v2.0.md`
-  - `apps/ferriscd-web/src/pages/FleetOverviewPage.tsx`
-  - `docs/lessons/20-progressive-delivery-policy-and-fleet-scale.md` & `docs/lessons/README.md`
+  - `apps/ferriscd-web/src/features/overview/FleetOverviewPage.tsx` (the app's feature-folder layout)
+  - `docs/lessons/20-multi-source-policy-progressive-delivery-and-fleet-scale.md` & `docs/lessons/README.md`
 - **Verification & Acceptance Criteria:**
   - 60-minute 250-app / 2,500-resource 3-shard soak test meets RSS, latency, and zero-leak targets with full raw metrics recorded in `docs/benchmarks/v2.0.md`.
   - Vitest tests verify `FleetOverviewPage` displays accurate RBAC-scoped rollups and zero cross-tenant leakage.

@@ -15,8 +15,10 @@
 #
 # Reuse:
 #   The v1.0 harness (`benchmarks/scale_harness.sh`) owns the fixture generator, the
-#   kind safety guard, the Prometheus histogram-quantile math and the RSS/FD
-#   flatness evaluator. This file *sources* it instead of forking those helpers.
+#   kind safety guard and the Prometheus histogram-quantile math. This file *sources*
+#   it instead of forking those helpers. Per-shard RSS/FD evaluation is its own
+#   (median-based, see `MIN_LEAK_SAMPLES`) because the v1.0 evaluator reads a
+#   single-process CSV, not one series per shard.
 
 set -euo pipefail
 
@@ -46,8 +48,18 @@ CONVERGENCE_TIMEOUT_SECS=1800
 DRIFT_HEAL_TIMEOUT_SECS=180
 BUILD_PROFILE="release"
 PRINT_PARTITION=0
+PRINT_CARDINALITY_LIMIT=0
+KEEP_FLEET=0
+FLEET_STARTED=0
+CLEANED_UP=0
 MAX_RSS_KB=153600          # 150 MiB per shard
+MAX_RECONCILE_P50_SECS=0.25
 MAX_RECONCILE_P95_SECS=1.5
+MAX_CONVERGENCE_SECS=900
+MAX_FD_GROWTH=16
+# A leak verdict needs a window long enough to separate a trend from connection churn.
+MIN_LEAK_SAMPLES=20
+MAX_RSS_GROWTH_PCT=10.0
 MAX_DRIFT_HEAL_SECS=60
 CONTROLLER_PIDS=()
 RESULTS_DIR=""
@@ -108,7 +120,7 @@ parse_args() {
       --cleanup) MODE="cleanup"; shift ;;
       --apps) [[ $# -ge 2 ]] || { log_err "--apps requires a value"; exit 2; }; require_positive_int "--apps" "$2"; APP_COUNT="$2"; shift 2 ;;
       --resources-per-app) [[ $# -ge 2 ]] || { log_err "--resources-per-app requires a value"; exit 2; }; require_positive_int "--resources-per-app" "$2"; RESOURCES_PER_APP="$2"; shift 2 ;;
-      --deployment-replicas) [[ $# -ge 2 ]] || { log_err "--deployment-replicas requires a value"; exit 2; }; DEPLOYMENT_REPLICAS="$2"; shift 2 ;;
+      --deployment-replicas) [[ $# -ge 2 ]] || { log_err "--deployment-replicas requires a value"; exit 2; }; require_nonneg_int "--deployment-replicas" "$2"; DEPLOYMENT_REPLICAS="$2"; shift 2 ;;
       --soak-minutes) [[ $# -ge 2 ]] || { log_err "--soak-minutes requires a value"; exit 2; }; require_positive_int "--soak-minutes" "$2"; SOAK_MINUTES="$2"; shift 2 ;;
       --warmup-minutes) [[ $# -ge 2 ]] || { log_err "--warmup-minutes requires a value"; exit 2; }; require_positive_int "--warmup-minutes" "$2"; WARMUP_MINUTES="$2"; shift 2 ;;
       --sample-interval) [[ $# -ge 2 ]] || { log_err "--sample-interval requires a value"; exit 2; }; require_positive_int "--sample-interval" "$2"; SAMPLE_INTERVAL_SECS="$2"; shift 2 ;;
@@ -123,7 +135,9 @@ parse_args() {
       --debug) BUILD_PROFILE="debug"; shift ;;
       --results-dir) [[ $# -ge 2 ]] || { log_err "--results-dir requires a value"; exit 2; }; RESULTS_DIR="$2"; shift 2 ;;
       --keep-temp) KEEP_TEMP=1; shift ;;
+      --keep-fleet) KEEP_FLEET=1; shift ;;
       --print-partition) PRINT_PARTITION=1; shift ;;
+      --print-cardinality-limit) PRINT_CARDINALITY_LIMIT=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) log_err "Unknown option: $1"; usage; exit 2 ;;
     esac
@@ -138,6 +152,13 @@ parse_args() {
 # once the index reaches two digits.
 # ---------------------------------------------------------------------------
 BUCKET_SIZE=100
+
+# At most 9 series per application (6 health + 3 sync) plus headroom, as documented
+# in `crates/ferriscd-controller/src/metrics.rs`.
+cardinality_limit_for() {
+  local apps="$1"
+  printf '%d\n' $(( apps * 9 + 50 ))
+}
 
 bucket_count() {
   local apps="$1"
@@ -381,7 +402,11 @@ soak_commit() {
     [[ -f "$cm" ]] || continue
     # Touch only one ConfigMap per commit so the write volume stays bounded.
     if [[ $((i % 50)) -eq 0 ]]; then
-      printf 'SOAK_MARKER: "%s"\n' "$marker" >> "$cm"
+      # Rewrite an **existing** key: appending a new one on every commit creates a
+      # duplicate mapping key, which the guarded YAML parser correctly refuses (the
+      # application then fails with a parse error instead of syncing the revision).
+      sed -i.bak "s|^  BENCHMARK_SUITE: .*|  BENCHMARK_SUITE: \"scale-v1-${marker}\"|" "$cm"
+      rm -f "${cm}.bak"
     fi
   done
   git -C "${work_dir}/repo" add -A
@@ -389,47 +414,41 @@ soak_commit() {
   printf '%s\n' "$marker"
 }
 
+# Deletes one managed `ConfigMap` out of band.
+#
+# A **delete** is the drift stimulus on purpose. An in-place edit — `kubectl patch`
+# or `kubectl edit` — records a field manager (`kubectl-patch` / `kubectl-edit`) and
+# therefore *takes ownership* of the field it writes; FerrisCD applies with
+# Server-Side Apply and `serverSideForce: false`, so it must not take that field
+# away from another manager. The controller surfaces exactly that as
+# `Ready=False, reason=SyncError` ("fields are owned by field manager(s)
+# kubectl-edit which are not listed in syncOptions.takeoverFieldManagers"), which is
+# correct behaviour and *not* drift it should revert. Deleting the object involves no
+# field ownership at all: the drift watcher sees the `Delete`, triggers a reconcile,
+# and the apply recreates the object from Git.
 soak_drift() {
   local work_dir="$1"
-  local i idx bucket
+  local skip="${2:-0}"
+
+  # Candidate applications: one per 50, rotated by `skip` so every interval touches
+  # a different object (the same one would measure the same reconcile).
+  local candidates=() i idx bucket
   for ((i = 1; i <= APP_COUNT; i++)); do
     idx="$(printf '%02d' "$i")"
     bucket=$(( (i - 1) / BUCKET_SIZE ))
     local cm="${work_dir}/repo/apps/bucket-${bucket}/bench-app-${idx}/05-configmaps.yaml"
     [[ -f "$cm" ]] || continue
     if [[ $((i % 50)) -eq 0 ]]; then
-      kubectl patch configmap "bench-app-${idx}-cm-01" \
-        -n "ferriscd-bench-app-${idx}" \
-        --type merge -p "{\"data\":{\"OUT_OF_BAND\":\"drift-$(date +%s)\"}}" >/dev/null 2>&1 || true
-      printf 'apps/bench-app-%s\n' "$idx"
-      return 0
+      candidates+=("$idx")
     fi
   done
+  local count="${#candidates[@]}"
+  [[ "$count" -gt 0 ]] || return 0
+  idx="${candidates[$(( skip % count ))]}"
+  kubectl delete "configmap/bench-app-${idx}-cm-01" \
+    -n "ferriscd-bench-app-${idx}" --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+  printf 'apps/bench-app-%s\n' "$idx"
   return 0
-}
-
-measure_drift_heal() {
-  local app_idx="$1"
-  local timeout_secs="$2"
-  local start now elapsed
-  start="$(date +%s)"
-  while true; do
-    now="$(date +%s)"
-    elapsed=$((now - start))
-    local value
-    value="$(kubectl get configmap "bench-app-${app_idx}-cm-01" \
-      -n "ferriscd-bench-app-${app_idx}" \
-      -o jsonpath='{.data.OUT_OF_BAND}' 2>/dev/null || true)"
-    if [[ -z "$value" ]]; then
-      printf '%d\n' "$elapsed"
-      return 0
-    fi
-    if [[ "$elapsed" -ge "$timeout_secs" ]]; then
-      printf '%d\n' -1
-      return 1
-    fi
-    sleep 1
-  done
 }
 
 # ---------------------------------------------------------------------------
@@ -538,16 +557,21 @@ run_self_test() {
     fi
   }
 
-  check "the fleet partitions into sets of at most 200 Applications" bash -c '
-    sets=$(./benchmarks/scale_250_sharded.sh --self-test --print-partition 2>/dev/null | grep -c "^apps/")
-    [ "$sets" -eq 3 ]'
-  check "the partition globs are disjoint and cover 250 Applications" bash -c '
-    ./benchmarks/scale_250_sharded.sh --self-test --print-partition 2>/dev/null | sort -u | awk "END { print NR }" | grep -qx 3'
-  check "the ApplicationSet template is valid YAML with the expected fields" bash -c '
-    out=$(./benchmarks/scale_250_sharded.sh --dry-run --apps 10 --results-dir /tmp/ferriscd-scale250-selftest 2>&1) &&
-    ruby -ryaml -e "d=YAML.load_stream(File.read(\"/tmp/ferriscd-scale250-selftest/applicationsets/bench-set-1.yaml\")).compact.first; abort unless d[\"kind\"]==\"ApplicationSet\"; abort unless d.dig(\"spec\",\"template\",\"spec\",\"project\")==\"bench-scale\""'
-  check "the histogram quantile math is reused unchanged from the v1.0 harness" bash -c '
-    grep -q "compute_histogram_quantile" benchmarks/scale_250_sharded.sh'
+  check "the 250-app fleet partitions into 3 disjoint sets of at most 200" bash -c "
+    sets=\$('${SCRIPT_DIR}/scale_250_sharded.sh' --self-test --print-partition 2>/dev/null)
+    [ \"\$(printf '%s\\n' \"\$sets\" | grep -c '^apps/')\" -eq 3 ] &&
+    [ \"\$(printf '%s\\n' \"\$sets\" | sort -u | awk 'END { print NR }')\" -eq 3 ]"
+  check "the cardinality bound is 9 series per application plus headroom" bash -c "
+    limit=\$('${SCRIPT_DIR}/scale_250_sharded.sh' --apps 250 --print-cardinality-limit 2>/dev/null)
+    [ \"\$limit\" -eq 2300 ] &&
+    [ \"\$('${SCRIPT_DIR}/scale_250_sharded.sh' --apps 10 --print-cardinality-limit 2>/dev/null)\" -eq 140 ]"
+  check "a negative --deployment-replicas is refused" bash -c "
+    ! '${SCRIPT_DIR}/scale_250_sharded.sh' --deployment-replicas -1 >/dev/null 2>&1"
+  check "the ApplicationSet template is valid YAML with the expected fields" bash -c "
+    out=\$('${SCRIPT_DIR}/scale_250_sharded.sh' --dry-run --apps 10 --results-dir '${test_dir}/dryrun' 2>&1) &&
+    ruby -ryaml -e \"d=YAML.load_stream(File.read('${test_dir}/dryrun/dryrun/applicationsets/bench-set-1.yaml')).compact.first; abort unless d['kind']=='ApplicationSet'; abort unless d.dig('spec','template','spec','project')=='bench-scale'\""
+  check "the histogram quantile math is reused unchanged from the v1.0 harness" bash -c "
+    grep -q 'compute_histogram_quantile' '${SCRIPT_DIR}/scale_250_sharded.sh'"
 
   printf '\nself-test: %d passed, %d failed\n' "$passed" "$failed"
   [[ "$failed" -eq 0 ]]
@@ -599,11 +623,13 @@ delete_benchmark_fleet() {
     --ignore-not-found=true --wait=false || true
 
   local obj
-  for obj in $(kubectl get applicationsets.ferriscd.io -n "$CONTROL_PLANE_NS" -o name 2>/dev/null || true); do
+  for obj in $(kubectl get applicationsets.ferriscd.io -n "$CONTROL_PLANE_NS" \
+      -l "${BENCHMARK_LABEL_KEY}=${BENCHMARK_LABEL_VAL}" -o name 2>/dev/null || true); do
     kubectl patch "$obj" -n "$CONTROL_PLANE_NS" --type=merge \
       -p '{"metadata":{"finalizers":null}}' >/dev/null 2>&1 || true
   done
-  for obj in $(kubectl get applications.ferriscd.io -n "$CONTROL_PLANE_NS" -o name 2>/dev/null || true); do
+  for obj in $(kubectl get applications.ferriscd.io -n "$CONTROL_PLANE_NS" \
+      -l "${BENCHMARK_LABEL_KEY}=${BENCHMARK_LABEL_VAL}" -o name 2>/dev/null || true); do
     kubectl patch "$obj" -n "$CONTROL_PLANE_NS" --type=merge \
       -p '{"metadata":{"finalizers":null}}' >/dev/null 2>&1 || true
   done
@@ -613,6 +639,34 @@ delete_benchmark_fleet() {
     -n "$CONTROL_PLANE_NS" \
     -l "${BENCHMARK_LABEL_KEY}=${BENCHMARK_LABEL_VAL}" \
     --ignore-not-found=true --wait=true --timeout=60s || true
+
+  # The rendered resources carry the benchmark label, so they can be removed without
+  # deleting 250 namespaces (which takes minutes because of the namespace finalizer).
+  # This also removes objects whose fields another manager owns — a `kubectl patch`
+  # leaves the field owned by `kubectl-patch`, and FerrisCD must not steal it, so a
+  # leftover such object would keep the next run's application `OutOfSync`.
+  log_info "Deleting the benchmark's rendered resources..."
+  kubectl delete configmaps,services,serviceaccounts,secrets -A \
+    -l "${BENCHMARK_LABEL_KEY}=${BENCHMARK_LABEL_VAL}" \
+    --ignore-not-found=true --wait=false || true
+  kubectl delete deployments.apps -A \
+    -l "${BENCHMARK_LABEL_KEY}=${BENCHMARK_LABEL_VAL}" \
+    --ignore-not-found=true --wait=false || true
+
+  # Deletion is asynchronous (`--wait=false`), so wait for the objects to actually
+  # disappear before the next apply: applying to a terminating object is a conflict.
+  local waited=0 remaining
+  while :; do
+    remaining="$(kubectl get configmaps,services,serviceaccounts,secrets,deployments.apps -A \
+      -l "${BENCHMARK_LABEL_KEY}=${BENCHMARK_LABEL_VAL}" -o name 2>/dev/null | wc -l | tr -d ' ')"
+    [[ "$remaining" -eq 0 ]] && break
+    if [[ "$waited" -ge 180 ]]; then
+      log_warn "${remaining} benchmark resource(s) still terminating after ${waited}s; continuing."
+      break
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
 
   if [[ "$with_namespaces" != "yes" ]]; then
     # The destination namespaces are reused by the next run (the applications
@@ -670,9 +724,13 @@ run_live_benchmark() {
 
   local work_dir
   if [[ -n "$RESULTS_DIR" ]]; then
-    work_dir="${RESULTS_DIR}/fixture"
-    rm -rf "$work_dir"
-    mkdir -p "$work_dir"
+    # Absolute: the fixture is cloned through a `file://` URL, and a relative path
+    # becomes `file://benchmark-results/...` — a URL with a non-localhost host, which
+    # the Git client correctly refuses, so the fleet could never converge.
+    mkdir -p "$RESULTS_DIR/fixture"
+    work_dir="$(cd "$RESULTS_DIR/fixture" && pwd)"
+    rm -rf "$work_dir"/*
+    CLEANUP_TEMP_DIRS+=("$work_dir")
   else
     work_dir="$(make_temp_dir "ferriscd-scale250-live")"
     CLEANUP_TEMP_DIRS+=("$work_dir")
@@ -717,6 +775,7 @@ run_live_benchmark() {
   log_info "Applying the benchmark AppProject and the ApplicationSets..."
   kubectl apply -f "${work_dir}/appproject.yaml" >/dev/null
   kubectl apply -f "${work_dir}/applicationsets" >/dev/null
+  FLEET_STARTED=1
 
   # Wait for the ApplicationSet controller to materialise the fleet.
   local gen_start gen_elapsed
@@ -762,6 +821,7 @@ run_live_benchmark() {
 
   log_info "Starting the ${SOAK_MINUTES}-minute soak (${soak_secs}s, ${warmup_secs}s warm-up, ${SAMPLE_INTERVAL_SECS}s sampling interval)..."
   local soak_start now elapsed last_commit=0 last_drift=0 commit_marker
+  local drift_app_idx="" drift_started=0 drift_injected_count=0
   soak_start="$(date +%s)"
 
   while true; do
@@ -787,24 +847,43 @@ run_live_benchmark() {
       log_info "Soak commit ${commit_marker} at t=${elapsed}s."
     fi
 
-    if [[ $((elapsed - last_drift)) -ge "$DRIFT_INTERVAL_SECS" ]]; then
+    if [[ $((elapsed - last_drift)) -ge "$DRIFT_INTERVAL_SECS" ]] \
+        && [[ $((elapsed - last_commit)) -ge 5 ]]; then
       last_drift="$elapsed"
       local drift_app
-      drift_app="$(soak_drift "$work_dir" | tail -1)"
+      drift_app="$(soak_drift "$work_dir" "$drift_injected_count" | tail -1)"
       local app_idx
       app_idx="$(printf '%s' "$drift_app" | sed -n 's#.*/bench-app-\([0-9]*\).*#\1#p')"
       if [[ -n "$app_idx" ]]; then
-        local heal
-        heal="$(measure_drift_heal "$app_idx" "$DRIFT_HEAL_TIMEOUT_SECS" || true)"
-        printf '%d,%d,%s,%s\n' "$now" "$elapsed" "$app_idx" "$heal" >> "$drift_file"
-        log_info "Out-of-band drift on bench-app-${app_idx} healed in ${heal}s (t=${elapsed}s)."
+        drift_app_idx="$app_idx"
+        drift_started="$now"
+        drift_injected_count=$((drift_injected_count + 1))
+        log_info "Injected out-of-band drift on bench-app-${app_idx} (t=${elapsed}s)."
+      fi
+    fi
+
+    # The heal is measured without blocking the sampling loop: the value is expected
+    # back within `DRIFT_HEAL_TIMEOUT_SECS`.
+    if [[ -n "$drift_app_idx" ]]; then
+      local current
+      current="$(kubectl get configmap "bench-app-${drift_app_idx}-cm-01" \
+        -n "ferriscd-bench-app-${drift_app_idx}" \
+        -o jsonpath='{.data.APP_NAME}' 2>/dev/null || true)"
+      if [[ "$current" == "bench-app-${drift_app_idx}" ]]; then
+        local heal=$(( now - drift_started ))
+        printf '%d,%d,%s,%d\n' "$now" "$elapsed" "$drift_app_idx" "$heal" >> "$drift_file"
+        log_info "Out-of-band drift on bench-app-${drift_app_idx} healed in ${heal}s (t=${elapsed}s)."
+        drift_app_idx=""
+      elif [[ $((now - drift_started)) -ge "$DRIFT_HEAL_TIMEOUT_SECS" ]]; then
+        printf '%d,%d,%s,%d\n' "$now" "$elapsed" "$drift_app_idx" -1 >> "$drift_file"
+        log_err "Out-of-band drift on bench-app-${drift_app_idx} was NOT healed within ${DRIFT_HEAL_TIMEOUT_SECS}s."
+        drift_app_idx=""
       fi
     fi
 
     if [[ "$elapsed" -ge "$soak_secs" ]]; then
       break
     fi
-
     local remaining=$((soak_secs - elapsed))
     local sleep_for="$SAMPLE_INTERVAL_SECS"
     if [[ "$remaining" -lt "$sleep_for" ]]; then
@@ -812,6 +891,13 @@ run_live_benchmark() {
     fi
     sleep "$sleep_for"
   done
+
+  # A drift that was still open when the soak ended counts as *not healed*.
+  if [[ -n "$drift_app_idx" ]]; then
+    printf '%d,%d,%s,%d\n' "$now" "$elapsed" "$drift_app_idx" -1 >> "$drift_file"
+    log_err "Out-of-band drift on bench-app-${drift_app_idx} was still not healed when the soak ended."
+    drift_app_idx=""
+  fi
 
   for ((shard = 0; shard < SHARD_COUNT; shard++)); do
     curl -fsS --max-time 10 "http://127.0.0.1:$((METRICS_BASE_PORT + shard))/metrics" \
@@ -826,13 +912,15 @@ run_live_benchmark() {
     cat "${out_results}"/metrics_shard-*_final.prom 2>/dev/null \
       | grep -E '^ferriscd_[a-z_]+\{' \
       | sed -E 's/^([a-z_]+)\{.*/\1/' \
-      | sort | uniq -c | awk '{ printf "%s,%d\n", $2, $1 }' | sort -t, -k2,2nr
+      | sort | uniq -c | awk '{ printf "%s,%d\n", $2, $1 }' | sort -t, -k2,2nr || true
   } > "$cardinality_file"
   local cardinality_max
   cardinality_max="$(awk -F, 'NR>1 && $2 > m { m = $2 } END { print (m == "" ? 0 : m) }' "$cardinality_file")"
-  # The per-application status gauges are bounded by the fleet size; 12 series per
-  # application (6 health + 3 sync + headroom) is the documented ceiling.
-  local cardinality_limit=$(( APP_COUNT * 12 + 50 ))
+  # `crates/ferriscd-controller/src/metrics.rs` documents at most 9 series per
+  # application (6 health + 3 sync). Anything above that ceiling is an unbounded
+  # per-resource / per-commit family, which the `T20.5` Trap Guard excludes.
+  local cardinality_limit
+  cardinality_limit="$(cardinality_limit_for "$APP_COUNT")"
 
   local summary="${out_results}/summary.txt"
   local verdict="PASS"
@@ -842,6 +930,11 @@ run_live_benchmark() {
     printf 'cold_convergence_seconds: %s\n' "$convergence_secs"
     printf 'soak_minutes: %s\n' "$SOAK_MINUTES"
   } > "$summary"
+
+  if [[ "$convergence_secs" -ge "$MAX_CONVERGENCE_SECS" ]]; then
+    verdict="FAIL"
+    violations+=("cold convergence ${convergence_secs}s >= ${MAX_CONVERGENCE_SECS}s")
+  fi
 
   for ((shard = 0; shard < SHARD_COUNT; shard++)); do
     local p50 p95 p99
@@ -853,21 +946,87 @@ run_live_benchmark() {
       printf 'shard_%d_reconcile_p95_seconds: %s\n' "$shard" "$p95"
       printf 'shard_%d_reconcile_p99_seconds: %s\n' "$shard" "$p99"
     } >> "$summary"
-    if [[ "$p95" != "N/A" ]] && awk -v v="$p95" 'BEGIN { exit !(v > '"$MAX_RECONCILE_P95_SECS"') }'; then
+    # A missing measurement is a failure, not a pass: `N/A` means the scrape or the
+    # histogram family was absent, so the latency SLO was never proven.
+    if [[ "$p95" == "N/A" ]]; then
+      verdict="FAIL"
+      violations+=("shard ${shard} reconcile p95 was not measured (no histogram data)")
+    elif awk -v v="$p95" 'BEGIN { exit !(v > '"$MAX_RECONCILE_P95_SECS"') }'; then
       verdict="FAIL"
       violations+=("shard ${shard} reconcile p95 ${p95}s > ${MAX_RECONCILE_P95_SECS}s")
+    fi
+    if [[ "$p50" == "N/A" ]] || awk -v v="$p50" 'BEGIN { exit !(v > '"$MAX_RECONCILE_P50_SECS"') }'; then
+      verdict="FAIL"
+      violations+=("shard ${shard} reconcile p50 ${p50}s is missing or > ${MAX_RECONCILE_P50_SECS}s")
     fi
 
     local shard_max_rss shard_fd_delta
     shard_max_rss="$(awk -F, -v s="$shard" -v w="$warmup_secs" 'NR>1 && $3==s && $2>=w && $4 ~ /^[0-9]+$/ { if ($4 > m) m=$4 } END { print (m == "" ? -1 : m) }' "$csv_file")"
-    shard_fd_delta="$(awk -F, -v s="$shard" -v w="$warmup_secs" 'NR>1 && $3==s && $2>=w && $5 ~ /^[0-9]+$/ { if (first == "") { first=$5; last=$5 } else { last=$5 } } END { print (first == "" ? 0 : last - first) }' "$csv_file")"
+    # File-descriptor leak detector: median of the first quarter of the post-warm-up
+    # window vs the last quarter. A first-sample baseline is dominated by the startup
+    # ramp (watches and pooled connections open over the first minutes), and a leak is
+    # a level shift, not a spike — the medians see the shift and ignore the ramp.
+    shard_fd_delta="$(awk -F, -v s="$shard" -v w="$warmup_secs" '
+      NR>1 && $3==s && $2>=w && $5 ~ /^[0-9]+$/ { v[n++]=$5 }
+      END {
+        if (n == 0) { print 0; exit }
+        q = int(n / 4); if (q < 1) q = 1
+        # Median of a small slice: sort a copy (insertion sort is fine for a few samples).
+        for (i = 0; i < q; i++) { a[i] = v[i]; b[i] = v[n - q + i] }
+        for (i = 1; i < q; i++) {
+          key = a[i]; j = i - 1
+          while (j >= 0 && a[j] > key) { a[j+1] = a[j]; j-- }
+          a[j+1] = key
+        }
+        for (i = 1; i < q; i++) {
+          key = b[i]; j = i - 1
+          while (j >= 0 && b[j] > key) { b[j+1] = b[j]; j-- }
+          b[j+1] = key
+        }
+        first = a[int((q - 1) / 2)]
+        last = b[int((q - 1) / 2)]
+        print last - first
+      }' "$csv_file")"
+    local shard_samples
+    shard_samples="$(awk -F, -v s="$shard" -v w="$warmup_secs" 'NR>1 && $3==s && $2>=w && $5 ~ /^[0-9]+$/ { n++ } END { print (n == "" ? 0 : n) }' "$csv_file")"
     {
       printf 'shard_%d_max_rss_kb: %s\n' "$shard" "$shard_max_rss"
-      printf 'shard_%d_fd_delta: %s\n' "$shard" "$shard_fd_delta"
+      printf 'shard_%d_post_warmup_samples: %s\n' "$shard" "$shard_samples"
+      if [[ "$shard_samples" -ge "$MIN_LEAK_SAMPLES" ]]; then
+        printf 'shard_%d_fd_delta: %s\n' "$shard" "$shard_fd_delta"
+      else
+        printf 'shard_%d_fd_delta: not evaluated (%s samples < %s)\n' "$shard" "$shard_samples" "$MIN_LEAK_SAMPLES"
+      fi
     } >> "$summary"
-    if [[ "$shard_max_rss" -gt "$MAX_RSS_KB" ]]; then
+    if [[ "$shard_max_rss" -lt 0 ]]; then
+      verdict="FAIL"
+      violations+=("shard ${shard} has no RSS telemetry (the process was not sampled)")
+    elif [[ "$shard_max_rss" -gt "$MAX_RSS_KB" ]]; then
       verdict="FAIL"
       violations+=("shard ${shard} peak RSS ${shard_max_rss} KiB > ${MAX_RSS_KB} KiB")
+    fi
+    # An FD/RSS *leak* needs a long enough window to tell a trend from connection
+    # churn; a short smoke run reports the delta but does not judge it. The
+    # acceptance run (60 min, 30 s samples) has ~110 samples per shard.
+    if [[ "$shard_samples" -ge "$MIN_LEAK_SAMPLES" && "$shard_fd_delta" -gt "$MAX_FD_GROWTH" ]]; then
+      verdict="FAIL"
+      violations+=("shard ${shard} leaked file descriptors (+${shard_fd_delta} > ${MAX_FD_GROWTH})")
+    fi
+
+    # A flat memory curve: peak RSS in the second half may not exceed the first half's
+    # peak by more than `MAX_RSS_GROWTH_PCT`.
+    local first_half_peak second_half_peak
+    first_half_peak="$(awk -F, -v s="$shard" -v lo="$warmup_secs" -v hi="$(( (warmup_secs + soak_secs) / 2 ))" \
+      'NR>1 && $3==s && $2>=lo && $2<hi && $4 ~ /^[0-9]+$/ { if ($4 > m) m=$4 } END { print (m == "" ? 0 : m) }' "$csv_file")"
+    second_half_peak="$(awk -F, -v s="$shard" -v lo="$(( (warmup_secs + soak_secs) / 2 ))" \
+      'NR>1 && $3==s && $2>=lo && $4 ~ /^[0-9]+$/ { if ($4 > m) m=$4 } END { print (m == "" ? 0 : m) }' "$csv_file")"
+    printf 'shard_%d_rss_first_half_peak_kb: %s\n' "$shard" "$first_half_peak" >> "$summary"
+    printf 'shard_%d_rss_second_half_peak_kb: %s\n' "$shard" "$second_half_peak" >> "$summary"
+    if [[ "$shard_samples" -ge "$MIN_LEAK_SAMPLES" && "$first_half_peak" -gt 0 ]] \
+        && awk -v a="$first_half_peak" -v b="$second_half_peak" -v pct="$MAX_RSS_GROWTH_PCT" \
+        'BEGIN { exit !(((b - a) / a) * 100.0 > pct) }'; then
+      verdict="FAIL"
+      violations+=("shard ${shard} RSS grew more than ${MAX_RSS_GROWTH_PCT}% between the two soak halves")
     fi
   done
 
@@ -883,6 +1042,23 @@ run_live_benchmark() {
     violations+=("drift heal ${drift_max}s > ${MAX_DRIFT_HEAL_SECS}s")
   fi
 
+  # Every injected drift must be healed: a drift that never heals is a **failure**,
+  # not a missing measurement. Counting the injections and the heals separately is
+  # what keeps a silent "no drift was ever observed" run from passing.
+  local drift_injected drift_healed
+  drift_injected="$drift_injected_count"
+  drift_healed="$(awk -F, 'NR>1 && $4 ~ /^[0-9]+$/ { n++ } END { print (n == "" ? 0 : n) }' "$drift_file")"
+  printf 'drift_injections: %s\n' "$drift_injected" >> "$summary"
+  printf 'drift_heals: %s\n' "$drift_healed" >> "$summary"
+  if [[ "$drift_injected" -eq 0 ]]; then
+    verdict="FAIL"
+    violations+=("no out-of-band drift was injected: heal latency was not measured")
+  fi
+  if [[ "$drift_healed" -lt "$drift_injected" ]]; then
+    verdict="FAIL"
+    violations+=("${drift_injected} out-of-band drift(s) injected, only ${drift_healed} healed")
+  fi
+
   printf 'max_metric_family_series: %s (limit %s)\n' "$cardinality_max" "$cardinality_limit" >> "$summary"
   if [[ "$cardinality_max" -gt "$cardinality_limit" ]]; then
     verdict="FAIL"
@@ -890,7 +1066,7 @@ run_live_benchmark() {
   fi
 
   local panic_lines=0 shard
-  for shard in 0 1 2; do
+  for ((shard = 0; shard < SHARD_COUNT; shard++)); do
     local log_file="${work_dir}/shard-${shard}.log"
     [[ -f "$log_file" ]] || continue
     panic_lines=$(( panic_lines + $(grep -ciE 'panicked at|fatal runtime error' "$log_file" || true) ))
@@ -927,6 +1103,10 @@ main() {
     partition_sets "$APP_COUNT"
     return 0
   fi
+  if [[ "$PRINT_CARDINALITY_LIMIT" -eq 1 ]]; then
+    cardinality_limit_for "$APP_COUNT"
+    return 0
+  fi
 
   case "$MODE" in
     dry-run) run_dry_run ;;
@@ -938,9 +1118,19 @@ main() {
 }
 
 cleanup_all() {
+  # `EXIT` and a caught `INT`/`TERM` can both fire: cleaning twice would delete the
+  # fleet twice and race `stop_shards` against itself.
+  [[ "${CLEANED_UP:-0}" -eq 1 ]] && return 0
+  CLEANED_UP=1
   stop_shards
   if [[ -n "$SERVER_PID" ]]; then
     kill -TERM "$SERVER_PID" 2>/dev/null || true
+  fi
+  # A live run must not leave 3 ApplicationSets, 250 Applications, 250 namespaces
+  # and 2,500 objects behind. The controllers are already stopped, so the
+  # finalizers are stripped by `delete_benchmark_fleet`.
+  if [[ "$MODE" == "live" && "$FLEET_STARTED" -eq 1 && "$KEEP_FLEET" -eq 0 ]]; then
+    delete_benchmark_fleet no >/dev/null 2>&1 || true
   fi
   cleanup_temp_dirs
 }

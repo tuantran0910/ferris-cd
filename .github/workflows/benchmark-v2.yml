@@ -64,13 +64,22 @@ jobs:
             crd/applications.ferriscd.io crd/appprojects.ferriscd.io crd/applicationsets.ferriscd.io
 
       - name: Run the sharded fleet benchmark
+        env:
+          BENCH_APPS: ${{ github.event.inputs.apps }}
+          BENCH_SOAK_MINUTES: ${{ github.event.inputs.soak_minutes }}
+          BENCH_TOTAL_SHARDS: ${{ github.event.inputs.total_shards }}
         run: |
           set -euo pipefail
+          # Workflow inputs go through `env`, never straight into a shell line, and are
+          # validated here: a dispatch input must not be able to inject commands.
+          for pair in "BENCH_APPS=${BENCH_APPS}" "BENCH_SOAK_MINUTES=${BENCH_SOAK_MINUTES}" "BENCH_TOTAL_SHARDS=${BENCH_TOTAL_SHARDS}"; do
+            [[ "${pair#*=}" =~ ^[0-9]+$ ]] || { echo "invalid numeric input: ${pair}"; exit 2; }
+          done
           ./benchmarks/scale_250_sharded.sh \
-            --apps "${{ github.event.inputs.apps }}" \
+            --apps "${BENCH_APPS}" \
             --resources-per-app 10 \
-            --total-shards "${{ github.event.inputs.total_shards }}" \
-            --soak-minutes "${{ github.event.inputs.soak_minutes }}" \
+            --total-shards "${BENCH_TOTAL_SHARDS}" \
+            --soak-minutes "${BENCH_SOAK_MINUTES}" \
             --warmup-minutes 5 \
             --sample-interval 30 \
             --commit-interval 600 \

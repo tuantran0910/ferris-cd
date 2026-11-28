@@ -75,7 +75,7 @@ Both produce the same verdict shape, and both are configured by cluster admins i
 
 | Rule level | Effect |
 |---|---|
-| `Enforce` | The sync is refused. The `Application` goes `Ready=False, reason=PolicyViolation`, the inventory is untouched, and nothing is applied or pruned. |
+| `Enforce` | The sync is refused. The `Application` goes `Ready=False, reason=PolicyGateViolation`, the inventory is untouched, and nothing is applied or pruned. (`PolicyViolation` is a *different* verdict — the `AppProject` allow-list refusing the repository, destination or kind.) |
 | `Warn` | The sync proceeds; the violation is recorded and surfaced in the UI diff. |
 
 The gate runs **before** any apply, so a refused policy never leaves a half-applied fleet behind.
@@ -88,7 +88,8 @@ An evaluation error is a refusal, not a pass: the gate fails closed.
 ```yaml
 spec:
   syncPolicy:
-    syncOptions: ["applyOutOfSyncOnly=true"]
+    syncOptions:
+      applyOutOfSyncOnly: true
     metricGates:
       - afterWave: 1
         provider: prod-prometheus
@@ -165,7 +166,8 @@ Git and editing the cluster out-of-band. The measured numbers and the SLO table 
 [`docs/benchmarks/v2.0.md`](../benchmarks/v2.0.md).
 
 The harness refuses to touch anything but a `kind-*` context, and it cleans up the fleet, the
-namespaces and the controller processes on exit — including on `SIGINT`.
+namespaces and the controller processes on exit — including on `SIGINT` (`--keep-fleet` opts out so
+the objects can be inspected).
 
 ### 5.2 The fleet overview must not leak
 
