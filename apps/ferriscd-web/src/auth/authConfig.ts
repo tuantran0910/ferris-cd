@@ -53,7 +53,11 @@ export function supportsSso(config: AuthConfigView): boolean {
 /** Whether the server still accepts a pasted Kubernetes `ServiceAccount` bearer token. */
 export function supportsTokenLogin(config: AuthConfigView): boolean {
   const mode = normalizeAuthMode(config.authMode);
-  return mode === "token-review" || mode === "token-review-or-oidc";
+  return (
+    mode === "token-review" ||
+    mode === "token-review-or-oidc" ||
+    mode === "pass-through"
+  );
 }
 
 /** Whether the server-side (BFF cookie) sign-in flow is available. */
