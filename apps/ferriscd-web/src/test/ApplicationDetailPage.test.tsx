@@ -45,6 +45,17 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
     setStoredToken("test-token");
   });
 
+  it("links the namespace to a filtered applications view and the project to its page", async () => {
+    renderDetailPage();
+    await screen.findByRole("heading", { name: "payments-api" });
+    expect(
+      screen.getByRole("link", { name: /Namespace:\s+ferriscd-system/ }),
+    ).toHaveAttribute("href", "/?q=ferriscd-system");
+    expect(
+      screen.getByRole("link", { name: /Project:\s+payments/ }),
+    ).toHaveAttribute("href", "/projects?q=payments");
+  });
+
   it("supports APG arrow/Home/End navigation between detail tabs", async () => {
     const user = userEvent.setup();
     renderDetailPage();

@@ -17,6 +17,8 @@ import type {
   PolicyViolation,
 } from "../../api/types";
 import { isBlockingEnforcement } from "../../api/types";
+import { parseResourceKey } from "../../utils/format";
+import { CopyButton } from "../../ui/CopyButton";
 import { EmptyState } from "../../ui/EmptyState";
 import {
   containsRedactedMarker,
@@ -211,16 +213,38 @@ function ResourceDiffCard({
         containsRedactedMarker(c.live) || containsRedactedMarker(c.predicted),
     );
 
+  const identity = parseResourceKey(resource.key);
+
   return (
     <article
       data-testid={`diff-resource-${resource.key}`}
+      title={resource.key}
       className="rounded-xl border border-line bg-surface p-4 motion-fade-in"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <code className="break-all font-mono text-xs font-semibold text-ink-strong">
-            {resource.key}
-          </code>
+          <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-muted">
+            {identity.kind}
+          </span>
+          <span className="truncate text-sm font-semibold text-ink-strong">
+            {identity.name}
+          </span>
+          <span className="text-[11px] text-ink-muted">
+            {identity.namespace ? (
+              <>
+                namespace <span className="font-mono">{identity.namespace}</span>
+              </>
+            ) : (
+              "cluster-scoped"
+            )}
+            {identity.group ? (
+              <>
+                {" "}
+                · <span className="font-mono">{identity.group}</span>
+              </>
+            ) : null}
+          </span>
+          <CopyButton value={resource.key} label="resource key" />
           <span
             className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getDiffStatusBadge(
               resource.status,

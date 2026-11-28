@@ -200,12 +200,22 @@ function ApplicationDetailContent({
             >
               {app.name}
             </h1>
-            <span className="max-w-full truncate rounded-md border border-control bg-surface px-2 py-0.5 font-mono text-xs text-ink-body">
-              {app.namespace}
-            </span>
-            <span className="max-w-full truncate rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 font-mono text-xs text-accent">
-              project: {app.project}
-            </span>
+            <Link
+              to={`/?q=${encodeURIComponent(app.namespace)}`}
+              title={`Show applications in namespace ${app.namespace}`}
+              className="inline-flex max-w-full items-center gap-1 truncate rounded-md border border-control bg-surface px-2 py-0.5 text-xs text-ink-body transition-colors hover:border-accent hover:text-accent"
+            >
+              <span className="text-ink-subtle">Namespace:</span>
+              <span className="truncate font-mono">{app.namespace}</span>
+            </Link>
+            <Link
+              to={`/projects?q=${encodeURIComponent(app.project)}`}
+              title={`Show project ${app.project}`}
+              className="inline-flex max-w-full items-center gap-1 truncate rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-xs text-accent transition-colors hover:border-accent"
+            >
+              <span className="opacity-80">Project:</span>
+              <span className="truncate font-mono">{app.project}</span>
+            </Link>
           </div>
 
           {/* Trap Guard T16.2: Strictly separate Sync Status & Health Status badges */}
@@ -214,14 +224,29 @@ function ApplicationDetailContent({
             <HealthStatusBadge status={app.health?.status} />
             <SyncWindowBadge syncWindow={syncWindow} />
           </div>
-          {app.health?.message && (
-            <p
-              title={app.health.message}
-              className="line-clamp-2 max-w-3xl break-words pt-1 text-xs leading-relaxed text-ink-muted"
-            >
-              {app.health.message}
-            </p>
-          )}
+          {app.health?.message &&
+            app.health.status?.toLowerCase() !== "healthy" && (
+              <div
+                data-testid="health-message"
+                title={app.health.message}
+                className={`mt-2 flex max-w-2xl items-start gap-2 rounded-lg border px-3 py-2 text-xs ${
+                  app.health.status?.toLowerCase() === "degraded" ||
+                  app.health.status?.toLowerCase() === "missing"
+                    ? "border-danger/40 bg-danger-tint text-danger"
+                    : app.health.status?.toLowerCase() === "progressing"
+                      ? "border-info/40 bg-info-tint text-info"
+                      : "border-warning/40 bg-warning-tint text-warning"
+                }`}
+              >
+                <TriangleAlert
+                  aria-hidden="true"
+                  className="mt-0.5 h-4 w-4 shrink-0"
+                />
+                <span className="break-words leading-relaxed">
+                  {app.health.message}
+                </span>
+              </div>
+            )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">

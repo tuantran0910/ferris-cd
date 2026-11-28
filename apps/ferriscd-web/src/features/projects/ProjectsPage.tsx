@@ -1,6 +1,6 @@
 import { FolderGit2, Search, ShieldCheck, Workflow } from "lucide-react";
-import { useMemo, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { useMemo, type ReactNode } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import type { ProjectView } from "../../api/types";
 import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Badge } from "../../ui/Badge";
@@ -27,7 +27,17 @@ import { useProjects } from "./hooks";
  * project?" is one click (and the filter lives in the URL, so it survives a reload).
  */
 export function ProjectsPage() {
-  const [search, setSearch] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const search = searchParams.get("q") ?? "";
+  const setSearch = (value: string) => {
+    const next = new URLSearchParams(searchParams);
+    if (value) {
+      next.set("q", value);
+    } else {
+      next.delete("q");
+    }
+    setSearchParams(next, { replace: true });
+  };
   const projectsQuery = useProjects();
   // The project → application rollup comes from the same filtered list the Applications page shows.
   const applicationsQuery = useApplications();

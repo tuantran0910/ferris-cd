@@ -2,6 +2,7 @@ import { Boxes, FolderGit2, Layers, Server } from "lucide-react";
 import type { ApplicationSummary, SourceEntryView } from "../../../api/types";
 import { Badge } from "../../../ui/Badge";
 import { Card } from "../../../ui/Card";
+import { CopyButton } from "../../../ui/CopyButton";
 import { repoWebUrl } from "../../../utils/format";
 import { SyncMetadata } from "./SyncMetadata";
 
@@ -93,34 +94,43 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
         </p>
         <dl className="mt-3 space-y-1.5">
           <div>
-            <dt className="text-ink-subtle">
+            <dt className="flex items-center gap-1.5 text-ink-subtle">
               {oci ? "Registry" : "Repository"}
+              {!repoWebUrl(app.source.repoUrl) && !oci ? (
+                <Badge tone="neutral" size="sm">
+                  local
+                </Badge>
+              ) : null}
             </dt>
             <dd
-              className="break-all font-mono text-ink"
+              className="flex items-start justify-between gap-1 font-mono text-ink"
               title={app.source.repoUrl}
             >
-              {repoWebUrl(app.source.repoUrl) ? (
-                <a
-                  href={repoWebUrl(app.source.repoUrl)!}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-accent hover:decoration-indigo-400"
-                >
-                  {app.source.repoUrl}
-                </a>
-              ) : (
-                app.source.repoUrl
-              )}
+              <span className="min-w-0 break-all">
+                {repoWebUrl(app.source.repoUrl) ? (
+                  <a
+                    href={repoWebUrl(app.source.repoUrl)!}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline decoration-dotted underline-offset-2 hover:text-accent"
+                  >
+                    {app.source.repoUrl}
+                  </a>
+                ) : (
+                  app.source.repoUrl
+                )}
+              </span>
+              <CopyButton value={app.source.repoUrl} label="repository" />
             </dd>
           </div>
           <div className="flex justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Path</dt>
             <dd
-              className="min-w-0 break-all text-right font-mono text-ink"
+              className="flex min-w-0 items-start justify-end gap-1 text-right font-mono text-ink"
               title={app.source.path}
             >
-              {app.source.path}
+              <span className="min-w-0 break-all">{app.source.path}</span>
+              <CopyButton value={app.source.path} label="path" />
             </dd>
           </div>
           {/*
@@ -256,14 +266,16 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
         <dl className="mt-3 space-y-1.5">
           <div className="flex justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Cluster</dt>
-            <dd className="min-w-0 break-all text-right font-mono text-ink">
-              {app.destination.cluster}
+            <dd className="flex min-w-0 items-center justify-end gap-1 text-right font-mono text-ink">
+              <span className="min-w-0 break-all">{app.destination.cluster}</span>
+              <CopyButton value={app.destination.cluster} label="cluster" />
             </dd>
           </div>
           <div className="flex justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Namespace</dt>
-            <dd className="min-w-0 break-all text-right font-mono text-ink">
-              {app.destination.namespace}
+            <dd className="flex min-w-0 items-center justify-end gap-1 text-right font-mono text-ink">
+              <span className="min-w-0 break-all">{app.destination.namespace}</span>
+              <CopyButton value={app.destination.namespace} label="namespace" />
             </dd>
           </div>
           <div className="flex justify-between gap-3">

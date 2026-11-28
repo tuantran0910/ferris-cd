@@ -275,8 +275,15 @@ export function ResourceGraph({
             edgesFocusable={false}
             edgesReconnectable={false}
             fitView
-            fitViewOptions={{ padding: 0.2 }}
-            minZoom={0.2}
+            fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+            minZoom={0.15}
+            onInit={(instance) => {
+              // Nodes are measured after the first frame; fitting immediately
+              // can leave the right-most column clipped in a fixed-height card.
+              window.setTimeout(() => {
+                void instance.fitView({ padding: 0.2, maxZoom: 1 });
+              }, 0);
+            }}
             maxZoom={1.8}
             proOptions={{ hideAttribution: true }}
             onNodeClick={(_evt, node) => {
@@ -288,7 +295,9 @@ export function ResourceGraph({
           >
             <Background color="var(--color-elevated)" gap={20} />
             <Controls />
+            {layout.nodes.length > 8 && (
             <MiniMap
+              position="top-right"
               style={{ background: "var(--color-surface)" }}
               maskColor="var(--color-canvas)"
               nodeStrokeColor="var(--color-line-strong)"
@@ -300,6 +309,7 @@ export function ResourceGraph({
                 return "var(--color-ink-subtle)";
               }}
             />
+            )}
           </ReactFlow>
         </div>
       ) : (

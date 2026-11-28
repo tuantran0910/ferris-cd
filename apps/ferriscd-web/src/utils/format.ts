@@ -94,3 +94,30 @@ export function commitWebUrl(
     : "/commit/";
   return `${base}${segment}${sha}`;
 }
+
+export interface ParsedResourceKey {
+  group?: string;
+  kind: string;
+  namespace?: string;
+  name: string;
+}
+
+/**
+ * Splits the GKNN inventory key (`[group/]Kind/[namespace/]name`) into the
+ * facts an operator reads. Cluster-scoped resources have an empty namespace
+ * segment, which is why the key contains `//`.
+ */
+export function parseResourceKey(key: string): ParsedResourceKey {
+  const parts = key.split("/");
+  if (key.startsWith("/")) {
+    const [, kind = key, namespace, name = ""] = parts;
+    return { kind, namespace: namespace || undefined, name };
+  }
+  const [group, kind = key, namespace, name = ""] = parts;
+  return {
+    group: group || undefined,
+    kind,
+    namespace: namespace || undefined,
+    name,
+  };
+}
