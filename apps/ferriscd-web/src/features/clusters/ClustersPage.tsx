@@ -1,6 +1,6 @@
 import { Layers, Server } from "lucide-react";
 import { useMemo } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import type { ClusterView } from "../../api/types";
 import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Badge } from "../../ui/Badge";
@@ -49,10 +49,21 @@ const EMPTY_ROLLUP: ClusterRollup = {
 export function ClustersPage() {
   const clustersQuery = useClusters();
   const applicationsQuery = useApplications();
+  const [params] = useSearchParams();
+  const filter = (params.get("q") ?? "").trim().toLowerCase();
 
-  const clusters = useMemo(
+  const allClusters = useMemo(
     () => clustersQuery.data?.items ?? [],
     [clustersQuery.data],
+  );
+  const clusters = useMemo(
+    () =>
+      filter
+        ? allClusters.filter((cluster) =>
+            cluster.name.toLowerCase().includes(filter),
+          )
+        : allClusters,
+    [allClusters, filter],
   );
   const applications = useMemo(
     () => applicationsQuery.data?.items ?? [],
@@ -97,9 +108,11 @@ export function ClustersPage() {
           Clusters
         </h1>
         <p className="mt-1 text-xs text-ink-body">
-          {clusters.length === 1
-            ? "1 destination cluster visible to your identity"
-            : `${clusters.length} destination clusters visible to your identity`}
+          {filter
+            ? `${clusters.length} of ${allClusters.length} clusters match “${filter}”`
+            : clusters.length === 1
+              ? "1 destination cluster visible to your identity"
+              : `${clusters.length} destination clusters visible to your identity`}
           {" — "}
           filtered to the destinations your AppProjects allow.
         </p>
@@ -127,12 +140,21 @@ export function ClustersPage() {
             <Skeleton key={index} className="h-40" />
           ))}
         </div>
-      ) : !clustersQuery.data ? null : clusters.length === 0 ? (
+      ) : !clustersQuery.data ? null : allClusters.length === 0 ? (
         <EmptyState size="lg">
           <p>
             No destination clusters are visible to your identity. A cluster appears here once one of
             your AppProjects lists it in <code className="font-mono">spec.destinations</code>.
           </p>
+        </EmptyState>
+      ) : clusters.length === 0 ? (
+        <EmptyState size="lg">
+          <p>
+            No cluster matches <code className="font-mono">{filter}</code>.
+          </p>
+          <Link to="/clusters" className="text-accent hover:underline">
+            Clear the filter
+          </Link>
         </EmptyState>
       ) : (
         <ul className="grid grid-cols-1 gap-4 md:grid-cols-2">

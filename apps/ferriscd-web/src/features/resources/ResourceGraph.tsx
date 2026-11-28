@@ -9,7 +9,7 @@ import {
   type NodeTypes,
 } from "@xyflow/react";
 import { AlertTriangle, GitFork, Table2 } from "lucide-react";
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { ResourceGraphView } from "../../api/types";
 import { EmptyState } from "../../ui/EmptyState";
 import { HealthStatusBadge, SyncStatusBadge } from "../../ui/StatusBadges";
@@ -37,7 +37,7 @@ function getNodeBorderClass(health: string, sync: string, isRoot: boolean): stri
   if (health === "Healthy") {
     return "border-emerald-500/60 bg-surface";
   }
-  return "border-line-strong bg-surface";
+  return "border-ink-subtle bg-surface";
 }
 
 const ResourceNodeCard = memo(function ResourceNodeCard({
@@ -115,11 +115,17 @@ export function ResourceGraph({
   onInspectDiff,
 }: ResourceGraphProps) {
   const isLargeGraph = graph.nodes.length >= LARGE_GRAPH_THRESHOLD;
-  const [viewMode, setViewMode] = useState<"graph" | "table">(() =>
-    isLargeGraph ? "table" : "graph",
-  );
+  const [viewMode, setViewMode] = useState<"graph" | "table">(() => {
+    const narrow =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(max-width: 640px)").matches;
+    return isLargeGraph || narrow ? "table" : "graph";
+  });
   const [userPickedMode, setUserPickedMode] = useState(false);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const fitTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(fitTimer.current), []);
 
   const selectedResource = useMemo(
     () =>
@@ -136,8 +142,12 @@ export function ResourceGraph({
     // Follow the graph size until the operator makes an explicit choice: a big
     // app defaults to the table, and one that shrank back gets the canvas again
     // (otherwise it would sit on the table with no banner explaining why).
+    const narrow =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(max-width: 640px)").matches;
     setViewMode(
-      graph.nodes.length >= LARGE_GRAPH_THRESHOLD ? "table" : "graph",
+      graph.nodes.length >= LARGE_GRAPH_THRESHOLD || narrow ? "table" : "graph",
     );
   }, [graph.nodes.length, userPickedMode]);
 
@@ -280,7 +290,7 @@ export function ResourceGraph({
             onInit={(instance) => {
               // Nodes are measured after the first frame; fitting immediately
               // can leave the right-most column clipped in a fixed-height card.
-              window.setTimeout(() => {
+              fitTimer.current = window.setTimeout(() => {
                 void instance.fitView({ padding: 0.2, maxZoom: 1 });
               }, 0);
             }}

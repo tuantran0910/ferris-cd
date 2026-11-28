@@ -18,10 +18,10 @@ const TONE_CLASSES: Record<BadgeTone, string> = {
   info: "border-sky-500/40 bg-sky-500/15 text-info",
   success: "border-emerald-500/40 bg-emerald-500/15 text-success",
   warning: "border-amber-500/40 bg-amber-500/15 text-warning",
-  orange: "border-warning/40 bg-warning/15 text-warning",
+  orange: "border-orange-500/40 bg-orange-500/15 text-kind-job",
   danger: "border-rose-500/40 bg-rose-500/15 text-danger",
-  violet: "border-violet-500/40 bg-violet-500/15 text-accent-alt",
-  fuchsia: "border-fuchsia-500/40 bg-fuchsia-500/15 text-accent-alt",
+  violet: "border-violet-500/40 bg-violet-500/15 text-kind-namespace",
+  fuchsia: "border-fuchsia-500/40 bg-fuchsia-500/15 text-kind-workload",
 };
 
 const SIZE_CLASSES: Record<BadgeSize, string> = {

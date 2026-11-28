@@ -16,6 +16,7 @@ import {
   nextMode,
   readMode,
   resolveMode,
+  syncThemeColor,
   type Theme,
   type ThemeMode,
 } from "./theme";
@@ -68,6 +69,7 @@ export function Layout() {
   useEffect(() => {
     document.documentElement.dataset.themeMode = mode;
     document.documentElement.dataset.theme = theme;
+    syncThemeColor(theme);
   }, [mode, theme]);
 
   // `system` must follow the OS live, not just at first paint.
@@ -79,10 +81,15 @@ export function Layout() {
     const onChange = () => {
       const resolved = resolveMode("system");
       document.documentElement.dataset.theme = resolved;
+      syncThemeColor(resolved);
       setTheme(resolved);
     };
-    query.addEventListener?.("change", onChange);
-    return () => query.removeEventListener?.("change", onChange);
+    if (typeof query.addEventListener === "function") {
+      query.addEventListener("change", onChange);
+      return () => query.removeEventListener("change", onChange);
+    }
+    query.addListener(onChange);
+    return () => query.removeListener(onChange);
   }, [mode]);
   useCommandPaletteShortcut(togglePalette);
 
@@ -111,6 +118,7 @@ export function Layout() {
           <div className="flex items-center gap-6">
             <Link
               to="/"
+              aria-label="FerrisCD home"
               className="flex items-center gap-2.5 font-semibold tracking-tight text-ink-strong transition-colors hover:text-ink-strong"
             >
               <img
@@ -225,7 +233,7 @@ export function Layout() {
       <main
         id="main-content"
         tabIndex={-1}
-        className="mx-auto w-full max-w-7xl flex-1 px-4 py-6  sm:px-6"
+        className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6"
       >
         <div key={pathname} className="motion-slide-up">
           <Outlet />

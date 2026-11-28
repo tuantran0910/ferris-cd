@@ -138,7 +138,7 @@ export function SyncModal({
               type="checkbox"
               checked={false}
               disabled
-              className="mt-0.5 cursor-not-allowed rounded border-line-strong bg-surface text-accent opacity-60"
+              className="mt-0.5 cursor-not-allowed rounded border-control bg-surface text-accent opacity-60"
             />
             <span>
               <strong className="block font-medium text-ink-body">
@@ -158,7 +158,7 @@ export function SyncModal({
               checked={dryRun}
               disabled={submitting}
               onChange={(e) => setDryRun(e.target.checked)}
-              className="mt-0.5 rounded border-line-emphasis bg-surface text-accent"
+              className="mt-0.5 rounded border-control bg-surface text-accent"
             />
             <span>
               <strong className="block font-medium">Dry-run preview</strong>

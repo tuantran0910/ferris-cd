@@ -213,7 +213,7 @@ function ApplicationDetailContent({
               title={`Show project ${app.project}`}
               className="inline-flex max-w-full items-center gap-1 truncate rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-xs text-accent transition-colors hover:border-accent"
             >
-              <span className="opacity-80">Project:</span>
+              <span>Project:</span>
               <span className="truncate font-mono">{app.project}</span>
             </Link>
           </div>

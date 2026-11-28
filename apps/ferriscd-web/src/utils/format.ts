@@ -79,22 +79,6 @@ export function repoWebUrl(repoURL: string | null | undefined): string | null {
  * GitLab serves commits under `/-/commit/<sha>`; every other host (GitHub,
  * Gitea, Forgejo, Bitbucket Server, ...) uses `/commit/<sha>`.
  */
-export function commitWebUrl(
-  repoURL: string | null | undefined,
-  revision: string | null | undefined,
-): string | null {
-  const base = repoWebUrl(repoURL);
-  const sha = revision?.trim();
-  if (!base || !sha || !/^[0-9a-f]{7,40}$/i.test(sha)) {
-    return null;
-  }
-  const host = new URL(base).hostname.toLowerCase();
-  const segment = host === "gitlab.com" || host.startsWith("gitlab.")
-    ? "/-/commit/"
-    : "/commit/";
-  return `${base}${segment}${sha}`;
-}
-
 export interface ParsedResourceKey {
   group?: string;
   kind: string;
@@ -109,6 +93,9 @@ export interface ParsedResourceKey {
  */
 export function parseResourceKey(key: string): ParsedResourceKey {
   const parts = key.split("/");
+  if (parts.length === 1) {
+    return { kind: key, name: "" };
+  }
   if (key.startsWith("/")) {
     const [, kind = key, namespace, name = ""] = parts;
     return { kind, namespace: namespace || undefined, name };

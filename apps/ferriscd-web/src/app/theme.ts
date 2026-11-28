@@ -31,13 +31,11 @@ export function resolveMode(mode: ThemeMode): Theme {
   return mode === "system" ? systemTheme() : mode;
 }
 
-/** The theme currently painted on the document. */
-export function currentTheme(): Theme {
-  const applied = document.documentElement.dataset.theme;
-  if (applied === "light" || applied === "dark") {
-    return applied;
-  }
-  return resolveMode(readMode());
+/** Keeps the browser chrome colour in step with the painted theme. */
+export function syncThemeColor(theme: Theme): void {
+  document
+    .querySelector('meta[name="theme-color"]')
+    ?.setAttribute("content", theme === "light" ? "#f1f5f9" : "#020617");
 }
 
 /** Applies a mode, remembers it, and returns the resolved theme. */
@@ -45,9 +43,7 @@ export function applyMode(mode: ThemeMode): Theme {
   const resolved = resolveMode(mode);
   document.documentElement.dataset.theme = resolved;
   document.documentElement.dataset.themeMode = mode;
-  document
-    .querySelector('meta[name="theme-color"]')
-    ?.setAttribute("content", resolved === "light" ? "#f1f5f9" : "#020617");
+  syncThemeColor(resolved);
   try {
     window.localStorage.setItem(STORAGE_KEY, mode);
   } catch {

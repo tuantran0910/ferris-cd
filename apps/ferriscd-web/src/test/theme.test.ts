@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyMode,
   applyThemeTransition,
-  currentTheme,
   nextMode,
   readMode,
   resolveMode,
@@ -28,7 +27,7 @@ describe("theme", () => {
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(document.documentElement.dataset.themeMode).toBe("system");
     expect(window.localStorage.getItem("ferriscd-theme")).toBe("system");
-    expect(currentTheme()).toBe("light");
+    expect(document.documentElement.dataset.theme).toBe("light");
     expect(readMode()).toBe("system");
     expect(resolveMode("dark")).toBe("dark");
   });

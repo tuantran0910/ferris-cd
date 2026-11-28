@@ -90,6 +90,7 @@ export function ResourceInspector({
               <CopyText
                 value={resource.key}
                 label="GKNN key"
+                wrap
                 className="break-all text-xs text-ink"
               />
             </span>

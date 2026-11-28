@@ -143,7 +143,7 @@ export function buildResourceGraphElements(
     const stroke =
       derivedHealth === "Degraded" || derivedHealth === "Missing"
         ? "var(--color-danger)"
-        : "var(--color-line-emphasis)";
+        : "var(--color-ink-muted)";
     edges.push({
       id: `${sourceId}->${resource.key}`,
       source: sourceId,

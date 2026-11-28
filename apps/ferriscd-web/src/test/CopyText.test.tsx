@@ -32,10 +32,33 @@ describe("CopyText", () => {
       </>,
     );
 
+    expect(screen.queryByText("Copied")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Copy rendered revision" }));
     expect(writeText).toHaveBeenCalledWith(
       "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
     );
     expect(await screen.findByText("Copied")).toBeInTheDocument();
+  });
+
+  it("does not claim success when both clipboard paths fail", async () => {
+    const user = userEvent.setup();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    writeText.mockRejectedValueOnce(new Error("blocked"));
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn().mockReturnValue(false),
+    });
+    render(
+      <>
+        <CopyToast />
+        <CopyText value="sha" label="revision" />
+      </>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Copy revision" }));
+    expect(screen.queryByText("Copied")).not.toBeInTheDocument();
   });
 });

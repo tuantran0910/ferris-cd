@@ -25,6 +25,9 @@
   --color-ink-subtle: #94a3b8;
   --color-accent: #a5b4fc;
   --color-accent-alt: #f0abfc;
+  --color-kind-namespace: #c4b5fd;
+  --color-kind-workload: #f0abfc;
+  --color-kind-job: #fdba74;
   --color-success: #6ee7b7;
   --color-warning: #fde68a;
   --color-danger: #fecdd3;
@@ -63,8 +66,11 @@
   --color-ink-subtle: #475569;
   --color-accent: #4338ca;
   --color-accent-alt: #a21caf;
-  --color-success: #047857;
-  --color-warning: #b45309;
+  --color-kind-namespace: #6d28d9;
+  --color-kind-workload: #a21caf;
+  --color-kind-job: #9a3412;
+  --color-success: #065f46;
+  --color-warning: #92400e;
   --color-danger: #be123c;
   --color-info: #0369a1;
   --color-accent-tint: #e0e7ff;
@@ -72,7 +78,7 @@
   --color-warning-tint: #fffbeb;
   --color-danger-tint: #ffe4e6;
   --color-info-tint: #e0f2fe;
-  --color-hint: #64748b;
+  --color-hint: #52627a;
   --color-control: #64748b;
 }
 

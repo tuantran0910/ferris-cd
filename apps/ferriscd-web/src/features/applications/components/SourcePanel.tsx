@@ -53,6 +53,12 @@ function sourceCount(count: number): string {
 export function SourcePanel({ app }: { app: ApplicationSummary }) {
   const oci = isOciSource(app);
   const repoWeb = repoWebUrl(app.source.repoUrl);
+  const localPath =
+    app.source.repoUrl.startsWith("file://") ||
+    app.source.repoUrl.startsWith("/") ||
+    app.source.repoUrl.startsWith("./") ||
+    app.source.repoUrl.startsWith("../") ||
+    app.source.repoUrl.startsWith("~");
   const sources = declaredSources(app);
   const multiSource = app.source.multiSource === true || sources.length > 1;
   return (
@@ -98,7 +104,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
           <div>
             <dt className="flex items-center gap-1.5 text-ink-subtle">
               {oci ? "Registry" : "Repository"}
-              {!repoWebUrl(app.source.repoUrl) && !oci ? (
+              {localPath && !oci ? (
                 <Badge tone="neutral" size="sm">
                   local
                 </Badge>

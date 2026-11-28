@@ -43,7 +43,7 @@ export function OperationBanner({ operation }: OperationBannerProps) {
             />
           )}
         </div>
-        <span className="font-mono text-[11px] opacity-80">
+        <span className="font-mono text-[11px]">
           Started: {formatTimestamp(operation.startedAt)}
           {operation.finishedAt
             ? ` • Finished: ${formatTimestamp(operation.finishedAt)}`
@@ -51,7 +51,7 @@ export function OperationBanner({ operation }: OperationBannerProps) {
         </span>
       </div>
       {operation.message && (
-        <p className="mt-1.5 break-words opacity-90">{operation.message}</p>
+        <p className="mt-1.5 break-words">{operation.message}</p>
       )}
     </section>
   );

@@ -173,7 +173,7 @@ export function RollbackModal({
                       value={entry.id}
                       checked={checked}
                       onChange={() => setSelectedId(entry.id)}
-                      className="border-line-emphasis bg-surface text-accent"
+                      className="border-control bg-surface text-accent"
                     />
                     <div className="min-w-0">
                       <p className="font-semibold text-ink-strong">

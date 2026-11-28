@@ -214,7 +214,7 @@ export function SyncWindowNotice({
         </p>
         <p className="mt-0.5 break-words">{syncWindow.message}</p>
         {syncWindow.nextTransition && (
-          <p className="mt-1 flex items-center gap-1.5 text-[11px] opacity-90">
+          <p className="mt-1 flex items-center gap-1.5 text-[11px]">
             <Clock aria-hidden="true" className="h-3 w-3" />
             Next transition{" "}
             <time dateTime={syncWindow.nextTransition}>
@@ -223,7 +223,7 @@ export function SyncWindowNotice({
           </p>
         )}
         {!override && (
-          <p className="mt-1 text-[11px] opacity-90">
+          <p className="mt-1 text-[11px]">
             Drift is still detected and reported. Add{" "}
             <code className="font-mono">manualSync: true</code> to the window in{" "}
             <code className="font-mono">spec.syncWindows</code> if a manual sync should be
@@ -232,7 +232,7 @@ export function SyncWindowNotice({
         )}
         {/* Finding N4: this verdict is a snapshot, not a reservation — the window can close (or
             open) between the page load and the reconcile that submits. */}
-        <p className="mt-1 text-[11px] opacity-75">
+        <p className="mt-1 text-[11px]">
           Evaluated when this page was loaded; the controller re-evaluates the window on
           every pass, so a verdict can still change before the sync runs.
         </p>

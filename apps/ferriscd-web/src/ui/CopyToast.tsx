@@ -54,8 +54,10 @@ export function CopyToast() {
         )}
       >
         <Check aria-hidden="true" className="h-3.5 w-3.5 text-success" />
-        <span>Copied</span>
-        <span className="sr-only">{toast.label} copied</span>
+        <span>{toast.visible ? "Copied" : ""}</span>
+        <span className="sr-only">
+          {toast.visible ? `${toast.label} copied` : ""}
+        </span>
       </div>
     </div>,
     document.body,
