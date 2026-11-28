@@ -694,6 +694,8 @@ export interface components {
             id: number;
             /** @description The commit that was deployed. */
             revision?: string | null;
+            /** @description Per-source revisions of that deployment (`T20.1`); empty for a single-source deployment. */
+            revisions?: string[];
         };
         /** @description What a `sync`/`rollback` request did. */
         OperationResponse: {
@@ -839,6 +841,30 @@ export interface components {
              */
             id: number;
         };
+        /** @description One `spec.sources` entry (`T20.1`). */
+        SourceEntryView: {
+            /** @description Pinned OCI manifest digest, when the entry pins one. */
+            digest?: string | null;
+            /** @description Path inside the source (`""` for its root). */
+            path: string;
+            /**
+             * @description `ref` alias other sources address this one by (`$<ref>/...`); absent when it has none.
+             *
+             *     Spelled `ref` on the wire, exactly like `spec.sources[].ref` in the CRD, so a client can map
+             *     the view back onto the spec without a rename.
+             */
+            ref?: string | null;
+            /** @description Renderer for this entry; absent means "support source only" (values, no manifests). */
+            renderer?: string | null;
+            /** @description Repository or registry URL, redacted. */
+            repoUrl: string;
+            /** @description Source kind (`git` or `oci`). */
+            sourceType: string;
+            /** @description OCI tag to resolve, when the entry is an OCI artifact. */
+            tag?: string | null;
+            /** @description Requested revision (`git.targetRevision`, else `oci.tag`, else `oci.digest`). */
+            targetRevision: string;
+        };
         /**
          * @description `spec.source` summary.
          *
@@ -858,6 +884,14 @@ export interface components {
              *     resolution — this is what the `Application` *pinned*, not what the registry answered.
              */
             digest?: string | null;
+            /**
+             * @description Whether the `Application` declares `spec.sources` (`T20.1`).
+             *
+             *     A single-source `Application` omits the key entirely and `sources` below is empty, so its
+             *     payload stays byte-identical to the `v1.1` one. It defaults to `false` when absent, which
+             *     covers both an older server's payload and that omitted-key case.
+             */
+            multiSource?: boolean;
             /** @description Path inside the repository (`""` for its root). */
             path: string;
             /** @description Selected renderer (`auto`, `plainYaml`, `kustomize`, `helm`). */
@@ -871,6 +905,14 @@ export interface components {
              *     report *is* a Git source.
              */
             sourceType: string;
+            /**
+             * @description Every declared source, in declaration order (`T20.1`).
+             *
+             *     `source` above always describes the **rendered** source (the first entry that contributes
+             *     manifests), so a pre-`T20.1` client keeps working; this list is what carries the values
+             *     repository and its alias. Empty for a single-source `Application`.
+             */
+            sources?: components["schemas"]["SourceEntryView"][];
             /**
              * @description OCI tag to resolve (`spec.source.oci.tag`); absent for a Git source and for a digest-only
              *     reference.
@@ -899,6 +941,12 @@ export interface components {
             lastSyncedRevision?: string | null;
             /** @description Revision the last pass rendered. */
             revision?: string | null;
+            /**
+             * @description Resolved revision of every declared source, in declaration order (`T20.1`).
+             *
+             *     Empty for a single-source `Application`, whose one revision is `revision` above.
+             */
+            revisions?: string[];
             /** @description `Synced` or `OutOfSync`. */
             status: string;
         };

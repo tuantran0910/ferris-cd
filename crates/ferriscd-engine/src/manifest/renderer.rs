@@ -202,6 +202,35 @@ impl RendererBinaries {
     }
 }
 
+/// Identity of one declared source of a multi-source `Application` (`T20.1`).
+///
+/// Part of [`super::cache::RenderCacheKey`] and nothing else: it answers "which exact source
+/// contents does this render depend on?" without carrying any content. `Debug` redacts the URL,
+/// because a Git remote routinely embeds a token and this type is reachable from the cache key's
+/// `Debug`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SourceIdentity {
+    /// Effective source URL (`git.repoURL` or `oci.url`).
+    pub url: String,
+    /// Resolved revision (commit SHA, or `sha256:<64 hex>` for an OCI digest).
+    pub revision: String,
+    /// The `path` this source renders or contributes.
+    pub path: String,
+    /// The `ref` alias this source answers to (`""` when it has none).
+    pub alias: String,
+}
+
+impl fmt::Debug for SourceIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceIdentity")
+            .field("url", &RedactedUrl::new(&self.url))
+            .field("revision", &self.revision)
+            .field("path", &self.path)
+            .field("alias", &self.alias)
+            .finish()
+    }
+}
+
 /// Everything one render needs, and nothing about the cluster.
 ///
 /// The `repo_url`/`commit_sha`/`app_namespace`/`app_name`/`destination_namespace`/
@@ -234,6 +263,16 @@ pub struct RenderContext {
     pub loader: ManifestLoaderConfig,
     /// Optional `kustomize`/`helm` binary overrides (never part of the render cache key).
     pub binaries: RendererBinaries,
+    /// `T20.1`: every declared source of a multi-source `Application`, in declaration order.
+    ///
+    /// Empty for a single-source `Application`, which is what keeps its cache key (and therefore
+    /// its digest) byte-identical to the pre-`T20.1` one.
+    pub sources: Vec<SourceIdentity>,
+    /// `T20.1`: the alias → worktree roots a renderer may address with `$ref/...`.
+    ///
+    /// Like [`Self::root_dir`] this is a *materialization* detail (the paths are temp
+    /// directories), so it is deliberately **not** part of the cache key: [`Self::sources`] is.
+    pub source_roots: super::sources::SourceRoots,
 }
 
 impl fmt::Debug for RenderContext {
@@ -252,6 +291,8 @@ impl fmt::Debug for RenderContext {
             .field("renderer", &self.renderer)
             .field("loader", &self.loader)
             .field("binaries", &self.binaries)
+            .field("sources", &self.sources)
+            .field("source_roots", &self.source_roots.aliases())
             .finish()
     }
 }
@@ -272,6 +313,8 @@ impl RenderContext {
             renderer: RendererConfig::Auto,
             loader: ManifestLoaderConfig::default(),
             binaries: RendererBinaries::default(),
+            sources: Vec::new(),
+            source_roots: super::sources::SourceRoots::default(),
         }
     }
 
@@ -280,24 +323,48 @@ impl RenderContext {
     /// This is the seam the controller uses (see `ferriscd-controller`'s `fetch_desired`): no
     /// controller code needs to know about renderers, detection order, or cache keys — it resolves
     /// the revision, leases the checkout, discovers the cluster version, and hands all three here.
+    ///
+    /// A multi-source `Application` (no `spec.source`) renders each entry through
+    /// [`Self::for_application_source`] instead; this function then falls back to that entry's
+    /// equivalent empty [`ferriscd_crd::SourceSpec`], which is exactly "no renderer configuration
+    /// beyond the default".
     #[must_use]
     pub fn for_application(
         root_dir: impl Into<PathBuf>,
         app: &Application,
         cluster_kube_version: &str,
     ) -> Self {
+        let source = app.spec.primary_source().cloned().unwrap_or_default();
+        Self::for_application_source(root_dir, app, &source, cluster_kube_version)
+    }
+
+    /// Builds a context for one declared source of `app` (`T20.1`).
+    ///
+    /// Used for `spec.source` and for every `spec.sources` entry, so a multi-source render and a
+    /// single-source render take the same path: `repo_url`/`source_path`/`renderer` describe the
+    /// **source**, while the app namespace/name, destination namespace, and kube version describe
+    /// the **application**.
+    #[must_use]
+    pub fn for_application_source(
+        root_dir: impl Into<PathBuf>,
+        app: &Application,
+        source: &ferriscd_crd::SourceSpec,
+        cluster_kube_version: &str,
+    ) -> Self {
         Self {
             root_dir: root_dir.into(),
-            repo_url: app.spec.source.repo_url().to_owned(),
+            repo_url: source.repo_url().to_owned(),
             commit_sha: String::new(),
-            source_path: app.spec.source.source_path().to_owned(),
+            source_path: source.source_path().to_owned(),
             app_namespace: app.metadata.namespace.clone().unwrap_or_default(),
             app_name: app.metadata.name.clone().unwrap_or_default(),
             destination_namespace: app.spec.destination.namespace.clone(),
             cluster_kube_version: cluster_kube_version.to_owned(),
-            renderer: RendererConfig::from_crd(&app.spec.source.renderer),
+            renderer: RendererConfig::from_crd(&source.renderer),
             loader: ManifestLoaderConfig::default(),
             binaries: RendererBinaries::default(),
+            sources: Vec::new(),
+            source_roots: super::sources::SourceRoots::default(),
         }
     }
 
@@ -362,6 +429,24 @@ impl RenderContext {
     #[must_use]
     pub fn with_binaries(mut self, binaries: RendererBinaries) -> Self {
         self.binaries = binaries;
+        self
+    }
+
+    /// Declares every source this render depends on (`T20.1`).
+    ///
+    /// Only a multi-source `Application` sets a non-empty list: a single-source render must keep
+    /// its pre-`T20.1` cache key (and therefore its digest) exactly, so the empty list means "the
+    /// `repo_url`/`commit_sha`/`source_path` fields above are the whole identity".
+    #[must_use]
+    pub fn with_sources(mut self, sources: Vec<SourceIdentity>) -> Self {
+        self.sources = sources;
+        self
+    }
+
+    /// Declares the `$ref` alias → worktree roots a renderer may address (`T20.1`).
+    #[must_use]
+    pub fn with_source_roots(mut self, source_roots: super::sources::SourceRoots) -> Self {
+        self.source_roots = source_roots;
         self
     }
 }

@@ -58,6 +58,7 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
         crate::api::ApplicationSummary,
         crate::api::ApplicationDetailView,
         crate::api::SourceView,
+        crate::api::SourceEntryView,
         crate::api::DestinationView,
         crate::api::SyncView,
         crate::api::HealthView,

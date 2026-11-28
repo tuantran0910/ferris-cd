@@ -571,6 +571,8 @@ syncPolicy:
             .application
             .spec
             .source
+            .as_ref()
+            .expect("the template carries a source")
             .git
             .as_ref()
             .expect("a rendered Application keeps the Git source the template carries");

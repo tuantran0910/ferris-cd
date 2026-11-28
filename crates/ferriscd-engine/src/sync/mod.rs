@@ -49,7 +49,7 @@ pub use history::{
     RollbackError, RollbackRequest, RollbackTarget, SyncRecording, clear_rollback_warning,
     clear_rollback_warning_if_automation_reenabled, disable_automated_sync,
     effective_history_limit, parse_rollback_request, plan_rollback, record_operation_success,
-    record_sync_success, rollback_target,
+    record_sync_success, recorded_revisions, rollback_target,
 };
 pub use plan::{
     OrphanCandidate, OrphanOwnership, PlanConflict, PlanRequest, PlanSkipReason, PlanSummary,

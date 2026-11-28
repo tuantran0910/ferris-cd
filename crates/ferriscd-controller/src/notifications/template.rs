@@ -41,9 +41,32 @@
 //! time — where [`NotificationConfig::parse`](crate::notifications::NotificationConfig::parse)
 //! falls back to the built-in default — instead of shipping an empty alert to PagerDuty at 3 a.m.
 
+/// Longest `{{app.repoUrl}}` this context carries, in bytes.
+///
+/// A multi-source `Application` reports **every** declared source (`spec.sources` is capped at 16),
+/// so the joined value has to be bounded like every other field that reaches a third-party receiver:
+/// a notification is not a status dump, and an oversized POST is rejected by more than one service.
+pub const MAX_REPO_URL_BYTES: usize = 1024;
+
+/// The source URLs a notification reports: **every** declared source (`T20.1`), in declaration
+/// order and comma-joined — `spec.source`'s URL alone for a `v1.0` `Application`, exactly as before.
+///
+/// Joining is what makes the field honest: a split chart/values `Application` deploys *both*
+/// repositories, so naming only the first one (or the first declared entry) would tell an on-call
+/// engineer to look at half the deployment. Every URL is redacted here — the caller must not have to
+/// remember — and the result is length-bounded ([`MAX_REPO_URL_BYTES`]).
+fn source_urls(app: &Application) -> String {
+    let described: Vec<String> = declared_sources(&app.spec)
+        .iter()
+        .map(|source| redact_repo_url(source.spec.repo_url()))
+        .filter(|url| !url.is_empty())
+        .collect();
+    truncate_utf8_bytes(&described.join(", "), MAX_REPO_URL_BYTES)
+}
+
 use ferriscd_crd::status::{ApplicationStatus, HealthStatus, SyncStatus};
 use ferriscd_crd::{Application, annotations};
-use ferriscd_engine::manifest::redact_repo_url;
+use ferriscd_engine::manifest::{declared_sources, redact_repo_url};
 use kube::ResourceExt as _;
 
 use crate::events::{sanitize_note, truncate_utf8_bytes};
@@ -100,8 +123,9 @@ impl NotificationContext {
     /// Every free-form field is sanitised here — the one constructor — so no caller can hand the
     /// renderer an unsanitised string:
     ///
-    /// * `app.repoUrl` goes through [`redact_repo_url`] (embedded `user:token@` credentials and SCP
-    ///   style remotes are stripped),
+    /// * `app.repoUrl` carries **every** declared source URL (`T20.1`), each one through
+    ///   [`redact_repo_url`] (embedded `user:token@` credentials and SCP style remotes are stripped)
+    ///   and the joined result is length-bounded,
     /// * `app.message` is the `Ready` condition's message (already bounded by the status writer) and
     ///   is then [`sanitize_note`]d, which redacts base64-shaped payload runs and URL credentials,
     /// * nothing else is copied: no `Secret`, no diff, no rendered manifest, no inventory body.
@@ -154,7 +178,9 @@ impl NotificationContext {
             app_name: bounded_identity(&app.name_any()),
             app_namespace: bounded_identity(&app.namespace().unwrap_or_default()),
             project: bounded_identity(&app.spec.project),
-            repo_url: redact_repo_url(app.spec.source.repo_url()),
+            // `T20.1`: an `Application` that declares `spec.sources` reports **every** declared
+            // source, redacted; a `v1.0` one reports exactly the URL it always did.
+            repo_url: source_urls(app),
             revision: bounded_identity(&revision),
             sync_status,
             health_status,
@@ -420,7 +446,7 @@ mod tests {
         let spec = ApplicationSpec {
             project: "payments".to_owned(),
             service_account_name: None,
-            source: SourceSpec {
+            source: Some(SourceSpec {
                 git: Some(GitSourceSpec {
                     repo_url: repo_url.to_owned(),
                     target_revision: "HEAD".to_owned(),
@@ -428,7 +454,8 @@ mod tests {
                 }),
                 oci: None,
                 renderer: RendererSpec::default(),
-            },
+            }),
+            sources: Vec::new(),
             destination: DestinationSpec {
                 cluster: "in-cluster".to_owned(),
                 namespace: "payments".to_owned(),
@@ -513,6 +540,69 @@ mod tests {
         // The identity and the revision stay: an alert that names nothing is useless.
         assert!(rendered.contains("ferriscd-system/demo-app"), "{rendered}");
         assert!(rendered.contains("abc1234"), "{rendered}");
+    }
+
+    /// **`T20.1` finding (M5).** `app.repoUrl` names **every** declared source of a multi-source
+    /// `Application`, each redacted — not just the first one, and not the first declared entry.
+    #[test]
+    fn the_repo_url_field_names_every_declared_source() {
+        let mut multi = app("https://example.com/chart.git");
+        multi.spec.source = None;
+        multi.spec.sources = vec![
+            ferriscd_crd::MultiSourceEntry {
+                ref_name: Some("chart".to_owned()),
+                git: None,
+                oci: Some(ferriscd_crd::OciSourceSpec {
+                    url: "oci://ghcr.io/example/payments".to_owned(),
+                    tag: Some("1.4.2".to_owned()),
+                    digest: None,
+                    path: String::new(),
+                }),
+                renderer: None,
+            },
+            ferriscd_crd::MultiSourceEntry {
+                ref_name: Some("values".to_owned()),
+                git: Some(GitSourceSpec {
+                    repo_url: "https://bot:ghp_SecretValuesToken@git.example.com/org/values.git"
+                        .to_owned(),
+                    target_revision: "main".to_owned(),
+                    path: String::new(),
+                }),
+                oci: None,
+                renderer: None,
+            },
+        ];
+        let ctx = NotificationContext::from_status(
+            &multi,
+            &status("ok"),
+            annotations::TRIGGER_SYNC_SUCCEEDED,
+            "slack",
+            "payments-oncall",
+        );
+        let repo_url = ctx.resolve("app.repoUrl").expect("the field resolves");
+        assert!(
+            repo_url.contains("oci://ghcr.io/example/payments"),
+            "the chart source must be reported: {repo_url}"
+        );
+        assert!(
+            repo_url.contains("git.example.com/org/values.git"),
+            "the values source must be reported too: {repo_url}"
+        );
+        assert!(
+            repo_url.contains(", "),
+            "the sources are comma-joined in declaration order: {repo_url}"
+        );
+        assert!(
+            !repo_url.contains("ghp_SecretValuesToken"),
+            "every joined URL is redacted, not only the first: {repo_url}"
+        );
+
+        // A `v1.0` single-source Application still reports exactly its one URL.
+        let single = context("https://example.com/repo.git", "ok");
+        assert_eq!(
+            single.resolve("app.repoUrl"),
+            Some("https://example.com/repo.git")
+        );
     }
 
     /// A `ConfigMap` template may only reference the closed allow-list; a typo is refused at load

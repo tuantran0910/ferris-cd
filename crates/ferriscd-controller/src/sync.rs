@@ -97,8 +97,9 @@ use ferriscd_engine::health::{
 };
 use ferriscd_engine::inventory::{self, Inventory, Ownership};
 use ferriscd_engine::manifest::{
-    self, DesiredResource, ManifestLoaderConfig, RenderContext, RenderPipeline, RendererBinaries,
-    ResourceKey,
+    self, COMPOSITE_PREFIX, DeclaredSource, DesiredResource, ManifestLoaderConfig, RenderContext,
+    RenderPipeline, RendererBinaries, ResourceKey, SourceIdentity, SourceRevisions, SourceRoots,
+    declared_sources,
 };
 use ferriscd_engine::policy::{
     AppProjectPolicy, ApplicationScope, PolicyError, SyncWindowSet, SyncWindowTarget,
@@ -110,7 +111,7 @@ use ferriscd_engine::repo::{
 use ferriscd_engine::sync::{
     DEFAULT_REQUEUE_AFTER, OrphanCandidate, OrphanOwnership, PlanRequest, RollbackDecision,
     RollbackError, StepAction, SyncMachine, SyncPlan, SyncStep, parse_rollback_request,
-    plan_rollback, record_operation_success,
+    plan_rollback, record_operation_success, recorded_revisions,
 };
 use futures::future::BoxFuture;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
@@ -503,6 +504,12 @@ struct PassRequest<'a> {
     discovery: &'a DiscoveryCache,
     owner: &'a TrackingOwner,
     revision: &'a str,
+    /// The per-source list `revision` is the composite digest of (`T20.1`).
+    ///
+    /// Empty for a `v1.0` `spec.source` `Application`. A failure raised inside the pass still carries
+    /// it, so the identity a failed pass reports and the per-source rows shown beside it always
+    /// describe the same deployment.
+    revisions: &'a [String],
     bundle: &'a BundleWaves,
     live: &'a LiveStateMap,
     statuses: &'a BTreeMap<ResourceKey, DiffStatus>,
@@ -638,7 +645,12 @@ struct PreparedPass {
     previous_status: ApplicationStatus,
     pass_started: Time,
     rollback: Option<RollbackRequested>,
+    /// The deployment identity of the pass: the resolved commit for a single source, the composite
+    /// digest over every declared source for a multi-source `Application` (`T20.1`).
     revision: String,
+    /// Per-source revisions in declaration order (`T20.1`); exactly one entry for a single-source
+    /// `Application`.
+    revisions: SourceRevisions,
     bundle: BundleWaves,
     live: LiveStateMap,
     diffs: Vec<ResourceDiff>,
@@ -1276,6 +1288,11 @@ impl InventorySyncPipeline {
     ///   driven by [`SyncMachine`] across requeues ([`Self::run_operation`]).
     async fn sync_apply(&self, app: &Application) -> Result<ApplyOutcome, ReconcileError> {
         let prepared = self.prepare_pass(app, PassMode::Apply).await?;
+        // `T20.1`: the per-source list this pass publishes, computed once from the same resolution
+        // `prepared.revision` was derived from. Every path that reports a revision — success, a
+        // partial/terminal sync failure, a history entry — publishes this list with it, so
+        // `status.sync.revision` and `status.sync.revisions` can never describe different passes.
+        let published = prepared.revisions.published(&app.spec);
 
         // --- Phase 08/10: execute -------------------------------------------------------
         let request = PassRequest {
@@ -1284,6 +1301,7 @@ impl InventorySyncPipeline {
             discovery: prepared.target.discovery(),
             owner: &prepared.owner,
             revision: &prepared.revision,
+            revisions: &published,
             bundle: &prepared.bundle,
             live: &prepared.live,
             statuses: &prepared.statuses,
@@ -1334,11 +1352,17 @@ impl InventorySyncPipeline {
             // (a second database migration) instead of observing the one that already exists.
             let message = failure.error.to_string();
             let operation = pass.operation.clone().map(Box::new);
+            // `T20.1` finding M1: the failure still resolved every source, so it publishes the
+            // composite identity **and** the per-source list that identity is computed from. Reporting
+            // the new composite next to the previous deployment's list would describe a commit set
+            // that is not what `status.sync.revision` names.
+            let revisions = published.clone();
             return Err(match failure.error.failure_class() {
                 FailureClass::Terminal => ReconcileError::SyncConflict {
                     message,
                     inventory: next_inventory,
                     revision: Some(prepared.revision.clone()),
+                    revisions,
                     // Finding H-A: a terminal failure drops nothing either. The state (and with it
                     // `activeHooks`) has to reach `/status` for both failure classes, or the next
                     // pass sees a hook that already exists as untracked.
@@ -1348,6 +1372,7 @@ impl InventorySyncPipeline {
                     message,
                     inventory: next_inventory,
                     revision: Some(prepared.revision.clone()),
+                    revisions,
                     operation,
                 },
             });
@@ -1372,7 +1397,15 @@ impl InventorySyncPipeline {
             })
         });
         let history = match (&operation, pass.settled && deployment_is_new) {
-            (Some(operation), true) => record_history(&prepared.previous_status, app, operation),
+            (Some(operation), true) => record_history(
+                &prepared.previous_status,
+                app,
+                operation,
+                // `T20.1`: a deployment of an `Application` that declares `spec.sources` records
+                // every source revision in the history entry, which is what a later rollback
+                // re-pins.
+                &published,
+            ),
             _ => None,
         };
         if pass.settled
@@ -1439,7 +1472,7 @@ impl InventorySyncPipeline {
             &prepared.summary,
             &prepared.spec_hash,
             counts,
-            prepared.revision.clone(),
+            &prepared.revisions,
             next_inventory,
         )
         .with_health(
@@ -1536,9 +1569,13 @@ impl InventorySyncPipeline {
             );
         }
 
-        let (revision, mut resources) = self
+        // `T20.1`: `fetch_desired` resolves **every** declared source before anything is rendered,
+        // so a partial fetch failure (source 2 of 2) fails the whole pass atomically: nothing has
+        // been applied, and the inventory the caller patches back is the one it read.
+        let (revisions, mut resources) = self
             .fetch_desired(app, pinned_revision.as_deref(), target.discovery())
             .await?;
+        let revision = revisions.composite();
         let (in_bundle_crds, in_bundle_namespaces) = self
             .prepare(
                 &mut resources,
@@ -1575,15 +1612,15 @@ impl InventorySyncPipeline {
         if desired_inventory.is_empty() && !prev_inventory.is_empty() && !empty_desired_allowed() {
             return Err(ReconcileError::Invalid {
                 message: format!(
-                    "the desired set from {} at path '{}' is empty but {} resource(s) are still \
-                     tracked in status.inventory; refusing to sync (check spec.source.git.path \
-                     and the repository contents). Set {ALLOW_EMPTY_DESIRED_ENV}=1 to allow \
-                     pruning the entire inventory",
-                    // Finding M4: this message reaches `Application.status`, so the repository URL
-                    // is quoted through the shared redaction helper — a Git remote routinely
-                    // carries a personal access token.
-                    manifest::redact_repo_url(app.spec.source.repo_url()),
-                    app.spec.source.source_path(),
+                    "the desired set from {} is empty but {} resource(s) are still tracked in \
+                     status.inventory; refusing to sync (check the source paths and the repository \
+                     contents). Set {ALLOW_EMPTY_DESIRED_ENV}=1 to allow pruning the entire \
+                     inventory",
+                    // Finding M4: this message reaches `Application.status`, so every repository URL
+                    // is quoted through the shared redaction helper — a Git remote routinely carries
+                    // a personal access token. `T20.1`: a multi-source `Application` names all of
+                    // them, so the operator can see which source rendered nothing.
+                    describe_sources(app),
                     prev_inventory.len()
                 ),
             });
@@ -1618,6 +1655,9 @@ impl InventorySyncPipeline {
                 message: err.to_string(),
                 inventory: prev_inventory,
                 revision: Some(revision),
+                // `T20.1` finding M1: this pass already resolved every source, so the composite it
+                // reports is published with the list that composite is computed from.
+                revisions: revisions.published(&app.spec),
             });
         }
 
@@ -1691,6 +1731,7 @@ impl InventorySyncPipeline {
             pass_started,
             rollback,
             revision,
+            revisions,
             bundle,
             live,
             diffs,
@@ -2462,8 +2503,16 @@ impl InventorySyncPipeline {
         app: &Application,
         pinned: Option<&str>,
         discovery: &DiscoveryCache,
-    ) -> Result<(String, Vec<DesiredResource>), ReconcileError> {
-        match (&app.spec.source.git, &app.spec.source.oci) {
+    ) -> Result<(SourceRevisions, Vec<DesiredResource>), ReconcileError> {
+        // `T20.1`: `spec.sources` renders through the composition path; a `v1.0` `spec.source`
+        // keeps its exact pre-`T20.1` code path (including the OCI digest fast path), so nothing
+        // about a single-source `Application` changes.
+        if app.spec.is_multi_source() {
+            return self
+                .fetch_multi_source_desired(app, pinned, discovery)
+                .await;
+        }
+        match (app.spec.primary_git_source(), app.spec.primary_oci_source()) {
             (Some(_), _) => self.fetch_git_desired(app, pinned, discovery).await,
             (None, Some(oci)) => {
                 let oci = oci.clone();
@@ -2479,17 +2528,280 @@ impl InventorySyncPipeline {
         }
     }
 
+    /// Fetches, composes, and renders a multi-source `Application` (`T20.1`).
+    ///
+    /// The order is deliberate and is what makes the pass deterministic and atomic:
+    ///
+    /// 1. **Resolve** every declared source's revision (a Git `rev-parse`, an OCI digest lookup).
+    ///    Nothing is rendered yet, and a failure here leaves the cluster untouched.
+    /// 2. **Build the identity list** — `(url, revision, path, ref)` per source — which is the
+    ///    render cache key's multi-source half. Resolving first is what lets the key include a
+    ///    source that has not been materialized yet.
+    /// 3. **Materialize** the worktrees this pass actually needs: every support source (it has no
+    ///    bundle of its own, so its files can only be read from a checkout) and every source that
+    ///    carries a `ref` alias (another source may address it as `$ref/...`).
+    /// 4. **Probe** the render cache for each rendered entry with the full composite key. A hit
+    ///    skips the artifact download *and* the renderer subprocess — the `T18.4` property is
+    ///    preserved for a multi-source chart, at the cost of one digest resolution for a movable
+    ///    tag (the composite key cannot be computed before every revision is known).
+    /// 5. **Render** the misses in declaration order and concatenate. Duplicate GKNN detection runs
+    ///    on the concatenated set downstream ([`Self::prepare`]), so two sources can never silently
+    ///    ship the same object.
+    async fn fetch_multi_source_desired(
+        &self,
+        app: &Application,
+        pinned: Option<&str>,
+        discovery: &DiscoveryCache,
+    ) -> Result<(SourceRevisions, Vec<DesiredResource>), ReconcileError> {
+        let sources = declared_sources(&app.spec);
+        if sources.is_empty() {
+            return Err(ReconcileError::Invalid {
+                message: "spec.sources must declare at least one source".to_owned(),
+            });
+        }
+        // `T20.1` finding H2: a rollback pin that cannot be decomposed into per-source revisions is
+        // refused *here*, before the first resolve call — never handed to a resolver as an opaque
+        // composite digest.
+        let pins = per_source_pins(app, &sources, pinned)?;
+
+        // Helm's `.Capabilities.KubeVersion` must match the destination cluster, and it is part of
+        // the render cache key, so the snapshot is refreshed once for the whole pass.
+        discovery.ensure_fresh().await?;
+        let kube_version = discovery.kube_version();
+
+        // 1. Resolve every revision. A failure aborts the pass before anything is written.
+        let mut revisions: Vec<String> = Vec::with_capacity(sources.len());
+        for (index, source) in sources.iter().enumerate() {
+            let pin = pins.get(index).and_then(|pin| pin.as_deref());
+            let revision = self.resolve_source_revision(source, pin).await?;
+            revisions.push(revision);
+        }
+        let revisions = SourceRevisions::new(revisions);
+
+        // 2. The composite identity list every rendered entry's cache key carries.
+        let identities: Vec<SourceIdentity> = sources
+            .iter()
+            .zip(&revisions.all)
+            .map(|(source, revision)| SourceIdentity {
+                url: source.spec.repo_url().to_owned(),
+                revision: revision.clone(),
+                path: source.spec.source_path().to_owned(),
+                alias: source.alias.clone(),
+            })
+            .collect();
+
+        // 3. Worktrees this pass needs regardless of the cache.
+        //
+        // `aliased` is filled as the worktrees are pushed, so building the `$ref` map is one pass
+        // over the declared sources rather than a scan per source (a 16-entry list stayed correct
+        // but was quadratic).
+        let mut roots: Vec<ferriscd_engine::repo::RepoCheckout> = Vec::with_capacity(sources.len());
+        let mut root_indices: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut aliased: Vec<(String, usize)> = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            let needed = !source.renders || !source.alias.is_empty();
+            if !needed {
+                continue;
+            }
+            let checkout = self
+                .materialize_source(source, &revisions.all[index])
+                .await?;
+            if !source.alias.is_empty() {
+                aliased.push((source.alias.clone(), roots.len()));
+            }
+            root_indices.insert(index, roots.len());
+            roots.push(checkout);
+        }
+        // Canonicalization is blocking filesystem work, so it runs off the async worker — exactly
+        // like every checkout/extraction step of a multi-source pass.
+        let source_roots = SourceRoots::canonicalize(
+            aliased
+                .iter()
+                .map(|(alias, slot)| (alias.clone(), roots[*slot].root_dir().to_path_buf())),
+        )
+        .await?;
+
+        // 4/5. Render every entry that declares a renderer, in declaration order.
+        let mut resources: Vec<DesiredResource> = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            if !source.renders {
+                continue;
+            }
+            let revision = &revisions.all[index];
+            // The probe does not need a checkout: the key is the composite identity, not a path.
+            let probe = RenderContext::for_application_source(
+                std::path::PathBuf::new(),
+                app,
+                &source.spec,
+                &kube_version,
+            )
+            .with_commit_sha(revision.clone())
+            .with_loader_config(self.loader.clone())
+            .with_binaries(self.renderer_binaries.clone())
+            .with_sources(identities.clone())
+            .with_source_roots(source_roots.clone());
+            if let Some(cached) = self.render.cached(&probe) {
+                tracing::debug!(
+                    app.namespace = %app.namespace().unwrap_or_default(),
+                    app.name = %app.name_any(),
+                    source = %manifest::redact_repo_url(source.spec.repo_url()),
+                    revision = %revision,
+                    "multi-source bundle already rendered; serving the render cache"
+                );
+                resources.extend(cached.as_ref().iter().cloned());
+                // The cache-hit counter is cumulative and bridged as a delta, so a pass that is
+                // served entirely from the cache still has to sample it — otherwise "the same
+                // revisions cost zero renderer subprocesses" is invisible to `/metrics`.
+                self.record_render_metrics();
+                continue;
+            }
+            let checkout = match root_indices.get(&index) {
+                Some(slot) => &roots[*slot],
+                None => {
+                    let checkout = self.materialize_source(source, revision).await?;
+                    let slot = roots.len();
+                    roots.push(checkout);
+                    root_indices.insert(index, slot);
+                    &roots[slot]
+                }
+            };
+            let context = RenderContext::for_application_source(
+                checkout.root_dir().to_path_buf(),
+                app,
+                &source.spec,
+                &kube_version,
+            )
+            .with_commit_sha(revision.clone())
+            .with_loader_config(self.loader.clone())
+            .with_binaries(self.renderer_binaries.clone())
+            .with_sources(identities.clone())
+            .with_source_roots(source_roots.clone());
+            let render_span = tracing::info_span!(
+                "manifest_render",
+                commit_sha = %revision,
+                path = %source.spec.source_path(),
+            );
+            let rendered = self.render.render(&context).instrument(render_span).await;
+            self.record_render_metrics();
+            resources.extend(rendered?.as_ref().iter().cloned());
+        }
+        Ok((revisions, resources))
+    }
+
+    /// Resolves the revision of one declared source (`T20.1`).
+    ///
+    /// `pin` (a rollback target) overrides the source's own requested revision, exactly like
+    /// [`Self::fetch_git_desired`]'s `pinned` does for a single-source `Application`.
+    async fn resolve_source_revision(
+        &self,
+        source: &DeclaredSource,
+        pin: Option<&str>,
+    ) -> Result<String, ReconcileError> {
+        if let Some(git) = source.spec.git_source() {
+            let git_source = GitSource::new(
+                git.repo_url.clone(),
+                pin.map(str::to_owned)
+                    .unwrap_or_else(|| git.target_revision.clone()),
+                git.path.clone(),
+            );
+            git_source.validate(self.url_policy)?;
+            let credentials = self.credentials_for(&git_source.repo_url).await?;
+            let fetch_started = std::time::Instant::now();
+            let resolved = self.repos.resolve_revision(&git_source, &credentials).await;
+            if let Some(metrics) = &self.metrics {
+                metrics.record_git_fetch(fetch_started.elapsed());
+            }
+            return Ok(resolved?.commit_sha);
+        }
+        let Some(oci) = source.spec.oci_source() else {
+            return Err(ReconcileError::Invalid {
+                message: "each declared source must set exactly one of `git` or `oci`".to_owned(),
+            });
+        };
+        let client = self.oci.as_deref().ok_or_else(|| ReconcileError::Invalid {
+            message: "spec.sources declares an OCI artifact but no OCI registry client is wired.                       No artifact was fetched and nothing in the cluster was changed."
+                .to_owned(),
+        })?;
+        let oci_source = OciSource::new(
+            oci.url.clone(),
+            pin.is_none().then(|| oci.tag.clone()).flatten(),
+            pin.map(str::to_owned).or_else(|| oci.digest.clone()),
+            oci.path.clone(),
+        );
+        oci_source.validate(self.oci_url_policy)?;
+        // A pinned digest is authoritative: nothing to resolve and nothing to dial.
+        if let Some(digest) = oci_source.digest.clone()
+            && oci_source.tag.is_none()
+        {
+            return Ok(digest);
+        }
+        let credentials = self.credentials_for(&oci_source.url).await?;
+        let fetch_started = std::time::Instant::now();
+        let resolved = client.resolve_digest(&oci_source, &credentials).await;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_source_fetch(crate::metrics::SourceKind::Oci, fetch_started.elapsed());
+        }
+        Ok(resolved?.manifest_digest)
+    }
+
+    /// Materializes the read-only worktree of one declared source at a resolved revision (`T20.1`).
+    async fn materialize_source(
+        &self,
+        source: &DeclaredSource,
+        revision: &str,
+    ) -> Result<ferriscd_engine::repo::RepoCheckout, ReconcileError> {
+        if let Some(git) = source.spec.git_source() {
+            let git_source =
+                GitSource::new(git.repo_url.clone(), revision.to_owned(), git.path.clone());
+            git_source.validate(self.url_policy)?;
+            let credentials = self.credentials_for(&git_source.repo_url).await?;
+            let fetch_started = std::time::Instant::now();
+            let checkout = self
+                .repos
+                .checkout(&git_source, revision, &credentials)
+                .await;
+            if let Some(metrics) = &self.metrics {
+                metrics.record_git_fetch(fetch_started.elapsed());
+            }
+            return checkout.map_err(ReconcileError::from);
+        }
+        let Some(oci) = source.spec.oci_source() else {
+            return Err(ReconcileError::Invalid {
+                message: "each declared source must set exactly one of `git` or `oci`".to_owned(),
+            });
+        };
+        let client = self.oci.as_deref().ok_or_else(|| ReconcileError::Invalid {
+            message: "spec.sources declares an OCI artifact but no OCI registry client is wired.                       No artifact was fetched and nothing in the cluster was changed."
+                .to_owned(),
+        })?;
+        let oci_source = OciSource::new(
+            oci.url.clone(),
+            oci.tag.clone(),
+            Some(revision.to_owned()),
+            oci.path.clone(),
+        );
+        oci_source.validate(self.oci_url_policy)?;
+        let credentials = self.credentials_for(&oci_source.url).await?;
+        let fetch_started = std::time::Instant::now();
+        let checkout = client
+            .fetch_artifact(&oci_source, revision, &credentials)
+            .await;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_source_fetch(crate::metrics::SourceKind::Oci, fetch_started.elapsed());
+        }
+        checkout.map_err(ReconcileError::from)
+    }
+
     /// Fetches and renders a Git-backed `Application` (the `v1.0` path, unchanged).
     async fn fetch_git_desired(
         &self,
         app: &Application,
         pinned: Option<&str>,
         discovery: &DiscoveryCache,
-    ) -> Result<(String, Vec<DesiredResource>), ReconcileError> {
+    ) -> Result<(SourceRevisions, Vec<DesiredResource>), ReconcileError> {
         let git = app
             .spec
-            .source
-            .git_source()
+            .primary_git_source()
             .ok_or_else(|| ReconcileError::Invalid {
                 message: "spec.source.git is required for a Git-backed Application".to_owned(),
             })?;
@@ -2570,7 +2882,10 @@ impl InventorySyncPipeline {
         let rendered = rendered?;
         // The pipeline hands back a shared, already-normalized bundle; stamping ownership below
         // mutates the resources, so this pass needs its own copy.
-        Ok((resolved.commit_sha, rendered.as_ref().clone()))
+        Ok((
+            SourceRevisions::single(resolved.commit_sha),
+            rendered.as_ref().clone(),
+        ))
     }
 
     /// Fetches and renders an OCI-backed `Application` (`T18.4`).
@@ -2604,7 +2919,7 @@ impl InventorySyncPipeline {
         oci: &ferriscd_crd::OciSourceSpec,
         pinned: Option<&str>,
         discovery: &DiscoveryCache,
-    ) -> Result<(String, Vec<DesiredResource>), ReconcileError> {
+    ) -> Result<(SourceRevisions, Vec<DesiredResource>), ReconcileError> {
         let client = self.oci.as_deref().ok_or_else(|| ReconcileError::Invalid {
             message: "spec.source.oci is not served by this controller build: no OCI registry \
                       client is wired. No artifact was fetched and nothing in the cluster was \
@@ -2647,7 +2962,7 @@ impl InventorySyncPipeline {
                  registry"
             );
             self.record_render_metrics();
-            return Ok((digest, cached.as_ref().clone()));
+            return Ok((SourceRevisions::single(digest), cached.as_ref().clone()));
         }
 
         // `T12.4`/`T18.3`: registry credentials come from a
@@ -2705,7 +3020,7 @@ impl InventorySyncPipeline {
             OciFetch::Cached { digest, bundle } => {
                 // A cached digest hit: no layer download and no subprocess.
                 self.record_render_metrics();
-                return Ok((digest, bundle.as_ref().clone()));
+                return Ok((SourceRevisions::single(digest), bundle.as_ref().clone()));
             }
             OciFetch::Fetched { digest, checkout } => (digest, checkout),
         };
@@ -2727,7 +3042,7 @@ impl InventorySyncPipeline {
         let rendered = self.render.render(&context).instrument(render_span).await;
         self.record_render_metrics();
         let rendered = rendered?;
-        Ok((digest, rendered.as_ref().clone()))
+        Ok((SourceRevisions::single(digest), rendered.as_ref().clone()))
     }
 
     /// Bridges the render cache's counters to `ferriscd_render_cache_total` (`T15.1`).
@@ -3113,17 +3428,22 @@ fn mid_operation_error(
 ) -> ReconcileError {
     let message = error.to_string();
     let revision = Some(request.revision.to_owned());
+    // `T20.1` finding M1: the failed pass resolved its sources, so the identity and the per-source
+    // list travel together to `/status`.
+    let revisions = request.revisions.to_vec();
     match error.failure_class() {
         FailureClass::Retryable => ReconcileError::PartialSync {
             message,
             inventory: inventory.clone(),
             revision,
+            revisions,
             operation: operation.map(Box::new),
         },
         FailureClass::Terminal => ReconcileError::SyncConflict {
             message: message.clone(),
             inventory: inventory.clone(),
             revision,
+            revisions,
             operation: operation.map(|mut state| {
                 state.phase = OperationPhase::Failed;
                 state.finished_at = Some(request.now.clone());
@@ -3164,12 +3484,14 @@ fn record_history(
     previous: &ApplicationStatus,
     app: &Application,
     operation: &OperationState,
+    revisions: &[String],
 ) -> Option<Vec<RevisionHistoryEntry>> {
     let mut scratch = previous.clone();
     record_operation_success(
         &mut scratch,
         operation,
-        Some(&app.spec.source),
+        app.spec.primary_source(),
+        revisions,
         app.spec.revision_history_limit,
     )
     .is_first()
@@ -3433,9 +3755,15 @@ fn build_outcome(
     summary: &DiffSummary,
     spec_hash: &str,
     counts: SyncCounts,
-    revision: String,
+    revisions: &SourceRevisions,
     inventory: Inventory,
 ) -> ApplyOutcome {
+    // `T20.1`: both revision facts come from the same pass-local list, so they cannot disagree:
+    // `revision` is the deployment identity (`composite`) and `per_source` is what `/status`
+    // publishes for an `Application` that declares `spec.sources` (empty for a `v1.0` `spec.source`
+    // one). One rule decides both the publish and the API's `multi_source` badge.
+    let revision = revisions.composite();
+    let per_source = revisions.published(&app.spec);
     let GateVerdict {
         decision,
         window,
@@ -3481,6 +3809,9 @@ fn build_outcome(
         // previous values when a pass reports `None` here.
         last_synced_revision: synced.then(|| revision.clone()),
         last_synced_spec_hash: synced.then(|| spec_hash.to_owned()),
+        // `T20.1`: the per-source revisions, empty for a single-source `Application` so its
+        // `/status` payload is unchanged.
+        revisions: per_source,
         last_synced_at: synced.then(|| now.clone()),
     };
 
@@ -3726,9 +4057,143 @@ fn plan_requeue(
     bound(configured)
 }
 
-/// First 7 characters of a commit SHA (the full SHA lives in `status.sync.revision`).
+/// The per-source pins a pass must honour for a multi-source `Application` (`T20.1`).
+///
+/// A rollback pins **one** revision string — the deployment identity recorded in
+/// `status.history[].revision`. For a multi-source `Application` that identity is the composite
+/// digest, which describes the whole deployment and no single source; the entry that identity came
+/// from also carries every source's revision (`status.history[].revisions`), so a multi-source
+/// rollback re-deploys exactly those revisions rather than "the pin for the first source, the tip
+/// for the rest".
+///
+/// Three cases are acceptable:
+///
+/// 1. a single declared source: pin it with `pinned`, exactly like a `v1.0` `Application`;
+/// 2. several sources, and the history entry records one revision per source: pin every source;
+/// 3. several sources, and `pinned` is **not** a `sha256:<64-hex>` digest (a plain commit SHA, an
+///    operator-supplied revision): pin the first source only and let every other source resolve its
+///    declared revision. The fallback is documented rather than silent, and it can never *widen*
+///    what a rollback deploys — the first source is the one the operator asked for.
+///
+/// Everything else is terminal ([`ReconcileError::Invalid`]): a `sha256:<64-hex>` digest has the same
+/// spelling whether it is FerrisCD's composite or an OCI manifest digest, so what the refusal can
+/// actually claim is the *fact* — no history entry decomposes this digest into one revision per
+/// declared source (finding N3: naming a cause the shape cannot prove misled operators whose pin was
+/// an OCI digest). Such a pin cannot be resolved as a single source's revision: handing it to a Git
+/// or registry resolver fails opaquely ("no such revision `sha256:...`") and retries forever, so the
+/// pass refuses with a message the operator can act on (finding H2).
+fn per_source_pins(
+    app: &Application,
+    sources: &[DeclaredSource],
+    pinned: Option<&str>,
+) -> Result<Vec<Option<String>>, ReconcileError> {
+    let mut pins = vec![None; sources.len()];
+    let Some(pinned) = pinned.filter(|pinned| !pinned.is_empty()) else {
+        return Ok(pins);
+    };
+    if sources.len() <= 1 {
+        if let Some(first) = pins.first_mut() {
+            *first = Some(pinned.to_owned());
+        }
+        return Ok(pins);
+    }
+    let recorded = app
+        .status
+        .as_ref()
+        .and_then(|status| recorded_revisions(status, pinned));
+    match recorded {
+        Some(revisions) if revisions.len() == sources.len() => {
+            Ok(revisions.into_iter().map(Some).collect())
+        }
+        Some(revisions) => Err(ReconcileError::Invalid {
+            message: format!(
+                "cannot roll back {} source(s) to {pinned}: the status.history entry that recorded \
+                 that revision describes {} source(s), not {}. A multi-source rollback must record \
+                 one revision per declared source; re-run the sync of that deployment (which \
+                 rewrites the entry with every source's revision) and roll back again",
+                sources.len(),
+                revisions.len(),
+                sources.len()
+            ),
+        }),
+        None if SourceRevisions::is_composite(pinned) => Err(ReconcileError::Invalid {
+            message: format!(
+                "cannot roll back to {pinned}: no status.history entry decomposes that digest into \
+                 one revision per declared source ({} declared). Pin a recorded multi-source \
+                 deployment, not an opaque digest: nothing was fetched and nothing in the cluster \
+                 was changed",
+                sources.len()
+            ),
+        }),
+        None => {
+            if let Some(first) = pins.first_mut() {
+                *first = Some(pinned.to_owned());
+            }
+            tracing::debug!(
+                app.namespace = %app.namespace().unwrap_or_default(),
+                app.name = %app.name_any(),
+                declared = sources.len(),
+                "the pinned revision is not a composite identity and no history entry records it; \
+                 pinning the first source only"
+            );
+            Ok(pins)
+        }
+    }
+}
+
+/// Renders the declared sources of `app` for a `/status` message (`T20.1`).
+///
+/// Every URL goes through the shared redaction helper: this string reaches `Application.status`,
+/// and a Git remote routinely embeds a token.
+fn describe_sources(app: &Application) -> String {
+    let sources = declared_sources(&app.spec);
+    if sources.len() <= 1 {
+        return sources.first().map_or_else(
+            || "spec.source".to_owned(),
+            |source| {
+                format!(
+                    "{} at path '{}'",
+                    manifest::redact_repo_url(source.spec.repo_url()),
+                    source.spec.source_path()
+                )
+            },
+        );
+    }
+    let described: Vec<String> = sources
+        .iter()
+        .map(|source| {
+            let alias = if source.alias.is_empty() {
+                String::new()
+            } else {
+                format!("ref: {} ", source.alias)
+            };
+            format!(
+                "{alias}{} at path '{}'",
+                manifest::redact_repo_url(source.spec.repo_url()),
+                source.spec.source_path()
+            )
+        })
+        .collect();
+    format!("spec.sources [{}]", described.join(", "))
+}
+
+/// Characters a revision is abbreviated to in a `/status` message.
+const SHORT_SHA_CHARS: usize = 7;
+
+/// Abbreviates a revision for a `/status` message (the full value stays in `status.sync.revision`).
+///
+/// A Git commit is shortened to its first 7 characters. A `sha256:<64-hex>` digest — the composite
+/// identity of a multi-source deployment, or an OCI manifest digest — is shortened **after** the
+/// algorithm prefix instead (`sha256:abc1234`): taking the first 7 characters of the whole string
+/// would print the bare prefix `sha256:`, which names no deployment at all (`T20.1` finding N1).
 fn short_sha(sha: &str) -> String {
-    sha.chars().take(7).collect()
+    if let Some(hex) = sha.strip_prefix(COMPOSITE_PREFIX)
+        && SourceRevisions::is_composite(sha)
+    {
+        let abbreviated: String = hex.chars().take(SHORT_SHA_CHARS).collect();
+        return format!("{COMPOSITE_PREFIX}{abbreviated}");
+    }
+    sha.chars().take(SHORT_SHA_CHARS).collect()
 }
 
 /// Rejects every desired resource whose live object is owned by a different `Application`.
@@ -4488,7 +4953,7 @@ mod tests {
         let spec = ApplicationSpec {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
-            source: SourceSpec {
+            source: Some(SourceSpec {
                 git: Some(GitSourceSpec {
                     repo_url: repo_url.to_owned(),
                     target_revision: "main".to_owned(),
@@ -4496,7 +4961,8 @@ mod tests {
                 }),
                 oci: None,
                 renderer: RendererSpec::default(),
-            },
+            }),
+            sources: Vec::new(),
             destination: DestinationSpec {
                 cluster: IN_CLUSTER.to_owned(),
                 namespace: destination_namespace.to_owned(),
@@ -4629,6 +5095,7 @@ mod tests {
     ) -> ApplyOutcome {
         let window = SyncWindowVerdict::allowed();
         let now = crate::reconcile::now();
+        let revisions = SourceRevisions::single(revision);
         super::build_outcome(
             app,
             super::GateVerdict {
@@ -4639,7 +5106,7 @@ mod tests {
             summary,
             spec_hash,
             counts,
-            revision,
+            &revisions,
             inventory,
         )
     }
@@ -5308,8 +5775,9 @@ spec:
     /// An `Application` whose source is an OCI artifact (`T18.4`).
     fn oci_app(url: &str, tag: Option<&str>, digest: Option<&str>, path: &str) -> Application {
         let mut app = application("", path, "payments");
-        app.spec.source.git = None;
-        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+        let source = app.spec.source.as_mut().expect("spec.source");
+        source.git = None;
+        source.oci = Some(ferriscd_crd::OciSourceSpec {
             url: url.to_owned(),
             tag: tag.map(str::to_owned),
             digest: digest.map(str::to_owned),
@@ -6519,7 +6987,7 @@ spec:
             "a blocked pass must not advance lastSyncedSpecHash"
         );
         let mut merged = app.status.clone().expect("previous status");
-        crate::reconcile::apply_outcome_status(&mut merged, &outcome);
+        crate::reconcile::apply_outcome_status(&mut merged, &app.spec, &outcome);
         let merged_sync = merged.sync.clone().expect("sync state");
         assert_eq!(
             merged_sync.last_synced_revision.as_deref(),
@@ -6952,7 +7420,7 @@ spec:
             SyncCounts::default(),
             // Only the *shape* of the revision matters here (`short_sha` is what the old message
             // quoted); the message under test never mentions it any more.
-            "1111111111111111111111111111111111111111".to_owned(),
+            &SourceRevisions::single("1111111111111111111111111111111111111111"),
             Inventory::new(),
         );
         assert_eq!(outcome.reason, REASON_SYNC_WINDOW_ACTIVE);
@@ -6983,6 +7451,63 @@ spec:
             "the operator must see which window blocks: {}",
             outcome.message
         );
+    }
+
+    /// **`T20.1` finding N1.** A composite identity is abbreviated **after** its algorithm prefix.
+    ///
+    /// `short_sha` took the first 7 characters of the whole string, so every multi-source `/status`
+    /// message quoted the bare prefix `sha256:` — a "revision" that names no deployment, printed
+    /// next to the resource counts the operator is trying to correlate with a commit.
+    #[test]
+    fn a_composite_revision_is_abbreviated_after_its_prefix() {
+        let now = at("2026-01-07T12:00:00Z");
+        let verdict = SyncWindowSet::compile(&[]).evaluate(
+            now.0,
+            &SyncWindowTarget::new("payments-api", "ferriscd-system", "in-cluster"),
+        );
+        let revisions = SourceRevisions::new(vec![
+            "1111111111111111111111111111111111111111".to_owned(),
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+        ]);
+        let composite = revisions.composite();
+        let hex = composite
+            .strip_prefix(COMPOSITE_PREFIX)
+            .expect("a two-source identity is a digest");
+        let expected = format!("{COMPOSITE_PREFIX}{}", &hex[..SHORT_SHA_CHARS]);
+
+        let outcome = super::build_outcome(
+            &application("https://example.com/repo.git", ".", "payments"),
+            super::GateVerdict {
+                decision: SyncDecision::Skip(SkipReason::AlreadySynced),
+                window: &verdict,
+                now: &now,
+            },
+            &DiffSummary::default(),
+            HASH,
+            SyncCounts::default(),
+            &revisions,
+            Inventory::new(),
+        );
+
+        assert!(
+            outcome
+                .message
+                .contains(&format!("at revision {expected},")),
+            "the message must quote the abbreviated digest, not its prefix: {}",
+            outcome.message
+        );
+        assert!(
+            !outcome.message.contains("revision sha256:,"),
+            "a bare `sha256:` prefix names no deployment: {}",
+            outcome.message
+        );
+        // The full identity is never dropped — it is what `/status.sync.revision` stores.
+        assert_eq!(
+            outcome.sync.as_ref().and_then(|sync| sync.revision.clone()),
+            Some(composite)
+        );
+        // A plain commit SHA keeps the `v1.0` presentation.
+        assert_eq!(super::short_sha("8f3a1c2b9d"), "8f3a1c2");
     }
 
     /// **Finding H3:** the transition instant survives the cap even when the explanation is at its
@@ -7034,7 +7559,7 @@ spec:
             &DiffSummary::default(),
             HASH,
             SyncCounts::default(),
-            "1111111111111111111111111111111111111111".to_owned(),
+            &SourceRevisions::single("1111111111111111111111111111111111111111"),
             Inventory::new(),
         );
         assert_eq!(outcome.reason, REASON_SYNC_WINDOW_ACTIVE);
@@ -10124,7 +10649,14 @@ spec:
             .expect("the first pass persists the spec hash");
 
         // The operator points the Application at a different directory in the *same* commit.
-        app.spec.source.git.as_mut().expect("git source").path = "config".to_owned();
+        app.spec
+            .source
+            .as_mut()
+            .expect("spec.source")
+            .git
+            .as_mut()
+            .expect("git source")
+            .path = "config".to_owned();
         let new_hash = source_spec_hash(&app.spec).expect("spec hash");
         assert_ne!(old_hash, new_hash, "a path edit must change the hash");
 
@@ -10774,6 +11306,7 @@ spec:
                 revision: Some(sha.to_owned()),
                 last_synced_revision: Some(sha.to_owned()),
                 last_synced_spec_hash: Some(spec_hash.to_owned()),
+                revisions: Vec::new(),
                 last_synced_at: Some(now()),
             }),
             ..ApplicationStatus::default()
@@ -11141,7 +11674,15 @@ spec:
         };
         let before = status.clone();
         let outcome = ApplyOutcome::ready(REASON_SYNC_SUCCEEDED, "done");
-        crate::reconcile::apply_outcome_status(&mut status, &outcome);
+        // A `v1.0` single-source spec: the only predicate `apply_outcome_status` forwards to
+        // `merge_sync_state` is whether `spec.sources` is declared, and this test reports no sync
+        // state at all, so either shape proves the untouched-field rule.
+        let spec: ApplicationSpec = serde_json::from_value(json!({
+            "source": {"git": {"repoURL": "https://example.com/repo.git"}},
+            "destination": {"namespace": "payments"},
+        }))
+        .expect("a valid v1.0 spec");
+        crate::reconcile::apply_outcome_status(&mut status, &spec, &outcome);
         assert_eq!(status.health, before.health);
         assert!(status.inventory.is_empty());
         assert!(status.sync.is_none());
@@ -11179,10 +11720,11 @@ spec:
         ]);
 
         let mut app = fixture.app(".");
-        app.spec.source.renderer = RendererSpec::Kustomize(ferriscd_crd::KustomizeRenderer {
-            kustomization_path: None,
-            images: Vec::new(),
-        });
+        app.spec.source.as_mut().expect("spec.source").renderer =
+            RendererSpec::Kustomize(ferriscd_crd::KustomizeRenderer {
+                kustomization_path: None,
+                images: Vec::new(),
+            });
 
         let outcome = fixture
             .pipeline
@@ -11245,10 +11787,11 @@ spec:
             ("configmap.yaml", CONFIGMAP),
         ]);
         let mut app = fixture.app(".");
-        app.spec.source.renderer = RendererSpec::Kustomize(ferriscd_crd::KustomizeRenderer {
-            kustomization_path: None,
-            images: Vec::new(),
-        });
+        app.spec.source.as_mut().expect("spec.source").renderer =
+            RendererSpec::Kustomize(ferriscd_crd::KustomizeRenderer {
+                kustomization_path: None,
+                images: Vec::new(),
+            });
 
         // Two passes at the same commit: one render (a miss) and one cache hit.
         fixture.pipeline.apply(&app).await.expect("first pass");
@@ -11331,11 +11874,12 @@ spec:
         ]);
 
         let mut app = fixture.app(".");
-        app.spec.source.renderer = RendererSpec::Helm(ferriscd_crd::HelmRenderer {
-            release_name: None,
-            value_files: Vec::new(),
-            include_crds: false,
-        });
+        app.spec.source.as_mut().expect("spec.source").renderer =
+            RendererSpec::Helm(ferriscd_crd::HelmRenderer {
+                release_name: None,
+                value_files: Vec::new(),
+                include_crds: false,
+            });
 
         fixture
             .pipeline
@@ -11643,24 +12187,26 @@ spec:
         // for a URL the project lists, so the assertions above are about the policy — not about a
         // fixture that could never have fetched anything.
         let mut permitted = app.clone();
-        permitted.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
-            url: "oci://ghcr.io/evil/payments".to_owned(),
-            tag: Some("1.4.2".to_owned()),
-            digest: None,
-            path: String::new(),
-        });
+        permitted.spec.source.as_mut().expect("spec.source").oci =
+            Some(ferriscd_crd::OciSourceSpec {
+                url: "oci://ghcr.io/evil/payments".to_owned(),
+                tag: Some("1.4.2".to_owned()),
+                digest: None,
+                path: String::new(),
+            });
         // `oci_only_project` lists `oci://ghcr.io/example/*`, so this is still denied…
         assert!(fixture.pipeline.apply(&permitted).await.is_err());
         // …while the same wiring allows a listed reference. (The fake has no artifact registered
         // for it, so the pass fails *after* the policy — which is exactly the point: it reached the
         // client.)
         let mut allowed = permitted.clone();
-        allowed.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
-            url: "oci://ghcr.io/example/payments".to_owned(),
-            tag: Some("1.4.2".to_owned()),
-            digest: None,
-            path: String::new(),
-        });
+        allowed.spec.source.as_mut().expect("spec.source").oci =
+            Some(ferriscd_crd::OciSourceSpec {
+                url: "oci://ghcr.io/example/payments".to_owned(),
+                tag: Some("1.4.2".to_owned()),
+                digest: None,
+                path: String::new(),
+            });
         let reached = fixture
             .pipeline
             .apply(&allowed)
@@ -11958,7 +12504,7 @@ spec:
         });
         fixture.cluster.seed_applied();
 
-        app.spec.source.oci = Some(ferriscd_crd::OciSourceSpec {
+        app.spec.source.as_mut().expect("spec.source").oci = Some(ferriscd_crd::OciSourceSpec {
             url: url.to_owned(),
             tag: Some("2.0.0".to_owned()),
             digest: None,
@@ -13139,5 +13685,682 @@ spec:
         let serialized = serde_json::to_string(&events).expect("events serialize");
         assert!(!serialized.contains("tok3n"), "{serialized}");
         assert!(!serialized.contains("qsecret"), "{serialized}");
+    }
+    // ---------------------------------------------------------------------
+    // `T20.1`: multi-source (`spec.sources`) composition
+    // ---------------------------------------------------------------------
+
+    /// A chart/values fixture: the chart lives on its own `charts` branch, the values live on a
+    /// `values` branch of a **second** repository, so each source resolves an independent revision
+    /// (which is what makes "the values repo moved" observable at all).
+    struct MultiSourceFixture {
+        fixture: Fixture,
+        chart_url: String,
+        values_url: String,
+        /// The fake `helm` that names the rendered `ConfigMap` after the values it received.
+        helm: FakeRenderer,
+        chart_sha: String,
+        values_sha: String,
+    }
+
+    /// A `helm` stand-in whose output depends on the values file it was handed.
+    ///
+    /// The rendered `ConfigMap` is named `scaled` when the first `--values` file contains
+    /// `replicaCount: 3` and `default` otherwise. That makes "the values from the *other*
+    /// repository reached the renderer" a fact in the applied object, not an assumption about argv.
+    #[cfg(unix)]
+    fn values_aware_helm() -> FakeRenderer {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("helm");
+        let script = r#"#!/bin/sh
+printf 'x\n' >> "$(dirname "$0")/invocations"
+{ printf '%s\n' "$@"; printf -- '---\n'; } >> "$(dirname "$0")/args"
+values=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--values" ]; then values="$argument"; fi
+  previous="$argument"
+done
+name=default
+if [ -n "$values" ] && grep -q 'replicaCount: 3' "$values"; then name=scaled; fi
+printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\n  namespace: payments\n' "$name"
+"#;
+        std::fs::write(&path, script).unwrap();
+        make_executable(&path);
+        FakeRenderer { dir, path }
+    }
+
+    #[cfg(unix)]
+    fn multi_source_fixture() -> MultiSourceFixture {
+        let helm = values_aware_helm();
+        let fixture = fixture_with_renderers(
+            FakeCluster::default().with_namespace("payments"),
+            RendererBinaries {
+                helm: Some(helm.path().to_path_buf()),
+                ..RendererBinaries::default()
+            },
+        );
+        let chart_url = "https://example.com/charts.git".to_owned();
+        let values_url = "https://example.com/values.git".to_owned();
+        let chart_sha = fixture.git.add_commit(
+            "charts",
+            [(
+                "charts/api/Chart.yaml",
+                "apiVersion: v2\nname: api\nversion: 0.1.0\n",
+            )],
+        );
+        let values_sha = fixture
+            .git
+            .add_commit("values", [("envs/prod/values.yaml", "replicaCount: 1\n")]);
+        MultiSourceFixture {
+            fixture,
+            chart_url,
+            values_url,
+            helm,
+            chart_sha,
+            values_sha,
+        }
+    }
+
+    /// The split chart + values `Application` the roadmap describes.
+    #[cfg(unix)]
+    fn multi_source_app(fixture: &MultiSourceFixture, policy: Option<SyncPolicy>) -> Application {
+        let spec = ApplicationSpec {
+            project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
+            service_account_name: None,
+            source: None,
+            sources: vec![
+                ferriscd_crd::MultiSourceEntry {
+                    ref_name: Some("chart".to_owned()),
+                    git: Some(GitSourceSpec {
+                        repo_url: fixture.chart_url.clone(),
+                        target_revision: "charts".to_owned(),
+                        path: "charts/api".to_owned(),
+                    }),
+                    oci: None,
+                    renderer: Some(RendererSpec::Helm(ferriscd_crd::HelmRenderer {
+                        release_name: Some("api".to_owned()),
+                        value_files: vec!["$values/envs/prod/values.yaml".to_owned()],
+                        include_crds: false,
+                    })),
+                },
+                ferriscd_crd::MultiSourceEntry {
+                    ref_name: Some("values".to_owned()),
+                    git: Some(GitSourceSpec {
+                        repo_url: fixture.values_url.clone(),
+                        target_revision: "values".to_owned(),
+                        path: String::new(),
+                    }),
+                    oci: None,
+                    renderer: None,
+                },
+            ],
+            destination: DestinationSpec {
+                cluster: IN_CLUSTER.to_owned(),
+                namespace: "payments".to_owned(),
+            },
+            sync_policy: policy,
+            ignore_differences: Vec::new(),
+            requeue_after_seconds: DEFAULT_REQUEUE_AFTER_SECONDS,
+            revision_history_limit: DEFAULT_REVISION_HISTORY_LIMIT,
+        };
+        let mut app = Application::new("payments", spec);
+        app.metadata.namespace = Some("ferriscd-system".to_owned());
+        app.metadata.generation = Some(4);
+        app
+    }
+
+    /// **Acceptance criterion.** A chart and its values in two different repositories render, and
+    /// the values file the chart asked for through `$values/...` is the one the renderer received.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_multi_source_chart_renders_with_values_from_the_other_repository() {
+        let multi = multi_source_fixture();
+        let app = multi_source_app(&multi, Some(self_heal_policy()));
+        assert!(app.spec.validate().is_ok(), "{:?}", app.spec.validate());
+
+        let outcome = multi
+            .fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("the multi-source pass must succeed");
+
+        assert_eq!(
+            multi.fixture.cluster.applies(),
+            vec!["/ConfigMap/payments/default".to_owned()],
+            "the chart renders, the values-only source contributes no manifests"
+        );
+        // The referenced values file was resolved inside the *values* worktree and handed to helm.
+        let args = multi.helm.recorded_args();
+        let values: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                index
+                    .checked_sub(1)
+                    .and_then(|index| args.get(index))
+                    .map(String::as_str)
+                    == Some("--values")
+            })
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(values.len(), 1, "exactly one value file: {args:?}");
+        assert!(
+            values[0].ends_with("envs/prod/values.yaml"),
+            "the referenced values file must be passed to helm: {}",
+            values[0]
+        );
+
+        // Deterministic per-source revisions, in declaration order, published in `/status`.
+        let sync = outcome.sync.as_ref().expect("sync state");
+        assert_eq!(
+            sync.revisions,
+            vec![multi.chart_sha.clone(), multi.values_sha.clone()]
+        );
+        let composite = sync.revision.clone().expect("composite revision");
+        assert!(
+            composite.starts_with("sha256:") && composite.len() == "sha256:".len() + 64,
+            "a multi-source revision is a composite digest, got {composite}"
+        );
+        // The history entry records the same per-source revisions, which a rollback re-pins.
+        let entry = outcome
+            .history
+            .as_ref()
+            .and_then(|history| history.first())
+            .expect("the settled pass appends a history entry");
+        assert_eq!(entry.revisions, sync.revisions);
+        assert_eq!(entry.revision.as_deref(), Some(composite.as_str()));
+    }
+
+    /// **Trap guard.** A single-source `Application` must not gain a `status.sync.revisions` field,
+    /// and its `status.sync.revision` stays the plain commit SHA it always was.
+    #[tokio::test]
+    async fn a_single_source_application_keeps_its_plain_revision() {
+        let fixture = fixture(FakeCluster::default().with_namespace("payments"));
+        let sha = fixture.commit(&[("configmap.yaml", CONFIGMAP)]);
+        let app = fixture.app(".");
+        let outcome = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("a single-source pass must succeed");
+        let sync = outcome.sync.as_ref().expect("sync state");
+        assert_eq!(sync.revision.as_deref(), Some(sha.as_str()));
+        assert!(
+            sync.revisions.is_empty(),
+            "a v1.0 Application must not gain a revision list: {:?}",
+            sync.revisions
+        );
+        let entry = outcome
+            .history
+            .as_ref()
+            .and_then(|history| history.first())
+            .expect("history entry");
+        assert!(entry.revisions.is_empty());
+        // The serialized `/status` carries no `revisions` key at all, which is what keeps a stored
+        // `v1.0` object byte-identical.
+        let serialized = serde_json::to_value(sync).expect("sync state serializes");
+        assert!(serialized.get("revisions").is_none(), "{serialized}");
+    }
+
+    /// **Acceptance criterion.** Editing a value file in the secondary repository moves
+    /// `status.sync.revisions` and re-syncs under `selfHeal: false`, even though the chart commit is
+    /// untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn editing_the_values_repository_resyncs_under_self_heal_false() {
+        let multi = multi_source_fixture();
+        let app = multi_source_app(&multi, Some(source_only_policy()));
+        let first = multi
+            .fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect("first pass");
+        let first_sync = first.sync.clone().expect("sync state");
+        assert_eq!(
+            first_sync.revisions,
+            vec![multi.chart_sha.clone(), multi.values_sha.clone()]
+        );
+        assert_eq!(
+            multi.fixture.cluster.applies(),
+            vec!["/ConfigMap/payments/default".to_owned()]
+        );
+        // The fake cluster now holds what the first pass applied, so the next pass diffs against a
+        // converged cluster instead of a missing object.
+        multi.fixture.cluster.seed_applied();
+
+        // A second pass at unchanged revisions must not re-apply (`selfHeal: false`).
+        let mut settled = app.clone();
+        settled.status = Some(ApplicationStatus {
+            sync: Some(first_sync.clone()),
+            history: first.history.clone().unwrap_or_default(),
+            ..ApplicationStatus::default()
+        });
+        let skipped = multi
+            .fixture
+            .pipeline
+            .apply(&settled)
+            .await
+            .expect("second pass");
+        assert_eq!(
+            multi.fixture.cluster.applies().len(),
+            1,
+            "an unchanged multi-source revision must not re-apply"
+        );
+        assert_eq!(
+            skipped.sync.as_ref().map(|sync| sync.status),
+            Some(SyncStatus::Synced)
+        );
+
+        // Now move **only** the values branch: the chart revision stays put.
+        let new_values_sha = multi
+            .fixture
+            .git
+            .add_commit("values", [("envs/prod/values.yaml", "replicaCount: 3\n")]);
+        assert_ne!(new_values_sha, multi.values_sha);
+        assert_eq!(
+            multi.fixture.git.branch_tip("charts").as_deref(),
+            Some(multi.chart_sha.as_str()),
+            "the chart branch must not have moved"
+        );
+
+        let mut drifted = app.clone();
+        drifted.status = Some(ApplicationStatus {
+            sync: skipped.sync.clone(),
+            history: skipped.history.clone().unwrap_or_default(),
+            ..ApplicationStatus::default()
+        });
+        let second = multi
+            .fixture
+            .pipeline
+            .apply(&drifted)
+            .await
+            .expect("third pass");
+        assert_eq!(
+            multi.fixture.cluster.applies(),
+            vec![
+                "/ConfigMap/payments/default".to_owned(),
+                // The new values file reaches the renderer: the rendered name changes.
+                "/ConfigMap/payments/scaled".to_owned(),
+            ],
+            "the moved values revision must re-render and re-apply"
+        );
+        let second_sync = second.sync.as_ref().expect("sync state");
+        assert_eq!(
+            second_sync.revisions,
+            vec![multi.chart_sha.clone(), new_values_sha],
+            "the chart revision is unchanged and the values revision moved"
+        );
+        assert_ne!(
+            second_sync.revision, first_sync.revision,
+            "the composite revision must move when any source moves"
+        );
+    }
+
+    /// **Risk guard.** A failure on the *second* source fails the whole pass: nothing is applied and
+    /// nothing is pruned, so a half-fetched bundle can never reach the cluster.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_second_source_applies_and_prunes_nothing() {
+        let multi = multi_source_fixture();
+        let mut app = multi_source_app(&multi, Some(self_heal_policy()));
+        app.status = Some(status_with_inventory(&["/ConfigMap/payments/previous"]));
+
+        // The chart source resolves (its branch exists); the values source names a branch that
+        // does not, so the *second* resolution fails after the first one already succeeded.
+        let mut broken = app.clone();
+        broken.spec.sources[1]
+            .git
+            .as_mut()
+            .expect("values source")
+            .target_revision = "does-not-exist".to_owned();
+        let fixture = &multi.fixture;
+        let resolves_before = fixture.git.resolve_calls();
+
+        let error = fixture
+            .pipeline
+            .apply(&broken)
+            .await
+            .expect_err("a failed second source must fail the pass");
+        assert!(
+            error.to_string().contains("does-not-exist"),
+            "the failure must name the revision that could not be resolved: {error}"
+        );
+        assert!(
+            fixture.cluster.applies().is_empty(),
+            "no half-rendered manifests may be applied: {:?}",
+            fixture.cluster.applies()
+        );
+        assert!(
+            fixture.cluster.deletes().is_empty(),
+            "an atomic fetch failure must never prune: {:?}",
+            fixture.cluster.deletes()
+        );
+        assert_eq!(
+            fixture.pipeline.mutating_applies(),
+            0,
+            "not a single mutating apply may be issued"
+        );
+        // `app` itself is untouched: the caller owns `/status`, and this pass never wrote to it.
+        assert_eq!(
+            app.status.as_ref().map(|status| status.inventory.len()),
+            Some(1)
+        );
+        assert!(
+            fixture.git.resolve_calls() > resolves_before,
+            "the second source really was attempted (non-vacuity)"
+        );
+    }
+
+    /// **`T20.1` finding H2 (acceptance).** A rollback of a two-source `Application` re-pins **both**
+    /// revisions from the history entry, re-renders the pinned values, and settles `Synced` — and the
+    /// composite identity is never handed to a Git resolver as if it were a commit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_multi_source_rollback_re_pins_every_recorded_revision() {
+        let multi = multi_source_fixture();
+        // Pruning is on, so the deployment that follows a moved values file really removes the
+        // previous `ConfigMap` — which is what makes "the rollback re-applied the pinned content" an
+        // observable apply rather than "the old object was still live".
+        let mut app = multi_source_app(&multi, Some(self_heal_policy()));
+        auto_prune(&mut app);
+
+        // Threads `/status` forward exactly like `apply_outcome_status` does, so the next pass reads
+        // the markers, history and inventory the previous one wrote.
+        let advance = |app: &mut Application, outcome: &ApplyOutcome| {
+            let mut status = app.status.clone().unwrap_or_default();
+            status.operation_state = outcome.operation_state.clone();
+            status.history = outcome.history.clone().unwrap_or(status.history);
+            if let Some(sync) = outcome.sync.clone() {
+                status.sync = Some(sync);
+            }
+            status.inventory = outcome
+                .inventory
+                .clone()
+                .map(|inventory| ferriscd_engine::inventory::to_status_entries(&inventory))
+                .unwrap_or(status.inventory);
+            app.status = Some(status);
+        };
+
+        // Pass 1: (chart-v1, values-v1) is deployed and recorded with both revisions.
+        let mut current = app.clone();
+        let first = multi
+            .fixture
+            .pipeline
+            .apply(&current)
+            .await
+            .expect("the first pass must succeed");
+        let first_sync = first.sync.clone().expect("sync state");
+        let composite_v1 = first_sync.revision.clone().expect("the composite revision");
+        let history_v1 = first.history.clone().expect("history entry");
+        assert_eq!(
+            first_sync.revisions,
+            vec![multi.chart_sha.clone(), multi.values_sha.clone()]
+        );
+        assert_eq!(
+            history_v1[0].revisions, first_sync.revisions,
+            "the entry must describe every source, which is what the rollback re-pins"
+        );
+        multi.fixture.cluster.seed_applied();
+        assert_eq!(
+            multi.fixture.cluster.applies(),
+            vec!["/ConfigMap/payments/default".to_owned()]
+        );
+        advance(&mut current, &first);
+
+        // **Both** repositories move, so a rollback that pinned only one of them would be visible.
+        let chart_sha_v2 = multi.fixture.git.add_commit(
+            "charts",
+            [(
+                "charts/api/Chart.yaml",
+                "apiVersion: v2\nname: api\nversion: 0.2.0\n",
+            )],
+        );
+        let values_sha_v2 = multi
+            .fixture
+            .git
+            .add_commit("values", [("envs/prod/values.yaml", "replicaCount: 3\n")]);
+        let second = multi
+            .fixture
+            .pipeline
+            .apply(&current)
+            .await
+            .expect("the second pass must succeed");
+        let second_sync = second.sync.clone().expect("sync state");
+        assert_eq!(
+            second_sync.revisions,
+            vec![chart_sha_v2.clone(), values_sha_v2.clone()]
+        );
+        assert_ne!(second_sync.revision, first_sync.revision);
+        multi.fixture.cluster.seed_applied();
+        assert_eq!(
+            multi.fixture.cluster.applies(),
+            vec![
+                "/ConfigMap/payments/default".to_owned(),
+                "/ConfigMap/payments/scaled".to_owned(),
+            ],
+            "the moved values revision really re-rendered"
+        );
+        assert!(
+            multi
+                .fixture
+                .cluster
+                .deletes()
+                .contains(&"/ConfigMap/payments/default".to_owned()),
+            "the previous ConfigMap is gone, so re-applying it is a real mutation: {:?}",
+            multi.fixture.cluster.deletes()
+        );
+        // The fake API server records a delete but keeps the object addressable; dropping it here
+        // models the completed prune, so the rollback's re-apply is a real mutation rather than
+        // "the object it wants was still live".
+        multi
+            .fixture
+            .cluster
+            .objects
+            .lock()
+            .unwrap()
+            .remove("/ConfigMap/payments/default");
+        advance(&mut current, &second);
+
+        // The operator asks for history id 1 — the (chart-v1, values-v1) deployment. The render cache
+        // is dropped first: a cache hit would serve the pinned bundle without proving that the pins
+        // were applied at all.
+        multi.fixture.pipeline.render.cache().clear();
+        multi.fixture.git.reset_call_log();
+        let mut rolling_back = current.clone();
+        rolling_back.annotations_mut().insert(
+            annotations::OPERATION.to_owned(),
+            r#"{"rollback":{"id":1}}"#.to_owned(),
+        );
+        let rollback = multi
+            .fixture
+            .pipeline
+            .apply(&rolling_back)
+            .await
+            .expect("the rollback pass must succeed");
+
+        let rollback_sync = rollback.sync.clone().expect("sync state");
+        assert_eq!(
+            rollback_sync.status,
+            SyncStatus::Synced,
+            "a multi-source rollback settles: {}",
+            rollback.message
+        );
+        assert_eq!(
+            rollback_sync.revisions,
+            vec![multi.chart_sha.clone(), multi.values_sha.clone()],
+            "every source is re-pinned from the history entry, not just the first"
+        );
+        assert_eq!(
+            rollback_sync.revision.as_deref(),
+            Some(composite_v1.as_str()),
+            "the rollback re-deploys the recorded composite identity"
+        );
+        // The resolver was asked for the two recorded commits — never for the composite digest.
+        let resolved = multi.fixture.git.resolve_log();
+        assert!(
+            resolved.contains(&multi.chart_sha) && resolved.contains(&multi.values_sha),
+            "both pinned revisions must be resolved: {resolved:?}"
+        );
+        assert!(
+            !resolved
+                .iter()
+                .any(|revision| SourceRevisions::is_composite(revision)),
+            "a composite digest must never reach a Git resolver: {resolved:?}"
+        );
+        // The pinned values content reached the renderer: the v1 ConfigMap is applied again.
+        assert_eq!(
+            multi.fixture.cluster.applies(),
+            vec![
+                "/ConfigMap/payments/default".to_owned(),
+                "/ConfigMap/payments/scaled".to_owned(),
+                "/ConfigMap/payments/default".to_owned(),
+            ],
+            "the pinned values revision is what re-rendered"
+        );
+        // The rollback is recorded like any other deployment, with both per-source revisions, so a
+        // second rollback (or a rollback of this one) still has a decomposable entry.
+        let recorded = rollback.history.clone().expect("history entry");
+        assert_eq!(recorded[0].revision.as_deref(), Some(composite_v1.as_str()));
+        assert_eq!(recorded[0].revisions, rollback_sync.revisions);
+        assert!(
+            rollback.warnings.iter().any(|warning| warning.reason
+                == ferriscd_engine::sync::REASON_AUTOMATED_SYNC_DISABLED_BY_ROLLBACK),
+            "the operator must be told automation was disabled: {:?}",
+            rollback.warnings
+        );
+    }
+
+    /// **`T20.1` finding H2.** A pin that no history entry decomposes into per-source revisions is a
+    /// **terminal** refusal: nothing is resolved, rendered, applied or pruned — instead of pinning the
+    /// composite digest as a Git revision and failing opaquely on every retry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_composite_rollback_pin_without_recorded_revisions_is_refused_before_any_fetch() {
+        let multi = multi_source_fixture();
+        // A history entry carrying the composite identity but **no** per-source list: the shape a
+        // pre-`T20.1` entry (or a hand-written `/status`) has.
+        let composite =
+            SourceRevisions::new(vec!["chart-sha".to_owned(), "values-sha".to_owned()]).composite();
+        let mut app = multi_source_app(&multi, Some(self_heal_policy()));
+        app.status = Some(ApplicationStatus {
+            history: vec![RevisionHistoryEntry::new(
+                1,
+                Some(composite.clone()),
+                at("2026-11-24T12:00:00Z"),
+            )],
+            ..ApplicationStatus::default()
+        });
+        app.annotations_mut().insert(
+            annotations::OPERATION.to_owned(),
+            r#"{"rollback":{"id":1}}"#.to_owned(),
+        );
+
+        let error = multi
+            .fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("a composite pin with no per-source list must be refused");
+        assert!(matches!(error, ReconcileError::Invalid { .. }), "{error:?}");
+        assert_eq!(
+            error.failure_class(),
+            crate::FailureClass::Terminal,
+            "the history entry is deterministic input, so a retry can never succeed"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&composite), "{message}");
+        assert!(
+            message.contains("history") || message.contains("source"),
+            "the message must name the missing per-source record: {message}"
+        );
+        // `T20.1` finding N3: the refusal states the *fact* — no history entry decomposes this
+        // digest. It must not diagnose the cause, because an OCI manifest digest has exactly the
+        // same `sha256:<64-hex>` spelling as a FerrisCD composite, so "that is a composite
+        // multi-source deployment identity" is a claim the shape cannot support.
+        assert!(
+            message.contains("decomposes"),
+            "the message must name the fact that makes the pin unusable: {message}"
+        );
+        assert!(
+            !message.contains("composite"),
+            "a `sha256:` pin may be an OCI manifest digest, so the refusal must not call it a \
+             composite: {message}"
+        );
+        assert_eq!(
+            multi.fixture.git.resolve_calls(),
+            0,
+            "the refusal happens before the first resolve"
+        );
+        assert_eq!(multi.fixture.git.checkout_calls(), 0);
+        assert!(multi.fixture.cluster.applies().is_empty());
+        assert!(multi.fixture.cluster.deletes().is_empty());
+    }
+
+    /// **`T20.1` acceptance (trap guard, mirroring the OCI test).** An unauthorized **second** source
+    /// is refused by `AppProject` before any clone: the values repository is never dialled, so a
+    /// tenant cannot use the values-only source to probe a repository its project does not grant.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unauthorized_second_source_is_refused_before_any_clone() {
+        let multi = multi_source_fixture();
+        let app = multi_source_app(&multi, Some(self_heal_policy()));
+        let MultiSourceFixture {
+            fixture, chart_url, ..
+        } = multi;
+        // The project grants the chart repository only — the values repository is not listed.
+        let project: AppProject = serde_saphyr::from_str(&format!(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: ferriscd-system
+spec:
+  sourceRepos:
+    - {chart_url}
+  sourceNamespaces:
+    - ferriscd-system
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+"#
+        ))
+        .expect("project must parse");
+        let mut fixture = fixture;
+        fixture.pipeline = fixture
+            .pipeline
+            .with_project_source(Arc::new(FakeProjectSource::default().with_project(project)));
+        assert!(
+            app.spec.validate().is_ok(),
+            "the spec is valid: the refusal is the project's"
+        );
+
+        let error = fixture
+            .pipeline
+            .apply(&app)
+            .await
+            .expect_err("an unauthorized second source must be refused");
+        assert!(
+            matches!(
+                error,
+                ReconcileError::Policy(PolicyError::SourceRepoNotAllowed { .. })
+            ),
+            "expected SourceRepoNotAllowed, got {error:?}"
+        );
+        assert_eq!(error.failure_class(), crate::FailureClass::Terminal);
+        assert_eq!(
+            fixture.git.resolve_calls(),
+            0,
+            "no source may be resolved before the project authorized every one of them"
+        );
+        assert_eq!(fixture.git.checkout_calls(), 0);
+        assert!(fixture.cluster.applies().is_empty());
+        assert!(fixture.cluster.deletes().is_empty());
     }
 }

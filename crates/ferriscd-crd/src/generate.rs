@@ -88,6 +88,49 @@ pub const OCI_REFERENCE_RULE: &str = "self.?tag.hasValue() || self.?digest.hasVa
 pub const OCI_REFERENCE_MESSAGE: &str =
     "at least one of spec.source.oci.tag or spec.source.oci.digest must be specified";
 
+/// CEL rule (`T20.1`): exactly one of `spec.source` / `spec.sources`.
+///
+/// Mirrors [`crate::SpecValidationError::MissingSourceDeclaration`] and
+/// [`crate::SpecValidationError::ConflictingSourceDeclaration`]. The two arms are spelled
+/// asymmetrically because they are different CEL types: `source` is an optional **object**
+/// (`has()` + `!= null`, see [`SOURCE_EXCLUSIVE_RULE`]), while `sources` is an optional **list**,
+/// so its presence test is `self.?sources.hasValue()` and the "has entries" test is a `size()`
+/// behind that guard.
+///
+/// ## Why every `self.sources` access is guarded
+///
+/// Field selection on an absent property is a **runtime** CEL error, and a runtime error in a
+/// validation rule rejects the write — for *every* `Application`, including every stored `v1.0`
+/// one. So `size(self.sources)` only ever appears to the right of a short-circuiting
+/// `self.?sources.hasValue() &&`. Optional chaining (`self.?field`, `.hasValue()`) requires
+/// Kubernetes `>= 1.29`, the floor [`OCI_REFERENCE_RULE`] already imposes.
+pub const SOURCE_DECLARATION_RULE: &str = "(has(self.source) && self.source != null && !(self.?sources.hasValue() && size(self.sources) > 0)) || (!(has(self.source) && self.source != null) && self.?sources.hasValue() && size(self.sources) > 0)";
+
+/// Message reported when [`SOURCE_DECLARATION_RULE`] fails.
+pub const SOURCE_DECLARATION_MESSAGE: &str =
+    "exactly one of spec.source or spec.sources must be specified";
+
+/// CEL rule (`T20.1`): `spec.sources` is capped at [`crate::MAX_SOURCES`] entries.
+///
+/// The offline half is [`crate::SpecValidationError::TooManySources`]; both are required by the
+/// roadmap ("Cap `spec.sources.len() <= 16` (CRD validation)"), because the controller's
+/// `spawn_blocking` checkout fan-out must be bounded before the object is ever accepted.
+pub const SOURCES_LIMIT_RULE: &str = "!self.?sources.hasValue() || size(self.sources) <= 16";
+
+/// Message reported when [`SOURCES_LIMIT_RULE`] fails.
+pub const SOURCES_LIMIT_MESSAGE: &str = "spec.sources must contain at most 16 entries";
+
+/// CEL rule (`T20.1`): every `spec.sources` entry sets exactly one of `git` / `oci`.
+///
+/// The per-entry arm of [`SOURCE_EXCLUSIVE_RULE`], lifted with CEL's `all()` macro over the list.
+/// Mirrors [`crate::SpecValidationError::MissingMultiSourceReference`] and
+/// [`crate::SpecValidationError::AmbiguousMultiSourceReference`].
+pub const MULTI_SOURCE_EXCLUSIVE_RULE: &str = "!self.?sources.hasValue() || self.sources.all(s, (has(s.git) && s.git != null && !(has(s.oci) && s.oci != null)) || (!(has(s.git) && s.git != null) && has(s.oci) && s.oci != null))";
+
+/// Message reported when [`MULTI_SOURCE_EXCLUSIVE_RULE`] fails.
+pub const MULTI_SOURCE_EXCLUSIVE_MESSAGE: &str =
+    "each spec.sources entry must set exactly one of git or oci";
+
 /// One generated manifest, ready to be written to `<dir>/<file_name>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrdDocument {
@@ -138,16 +181,16 @@ pub enum CrdGenerationError {
 #[must_use]
 pub fn application_crd() -> CustomResourceDefinition {
     let mut crd = Application::crd();
-    inject_source_validation_rules(&mut crd);
+    inject_validation_rules(&mut crd);
     crd
 }
 
-/// Injects the `T18.3` CEL rules into the `spec.source` / `spec.source.oci` schemas.
+/// Injects the `T18.3`/`T20.1` CEL rules into the `spec` and `spec.source` schemas.
 ///
 /// Idempotent: the rules are *set*, not appended, so regenerating an already-injected CRD cannot
 /// duplicate them (the drift check compares rendered bytes, and a duplicated rule would show up as
 /// permanent drift).
-fn inject_source_validation_rules(crd: &mut CustomResourceDefinition) {
+fn inject_validation_rules(crd: &mut CustomResourceDefinition) {
     for version in &mut crd.spec.versions {
         let Some(schema) = version
             .schema
@@ -156,8 +199,19 @@ fn inject_source_validation_rules(crd: &mut CustomResourceDefinition) {
         else {
             continue;
         };
-        let Some(source) = field_mut(schema, "spec").and_then(|spec| field_mut(spec, "source"))
-        else {
+        let Some(spec) = field_mut(schema, "spec") else {
+            continue;
+        };
+        // `T20.1`: the spec-level rules are a fixed, ordered triple, re-set on every run.
+        set_rule_list(
+            spec,
+            &[
+                (SOURCE_DECLARATION_RULE, SOURCE_DECLARATION_MESSAGE),
+                (SOURCES_LIMIT_RULE, SOURCES_LIMIT_MESSAGE),
+                (MULTI_SOURCE_EXCLUSIVE_RULE, MULTI_SOURCE_EXCLUSIVE_MESSAGE),
+            ],
+        );
+        let Some(source) = field_mut(spec, "source") else {
             continue;
         };
         set_rules(source, SOURCE_EXCLUSIVE_RULE, SOURCE_EXCLUSIVE_MESSAGE);
@@ -174,11 +228,21 @@ fn field_mut<'a>(schema: &'a mut JSONSchemaProps, name: &str) -> Option<&'a mut 
 
 /// Sets the single CEL rule of `schema` to `rule`.
 fn set_rules(schema: &mut JSONSchemaProps, rule: &str, message: &str) {
-    schema.x_kubernetes_validations = Some(vec![ValidationRule {
-        rule: rule.to_owned(),
-        message: Some(message.to_owned()),
-        ..ValidationRule::default()
-    }]);
+    set_rule_list(schema, &[(rule, message)]);
+}
+
+/// Sets the CEL rules of `schema` to exactly `rules`, in order.
+fn set_rule_list(schema: &mut JSONSchemaProps, rules: &[(&str, &str)]) {
+    schema.x_kubernetes_validations = Some(
+        rules
+            .iter()
+            .map(|(rule, message)| ValidationRule {
+                rule: (*rule).to_owned(),
+                message: Some((*message).to_owned()),
+                ..ValidationRule::default()
+            })
+            .collect(),
+    );
 }
 
 /// Returns the generated `AppProject` CRD object.
@@ -453,7 +517,7 @@ mod tests {
         );
 
         let mut twice = application_crd();
-        inject_source_validation_rules(&mut twice);
+        inject_validation_rules(&mut twice);
         assert_eq!(
             render_crd(APPLICATION_CRD_FILE_NAME, &twice).expect("render must succeed"),
             manifest,

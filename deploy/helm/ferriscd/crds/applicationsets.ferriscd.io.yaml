@@ -395,7 +395,16 @@ spec:
                         nullable: true
                         type: string
                       source:
-                        description: Where the desired manifests come from and how they are rendered.
+                        description: |-
+                          Where the desired manifests come from and how they are rendered.
+
+                          `T20.1` relaxed this from a required [`SourceSpec`] to `Option<SourceSpec>` so a
+                          multi-source `Application` can declare [`Self::sources`] instead. The two are **mutually
+                          exclusive**, enforced by the injected CEL rule ([`crate::generate::SOURCE_DECLARATION_RULE`])
+                          and by [`Self::validate`] with identical verdicts. Everything a `v1.0` client writes is
+                          unaffected: `source` is still serialized exactly where it always was, and a Git application
+                          never gains a `sources` key.
+                        nullable: true
                         properties:
                           git:
                             description: Git repository, revision, and manifest sub-path. Mutually exclusive with `oci`.
@@ -511,6 +520,160 @@ spec:
                                 type: object
                             type: object
                         type: object
+                      sources:
+                        description: |-
+                          Additional sources for a split chart/values layout (`T20.1`).
+
+                          Each entry is an independent Git repository or OCI artifact. An entry that declares a
+                          `renderer` contributes manifests; one that does not is a **values-only** source that can be
+                          referenced by an aliased sibling (`ref: values` → `$values/envs/prod/values.yaml`).
+
+                          Capped at [`MAX_SOURCES`] so a single `Application` cannot fan out an unbounded number of
+                          checkouts or overflow the `etcd` object limit with per-source revisions.
+                        items:
+                          description: |-
+                            One entry of `spec.sources` (`T20.1`).
+
+                            Carries exactly one of `git`/`oci` (the mirrored CEL rule and
+                            [`ApplicationSpec::validate`] both refuse neither-set and both-set), an **optional**
+                            `renderer`, and an optional `ref` alias.
+
+                            * An entry that declares a `renderer` is **rendered** and contributes its manifests to the
+                              bundle.
+                            * An entry without a `renderer` is a **support source**: it is still fetched into its own
+                              isolated, sanitized worktree (so its revision is tracked and its content can be referenced),
+                              but it contributes no manifests of its own. A Helm sibling addresses its files through the
+                              alias: `valueFiles: [$values/envs/prod/values.yaml]`.
+                            * When *no* entry declares a `renderer`, the first entry is rendered with the default
+                              (`renderer.auto`), which makes a one-entry `spec.sources` behave exactly like the equivalent
+                              `spec.source`.
+                          properties:
+                            git:
+                              description: Git repository, revision, and manifest sub-path. Mutually exclusive with `oci`.
+                              nullable: true
+                              properties:
+                                path:
+                                  default: ""
+                                  description: Relative sub-directory inside the repository (`""` means repository root).
+                                  type: string
+                                repoURL:
+                                  description: >-
+                                    Repository clone URL (`https://`, `ssh://`, SCP-style SSH, or a local test
+                                    path).
+                                  type: string
+                                targetRevision:
+                                  default: HEAD
+                                  description: Branch, tag, `HEAD`, or full 40-character commit SHA.
+                                  type: string
+                              required:
+                              - repoURL
+                              type: object
+                            oci:
+                              description: OCI artifact (Helm chart or manifest bundle). Mutually exclusive with `git`.
+                              nullable: true
+                              properties:
+                                digest:
+                                  description: |-
+                                    Immutable manifest digest (`sha256:<64 lowercase hex>`).
+
+                                    When both `tag` and `digest` are set the resolved manifest must match `digest`.
+                                  nullable: true
+                                  type: string
+                                path:
+                                  default: ""
+                                  description: >-
+                                    Relative sub-directory inside the extracted artifact (`""` means the artifact
+                                    root).
+                                  type: string
+                                tag:
+                                  description: "Tag to resolve (a plain tag, never a SemVer range: resolution stays a digest lookup)."
+                                  nullable: true
+                                  type: string
+                                url:
+                                  description: "Artifact reference: `oci://<registry>/<repository>` (HTTPS-only registry transport)."
+                                  type: string
+                              required:
+                              - url
+                              type: object
+                            ref:
+                              description: |-
+                                Alias other sources use to reference this one (`$<ref>/<path>`, e.g. `ref: values`).
+
+                                Must be a DNS-1123 label and unique within `spec.sources`;
+                                [`ApplicationSpec::validate`] rejects anything else so `$values/...` can never be ambiguous.
+                                That check is offline-only — the CRD schema carries no CEL rule or `pattern` for it (see
+                                [`validate_source_ref`]) — so the CLI and the controller are what enforce it, before any
+                                source is fetched.
+                              nullable: true
+                              type: string
+                            renderer:
+                              description: >-
+                                Renderer for this entry. Omitted means "support source only" (see the type
+                                docs).
+                              nullable: true
+                              oneOf:
+                              - required:
+                                - auto
+                              - required:
+                                - plainYaml
+                              - required:
+                                - kustomize
+                              - required:
+                                - helm
+                              properties:
+                                auto:
+                                  description: Automatic renderer detection based on the files present in the source path.
+                                  type: object
+                                helm:
+                                  description: Helm chart rendering (CRDs are not installed unless `includeCRDs` is set).
+                                  properties:
+                                    includeCRDs:
+                                      default: false
+                                      description: Install CRDs shipped in the chart's `crds/` directory (default `false`).
+                                      type: boolean
+                                    releaseName:
+                                      description: Release name used for rendering; defaults to the `Application` name.
+                                      nullable: true
+                                      type: string
+                                    valueFiles:
+                                      default: []
+                                      description: |-
+                                        Additional values files, relative to the source path (`spec.source.git.path` /
+                                        `spec.source.oci.path`).
+                                      items:
+                                        type: string
+                                      type: array
+                                  type: object
+                                kustomize:
+                                  description: Kustomize overlay (remote resources are rejected).
+                                  properties:
+                                    images:
+                                      default: []
+                                      description: Image overrides applied to the rendered output (`name=newImage:tag`).
+                                      items:
+                                        type: string
+                                      type: array
+                                    kustomizationPath:
+                                      description: |-
+                                        Overlay directory (relative to the source path (`spec.source.git.path` /
+                                        `spec.source.oci.path`)); defaults to the source path.
+                                      nullable: true
+                                      type: string
+                                  type: object
+                                plainYaml:
+                                  description: Literal multi-document YAML/JSON manifests.
+                                  properties:
+                                    recursive:
+                                      default: true
+                                      description: |-
+                                        Recurse into sub-directories of the source path (`spec.source.git.path` /
+                                        `spec.source.oci.path`) (default `true`).
+                                      type: boolean
+                                  type: object
+                              type: object
+                          type: object
+                        maxItems: 16
+                        type: array
                       syncPolicy:
                         description: |-
                           Automated sync policy, sync options, and retry behaviour.
@@ -609,7 +772,6 @@ spec:
                         type: object
                     required:
                     - destination
-                    - source
                     type: object
                 required:
                 - metadata

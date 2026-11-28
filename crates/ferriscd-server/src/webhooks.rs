@@ -626,26 +626,31 @@ pub fn repository_identity(url: &str) -> Option<String> {
 
 /// Whether `app` should be refreshed by `event`.
 ///
-/// Two conditions, both required:
+/// Two conditions, both required **for one declared source**:
 ///
-/// 1. the `Application`'s repository identity is one of the pushed identities;
-/// 2. its `spec.source.git.targetRevision` is the branch/tag that moved — `HEAD` only matches the
-///    pushed repository's **default branch**, because "HEAD" means "whatever the remote's default
-///    is" and matching every branch would wake every manifest-only app on every feature branch.
+/// 1. that source's repository identity is one of the pushed identities;
+/// 2. that source's `targetRevision` is the branch/tag that moved — `HEAD` only matches the pushed
+///    repository's **default branch**, because "HEAD" means "whatever the remote's default is" and
+///    matching every branch would wake every manifest-only app on every feature branch.
+///
+/// `T20.1`: **every** declared Git source is considered, not just `spec.source`. A split
+/// chart/values `Application` clones a chart repository *and* a values repository, so a push to
+/// either one is a deployment-relevant change (a values commit re-renders the chart) and must wake
+/// the `Application` — matching only the first source silently ignored every push to the values
+/// repo. The identity and the revision are tested **per source**, so a push to the chart repository
+/// at a branch the chart source does not track still matches nothing.
 #[must_use]
 pub fn application_matches(app: &Application, event: &PushEvent) -> bool {
     // `T18.3`: only a Git source can be woken by a push. An OCI-backed `Application` has no Git
-    // identity to match, so a push event never refreshes it.
-    let Some(git) = app.spec.source.git_source() else {
-        return false;
-    };
-    let Some(identity) = repository_identity(&git.repo_url) else {
-        return false;
-    };
-    if !event.identities.iter().any(|pushed| pushed == &identity) {
-        return false;
-    }
-    revision_matches(&git.target_revision, &event.reference)
+    // identity to match, so a push event never refreshes it (an `oci` entry contributes nothing to
+    // `git_sources`, and an all-OCI `spec.sources` yields an empty iterator).
+    app.spec.git_sources().any(|git| {
+        let Some(identity) = repository_identity(&git.repo_url) else {
+            return false;
+        };
+        event.identities.iter().any(|pushed| pushed == &identity)
+            && revision_matches(&git.target_revision, &event.reference)
+    })
 }
 
 /// Whether a `targetRevision` tracks the pushed ref.
@@ -1584,6 +1589,133 @@ mod tests {
     fn a_different_repository_never_matches() {
         let app = application("https://github.com/example/other-service", "main");
         assert!(!application_matches(&app, &push("refs/heads/main")));
+    }
+
+    /// A push event that names `identity` on `reference`, with `default_branch` as the payload's
+    /// default.
+    fn pushed(identity: &str, reference: &str, default_branch: Option<&str>) -> PushEvent {
+        PushEvent {
+            identities: vec![identity.to_owned()],
+            reference: PushRef::parse(reference, default_branch).expect("a branch or tag"),
+        }
+    }
+
+    /// The split chart/values `Application` the `T20.1` roadmap describes: an OCI chart (no Git
+    /// identity) plus a separate **Git** values repository.
+    fn multi_source_application(
+        chart: Option<&str>,
+        values_url: &str,
+        values_revision: &str,
+    ) -> Application {
+        let mut entries = Vec::new();
+        match chart {
+            Some(chart_url) => entries.push(serde_json::json!({
+                "ref": "chart",
+                "git": {"repoURL": chart_url, "targetRevision": "main", "path": "charts/api"},
+                "renderer": {"helm": {"valueFiles": ["$values/envs/prod/values.yaml"]}},
+            })),
+            None => entries.push(serde_json::json!({
+                "ref": "chart",
+                "oci": {"url": "oci://ghcr.io/example/payments", "tag": "1.4.2"},
+                "renderer": {"helm": {"valueFiles": ["$values/envs/prod/values.yaml"]}},
+            })),
+        }
+        entries.push(serde_json::json!({
+            "ref": "values",
+            "git": {"repoURL": values_url, "targetRevision": values_revision},
+        }));
+        let spec: ApplicationSpec = serde_json::from_value(serde_json::json!({
+            "project": "default",
+            "sources": entries,
+            "destination": {"cluster": "in-cluster", "namespace": "payments"},
+        }))
+        .expect("a valid multi-source ApplicationSpec");
+        assert!(spec.validate().is_ok(), "{:?}", spec.validate());
+        let mut app = Application::new("payments", spec);
+        app.metadata.namespace = Some("ferriscd-system".to_owned());
+        app
+    }
+
+    /// **`T20.1` finding H1.** A push to the *values* repository of a split chart/values
+    /// `Application` must refresh it: the values commit is what re-renders the chart, and matching
+    /// only `spec.source` (absent here) meant no push ever woke the `Application`.
+    #[test]
+    fn a_push_to_the_values_repository_refreshes_a_multi_source_application() {
+        let app = multi_source_application(None, "https://github.com/example/values.git", "main");
+
+        // The values repository's push (GitHub reports the HTTPS spelling) matches.
+        assert!(
+            application_matches(
+                &app,
+                &pushed("github.com/example/values", "refs/heads/main", Some("main"))
+            ),
+            "a values-repository push must refresh the Application"
+        );
+        // Even when the Application clones it over SSH: the identity is transport-independent.
+        let over_ssh = multi_source_application(None, "git@github.com:example/values.git", "main");
+        assert!(application_matches(
+            &over_ssh,
+            &pushed("github.com/example/values", "refs/heads/main", Some("main"))
+        ));
+        // A different branch of the values repository does not: the source tracks `main`.
+        assert!(
+            !application_matches(
+                &app,
+                &pushed(
+                    "github.com/example/values",
+                    "refs/heads/feature/x",
+                    Some("main")
+                )
+            ),
+            "the values source tracks `main`, so a feature branch is not a deployment change"
+        );
+        // And neither does an unrelated repository.
+        assert!(!application_matches(
+            &app,
+            &pushed("github.com/example/other", "refs/heads/main", Some("main"))
+        ));
+    }
+
+    /// **`T20.1` finding H1.** With *both* sources Git-backed, a push to either repository matches —
+    /// and the per-source revision rule still applies to each of them independently.
+    #[test]
+    fn every_git_source_of_a_multi_source_application_is_matched() {
+        let app = multi_source_application(
+            Some("git@github.com:example/charts.git"),
+            "https://github.com/example/values.git",
+            "main",
+        );
+
+        for identity in ["github.com/example/charts", "github.com/example/values"] {
+            assert!(
+                application_matches(&app, &pushed(identity, "refs/heads/main", Some("main"))),
+                "a push to {identity} must refresh the Application"
+            );
+            assert!(
+                !application_matches(&app, &pushed(identity, "refs/heads/release/2", None)),
+                "neither source tracks `release/2`: {identity}"
+            );
+        }
+    }
+
+    /// An all-OCI `spec.sources` has no Git identity at all, so no push can wake it (the `T18.3`
+    /// rule, still true after `T20.1` widened the iteration to every declared source).
+    #[test]
+    fn an_all_oci_multi_source_application_is_never_woken_by_a_push() {
+        let spec: ApplicationSpec = serde_json::from_value(serde_json::json!({
+            "sources": [
+                {"ref": "a", "oci": {"url": "oci://ghcr.io/example/a", "tag": "1"}},
+                {"ref": "b", "oci": {"url": "oci://ghcr.io/example/b", "tag": "2"}},
+            ],
+            "destination": {"namespace": "payments"},
+        }))
+        .expect("a valid spec");
+        let mut app = Application::new("payments", spec);
+        app.metadata.namespace = Some("ferriscd-system".to_owned());
+        assert!(!application_matches(
+            &app,
+            &pushed("github.com/example/values", "refs/heads/main", Some("main"))
+        ));
     }
 
     #[test]

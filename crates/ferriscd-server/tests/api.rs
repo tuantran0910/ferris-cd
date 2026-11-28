@@ -68,6 +68,7 @@ fn application(namespace: &str, name: &str) -> Application {
             revision: Some("8f3a1c2".to_owned()),
             last_synced_revision: Some("8f3a1c2".to_owned()),
             last_synced_spec_hash: Some("hash".to_owned()),
+            revisions: Vec::new(),
             last_synced_at: Some(now()),
         }),
         health: Some(ferriscd_crd::status::HealthState {
@@ -248,7 +249,10 @@ impl DiffSource for Diffs {
         self.asked.lock().expect("test state").push((
             app.metadata.namespace.clone().unwrap_or_default(),
             app.metadata.name.clone().unwrap_or_default(),
-            app.spec.source.repo_url().to_owned(),
+            app.spec
+                .primary_source()
+                .map(|source| source.repo_url().to_owned())
+                .unwrap_or_default(),
         ));
         let preview = self.preview.clone();
         let error = self.error.clone();
@@ -437,7 +441,14 @@ async fn the_readiness_probe_reports_the_seam() {
 #[tokio::test]
 async fn applications_are_listed_with_a_redacted_repository_url() {
     let mut app = application("ferriscd-system", "payment-api");
-    app.spec.source.git.as_mut().expect("git source").repo_url =
+    app.spec
+        .source
+        .as_mut()
+        .expect("spec.source")
+        .git
+        .as_mut()
+        .expect("git source")
+        .repo_url =
         "https://oauth2:ghp_averysecrettoken@github.com/example/payment-service.git".to_owned();
     let (status, body) = get(state(vec![app]), "/api/v1/applications").await;
     assert_eq!(status, StatusCode::OK);
@@ -468,6 +479,222 @@ async fn applications_are_listed_with_a_redacted_repository_url() {
         rendered.contains("https://oauth2:***@github.com/example/payment-service.git"),
         "the URL stays recognizable while the credential is masked: {rendered}"
     );
+}
+
+/// A split OCI chart + aliased Git values `Application` (`T20.1`), with the per-source revisions a
+/// finished multi-source pass would have written.
+fn multi_source_application(chart_sha: &str, values_sha: &str, composite: &str) -> Application {
+    let mut app = application("ferriscd-system", "payment-api");
+    app.spec.source = None;
+    app.spec.sources = serde_json::from_value(json!([
+        {
+            "ref": "chart",
+            "oci": {"url": "oci://ghcr.io/example/payments", "tag": "1.4.2", "path": ""},
+            "renderer": {
+                "helm": {
+                    "releaseName": "payments",
+                    "valueFiles": ["$values/envs/prod/values.yaml"],
+                }
+            },
+        },
+        {
+            "ref": "values",
+            "git": {
+                // A remote URL routinely carries a token; the API must never echo it.
+                "repoURL": "https://oauth2:ghp_valuesecrettoken@github.com/example/values.git",
+                "targetRevision": "main",
+            },
+        },
+    ]))
+    .expect("a valid spec.sources list");
+    app.spec.validate().expect("the fixture must be valid");
+
+    let status = app.status.as_mut().expect("status");
+    let sync = status.sync.as_mut().expect("sync");
+    sync.revision = Some(composite.to_owned());
+    sync.last_synced_revision = Some(composite.to_owned());
+    sync.revisions = vec![chart_sha.to_owned(), values_sha.to_owned()];
+    status.history[0].revision = Some(composite.to_owned());
+    status.history[0].revisions = vec![chart_sha.to_owned(), values_sha.to_owned()];
+    app
+}
+
+/// **`T20.1` acceptance criterion.** `multiSource`, every declared source (with its `ref` and
+/// whether it renders), and the per-source revisions are surfaced on both the list and the detail
+/// payload — and the values repository's credential is redacted on every one of them.
+#[tokio::test]
+async fn a_multi_source_application_surfaces_sources_and_per_source_revisions() {
+    let chart_sha = "1111111111111111111111111111111111111111";
+    let values_sha = "2222222222222222222222222222222222222222";
+    let composite = format!("sha256:{}", "a".repeat(64));
+    let app = multi_source_application(chart_sha, values_sha, &composite);
+
+    let (status, body) = get(state(vec![app.clone()]), "/api/v1/applications").await;
+    assert_eq!(status, StatusCode::OK);
+    let item = &body["items"][0];
+
+    // The top-level `source` describes the **rendered** entry (the chart), so a client that knows
+    // nothing about `spec.sources` still shows the artifact that produced the bundle.
+    assert_eq!(item["source"]["multiSource"], json!(true));
+    assert_eq!(item["source"]["sourceType"], json!("oci"));
+    assert_eq!(item["source"]["targetRevision"], json!("1.4.2"));
+    assert_eq!(item["source"]["renderer"], json!("helm"));
+
+    let sources = item["source"]["sources"]
+        .as_array()
+        .expect("sources must be an array");
+    assert_eq!(sources.len(), 2, "declaration order: {sources:?}");
+    assert_eq!(sources[0]["ref"], json!("chart"));
+    assert_eq!(sources[0]["sourceType"], json!("oci"));
+    assert_eq!(
+        sources[0]["repoUrl"],
+        json!("oci://ghcr.io/example/payments")
+    );
+    assert_eq!(sources[0]["tag"], json!("1.4.2"));
+    assert_eq!(
+        sources[0]["renderer"],
+        json!("helm"),
+        "an entry that renders names its renderer"
+    );
+    assert_eq!(sources[1]["ref"], json!("values"));
+    assert_eq!(sources[1]["sourceType"], json!("git"));
+    assert_eq!(sources[1]["targetRevision"], json!("main"));
+    assert_eq!(
+        sources[1]["repoUrl"],
+        json!("https://oauth2:***@github.com/example/values.git"),
+        "the values repository URL must be redacted"
+    );
+    assert!(
+        sources[1].get("renderer").is_none(),
+        "a values-only source renders nothing, so it has no renderer: {:?}",
+        sources[1]
+    );
+
+    // Per-source revisions: the whole reason a moved values repository is visible.
+    assert_eq!(
+        item["sync"]["revisions"],
+        json!([chart_sha, values_sha]),
+        "status.sync.revisions must be surfaced in declaration order"
+    );
+    assert_eq!(
+        item["sync"]["revision"],
+        json!(composite),
+        "status.sync.revision stays the composite deployment identity"
+    );
+
+    // Nothing the API serves carries the token.
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains("ghp_valuesecrettoken"),
+        "a repository credential must never reach the API: {rendered}"
+    );
+
+    // The detail payload carries the same view, plus the history entries a rollback pins.
+    let (status, detail) = get(
+        state(vec![app]),
+        "/api/v1/applications/ferriscd-system/payment-api",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["application"]["source"]["multiSource"], json!(true));
+    assert_eq!(
+        detail["application"]["source"]["sources"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        detail["application"]["sync"]["revisions"],
+        json!([chart_sha, values_sha])
+    );
+    assert_eq!(
+        detail["history"][0]["revisions"],
+        json!([chart_sha, values_sha]),
+        "a history entry records every source revision so a rollback can re-pin them"
+    );
+    assert_eq!(detail["history"][0]["revision"], json!(composite));
+    assert!(
+        !detail.to_string().contains("ghp_valuesecrettoken"),
+        "the detail payload must redact the credential too"
+    );
+}
+
+/// Every object key anywhere in `value`, recursively.
+fn keys_of(value: &Value, into: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, nested) in map {
+                into.push(key.clone());
+                keys_of(nested, into);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                keys_of(item, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// **`T20.1` trap guard.** A single-source `Application` must not gain a single byte: `source` and
+/// `sync` serialize exactly as the `v1.1` server wrote them, and no `T20.1` key appears anywhere in
+/// the payload (including `status.history`).
+#[tokio::test]
+async fn a_single_source_payload_stays_byte_compatible_with_v1_1() {
+    let app = application("ferriscd-system", "payment-api");
+    let (status, body) = get(state(vec![app]), "/api/v1/applications").await;
+    assert_eq!(status, StatusCode::OK);
+    let item = &body["items"][0];
+
+    // The exact `v1.1` bytes of the two DTOs `T20.1` touched.
+    assert_eq!(
+        serde_json::to_string(&item["source"]).expect("the source view serializes"),
+        concat!(
+            r#"{"path":"deploy","renderer":"plainYaml","#,
+            r#""repoUrl":"https://github.com/example/payment-service.git","#,
+            r#""sourceType":"git","targetRevision":"main"}"#
+        ),
+        "a single-source `source` view must keep its v1.1 wire form"
+    );
+    assert_eq!(
+        serde_json::to_string(&item["sync"]).expect("the sync view serializes"),
+        concat!(
+            r#"{"lastSyncedAt":"2027-01-15T10:30:00Z","lastSyncedRevision":"8f3a1c2","#,
+            r#""revision":"8f3a1c2","status":"Synced"}"#
+        ),
+        "a single-source `sync` view must keep its v1.1 wire form"
+    );
+
+    let mut keys = Vec::new();
+    keys_of(&body, &mut keys);
+    for added in ["multiSource", "sources", "revisions"] {
+        assert!(
+            !keys.iter().any(|key| key == added),
+            "a single-source payload must not carry the `{added}` key: {body}"
+        );
+    }
+
+    // The history entry keeps its v1.1 shape too.
+    let (status, detail) = get(
+        state(vec![application("ferriscd-system", "payment-api")]),
+        "/api/v1/applications/ferriscd-system/payment-api",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::to_string(&detail["history"][0]).expect("the history view serializes"),
+        r#"{"deployedAt":"2027-01-15T10:30:00Z","id":7,"revision":"8f3a1c2"}"#,
+        "a single-source history entry must keep its v1.1 wire form"
+    );
+    let mut keys = Vec::new();
+    keys_of(&detail, &mut keys);
+    for added in ["multiSource", "sources", "revisions"] {
+        assert!(
+            !keys.iter().any(|key| key == added),
+            "a single-source detail payload must not carry the `{added}` key: {detail}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2069,8 +2296,14 @@ async fn a_monorepo_push_fans_out_once_per_application() {
     let mut apps = Vec::new();
     for name in ["api", "worker", "cron"] {
         let mut app = application("ferriscd-system", name);
-        app.spec.source.git.as_mut().expect("git source").repo_url =
-            "git@github.com:example/payment-service.git".to_owned();
+        app.spec
+            .source
+            .as_mut()
+            .expect("spec.source")
+            .git
+            .as_mut()
+            .expect("git source")
+            .repo_url = "git@github.com:example/payment-service.git".to_owned();
         apps.push(app);
     }
     // An application tracking a different branch must not be woken.
@@ -2078,6 +2311,8 @@ async fn a_monorepo_push_fans_out_once_per_application() {
     other
         .spec
         .source
+        .as_mut()
+        .expect("spec.source")
         .git
         .as_mut()
         .expect("git source")

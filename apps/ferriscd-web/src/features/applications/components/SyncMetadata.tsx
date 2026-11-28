@@ -24,6 +24,17 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
     app.source.repoUrl,
     app.sync?.lastSyncedRevision,
   );
+  // `T20.1`: a multi-source pass reports one revision per declared source.
+  // They are shown next to the composite revision above, because the whole
+  // point of the list is answering "did the values repository move?" — a
+  // question the composite digest alone cannot answer.
+  const sources = app.source.sources ?? [];
+  const perSource = app.sync?.revisions ?? [];
+  // The block is gated on the *data*, not on the badge: a multi-source
+  // application that has never synced (or whose spec has not been reconciled
+  // yet) has no revisions to show, and rendering an empty `Source Revisions`
+  // heading would look like a controller bug (finding N2).
+  const showPerSource = perSource.length > 0;
 
   return (
     <Card className="text-xs">
@@ -81,6 +92,53 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
             {formatTimestamp(app.sync?.lastSyncedAt)}
           </dd>
         </div>
+        {showPerSource ? (
+          <div
+            data-testid="per-source-revisions"
+            className="border-t border-slate-700/60 pt-1.5"
+          >
+            <p className="text-slate-500">Source Revisions</p>
+            <ul aria-label="Source revisions" className="mt-1 space-y-1">
+              {perSource.map((revision, index) => {
+                // The API reports the revisions in `spec.sources` declaration
+                // order, so the alias comes from the same index. A missing
+                // entry (an older payload, or a source added since the last
+                // pass) is labelled by position rather than dropped.
+                const alias = sources[index]?.ref?.trim();
+                const repoUrl = sources[index]?.repoUrl ?? app.source.repoUrl;
+                const href = commitWebUrl(repoUrl, revision);
+                return (
+                  <li
+                    key={`${alias ?? "source"}-${index}`}
+                    data-testid={`source-revision-${index}`}
+                    className="flex justify-between gap-3"
+                  >
+                    <span className="shrink-0 font-mono text-slate-400">
+                      {alias ?? `source ${index + 1}`}
+                    </span>
+                    <span
+                      className="min-w-0 break-all text-right font-mono text-slate-200"
+                      title={revision}
+                    >
+                      {href ? (
+                        <a
+                          href={href}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-indigo-300 hover:decoration-indigo-400"
+                        >
+                          {shortRevision(revision, 12)}
+                        </a>
+                      ) : (
+                        shortRevision(revision, 12)
+                      )}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ) : null}
       </dl>
     </Card>
   );
