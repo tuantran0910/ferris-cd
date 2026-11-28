@@ -38,7 +38,7 @@ export function CopyText({ value, display, label, className }: CopyTextProps) {
       title={`Click to copy ${label}`}
       aria-label={`Copy ${label}`}
       className={cx(
-        "inline max-w-full truncate text-left align-baseline [cursor:copy] hover:text-accent hover:underline",
+        "inline max-w-full truncate text-left align-baseline cursor-pointer hover:text-accent hover:underline",
         className,
       )}
     >
