@@ -1,4 +1,14 @@
-import { FolderGit2, Layers, LogOut, Monitor, Moon, Search, Server, Sun } from "lucide-react";
+import {
+  FolderGit2,
+  Gauge,
+  Layers,
+  LogOut,
+  Monitor,
+  Moon,
+  Search,
+  Server,
+  Sun,
+} from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { flushSync } from "react-dom";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
@@ -23,6 +33,10 @@ import {
 
 const NAV_ITEMS = [
   { to: "/", label: "Applications", icon: Layers, end: true },
+  // `T20.5`: the fleet-wide rollup. It sits next to Applications (not inside it) because it answers
+  // a different question — "how is the fleet doing" rather than "what does this application do" —
+  // and it is scoped by the same RBAC filter as the list it aggregates.
+  { to: "/overview", label: "Overview", icon: Gauge, end: true },
   { to: "/projects", label: "Projects", icon: FolderGit2, end: false },
   { to: "/clusters", label: "Clusters", icon: Server, end: false },
 ] as const;

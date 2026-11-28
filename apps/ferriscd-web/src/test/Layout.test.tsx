@@ -22,6 +22,7 @@ function renderShell(initialEntry = "/") {
           <Routes>
             <Route element={<Layout />}>
               <Route path="/" element={<h1>Applications</h1>} />
+              <Route path="/overview" element={<h1>Fleet overview</h1>} />
               <Route path="/projects" element={<h1>Projects</h1>} />
               <Route path="/clusters" element={<h1>Clusters</h1>} />
             </Route>
@@ -125,6 +126,15 @@ describe("Layout accessibility (T17.3)", () => {
       expect(nav.querySelector(`a[href="${name === "Applications" ? "/" : `/${name.toLowerCase()}`}"]`))
         .not.toBeNull();
     }
+  });
+
+  it("offers the fleet overview as a primary destination (T20.5)", () => {
+    renderShell("/overview");
+
+    const nav = screen.getByRole("navigation", { name: "Primary" });
+    const overview = nav.querySelector('a[href="/overview"]');
+    expect(overview).not.toBeNull();
+    expect(overview).toHaveTextContent("Overview");
   });
 
   it("opens the command palette from the header button and from the shortcut", async () => {

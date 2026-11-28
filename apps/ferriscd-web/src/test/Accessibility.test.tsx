@@ -10,6 +10,7 @@ import { resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
 import { ApplicationDetailPage } from "../features/applications/ApplicationDetailPage";
 import { ApplicationsPage } from "../features/applications/ApplicationsPage";
 import { ClustersPage } from "../features/clusters/ClustersPage";
+import { FleetOverviewPage } from "../features/overview/FleetOverviewPage";
 import { ProjectsPage } from "../features/projects/ProjectsPage";
 import { RollbackModal } from "../features/sync/RollbackModal";
 import { SyncModal } from "../features/sync/SyncModal";
@@ -60,6 +61,23 @@ describe("WCAG 2.2 AA automated checks (T17.3)", () => {
     try {
       const { container } = renderWithProviders(<ApplicationsPage />);
       await screen.findByTestId("applications-grid");
+      await expectNoA11yViolations(container);
+    } finally {
+      delete document.documentElement.dataset.theme;
+    }
+  });
+
+  it("FleetOverviewPage (T20.5)", async () => {
+    const { container } = renderWithProviders(<FleetOverviewPage />, "/overview");
+    await screen.findByTestId("overview-kpi-total");
+    await expectNoA11yViolations(container);
+  });
+
+  it("FleetOverviewPage in light mode (T20.5)", async () => {
+    document.documentElement.dataset.theme = "light";
+    try {
+      const { container } = renderWithProviders(<FleetOverviewPage />, "/overview");
+      await screen.findByTestId("overview-kpi-total");
       await expectNoA11yViolations(container);
     } finally {
       delete document.documentElement.dataset.theme;

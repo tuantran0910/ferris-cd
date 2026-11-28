@@ -2,6 +2,7 @@ import {
   Boxes,
   Command as CommandIcon,
   FileDiff,
+  Gauge,
   History,
   Layers,
   ListChecks,
@@ -377,6 +378,15 @@ function buildGroups({
       group: "Views",
       icon: <Boxes className="h-3.5 w-3.5" />,
       to: { pathname: "/" },
+    },
+    // `T20.5`: the fleet-wide rollup, reachable without hunting for the nav item.
+    {
+      id: "view-overview",
+      label: "Fleet overview",
+      hint: "view",
+      group: "Views",
+      icon: <Gauge className="h-3.5 w-3.5" />,
+      to: { pathname: "/overview" },
     },
     {
       id: "view-projects",

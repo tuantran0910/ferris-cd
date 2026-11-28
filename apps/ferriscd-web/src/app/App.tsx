@@ -7,6 +7,7 @@ import { SSO_CALLBACK_PATH } from "../auth/pkce";
 import { ApplicationDetailPage } from "../features/applications/ApplicationDetailPage";
 import { ApplicationsPage } from "../features/applications/ApplicationsPage";
 import { ClustersPage } from "../features/clusters/ClustersPage";
+import { FleetOverviewPage } from "../features/overview/FleetOverviewPage";
 import { ProjectsPage } from "../features/projects/ProjectsPage";
 import { ApiErrorBoundary } from "../ui/ApiErrorBoundary";
 import { Layout } from "./Layout";
@@ -39,6 +40,7 @@ function AuthenticatedRoutes() {
         />
         <Route element={<Layout />}>
           <Route path="/" element={<ApplicationsPage />} />
+          <Route path="/overview" element={<FleetOverviewPage />} />
           <Route path="/projects" element={<ProjectsPage />} />
           <Route path="/clusters" element={<ClustersPage />} />
           <Route
