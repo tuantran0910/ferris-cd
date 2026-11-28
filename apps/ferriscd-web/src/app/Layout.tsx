@@ -34,7 +34,7 @@ const NAV_ITEMS = [
  *   discoverable rather than folklore.
  */
 export function Layout() {
-  const { baseUrl, logout } = useAuth();
+  const { baseUrl, logout, sessionStatus, beginSsoLogin, ssoAvailable } = useAuth();
   const { pathname } = useLocation();
   const [paletteOpen, setPaletteOpen] = useState(false);
 
@@ -130,6 +130,31 @@ export function Layout() {
           </div>
         </div>
       </header>
+
+      {/* `T19.2`: a warning *before* the token expires, while the operator still has a session — the
+          one-click re-authenticate keeps the current route, so nothing in progress is lost. */}
+      {sessionStatus === "expiring" && (
+        <div
+          role="status"
+          className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-200 sm:px-6"
+        >
+          <div className="mx-auto flex max-w-7xl items-center justify-between gap-3">
+            <span>
+              Your SSO session expires in less than a minute. Re-authenticate now to
+              stay signed in.
+            </span>
+            {ssoAvailable && (
+              <button
+                type="button"
+                onClick={() => void beginSsoLogin()}
+                className="shrink-0 rounded-md border border-amber-400/50 bg-amber-500/20 px-2.5 py-1 font-semibold text-amber-100 transition-colors hover:bg-amber-500/30"
+              >
+                Re-authenticate
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       <main
         id="main-content"

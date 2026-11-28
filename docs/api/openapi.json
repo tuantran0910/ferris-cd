@@ -712,6 +712,74 @@
         ]
       }
     },
+    "/api/v1/auth/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`GET /api/v1/auth/callback` — completes the BFF flow (`T19.2`).",
+        "description": "Validates that `state` is **this browser's** (the [`STATE_COOKIE_NAME`] cookie must equal the query\nparameter, compared in constant time), consumes the one-shot transaction, exchanges the code with\nthe stored verifier, seals a session cookie plus the CSRF cookie, and answers `303` to the\nconfigured post-login path. The state cookie is expired on the response whatever the outcome.",
+        "operationId": "callback",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "description": "The authorization code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The state this server issued",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "Session established; redirect to the post-login path"
+          },
+          "400": {
+            "description": "The state is missing, unknown, expired or not this browser's",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The session cookie could not be sealed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The BFF flow is not enabled on this server"
+          },
+          "502": {
+            "description": "The identity provider could not be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/auth/config": {
       "get": {
         "tags": [
@@ -730,6 +798,93 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/login": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`GET /api/v1/auth/login` — starts the BFF flow (`T19.2`).",
+        "description": "Answers `302` to the IdP's authorization endpoint with a fresh `state`, `nonce` and `S256`\nchallenge — plus the short-lived [`STATE_COOKIE_NAME`] cookie that binds that `state` to this\nbrowser — or `404` when the server was started without `--oidc-bff-enabled`.\n\n`429` is the per-client sign-in budget ([`MAX_LOGINS_PER_CLIENT`] per [`LOGIN_WINDOW`]).",
+        "operationId": "login",
+        "parameters": [
+          {
+            "name": "redirect_uri",
+            "in": "query",
+            "description": "The registered redirect URI; must match exactly",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to the identity provider's authorization endpoint"
+          },
+          "400": {
+            "description": "redirect_uri is not the registered one",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The BFF flow is not enabled on this server"
+          },
+          "429": {
+            "description": "Too many sign-ins were started from this address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The identity provider's discovery document is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /api/v1/auth/logout` — clears the BFF session (`T19.2`).",
+        "description": "Requires the double-submit CSRF header (see [`csrf`]) for a *usable* session: a cross-site page\nmust not be able to sign an operator out. A request the browser labels cross-site is refused\noutright, even with no session cookie at all — otherwise any page could force the `Max-Age=0`\ncookies to be stored. A cookie that no longer opens (expired, tampered, sealed under a rotated\nkey) is treated as absent here, because the caller's only remaining goal is to get rid of it —\nrefusing that would leave the browser stuck behind a `401` it cannot clear.\n\nThe session is stateless, so this cannot revoke a cookie that was copied before the sign-out: that\ncopy keeps working until the token (or the cookie) expires; only the IdP can revoke it earlier.",
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "Session cookies cleared"
+          },
+          "403": {
+            "description": "The CSRF header is missing or does not match, or the sign-out was initiated from another site",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The BFF flow is not enabled on this server"
           }
         }
       }
@@ -1097,7 +1252,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "Stable code (`NotFound`, `BadRequest`, `Conflict`, `Unprocessable`, `Unauthorized`,\n`Forbidden`, `BackendUnavailable`, `PayloadTooLarge`)."
+            "description": "Stable code (`NotFound`, `BadRequest`, `Conflict`, `Unprocessable`, `Unauthorized`,\n`Forbidden`, `BackendUnavailable`, `PayloadTooLarge`, `TooManyRequests`)."
           },
           "message": {
             "type": "string",

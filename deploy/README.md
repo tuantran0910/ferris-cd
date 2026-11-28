@@ -346,6 +346,91 @@ data:
   repository credentials (see the namespaced `Role`/`RoleBinding` above), and this `Secret` is read
   under that same namespaced grant — never cluster-wide.
 
+#### Registering the redirect URI (`T19.2`)
+
+Both sign-in modes are OAuth 2.1 **public clients** (Authorization Code + PKCE `S256`, no client
+secret), so each needs exactly **one** redirect URI registered at the IdP. Register these exact
+strings — a wildcard is not needed and must not be used (it is the open redirect the exact-match
+allowlist exists to prevent):
+
+| Mode | Redirect URI to register |
+|---|---|
+| Web UI, SPA in-memory token (`--auth-policy oidc` / `token-review-or-oidc`) | `https://<ferriscd-web-host>/auth/callback` |
+| Web UI, server-side cookie (`--oidc-bff-enabled`) | the value of `--oidc-bff-redirect-uri`, normally `https://<ferriscd-web-host>/api/v1/auth/callback` |
+| `ferriscd login --oidc` (CLI) | none — it uses an ephemeral `http://127.0.0.1:<random-port>/callback` loopback redirect (RFC 8252). Register `http://127.0.0.1` as an allowed loopback redirect if your IdP requires an entry (Auth0/Okta accept any port on an exact loopback URI). |
+
+* The SPA redirect URI is **fixed** (`origin + /auth/callback`), not `origin + <current route>`, so the
+  page an operator was on is carried through the sign-in transaction and restored afterwards. The
+  static host therefore has to serve `index.html` for `/auth/callback` exactly as it already does for
+  `/applications/...` deep links.
+* The BFF redirect URI is compared **byte for byte** against `--oidc-bff-redirect-uri`; a request that
+  supplies any other `redirect_uri` to `GET /api/v1/auth/login` is refused before anything is sent to
+  the IdP.
+* Optional but recommended for the BFF flow: enable `--oidc-bff-enabled` with
+  `--oidc-bff-redirect-uri` and `--oidc-bff-session-key-file` (the `sessionKey` entry of the
+  `ferriscd.io/secret-type: oidc` `Secret`, at least 32 bytes). The cookies it issues are all
+  `__Host-` prefixed, `Secure`, `SameSite=Lax` and `Path=/`, so they need an **https** origin (a
+  loopback `http://` dev setup works in Chromium/Firefox, which treat `localhost` as trustworthy).
+
+##### One sign-in at a time per browser (`T19.2`)
+
+The BFF flow binds each pending sign-in to the browser that started it with a **single-valued**
+`__Host-ferriscd_oidc_state` cookie, so a browser profile holds at most one pending sign-in:
+
+* Starting a second sign-in in **another tab or window of the same browser** replaces that cookie, and
+  the first tab's callback is then refused (`400`, "this browser did not start the sign-in"). The
+  first tab has to start again — nothing is signed in and no token was ever exchanged, so the only
+  cost is the click.
+* Two operators on two machines, or two different browser profiles, are unrelated: each has its own
+  cookie jar and its own pending transaction.
+* A sign-in left unfinished simply expires after five minutes (`DEFAULT_TRANSACTION_TTL`, 300 s; the
+  pending transaction has no flag of its own) and can be restarted.
+
+This is a deliberate trade: a per-tab `state` store would need either a cookie per transaction or a
+server-side tab identifier, and the single-use cookie is what makes login CSRF / account swap
+impossible (see `docs/REVIEW_LOG.md`, `T19.2` finding `H1`).
+
+##### CSRF and cross-site sign-out (`T19.2`)
+
+Cookie mode adds two browser-side defences, and both leave one residual worth knowing about:
+
+* **Double-submit CSRF on every mutating request.** A request that carries the session cookie must
+  also echo the sealed CSRF token in the `x-ferriscd-csrf` header **and** in the readable
+  `__Host-ferriscd_csrf` cookie (`403` otherwise). A `Bearer` request is exempt: the CLI and CI cannot
+  be forged by a page, so demanding the header would only break scripted syncs.
+* **A cross-site sign-out is refused.** `SameSite=Lax` withholds the session cookie from a cross-site
+  `POST`, so such a `/api/v1/auth/logout` request has nothing to authenticate — but answering it would
+  still store its `Max-Age=0` cookies, i.e. any page on the internet could sign an operator out. A
+  logout the browser itself labelled `Sec-Fetch-Site: cross-site` is therefore refused `403` before
+  the cookie is looked at; `same-origin`, `none`, and a client that sends no Fetch Metadata header at
+  all (curl, the CLI, an older browser) still work.
+* **`same-site` is deliberately allowed, not an oversight.** The web UI and the API are separate
+  origins in a split-origin deployment (`https://ferriscd.example.com` for the SPA,
+  `https://ferriscd-api.example.com` for the server, or two ports on the same host), and a request
+  between them is labelled `same-site`, not `same-origin`. Refusing it would break every such
+  deployment, so only `cross-site` is refused. The residual, stated plainly: a page on a **sibling
+  subdomain** of the same registrable domain (any other team's app on `*.example.com`) is `same-site`,
+  so its `POST /api/v1/auth/logout` reaches the double-submit check instead of the Fetch Metadata one.
+  With a **usable** session cookie it is still refused `403` (it cannot set the `x-ferriscd-csrf`
+  header, and `Set-Cookie` is never sent on a refusal). What it can still reach is the dead-cookie
+  path: a request with no usable session cookie is let through to the handler, so a sibling subdomain
+  can clear cookies that were already dead — a restart click, nothing signed in, no code exchanged.
+  Host the control plane on its own registrable domain if sibling subdomains are not trusted.
+
+##### Cookie mode has no "am I signed in?" probe (`T19.2`)
+
+A BFF deployment holds the credential in an `HttpOnly` cookie the SPA cannot read, and the server
+exposes no session probe on purpose: `GET /api/v1/auth/login` starts a flow, `POST /api/v1/auth/logout`
+ends one, and nothing answers "is this cookie still good?" — such a route would exist only to be a
+`200`/`401` oracle, and the `401` on any real read already says the same thing.
+
+The cost, stated plainly: on a **cold load with an expired (or rotated-key) cookie** the SPA renders
+the authenticated shell first and only discovers the dead session when its first API call answers
+`401`, at which point the existing `401 → logout` path clears the dead cookie and returns to the
+sign-in screen. That flash of the authenticated shell is the trade for keeping the token in exactly
+one place (an `HttpOnly` cookie, never JavaScript memory or `localStorage`). SPA in-memory mode does
+not have it — it can read the token's `exp` and show the re-auth banner before it expires.
+
 ### HA: `Lease` leader election (`T13.2`) — opt-in
 
 By default the controller runs as a single replica: run exactly one. Two replicas without leader

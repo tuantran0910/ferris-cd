@@ -121,6 +121,54 @@ pub struct ServerArgs {
     #[arg(long = "oidc-insecure-http")]
     pub oidc_insecure_http: bool,
 
+    /// Enable the optional server-side (BFF) OIDC session flow (`T19.2`).
+    ///
+    /// The browser then holds an AEAD-sealed `HttpOnly; Secure; SameSite=Lax` cookie instead of a
+    /// token, which survives a hard refresh at the cost of the server holding the session. Requires
+    /// `--oidc-bff-redirect-uri` and `--oidc-bff-session-key-file`. Off by default: the SPA's own
+    /// in-memory PKCE flow needs no server-side state and is the stronger XSS posture.
+    #[arg(long = "oidc-bff-enabled")]
+    pub oidc_bff_enabled: bool,
+
+    /// The **exact** redirect URI registered at the IdP for the BFF flow.
+    ///
+    /// e.g. `https://ferriscd.example.com/api/v1/auth/callback`. Any other `redirect_uri` a client
+    /// supplies to `GET /api/v1/auth/login` is refused, so this route can never become an open
+    /// redirect.
+    #[arg(
+        long = "oidc-bff-redirect-uri",
+        value_name = "URL",
+        env = "FERRISCD_OIDC_BFF_REDIRECT_URI"
+    )]
+    pub oidc_bff_redirect_uri: Option<String>,
+
+    /// File holding the 256-bit key that seals the BFF session cookie.
+    ///
+    /// Mount the `ferriscd.io/secret-type: oidc` `Secret` and point this at its `sessionKey` entry;
+    /// the file may hold raw bytes or base64. Read once at startup and never logged.
+    #[arg(
+        long = "oidc-bff-session-key-file",
+        value_name = "PATH",
+        env = "FERRISCD_OIDC_BFF_SESSION_KEY_FILE"
+    )]
+    pub oidc_bff_session_key_file: Option<PathBuf>,
+
+    /// Where the browser lands after a successful BFF sign-in (a same-origin path).
+    #[arg(
+        long = "oidc-bff-post-login-path",
+        value_name = "PATH",
+        default_value = ferriscd_server::auth_bff::DEFAULT_POST_LOGIN_PATH
+    )]
+    pub oidc_bff_post_login_path: String,
+
+    /// BFF session lifetime, in seconds (at most 12 hours).
+    #[arg(
+        long = "oidc-bff-session-seconds",
+        value_name = "SECONDS",
+        default_value_t = ferriscd_server::auth_bff::DEFAULT_SESSION_TTL.as_secs()
+    )]
+    pub oidc_bff_session_seconds: u64,
+
     /// GitHub webhook secret (HMAC-SHA256 key for `X-Hub-Signature-256`).
     ///
     /// Without it `POST /api/v1/webhooks/github` answers `422`: an unverified webhook is never
@@ -185,6 +233,14 @@ impl std::fmt::Debug for ServerArgs {
             .field("oidc_groups_prefix", &self.oidc_groups_prefix)
             .field("oidc_scopes", &self.oidc_scopes)
             .field("oidc_insecure_http", &self.oidc_insecure_http)
+            .field("oidc_bff_enabled", &self.oidc_bff_enabled)
+            .field("oidc_bff_redirect_uri", &self.oidc_bff_redirect_uri)
+            .field(
+                "oidc_bff_session_key_file",
+                &redacted(self.oidc_bff_session_key_file.is_some()),
+            )
+            .field("oidc_bff_post_login_path", &self.oidc_bff_post_login_path)
+            .field("oidc_bff_session_seconds", &self.oidc_bff_session_seconds)
             .field(
                 "github_webhook_secret",
                 &redacted(self.github_webhook_secret.is_some()),
@@ -457,6 +513,56 @@ async fn oidc_authenticator(
     Ok((authenticator, public))
 }
 
+/// Builds the optional server-side (BFF) session flow (`T19.2`).
+///
+/// Off unless `--oidc-bff-enabled`; the dependent flags are then refused rather than ignored. The
+/// session key is read from the file the `ferriscd.io/secret-type: oidc` `Secret` is mounted into (a
+/// blocking read, so it runs on the blocking pool) and is never logged.
+async fn bff_state(
+    args: &ServerArgs,
+    config: &ferriscd_server::oidc::OidcConfig,
+) -> Result<Option<std::sync::Arc<ferriscd_server::BffState>>> {
+    use std::sync::Arc;
+
+    use ferriscd_server::auth_bff::{BffConfig, BffState, HttpsOidcSession, SessionKey};
+
+    if !args.oidc_bff_enabled {
+        anyhow::ensure!(
+            args.oidc_bff_redirect_uri.is_none() && args.oidc_bff_session_key_file.is_none(),
+            "--oidc-bff-redirect-uri/--oidc-bff-session-key-file require --oidc-bff-enabled: \
+             without the master switch they would silently do nothing"
+        );
+        return Ok(None);
+    }
+    let redirect_uri = args.oidc_bff_redirect_uri.clone().context(
+        "--oidc-bff-enabled requires --oidc-bff-redirect-uri: the exact URI registered at the IdP",
+    )?;
+    let key_path = args.oidc_bff_session_key_file.clone().context(
+        "--oidc-bff-enabled requires --oidc-bff-session-key-file: a 256-bit key for the session \
+         cookie",
+    )?;
+    let material = tokio::task::spawn_blocking(move || std::fs::read(&key_path))
+        .await
+        .context("reading the BFF session key panicked")?
+        .context("cannot read --oidc-bff-session-key-file")?;
+    let key = SessionKey::from_secret_material(&material)?;
+    let bff_config = BffConfig::new(config.issuer.clone(), config.client_id.clone())
+        .with_scopes(config.scopes.clone())
+        .with_redirect_uri(redirect_uri)
+        .with_session_key(key)
+        .with_session_ttl(std::time::Duration::from_secs(
+            args.oidc_bff_session_seconds,
+        ))
+        .with_post_login_path(args.oidc_bff_post_login_path.clone())
+        .with_allow_insecure_http(config.allow_insecure_http);
+    let session =
+        HttpsOidcSession::new(&bff_config, config.ca_pem.as_deref(), config.http_timeout)?;
+    Ok(Some(Arc::new(BffState::new(
+        bff_config,
+        Arc::new(session),
+    )?)))
+}
+
 /// Builds the shared control plane and runs the controller and the API server together.
 async fn serve(args: ServerArgs) -> Result<()> {
     let address: SocketAddr = args
@@ -472,6 +578,22 @@ async fn serve(args: ServerArgs) -> Result<()> {
     // `T19.1`: refused before any listener is bound, so a misconfigured OIDC deployment cannot start
     // into a state where every protected request answers `401`.
     let oidc = oidc_config(&args)?;
+    // `T19.2`: the optional BFF session flow is refused up front when it could not work — a session
+    // cookie with no key, or no OIDC at all, must not start serving.
+    if args.oidc_bff_enabled && oidc.is_none() {
+        anyhow::bail!(
+            "--oidc-bff-enabled requires --auth-policy oidc or token-review-or-oidc with \
+             --oidc-issuer/--oidc-client-id: the server-side flow exchanges an authorization code \
+             with the IdP"
+        );
+    }
+
+    // `T19.2`: built before the controller arguments are moved into the control plane, from the same
+    // validated OIDC configuration the JWT verifier uses.
+    let bff = match oidc.as_ref() {
+        Some(config) => bff_state(&args, config).await?,
+        None => None,
+    };
 
     // The ONE control plane: the same caches, registry, pipeline and discovery every handler and
     // every reconcile uses (finding C9).
@@ -498,6 +620,15 @@ async fn serve(args: ServerArgs) -> Result<()> {
         state = state
             .with_token_authenticator(authenticator)
             .with_auth_config(public);
+        if let Some(bff) = bff {
+            tracing::info!(
+                redirect_uri = %bff.config().redirect_uri,
+                session_ttl_seconds = bff.config().session_ttl.as_secs(),
+                "the server-side (BFF) session flow is enabled: the browser holds an encrypted \
+                 HttpOnly session cookie instead of a token"
+            );
+            state = state.with_bff(bff);
+        }
     }
     if let Some(metrics_addr) = plane.metrics_addr() {
         // `T15.1`: said out loud where the API address is decided, so a scrape that fails is not
@@ -703,6 +834,133 @@ mod tests {
         // Only a parsed socket address can collide; an unparsable value is the controller's own
         // startup error (with the expected format), not a silent default.
         ensure_metrics_addr_differs(api, "9090").expect("the controller validates the format");
+    }
+
+    /// **`T19.2`:** the optional BFF flow is off by default, refuses its dependent flags without the
+    /// master switch, refuses to start without a usable 256-bit session key, and — when complete —
+    /// turns `bffEnabled` on for `GET /api/v1/auth/config`.
+    #[tokio::test]
+    async fn the_bff_flags_are_off_by_default_and_validated_when_on() {
+        ferriscd_controller::impersonation::ensure_crypto_provider();
+        let base = [
+            "ferriscd",
+            "server",
+            "--auth-policy",
+            "oidc",
+            "--oidc-issuer",
+            "https://dex.example.com",
+            "--oidc-client-id",
+            "ferriscd",
+        ];
+
+        // Off by default, and the discovery document then says so.
+        let default = parse(&base);
+        assert!(!default.oidc_bff_enabled);
+        assert_eq!(
+            default.oidc_bff_post_login_path,
+            ferriscd_server::auth_bff::DEFAULT_POST_LOGIN_PATH
+        );
+        assert_eq!(
+            default.oidc_bff_session_seconds,
+            ferriscd_server::auth_bff::DEFAULT_SESSION_TTL.as_secs()
+        );
+        let config = oidc_config(&default)
+            .expect("a complete OIDC configuration")
+            .expect("OIDC is configured");
+        assert!(
+            bff_state(&default, &config)
+                .await
+                .expect("the disabled flow is not an error")
+                .is_none()
+        );
+
+        // A dependent flag without the master switch is refused rather than silently ignored.
+        let orphan = parse(&[
+            "ferriscd",
+            "server",
+            "--auth-policy",
+            "oidc",
+            "--oidc-issuer",
+            "https://dex.example.com",
+            "--oidc-client-id",
+            "ferriscd",
+            "--oidc-bff-redirect-uri",
+            "https://ferriscd.example.com/api/v1/auth/callback",
+        ]);
+        let orphan_config = oidc_config(&orphan)
+            .expect("a complete OIDC configuration")
+            .expect("OIDC is configured");
+        let error = bff_state(&orphan, &orphan_config)
+            .await
+            .expect_err("a redirect URI without --oidc-bff-enabled is a mistake");
+        assert!(error.to_string().contains("--oidc-bff-enabled"), "{error}");
+
+        // Enabled without a key file: refused before any listener binds.
+        let enabled = parse(&[
+            "ferriscd",
+            "server",
+            "--auth-policy",
+            "oidc",
+            "--oidc-issuer",
+            "https://dex.example.com",
+            "--oidc-client-id",
+            "ferriscd",
+            "--oidc-bff-enabled",
+            "--oidc-bff-redirect-uri",
+            "https://ferriscd.example.com/api/v1/auth/callback",
+        ]);
+        let enabled_config = oidc_config(&enabled)
+            .expect("a complete OIDC configuration")
+            .expect("OIDC is configured");
+        let error = bff_state(&enabled, &enabled_config)
+            .await
+            .expect_err("a session cookie needs a key");
+        assert!(
+            error.to_string().contains("--oidc-bff-session-key-file"),
+            "{error}"
+        );
+
+        // A complete configuration builds the flow.
+        let directory = tempfile::tempdir().expect("a scratch directory");
+        let key = directory.path().join("sessionKey");
+        std::fs::write(&key, "0123456789abcdef0123456789abcdef").expect("write the key");
+        let complete = parse(&[
+            "ferriscd",
+            "server",
+            "--auth-policy",
+            "oidc",
+            "--oidc-issuer",
+            "https://dex.example.com",
+            "--oidc-client-id",
+            "ferriscd",
+            "--oidc-bff-enabled",
+            "--oidc-bff-redirect-uri",
+            "https://ferriscd.example.com/api/v1/auth/callback",
+            "--oidc-bff-session-key-file",
+            key.to_str().expect("a UTF-8 path"),
+        ]);
+        let complete_config = oidc_config(&complete)
+            .expect("a complete OIDC configuration")
+            .expect("OIDC is configured");
+        let bff = bff_state(&complete, &complete_config)
+            .await
+            .expect("the complete configuration is accepted")
+            .expect("the flow is enabled");
+        assert_eq!(
+            bff.config().redirect_uri,
+            "https://ferriscd.example.com/api/v1/auth/callback"
+        );
+        assert_eq!(bff.config().issuer, "https://dex.example.com");
+        assert_eq!(bff.config().client_id, "ferriscd");
+        // The key is never printed, not even by `Debug`.
+        let rendered = format!("{bff:?}");
+        assert!(!rendered.contains("0123456789abcdef"), "{rendered}");
+        // A short key file is refused.
+        std::fs::write(&key, "too-short").expect("write");
+        let error = bff_state(&complete, &complete_config)
+            .await
+            .expect_err("a short key is refused");
+        assert!(error.to_string().contains("32 bytes"), "{error}");
     }
 
     /// **Finding `P14-H1`:** the policy is selectable, the flag takes both documented values, a typo

@@ -164,6 +164,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/auth/callback` — completes the BFF flow (`T19.2`).
+         * @description Validates that `state` is **this browser's** (the [`STATE_COOKIE_NAME`] cookie must equal the query
+         *     parameter, compared in constant time), consumes the one-shot transaction, exchanges the code with
+         *     the stored verifier, seals a session cookie plus the CSRF cookie, and answers `303` to the
+         *     configured post-login path. The state cookie is expired on the response whatever the outcome.
+         */
+        get: operations["callback"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/config": {
         parameters: {
             query?: never;
@@ -179,6 +202,58 @@ export interface paths {
         get: operations["auth_config"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /api/v1/auth/login` — starts the BFF flow (`T19.2`).
+         * @description Answers `302` to the IdP's authorization endpoint with a fresh `state`, `nonce` and `S256`
+         *     challenge — plus the short-lived [`STATE_COOKIE_NAME`] cookie that binds that `state` to this
+         *     browser — or `404` when the server was started without `--oidc-bff-enabled`.
+         *
+         *     `429` is the per-client sign-in budget ([`MAX_LOGINS_PER_CLIENT`] per [`LOGIN_WINDOW`]).
+         */
+        get: operations["login"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /api/v1/auth/logout` — clears the BFF session (`T19.2`).
+         * @description Requires the double-submit CSRF header (see [`csrf`]) for a *usable* session: a cross-site page
+         *     must not be able to sign an operator out. A request the browser labels cross-site is refused
+         *     outright, even with no session cookie at all — otherwise any page could force the `Max-Age=0`
+         *     cookies to be stored. A cookie that no longer opens (expired, tampered, sealed under a rotated
+         *     key) is treated as absent here, because the caller's only remaining goal is to get rid of it —
+         *     refusing that would leave the browser stuck behind a `401` it cannot clear.
+         *
+         *     The session is stateless, so this cannot revoke a cookie that was copied before the sign-out: that
+         *     copy keeps working until the token (or the cookie) expires; only the IdP can revoke it earlier.
+         */
+        post: operations["logout"];
         delete?: never;
         options?: never;
         head?: never;
@@ -341,7 +416,7 @@ export interface components {
         ApiErrorDetail: {
             /**
              * @description Stable code (`NotFound`, `BadRequest`, `Conflict`, `Unprocessable`, `Unauthorized`,
-             *     `Forbidden`, `BackendUnavailable`, `PayloadTooLarge`).
+             *     `Forbidden`, `BackendUnavailable`, `PayloadTooLarge`, `TooManyRequests`).
              */
             code: string;
             /** @description Human-readable explanation, secret-free. */
@@ -1223,6 +1298,63 @@ export interface operations {
             };
         };
     };
+    callback: {
+        parameters: {
+            query?: {
+                /** @description The authorization code */
+                code?: string;
+                /** @description The state this server issued */
+                state?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session established; redirect to the post-login path */
+            303: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The state is missing, unknown, expired or not this browser's */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The session cookie could not be sealed */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The BFF flow is not enabled on this server */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The identity provider could not be reached */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
     auth_config: {
         parameters: {
             query?: never;
@@ -1240,6 +1372,95 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["AuthConfigView"];
                 };
+            };
+        };
+    };
+    login: {
+        parameters: {
+            query?: {
+                /** @description The registered redirect URI; must match exactly */
+                redirect_uri?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Redirect to the identity provider's authorization endpoint */
+            302: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description redirect_uri is not the registered one */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The BFF flow is not enabled on this server */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Too many sign-ins were started from this address */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The identity provider's discovery document is unavailable */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    logout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session cookies cleared */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The CSRF header is missing or does not match, or the sign-out was initiated from another site */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The BFF flow is not enabled on this server */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

@@ -63,10 +63,12 @@ pub enum ClusterCommand {
 ///
 /// Any client or serialization failure.
 pub async fn run_project(args: ProjectArgs) -> Result<u8> {
-    let client = Client::connect(
+    // `T19.2`: the stored credential is read on the blocking pool, not on an executor thread.
+    let client = Client::connect_async(
         args.connection.server_url.as_deref(),
         args.connection.token.as_deref(),
-    )?;
+    )
+    .await?;
     match args.command {
         ProjectCommand::List(list) => list_projects(&client, list).await,
     }
@@ -78,10 +80,12 @@ pub async fn run_project(args: ProjectArgs) -> Result<u8> {
 ///
 /// Any client or serialization failure.
 pub async fn run_cluster(args: ClusterArgs) -> Result<u8> {
-    let client = Client::connect(
+    // `T19.2`: the stored credential is read on the blocking pool, not on an executor thread.
+    let client = Client::connect_async(
         args.connection.server_url.as_deref(),
         args.connection.token.as_deref(),
-    )?;
+    )
+    .await?;
     match args.command {
         ClusterCommand::List(list) => list_clusters(&client, list).await,
     }

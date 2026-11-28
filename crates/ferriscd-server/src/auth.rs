@@ -665,6 +665,52 @@ pub async fn authenticate(
         // composite), so the middleware — and every handler behind it — is unchanged by the new
         // policy: it resolves an identity or it answers `401`.
         AuthPolicy::TokenReview | AuthPolicy::Oidc | AuthPolicy::TokenReviewOrOidc => {
+            // `T19.2`: when the optional BFF session flow is enabled the browser never holds a token,
+            // so the credential arrives inside the AEAD-sealed session cookie. Opening it *here* (and
+            // only here) means every handler and every RBAC decision below is unchanged: the cookie's
+            // access token runs through exactly the same authenticator, cache and audit path as a
+            // bearer credential, and an expired or tampered cookie is a `401` rather than a silent
+            // fallback to "no credentials".
+            if let Some(bff) = state.bff.as_ref() {
+                match bff.session_credential(request.headers(), std::time::SystemTime::now()) {
+                    crate::auth_bff::SessionCredential::Absent => {}
+                    crate::auth_bff::SessionCredential::Invalid => {
+                        tracing::debug!(
+                            path = %path,
+                            "protected request refused: the BFF session cookie is not usable"
+                        );
+                        record_auth_denied(
+                            &state.audit,
+                            request_id.as_deref(),
+                            &path,
+                            None,
+                            "the session cookie is expired or was not issued by this server",
+                        );
+                        return unauthorized(
+                            "your session expired or is not usable; sign in again",
+                        );
+                    }
+                    crate::auth_bff::SessionCredential::Active(session) => {
+                        // The access token becomes the bearer credential for the rest of this request;
+                        // nothing about it is logged (the fingerprint path below handles that). A
+                        // browser never sends both, so the cookie winning over a stale header is the
+                        // intended precedence.
+                        match axum::http::HeaderValue::from_str(&format!(
+                            "Bearer {}",
+                            session.access_token
+                        )) {
+                            Ok(value) => {
+                                request.headers_mut().insert(AUTHORIZATION, value);
+                            }
+                            Err(_) => {
+                                return unauthorized(
+                                    "your session expired or is not usable; sign in again",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             let token = match BearerToken::parse(request.headers()) {
                 Ok(token) => token,
                 Err(error) => {
