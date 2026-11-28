@@ -32,6 +32,7 @@ export type ClusterView = components["schemas"]["ClusterView"];
 export type ApplicationEventListView =
   components["schemas"]["ApplicationEventListView"];
 export type ApplicationEventView = components["schemas"]["ApplicationEventView"];
+export type AuthConfigView = components["schemas"]["AuthConfigView"];
 export type HealthResponse = components["schemas"]["HealthResponse"];
 export type ReadyResponse = components["schemas"]["ReadyResponse"];
 

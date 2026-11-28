@@ -568,6 +568,12 @@ export function createMockApiClient(
     }),
     listProjects: async () => sampleProjects,
     listClusters: async () => sampleClusters,
+    getAuthConfig: async () => ({
+      authMode: "token-review",
+      scopes: [],
+      bffEnabled: false,
+    }),
+    logoutSession: async () => {},
     ...overrides,
   };
 }

@@ -44,6 +44,7 @@
 pub mod api;
 pub mod audit;
 pub mod auth;
+pub mod auth_bff;
 pub mod error;
 pub mod kube;
 pub mod oidc;
@@ -68,6 +69,11 @@ pub use auth::{
     AuthPolicy, AuthenticatedCredential, AuthenticatedIdentity, BearerError, BearerToken,
     DEFAULT_IDENTITY_CACHE_TTL, IdentityCache, TokenAuthenticator, UnconfiguredTokenAuthenticator,
     UnknownAuthPolicy, fingerprint_label, token_fingerprint,
+};
+pub use auth_bff::{
+    BffConfig, BffConfigError, BffError, BffState, CodeExchangeRequest, ExchangedTokens,
+    HttpsOidcSession, OidcEndpoints, OidcSession, PkcePair, Session, SessionKey, SessionSealer,
+    s256_challenge,
 };
 pub use error::{ApiError, ApiErrorBody, ApiErrorDetail};
 pub use oidc::{
@@ -206,10 +212,17 @@ where
              default TokenReview authentication, or bind --api-addr to 127.0.0.1"
         );
     }
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(|source| ServeError::Serve { source })
+    // **`T19.2`:** with connect info installed, `/api/v1/auth/login` can charge its per-client
+    // sign-in budget to the *peer address* instead of to a single shared bucket. Without it the
+    // handler sees `Option<ConnectInfo>` = `None` and every anonymous caller shares one budget, which
+    // would refuse legitimate operators while leaving the per-client cap meaningless.
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .map_err(|source| ServeError::Serve { source })
 }
 
 /// Builds the router from a state (a convenience alias for [`api::router`]).

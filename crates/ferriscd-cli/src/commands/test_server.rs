@@ -327,7 +327,8 @@ mod tests {
                 ),
         )
         .await;
-        let client = Client::connect(Some(server.base_url()), Some("fake-cli-test-token"))
+        let client = Client::connect_async(Some(server.base_url()), Some("fake-cli-test-token"))
+            .await
             .expect("a client");
 
         let list = client.list_applications().await.expect("the list");
@@ -538,7 +539,8 @@ mod tests {
         ))
         .await;
 
-        let projects = Client::connect(Some(server.base_url()), Some("fake-cli-test-token"))
+        let projects = Client::connect_async(Some(server.base_url()), Some("fake-cli-test-token"))
+            .await
             .expect("a client")
             .list_projects()
             .await
@@ -718,8 +720,10 @@ mod tests {
             }}),
         ))
         .await;
-        let client = Client::connect(Some(unauthorized.base_url()), Some("expired-token-value"))
-            .expect("a client");
+        let client =
+            Client::connect_async(Some(unauthorized.base_url()), Some("expired-token-value"))
+                .await
+                .expect("a client");
         let error = client
             .list_applications()
             .await
@@ -793,7 +797,9 @@ mod tests {
             Reply::Raw(StatusCode::OK, "{not json".to_owned()),
         ))
         .await;
-        let client = Client::connect(Some(malformed.base_url()), Some("token")).expect("a client");
+        let client = Client::connect_async(Some(malformed.base_url()), Some("token"))
+            .await
+            .expect("a client");
         let error = client
             .list_applications()
             .await
@@ -801,7 +807,9 @@ mod tests {
         assert!(matches!(error, ClientError::Decode { .. }), "{error:?}");
 
         // A port nobody listens on: `127.0.0.1:1` is refused immediately by the kernel.
-        let client = Client::connect(Some("http://127.0.0.1:1"), Some("token")).expect("a client");
+        let client = Client::connect_async(Some("http://127.0.0.1:1"), Some("token"))
+            .await
+            .expect("a client");
         let error = client
             .list_applications()
             .await
@@ -827,7 +835,8 @@ mod tests {
             }),
         ))
         .await;
-        let client = Client::connect(Some(server.base_url()), Some("fake-cli-test-token"))
+        let client = Client::connect_async(Some(server.base_url()), Some("fake-cli-test-token"))
+            .await
             .expect("a client");
         // A long timeout and a long interval: success must come from the first poll, not the clock.
         let code = app::watch_for_tests(

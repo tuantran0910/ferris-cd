@@ -582,6 +582,8 @@ pub struct AppState {
     pub identities: Arc<IdentityCache>,
     /// `T19.1` secret-free OIDC facts `GET /api/v1/auth/config` publishes.
     pub auth_config: PublicAuthConfig,
+    /// `T19.2` optional server-side (BFF) session flow. `None` = the SPA does its own PKCE flow.
+    pub bff: Option<Arc<crate::auth_bff::BffState>>,
     /// `T14.4` / `T17.1` live-reloading project-scoped authorization policy store (empty = deny
     /// every authenticated caller).
     pub rbac: RbacPolicyStore,
@@ -610,6 +612,7 @@ impl fmt::Debug for AppState {
             .field("rbac_rules", &self.rbac.rule_count())
             .field("webhooks", &self.webhooks)
             .field("readiness", &self.readiness.is_ready())
+            .field("bff_enabled", &self.bff.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -650,6 +653,7 @@ impl AppState {
             tokens: Arc::new(UnconfiguredTokenAuthenticator),
             identities: Arc::new(IdentityCache::default()),
             auth_config: PublicAuthConfig::default(),
+            bff: None,
             rbac: RbacPolicyStore::empty(),
             rbac_namespace: crate::rbac::DEFAULT_RBAC_NAMESPACE.to_owned(),
             webhooks,
@@ -719,6 +723,22 @@ impl AppState {
     #[must_use]
     pub fn with_auth_config(mut self, auth_config: PublicAuthConfig) -> Self {
         self.auth_config = auth_config;
+        self
+    }
+
+    /// Enables the optional server-side (BFF) session flow (`T19.2`).
+    ///
+    /// Turns on `GET /api/v1/auth/login`, `GET /api/v1/auth/callback`, `POST /api/v1/auth/logout`, the
+    /// CSRF middleware on mutating routes, cookie authentication in [`crate::auth::authenticate`], and
+    /// the `bffEnabled` flag `GET /api/v1/auth/config` publishes.
+    ///
+    /// Call it **after** [`Self::with_auth_config`]: this sets `bffEnabled` on that value, so calling
+    /// it first would let the later `with_auth_config` publish `bffEnabled: false` for a server that
+    /// really answers the cookie flow.
+    #[must_use]
+    pub fn with_bff(mut self, bff: Arc<crate::auth_bff::BffState>) -> Self {
+        self.auth_config.bff_enabled = true;
+        self.bff = Some(bff);
         self
     }
 

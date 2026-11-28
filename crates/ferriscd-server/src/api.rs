@@ -1,10 +1,14 @@
 //! The REST API: routes, handlers, and the DTOs the OpenAPI contract freezes.
 //!
-//! Three route groups, deliberately disjoint (see [`crate::auth`]):
+//! Four route groups, deliberately disjoint (see [`crate::auth`]):
 //!
 //! ```text
 //! public      GET  /healthz
 //!             GET  /readyz
+//!             GET  /api/v1/auth/config             (T19.1 sign-in discovery)
+//! sessions    GET  /api/v1/auth/login              (T19.2 BFF; 404 unless --oidc-bff-enabled)
+//!             GET  /api/v1/auth/callback           (state cookie must match the query parameter)
+//!             POST /api/v1/auth/logout             (CSRF double-submit required)
 //! webhooks    POST /api/v1/webhooks/github         (HMAC-authenticated, T14.2)
 //!             POST /api/v1/webhooks/gitlab         (token-authenticated, T14.2)
 //! protected   GET  /api/v1/applications
@@ -69,6 +73,7 @@ use crate::audit::{
     self, AuditOutcome, RequestId, TokenFingerprint, record_api_operation, record_rbac_denied,
 };
 use crate::auth::{self, AuthenticatedIdentity};
+use crate::auth_bff;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::openapi;
 use crate::rbac::{Action, Actor, RbacPolicyStore};
@@ -705,6 +710,14 @@ pub fn router(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
+        ))
+        // `T19.2`: when the optional BFF session cookie flow is on, every mutating request that
+        // carries that cookie must echo the double-submit CSRF header. Installed on the same route
+        // group (and after the routes, like the auth layer) so a new protected POST cannot silently
+        // lose it.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_bff::csrf,
         ));
 
     let public = Router::new()
@@ -715,6 +728,19 @@ pub fn router(state: AppState) -> Router {
         // never behind the middleware above.
         .route("/api/v1/auth/config", get(auth_config));
 
+    // `T19.2`: the optional BFF routes. Always registered so the OpenAPI document is honest about
+    // them; each answers `404` when the server was not started with `--oidc-bff-enabled`. `logout`
+    // sits in this group deliberately: it must be reachable with an expired/absent session cookie so
+    // a stuck browser can always clear it, and the CSRF layer is installed on the group.
+    let auth_sessions = Router::new()
+        .route(auth_bff::LOGIN_PATH, get(auth_bff::login))
+        .route(auth_bff::CALLBACK_PATH, get(auth_bff::callback))
+        .route(auth_bff::LOGOUT_PATH, post(auth_bff::logout))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_bff::csrf,
+        ));
+
     let webhooks = Router::new()
         .route("/api/v1/webhooks/github", post(webhooks::github))
         .route("/api/v1/webhooks/gitlab", post(webhooks::gitlab));
@@ -722,6 +748,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(protected)
         .merge(public)
+        .merge(auth_sessions)
         .merge(webhooks)
         .layer(DefaultBodyLimit::max(state.webhooks.max_body_bytes()))
         // `T17.2`: outermost correlation layer so every protected handler, 401 auth rejection,

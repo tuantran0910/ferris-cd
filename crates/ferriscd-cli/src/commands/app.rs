@@ -51,8 +51,12 @@ pub struct ConnectionArgs {
 
 impl ConnectionArgs {
     /// Builds the client from the flags, the environment, or the stored configuration.
-    fn client(&self) -> Result<Client> {
-        Client::connect(self.server_url.as_deref(), self.token.as_deref())
+    ///
+    /// Async since `T19.2`: the stored credential is read on the blocking pool instead of on an
+    /// executor thread (the `docs/REVIEW_LOG.md` §`v1.0` follow-up).
+    async fn client(&self) -> Result<Client> {
+        Client::connect_async(self.server_url.as_deref(), self.token.as_deref())
+            .await
             .context("cannot connect to ferriscd-server")
     }
 }
@@ -213,7 +217,7 @@ pub struct HistoryArgs {
 ///
 /// Any client or serialization failure; the caller maps it onto exit code `1`.
 pub async fn run(args: AppArgs) -> Result<u8> {
-    let client = args.connection.client()?;
+    let client = args.connection.client().await?;
     match args.command {
         AppCommand::List(list) => list_applications(&client, list).await,
         AppCommand::Get(get) => get_application(&client, get).await,
