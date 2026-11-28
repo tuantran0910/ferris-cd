@@ -4,6 +4,7 @@ import { flushSync } from "react-dom";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { Button } from "../ui/Button";
+import { CopyToast } from "../ui/CopyToast";
 import {
   CommandPalette,
   COMMAND_PALETTE_HINT,
@@ -96,6 +97,7 @@ export function Layout() {
 
   return (
     <div className="flex min-h-screen flex-col bg-canvas text-ink-strong">
+      <CopyToast />
       <a
         href="#main-content"
         data-testid="skip-to-content"
