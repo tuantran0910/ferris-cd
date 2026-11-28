@@ -678,6 +678,7 @@ impl SyncMachine {
             // A new operation starts with no tracked hooks: the previous operation's records are
             // not the hooks of this revision (their deletion policy owns the old objects).
             active_hooks: Vec::new(),
+            metric_gate: None,
             message: Some(dispatch_message(SyncStep::pre_sync())),
             started_at: now.clone(),
             finished_at: None,
@@ -834,6 +835,10 @@ impl SyncMachine {
         state.phase_started_at = Some(now.clone());
         state.revision = Some(revision.to_owned());
         state.active_hooks.clear();
+        // `T20.3`: a metric gate's samples belong to the revision they were taken on. Carrying them
+        // across a restart would credit a bake that measured a *different* commit's canary, which is
+        // the one way a re-entrant gate could promote without a single sample of the new revision.
+        state.metric_gate = None;
         state.message = Some(truncate_message(&format!(
             "revision changed from {previous} to {revision} while the operation was running; \
              restarting at PreSync"
@@ -1573,6 +1578,7 @@ mod tests {
             phase_started_at: None,
             revision: Some("rev-legacy".to_owned()),
             active_hooks: Vec::new(),
+            metric_gate: None,
             message: None,
             started_at: now.clone(),
             finished_at: None,
@@ -1704,6 +1710,7 @@ mod tests {
                 phase_started_at: Some(now.clone()),
                 revision: None,
                 active_hooks: Vec::new(),
+                metric_gate: None,
                 message: None,
                 started_at: now.clone(),
                 finished_at: Some(now.clone()),
@@ -1760,6 +1767,7 @@ mod tests {
                 phase_started_at: Some(now.clone()),
                 revision: Some("rev-a".to_owned()),
                 active_hooks: Vec::new(),
+                metric_gate: None,
                 message: Some("sync completed".to_owned()),
                 started_at: now.clone(),
                 finished_at: Some(now.clone()),
@@ -2074,6 +2082,7 @@ mod tests {
                 phase_started_at: Some(now.clone()),
                 revision: Some("rev-a".to_owned()),
                 active_hooks: Vec::new(),
+                metric_gate: None,
                 message: None,
                 started_at: now.clone(),
                 finished_at: None,
@@ -2093,6 +2102,7 @@ mod tests {
             phase_started_at: None,
             revision: None,
             active_hooks: Vec::new(),
+            metric_gate: None,
             message: None,
             started_at: now.clone(),
             finished_at: Some(now.clone()),

@@ -3361,6 +3361,7 @@ mod tests {
                 "migrate-abcde",
                 HealthStatus::Progressing,
             )],
+            metric_gate: None,
             message: Some("running PreSync hooks".to_owned()),
             started_at: now(),
             finished_at: None,
@@ -3376,6 +3377,7 @@ mod tests {
             }),
             sync_options: None,
             retry: None,
+            metric_gates: Vec::new(),
         }
     }
 

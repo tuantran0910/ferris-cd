@@ -33,6 +33,29 @@ pub(crate) fn int(object: &DynamicObject, path: &[&str]) -> Option<i64> {
     field(object, path).and_then(Value::as_i64)
 }
 
+/// Returns the integer at `path`, accepting **both** a JSON number and a decimal string.
+///
+/// The `T20.3` finding H3 case: `observedGeneration` is an `int64` in the typed API, but a
+/// controller that writes its status through an unstructured object can publish it as a string —
+/// Argo Rollouts does exactly that, so `"observedGeneration": "3"` is what a real `Rollout` carries.
+/// Reading only the numeric form made the stale-generation guard silently dead: `None` reads as
+/// "unknown", which is documented as "not stale", so every canary would look settled.
+///
+/// A value that is neither a number nor a decimal integer string (a float, `"two"`, an object) is
+/// `None`, i.e. still "unknown" — never a guessed generation.
+pub(crate) fn int_or_numeric_string(object: &DynamicObject, path: &[&str]) -> Option<i64> {
+    field(object, path).and_then(value_int_or_numeric_string)
+}
+
+/// Reads one raw JSON value as an integer: a JSON number, or a decimal string of one.
+pub(crate) fn value_int_or_numeric_string(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 /// Returns the boolean at `path`, if it is a JSON boolean.
 pub(crate) fn flag(object: &DynamicObject, path: &[&str]) -> Option<bool> {
     field(object, path).and_then(Value::as_bool)
@@ -101,7 +124,16 @@ impl ConditionView<'_> {
 
 /// Reads `status.conditions`, skipping entries without a `type`.
 pub(crate) fn conditions(object: &DynamicObject) -> Vec<ConditionView<'_>> {
-    entries(object, &["status", "conditions"])
+    condition_views(entries(object, &["status", "conditions"]))
+}
+
+/// Reads a **nested** conditions array (a Gateway API `HTTPRoute`'s `status.parents[].conditions`,
+/// `T20.3`) into the same total view the top-level accessor produces.
+///
+/// One parser for both shapes: the staleness/`True`/`False` rules are what a health verdict is made
+/// of, and having two of them would let the nested one drift from the tested top-level one.
+pub(crate) fn condition_views(conditions: &[Value]) -> Vec<ConditionView<'_>> {
+    conditions
         .iter()
         .filter_map(|value| {
             Some(ConditionView {
@@ -109,10 +141,20 @@ pub(crate) fn conditions(object: &DynamicObject) -> Vec<ConditionView<'_>> {
                 status: value.get("status").and_then(Value::as_str).unwrap_or(""),
                 reason: value.get("reason").and_then(Value::as_str).unwrap_or(""),
                 message: value.get("message").and_then(Value::as_str).unwrap_or(""),
-                observed_generation: value.get("observedGeneration").and_then(Value::as_i64),
+                observed_generation: value
+                    .get("observedGeneration")
+                    .and_then(value_int_or_numeric_string),
             })
         })
         .collect()
+}
+
+/// Returns the JSON array at `key` of a raw `serde_json::Value`, or an empty slice.
+pub(crate) fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
 }
 
 /// Finds the condition of the given type (exact match, case-sensitive: Kubernetes condition types
@@ -208,5 +250,50 @@ mod tests {
             observed_generation: None,
         };
         assert_eq!(bare.describe(), "Ready");
+    }
+
+    /// `T20.3` finding H3: `observedGeneration` is published as a **string** by controllers that
+    /// write their status through an unstructured object (Argo Rollouts), so reading only the numeric
+    /// form silently disabled the stale-generation guard.
+    #[test]
+    fn a_string_observed_generation_is_read_as_an_integer() {
+        let live = object(json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Rollout",
+            "metadata": { "name": "api", "generation": 4 },
+            "status": {
+                "observedGeneration": "3",
+                "conditions": [{ "type": "InvalidSpec", "status": "False",
+                                 "observedGeneration": "3" }],
+            },
+        }));
+        assert_eq!(int(&live, &["status", "observedGeneration"]), None);
+        assert_eq!(
+            int_or_numeric_string(&live, &["status", "observedGeneration"]),
+            Some(3)
+        );
+        let parsed = conditions(&live);
+        assert_eq!(parsed[0].observed_generation, Some(3));
+
+        // Anything that is not a decimal integer is still "unknown", never a guessed generation.
+        for value in [
+            json!("two"),
+            json!("3.5"),
+            json!(3.5),
+            json!(true),
+            json!(null),
+            json!({ "value": 3 }),
+        ] {
+            assert_eq!(
+                value_int_or_numeric_string(&value),
+                None,
+                "{value} must not become a generation"
+            );
+        }
+        // Both spellings of a real generation agree.
+        assert_eq!(
+            value_int_or_numeric_string(&json!("4")),
+            value_int_or_numeric_string(&json!(4))
+        );
     }
 }
