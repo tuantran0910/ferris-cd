@@ -92,6 +92,14 @@ pub const REASON_OWNERSHIP_CONFLICT: &str = "OwnershipConflict";
 /// because the condition message names the offending field and key.
 pub const REASON_POLICY_VIOLATION: &str = "PolicyViolation";
 
+/// Condition reason recorded when a pre-sync **policy rule** refuses the bundle (`T20.2`).
+///
+/// Distinct from [`REASON_POLICY_VIOLATION`], which is the `AppProject` allow-list verdict: this one
+/// means every rendered resource was authorized but at least one broke a manifest invariant (a
+/// `privileged` container, an unapproved registry, a missing label). Terminal — the manifests or the
+/// rule must change — and raised before a single apply, prune, or `dryRun=All` call.
+pub const REASON_POLICY_GATE_VIOLATION: &str = "PolicyGateViolation";
+
 /// Whether a deletion cascades through `status.inventory`.
 ///
 /// Defaulting to [`CleanupMode::Orphan`] means deleting an `Application` never silently
@@ -136,6 +144,12 @@ pub struct ApplyOutcome {
     pub history: Option<Vec<RevisionHistoryEntry>>,
     /// Conditions to add or refresh (the `T10.5` rollback warning).
     pub warnings: Vec<Condition>,
+    /// The `T20.2` `PolicyAdvisory` condition for this pass (`None` = leave untouched).
+    ///
+    /// Kept out of [`Self::warnings`] deliberately: policy advisories are refreshed on **every**
+    /// pass (including the `False`/`PolicyCompliant` form that clears a stale advisory), and the
+    /// rollback-warning lifecycle keys off `warnings.is_empty()`.
+    pub policy_advisories: Option<Condition>,
     /// Canonical GKNN keys confirmed pruned during this pass (`T15.2` `ResourcePruned` event).
     pub pruned: Vec<ResourceKey>,
 }
@@ -155,6 +169,7 @@ impl ApplyOutcome {
             operation_state: None,
             history: None,
             warnings: Vec::new(),
+            policy_advisories: None,
             pruned: Vec::new(),
         }
     }
@@ -199,6 +214,13 @@ impl ApplyOutcome {
     #[must_use]
     pub fn with_history(mut self, history: Option<Vec<RevisionHistoryEntry>>) -> Self {
         self.history = history;
+        self
+    }
+
+    /// Attaches the `T20.2` `PolicyAdvisory` condition for this pass.
+    #[must_use]
+    pub fn with_policy_advisories(mut self, condition: Option<Condition>) -> Self {
+        self.policy_advisories = condition;
         self
     }
 
@@ -412,12 +434,68 @@ pub enum ReconcileError {
         message: String,
     },
 
+    /// The pre-sync policy gate refused the bundle (`T20.2`).
+    ///
+    /// Terminal and raised **before any mutation**: after tenancy policy and Stage-2 scope
+    /// normalization, before the live read, the `dryRun=All` diff, every apply and every prune. The
+    /// inventory is the one that was already true — nothing was applied or pruned — so `/status`
+    /// reports `OutOfSync` and **keeps** `lastSyncedRevision`: a refused pass must never look like a
+    /// pass that lost its history, and `selfHeal` must still be able to converge once the manifests
+    /// change.
+    ///
+    /// Boxed for the same reason [`Self::PartialSync`]'s operation state is: `ReconcileError` is
+    /// returned **by value** from every pipeline call, so a refusal carrying two violation lists,
+    /// the unchanged inventory and the revision must not grow the enum that every other, far more
+    /// common error pays for (`clippy::result_large_err`).
+    #[error("{0}")]
+    PolicyGate(Box<PolicyGateRefusal>),
+
     /// The desired state is invalid and retrying cannot help (terminal).
     #[error("{message}")]
     Invalid {
         /// Actionable, secret-free description.
         message: String,
     },
+}
+
+/// The detail of a [`ReconcileError::PolicyGate`] refusal (`T20.2`).
+///
+/// A refusal carries more than a sentence: the blocking violations are what the operator has to fix
+/// and the advisories are what the refusal path must write (or clear) on `/status`, and the
+/// inventory is what has to survive a pass that applied nothing. It lives in its own struct only so
+/// the error variant can box it.
+#[derive(Debug)]
+pub struct PolicyGateRefusal {
+    /// Actionable, `Secret`-free summary naming every blocking violation.
+    pub message: String,
+    /// The blocking violations, in rule-then-resource order.
+    pub violations: Vec<ferriscd_engine::policy::PolicyViolation>,
+    /// The advisory (`Warn`) violations of the same pass.
+    ///
+    /// Carried so the refusal path can write — or **clear** — the `PolicyAdvisory` condition
+    /// (finding M7): a refused pass never reaches the success path that refreshes it, so without
+    /// them a stale advisory would outlive the violation that produced it.
+    pub advisories: Vec<ferriscd_engine::policy::PolicyViolation>,
+    /// How many rules were in force, for the advisory condition's message.
+    pub rules: usize,
+    /// How many advisories the gate found but could not list (its violation budget).
+    ///
+    /// Carried for the same reason as [`Self::advisories`], and it is what makes the condition's
+    /// count **accurate** (`T20.2`, finding M10): a refused pass whose advisory list overflowed
+    /// must not report the retained entries as the whole story, and it must not claim there were no
+    /// advisories at all when every one of them was dropped.
+    pub advisories_omitted: usize,
+    /// The inventory as it was before the pass: nothing was applied, so nothing changed.
+    pub inventory: Inventory,
+    /// The revision that could not be synced.
+    pub revision: Option<String>,
+}
+
+impl std::fmt::Display for PolicyGateRefusal {
+    /// The one-line refusal; the `ReconcileError` carries it verbatim into `Ready=False`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 impl ReconcileError {
@@ -438,6 +516,7 @@ impl ReconcileError {
             | Self::SyncConflict { .. }
             | Self::SyncRetry { .. }
             | Self::OwnershipConflict { .. }
+            | Self::PolicyGate(_)
             | Self::Policy(_)
             | Self::Impersonation(_)
             | Self::Credentials(_)
@@ -468,6 +547,7 @@ impl ReconcileError {
             | Self::Invalid { .. }
             | Self::SyncConflict { .. }
             | Self::OwnershipConflict { .. }
+            | Self::PolicyGate(_)
             | Self::Policy(_)
             // An unusable ServiceAccount identity is deterministic too: the spec (or the
             // controller's wiring) must change.
@@ -521,6 +601,10 @@ impl ReconcileError {
                 revision,
                 ..
             } => Some((inventory, revision.as_ref())),
+            // `T20.2`: nothing was applied, so the inventory is unchanged; reporting it still
+            // surfaces `sync.status = OutOfSync` while `merge_sync_state` preserves the
+            // `lastSynced*` markers (they are `None` here on purpose).
+            Self::PolicyGate(refusal) => Some((&refusal.inventory, refusal.revision.as_ref())),
             _ => None,
         }
     }
@@ -591,7 +675,16 @@ pub struct DiffPreview {
     /// How many resources the rendered bundle contains (drift-independent).
     pub desired: usize,
     /// Whether the sync decision gate would apply this set right now.
+    ///
+    /// A blocking `T20.2` policy violation makes this `false`: the preview reports the verdict the
+    /// next reconcile would reach instead of pretending the bundle is applicable.
     pub would_sync: bool,
+    /// The pre-sync policy gate's violations (`T20.2`), blockings and advisories alike.
+    ///
+    /// Carried as data rather than as an error so `GET .../diff` (and therefore
+    /// `ferriscd app diff`, exit code `3`) can *show* a refused bundle. Nothing is applied either
+    /// way: the gate runs before the first mutating call.
+    pub policy_violations: Vec<ferriscd_engine::policy::PolicyViolation>,
 }
 
 /// The diff/sync pipeline seam implemented in Phases 07–08.
@@ -985,6 +1078,9 @@ pub fn failure_reason(err: &ReconcileError) -> &'static str {
         ReconcileError::OwnershipConflict { .. } => REASON_OWNERSHIP_CONFLICT,
         // Nor is a project denial: it is a tenancy decision, and the message names the field.
         ReconcileError::Policy(_) => REASON_POLICY_VIOLATION,
+        // A manifest-invariant denial is its own reason: `kubectl describe app` must let an
+        // operator tell "the project does not allow this" from "the manifest breaks a policy".
+        ReconcileError::PolicyGate(_) => REASON_POLICY_GATE_VIOLATION,
         // An unusable ServiceAccount identity is a spec problem (`T12.3`): the operator has to fix
         // `spec.serviceAccountName`, `spec.destination.namespace`, or the controller's RBAC.
         ReconcileError::Impersonation(_) => REASON_INVALID_SPEC,
@@ -1123,7 +1219,45 @@ pub fn record_failure(
     timestamp: Time,
 ) {
     status.observed_generation = generation;
-    status.set_condition(failure_condition(generation, err, timestamp));
+    status.set_condition(failure_condition(generation, err, timestamp.clone()));
+    // `T20.2` (finding M7): a policy gate refusal is a *failed* pass, so it never reaches
+    // `apply_outcome_status`, which is where a completed pass refreshes the advisory condition.
+    // Without this, a stale `PolicyAdvisory=True` from an earlier pass would outlive the violation
+    // that produced it — and the advisories of the refused bundle itself would never be shown.
+    if let Some(condition) = policy_advisory_for_failure(status, generation, err, timestamp) {
+        status.set_condition(condition);
+    }
+}
+
+/// The `PolicyAdvisory` condition to write on a **refused** pass (`T20.2`, finding M7).
+///
+/// Returns `None` for every error that is not a policy refusal, and for a refusal with no rule in
+/// force that also has no advisory on `/status` — an `Application` that never had a policy must not
+/// gain a condition it did not have before `T20.2`. A stale advisory *is* cleared, exactly like the
+/// success path does.
+fn policy_advisory_for_failure(
+    status: &ApplicationStatus,
+    generation: Option<i64>,
+    err: &ReconcileError,
+    timestamp: Time,
+) -> Option<Condition> {
+    let ReconcileError::PolicyGate(refusal) = err else {
+        return None;
+    };
+    if refusal.rules == 0
+        && status
+            .condition(ferriscd_engine::policy::CONDITION_POLICY_ADVISORY)
+            .is_none()
+    {
+        return None;
+    }
+    Some(ferriscd_engine::policy::policy_advisory_condition(
+        &refusal.advisories,
+        refusal.rules,
+        refusal.advisories_omitted,
+        generation,
+        timestamp,
+    ))
 }
 
 /// Runs the apply pipeline under the always-update-status wrapper.
@@ -1291,6 +1425,11 @@ pub fn apply_outcome_status(status: &mut ApplicationStatus, outcome: &ApplyOutco
     }
     for warning in &outcome.warnings {
         status.set_condition(warning.clone());
+    }
+    // `T20.2`: the policy advisory is refreshed on every pass, so a stale `PolicyAdvisory=True`
+    // cannot outlive the violation that produced it.
+    if let Some(advisories) = &outcome.policy_advisories {
+        status.set_condition(advisories.clone());
     }
 }
 
@@ -1869,6 +2008,20 @@ mod tests {
                 },
                 FailureClass::Terminal,
             ),
+            // `T20.2`: a policy gate refusal is deterministic — the manifests or the rule must
+            // change — so it is terminal, exactly like a project denial.
+            (
+                ReconcileError::PolicyGate(Box::new(PolicyGateRefusal {
+                    message: "policy gate: privileged containers are forbidden".to_owned(),
+                    violations: Vec::new(),
+                    advisories: Vec::new(),
+                    rules: 1,
+                    advisories_omitted: 0,
+                    inventory: Inventory::new(),
+                    revision: Some("deadbeef".to_owned()),
+                })),
+                FailureClass::Terminal,
+            ),
             // Trap T10: another `Application` owns the object, so no amount of retrying helps.
             (
                 ReconcileError::OwnershipConflict {
@@ -1964,6 +2117,40 @@ mod tests {
         assert!(
             policy.partial_status().is_none(),
             "a policy denial happens before any mutation, so there is no inventory to persist"
+        );
+
+        // `T20.2`: a pre-sync policy refusal has its own reason, and it carries the unchanged
+        // inventory + revision so `/status` still reports `OutOfSync` without clearing
+        // `lastSyncedRevision`.
+        let gate = ReconcileError::PolicyGate(Box::new(PolicyGateRefusal {
+            message: "policy gate: 1 blocking violation(s)".to_owned(),
+            violations: vec![ferriscd_engine::policy::PolicyViolation {
+                rule: "no-privileged".to_owned(),
+                enforcement: ferriscd_engine::policy::PolicyEnforcement::Enforce,
+                resource_key: "apps/Deployment/payments/api".to_owned(),
+                message: "privileged containers are forbidden".to_owned(),
+            }],
+            advisories: Vec::new(),
+            rules: 1,
+            advisories_omitted: 0,
+            inventory: Inventory::new(),
+            revision: Some("deadbeef".to_owned()),
+        }));
+        assert_eq!(failure_reason(&gate), REASON_POLICY_GATE_VIOLATION);
+        assert_ne!(
+            failure_reason(&gate),
+            REASON_POLICY_VIOLATION,
+            "a manifest-invariant denial must be distinguishable from a project denial"
+        );
+        assert_eq!(gate.failure_class(), FailureClass::Terminal);
+        assert!(!gate.is_already_deleted());
+        assert!(
+            gate.partial_status().is_some(),
+            "the unchanged inventory must still reach `/status` as `OutOfSync`"
+        );
+        assert!(
+            gate.to_string().contains("priv") || gate.to_string().contains("policy gate"),
+            "{gate}"
         );
 
         // `T12.3`: an unusable ServiceAccount identity is a spec problem, and it is just as
@@ -2119,6 +2306,226 @@ mod tests {
         assert!(
             status.sync.is_none(),
             "a denial must not claim a sync state it never reached"
+        );
+    }
+
+    /// **`T20.2` trap guard:** a policy gate refusal must be terminal, must leave the inventory of
+    /// the last good pass untouched, must report `OutOfSync` — and must **keep
+    /// `lastSyncedRevision`**. A refused pass that cleared that marker would look like an
+    /// `Application` that never deployed anything, and a subsequent `selfHeal` pass could no longer
+    /// tell what it had already shipped.
+    #[tokio::test]
+    async fn a_policy_gate_refusal_keeps_the_last_synced_revision_and_the_inventory() {
+        let mut app = application(&[]);
+        app.status = Some(inventory_status());
+        app.metadata.generation = Some(9);
+        // The pipeline reports the inventory it started from: nothing was applied, so nothing
+        // changed (this is `prepare_pass`'s `prev_inventory`).
+        let mut kept = Inventory::new();
+        kept.insert(
+            ResourceKey::new("apps", "Deployment", Some("payments".to_owned()), "old"),
+            InventoryEntry::new("v1"),
+        );
+        let reported = kept.clone();
+        let pipeline = FakePipeline::failing(move || {
+            ReconcileError::PolicyGate(Box::new(PolicyGateRefusal {
+                message: "policy gate: 1 blocking, 0 advisory violation(s): no-privileged on \
+                          apps/Deployment/payments/api: privileged containers are forbidden"
+                    .to_owned(),
+                violations: vec![ferriscd_engine::policy::PolicyViolation {
+                    rule: "no-privileged".to_owned(),
+                    enforcement: ferriscd_engine::policy::PolicyEnforcement::Enforce,
+                    resource_key: "apps/Deployment/payments/api".to_owned(),
+                    message: "privileged containers are forbidden".to_owned(),
+                }],
+                advisories: Vec::new(),
+                rules: 1,
+                advisories_omitted: 0,
+                inventory: reported.clone(),
+                revision: Some("newsha".to_owned()),
+            }))
+        });
+        let writer = RecordingStatusWriter::default();
+
+        let err = apply_once(&app, &pipeline, &writer)
+            .await
+            .expect_err("a policy gate refusal must fail the reconcile");
+        assert!(matches!(err, ReconcileError::PolicyGate(_)), "{err:?}");
+
+        let patched = writer.patches();
+        assert_eq!(patched.len(), 1, "the always-update-status contract holds");
+        let status = &patched[0];
+        assert_eq!(status.observed_generation, Some(9));
+
+        let ready = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == ferriscd_crd::status::CONDITION_READY)
+            .expect("a Ready condition must be written");
+        assert_eq!(ready.status, ferriscd_crd::status::ConditionStatus::False);
+        assert_eq!(
+            ready.reason, REASON_POLICY_GATE_VIOLATION,
+            "an operator must be able to tell a policy refusal from a project denial"
+        );
+        assert!(
+            ready.message.contains("no-privileged"),
+            "the condition must name the rule: {}",
+            ready.message
+        );
+
+        let sync = status
+            .sync
+            .as_ref()
+            .expect("a refused pass reports OutOfSync, never nothing");
+        assert_eq!(sync.status, SyncStatus::OutOfSync);
+        assert_eq!(
+            sync.last_synced_revision.as_deref(),
+            Some("oldsha"),
+            "a policy refusal must never clear the last successful revision"
+        );
+        assert_eq!(sync.last_synced_spec_hash.as_deref(), Some("spec-hash"));
+        assert_eq!(
+            status
+                .inventory
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["apps/Deployment/payments/old"],
+            "the inventory a refused pass reports is the unchanged one"
+        );
+        assert_eq!(
+            status.history.len(),
+            1,
+            "a refused pass appends no history entry"
+        );
+    }
+
+    /// **`T20.2` finding M10:** a *refused* pass writes the advisory condition too — and its count
+    /// includes the advisories the gate's violation budget dropped.
+    ///
+    /// The refusal path never reaches `apply_outcome_status`, so it is the only place these
+    /// advisories can surface. Before the fix the condition received the retained advisories only,
+    /// so a refused pass whose list overflowed reported a truncated set as the whole story (or,
+    /// when every advisory was evicted by blocking findings, claimed there were none).
+    #[tokio::test]
+    async fn a_refused_pass_reports_advisories_it_could_not_list() {
+        let mut app = application(&[]);
+        app.metadata.generation = Some(11);
+        let pipeline = FakePipeline::failing(|| {
+            ReconcileError::PolicyGate(Box::new(PolicyGateRefusal {
+                message: "policy gate: 1 blocking, 5 advisory violation(s)".to_owned(),
+                violations: vec![ferriscd_engine::policy::PolicyViolation {
+                    rule: "no-privileged".to_owned(),
+                    enforcement: ferriscd_engine::policy::PolicyEnforcement::Enforce,
+                    resource_key: "apps/Deployment/payments/api".to_owned(),
+                    message: "privileged containers are forbidden".to_owned(),
+                }],
+                // Every advisory was evicted by the blocking findings, so the retained advice list
+                // is empty — and the count must still be five.
+                advisories: Vec::new(),
+                advisories_omitted: 5,
+                rules: 2,
+                inventory: Inventory::new(),
+                revision: Some("newsha".to_owned()),
+            }))
+        });
+        let writer = RecordingStatusWriter::default();
+        apply_once(&app, &pipeline, &writer)
+            .await
+            .expect_err("a policy gate refusal must fail the reconcile");
+
+        let status = &writer.patches()[0];
+        let condition = status
+            .condition(ferriscd_engine::policy::CONDITION_POLICY_ADVISORY)
+            .expect("the refusal must write the advisory condition");
+        assert_eq!(
+            condition.status,
+            ferriscd_crd::status::ConditionStatus::True,
+            "five advisories were found, so the condition is `True`"
+        );
+        assert!(
+            condition.message.contains('5'),
+            "the message must report all five, not zero: {condition:?}"
+        );
+        assert_eq!(condition.observed_generation, Some(11));
+    }
+
+    /// The `T20.2` advisory condition is refreshed on **every** pass: `True` with the advisories and
+    /// `False`/`PolicyCompliant` without, which is what clears a stale advisory.
+    #[tokio::test]
+    async fn the_policy_advisory_condition_is_refreshed_and_cleared() {
+        let app = application(&[]);
+        let timestamp = now();
+        let advisory = |status, reason: &'static str, message: &'static str| {
+            ApplyOutcome::ready("SyncSucceeded", "applied").with_policy_advisories(Some(
+                Condition::new(
+                    ferriscd_engine::policy::CONDITION_POLICY_ADVISORY,
+                    status,
+                    reason,
+                    message,
+                    timestamp.clone(),
+                ),
+            ))
+        };
+
+        // A pass with advisories writes `PolicyAdvisory=True`.
+        let pipeline = FakePipeline {
+            apply: Box::new(|| {
+                Ok(
+                    ApplyOutcome::ready("SyncSucceeded", "applied").with_policy_advisories(Some(
+                        Condition::new(
+                            ferriscd_engine::policy::CONDITION_POLICY_ADVISORY,
+                            ferriscd_crd::status::ConditionStatus::True,
+                            ferriscd_engine::policy::REASON_POLICY_ADVISORY,
+                            "no-privileged: privileged containers are forbidden",
+                            now(),
+                        ),
+                    )),
+                )
+            }),
+            ..FakePipeline::ready()
+        };
+        let writer = RecordingStatusWriter::default();
+        apply_once(&app, &pipeline, &writer)
+            .await
+            .expect("apply must succeed");
+        let status = writer.patches()[0].clone();
+        let condition = status
+            .condition(ferriscd_engine::policy::CONDITION_POLICY_ADVISORY)
+            .expect("the advisory must be persisted");
+        assert_eq!(
+            condition.status,
+            ferriscd_crd::status::ConditionStatus::True
+        );
+        assert!(condition.message.contains("privileged"), "{condition:?}");
+
+        // The next compliant pass overwrites it with `False`/`PolicyCompliant`.
+        let mut app = app;
+        app.status = Some(status);
+        let cleared = advisory(
+            ferriscd_crd::status::ConditionStatus::False,
+            ferriscd_engine::policy::REASON_POLICY_COMPLIANT,
+            "no policy advisories",
+        );
+        let pipeline = FakePipeline {
+            apply: Box::new(move || Ok(cleared.clone())),
+            ..FakePipeline::ready()
+        };
+        let writer = RecordingStatusWriter::default();
+        apply_once(&app, &pipeline, &writer)
+            .await
+            .expect("apply must succeed");
+        let condition = writer.patches()[0]
+            .condition(ferriscd_engine::policy::CONDITION_POLICY_ADVISORY)
+            .cloned()
+            .expect("the advisory condition must still be present");
+        assert_eq!(
+            condition.status,
+            ferriscd_crd::status::ConditionStatus::False
+        );
+        assert_eq!(
+            condition.reason,
+            ferriscd_engine::policy::REASON_POLICY_COMPLIANT
         );
     }
 

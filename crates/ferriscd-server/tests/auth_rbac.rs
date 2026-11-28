@@ -204,6 +204,7 @@ impl DiffSource for SecretsDiff {
                 summary: DiffSummary::from_diffs(&diffs),
                 desired: diffs.len(),
                 would_sync: true,
+                policy_violations: Vec::new(),
                 diffs,
             })
         })

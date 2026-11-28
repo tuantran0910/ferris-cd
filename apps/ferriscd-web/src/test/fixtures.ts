@@ -1,4 +1,5 @@
 import type { FerrisApiClient } from "../api/client";
+import { PolicyEnforcement } from "../api/types";
 import type {
   ApplicationDetailView,
   ApplicationEventListView,
@@ -430,6 +431,32 @@ export const sampleDiffPayload: DiffPayload = {
       truncated: false,
       conflicts: [],
       changes: [],
+    },
+  ],
+};
+
+/**
+ * A `DiffView` the policy gate refused (`T20.2`): the manifests are exactly what Git says, but one
+ * `Enforce` rule rejects them, so `wouldSync` is `false`. Nothing here may carry a `Secret` value —
+ * the server scrubs violation messages before they leave the process.
+ */
+export const sampleDiffPayloadWithPolicyViolations: DiffPayload = {
+  ...sampleDiffPayload,
+  wouldSync: false,
+  policyViolations: [
+    {
+      rule: "no-privileged",
+      enforcement: PolicyEnforcement.Enforce,
+      resourceKey: "apps/Deployment/payments/payments-api",
+      message:
+        "privileged containers are forbidden (policy \"no-privileged\")",
+    },
+    {
+      rule: "prefer-approved-registry",
+      enforcement: PolicyEnforcement.Warn,
+      resourceKey: "apps/Deployment/payments/payments-api",
+      message:
+        "prefer the approved registry (policy \"prefer-approved-registry\")",
     },
   ],
 };

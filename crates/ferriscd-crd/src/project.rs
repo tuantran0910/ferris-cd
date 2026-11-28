@@ -71,6 +71,103 @@ pub struct AppProjectSpec {
     /// `spec.serviceAccountName` is rejected unless its project lists it here.
     #[serde(default)]
     pub allowed_service_accounts: Vec<String>,
+
+    /// Pre-sync policy rules enforced on every rendered resource of this project (`T20.2`).
+    ///
+    /// Additive and optional: a project that lists none behaves exactly as before `T20.2`. Each
+    /// rule's `expression` is an invariant that **must hold** — a resource the expression rejects
+    /// is a violation. `enforcement: Enforce` refuses the sync before anything is applied or
+    /// pruned; `enforcement: Warn` surfaces an advisory condition and lets it proceed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_rules: Vec<PolicyRuleSpec>,
+}
+
+/// What a policy rule does when its expression rejects a resource.
+#[derive(
+    Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, JsonSchema,
+)]
+pub enum PolicyEnforcement {
+    /// Refuse the sync — a terminal pre-sync violation with zero applies and zero prunes.
+    ///
+    /// The default on purpose: a rule whose `enforcement` was forgotten must block, never wave a
+    /// non-compliant manifest through.
+    #[default]
+    Enforce,
+
+    /// Report an advisory `PolicyAdvisory` condition and let the sync proceed.
+    Warn,
+}
+
+impl PolicyEnforcement {
+    /// Whether this enforcement refuses the sync.
+    ///
+    /// One typed predicate for every consumer — the engine, `ferriscd app diff`, and the API views —
+    /// so no code path compares against the literal `"Enforce"` and a rename (or a third variant)
+    /// cannot silently turn a refusal into an advisory.
+    #[must_use]
+    pub fn is_blocking(self) -> bool {
+        matches!(self, Self::Enforce)
+    }
+}
+
+impl std::fmt::Display for PolicyEnforcement {
+    /// The wire label (`Enforce`/`Warn`), so a rendered banner and the JSON always agree.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Enforce => "Enforce",
+            Self::Warn => "Warn",
+        })
+    }
+}
+
+/// Which expression engine evaluates a policy rule.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+pub enum PolicyRuleEngine {
+    /// The built-in, offline, bounded CEL subset (the default).
+    #[default]
+    Cel,
+
+    /// Embedded OPA/Rego. Requires a controller **binary built** with the `opa-policy` feature
+    /// (`cargo build -p ferriscd-cli --features opa-policy`, or the image's `FERRISCD_FEATURES`
+    /// build arg — see `deploy/README.md`); without it the rule fails closed as a compile error
+    /// instead of being skipped. It is a build-time choice, not a runtime flag.
+    Rego,
+}
+
+/// One pre-sync policy rule (`T20.2`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyRuleSpec {
+    /// Rule name; appears verbatim in every violation message and in `status.conditions`.
+    pub name: String,
+
+    /// `Enforce` (default) or `Warn`.
+    #[serde(default)]
+    pub enforcement: PolicyEnforcement,
+
+    /// Expression engine; unset means [`PolicyRuleEngine::Cel`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<PolicyRuleEngine>,
+
+    /// GroupKind globs the rule applies to (`*`, `Kind`, `group/Kind`, `group/*`).
+    ///
+    /// Empty means "every rendered resource"; a hook is a rendered resource too. A manifest-shaped
+    /// `v1/Secret` is normalized to `Secret`, but an entry that names only an `apiVersion`
+    /// (`v1`, `apps/v1`) is **refused** by the policy gate: it would match no resource at all, and a
+    /// rule that matches nothing allows everything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub match_kinds: Vec<String>,
+
+    /// The invariant that must hold for every matching resource.
+    ///
+    /// A `false` result is a violation, the Kubernetes `x-kubernetes-validations` convention: write
+    /// `!object.spec.template.spec.containers.exists(c, has(c.securityContext) &&
+    /// c.securityContext.privileged == true)` to forbid privileged containers.
+    pub expression: String,
+
+    /// Operator-facing violation text; a generated sentence naming the rule is used when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 fn default_source_namespaces() -> Vec<String> {
@@ -281,6 +378,111 @@ spec: {}
         let group_kind = &schema["$defs"]["GroupKind"]["properties"];
         assert!(group_kind.get("group").is_some());
         assert!(group_kind.get("kind").is_some());
+    }
+
+    /// `T20.2`: `policyRules` is additive, defaults to `Enforce`, and survives a round-trip.
+    #[test]
+    fn policy_rules_round_trip_with_enforce_as_the_safe_default() {
+        let project = parse(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: payments
+  namespace: ferriscd-system
+spec:
+  sourceRepos: ["*"]
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+  policyRules:
+    - name: no-privileged
+      matchKinds: ["Pod", "apps/*"]
+      expression: "!object.spec.containers.exists(c, c.securityContext.privileged == true)"
+      message: privileged containers are forbidden
+    - name: prefer-registry
+      enforcement: Warn
+      engine: Rego
+      expression: "package ferriscd\nallow = true"
+"#,
+        );
+        let rules = &project.spec.policy_rules;
+        assert_eq!(rules.len(), 2);
+
+        // An omitted `enforcement` is `Enforce`: a rule whose author forgot the field must block.
+        assert_eq!(rules[0].name, "no-privileged");
+        assert_eq!(rules[0].enforcement, PolicyEnforcement::Enforce);
+        assert_eq!(rules[0].engine, None, "unset engine means CEL");
+        assert_eq!(
+            rules[0].match_kinds,
+            vec!["Pod".to_owned(), "apps/*".to_owned()]
+        );
+        assert_eq!(
+            rules[0].message.as_deref(),
+            Some("privileged containers are forbidden")
+        );
+
+        assert_eq!(rules[1].enforcement, PolicyEnforcement::Warn);
+        assert_eq!(rules[1].engine, Some(PolicyRuleEngine::Rego));
+
+        // Round-trip through YAML and JSON: the wire form is camelCase and stable.
+        let yaml = serde_saphyr::to_string(&project).expect("project must serialize");
+        assert_eq!(parse(&yaml), project);
+        let value: Value = serde_json::to_value(&project).expect("project must serialize to json");
+        let wire = &value["spec"]["policyRules"];
+        assert_eq!(wire[0]["name"], json!("no-privileged"));
+        assert_eq!(wire[0]["enforcement"], json!("Enforce"));
+        assert_eq!(wire[0]["matchKinds"][1], json!("apps/*"));
+        assert_eq!(wire[1]["engine"], json!("Rego"));
+        assert!(wire[0].get("enforcement_").is_none());
+
+        // The schema carries the rules and the enforcement enum, so the CRD (and `kubectl
+        // explain`) documents them without a hand-written schema.
+        let schema = serde_json::to_value(schemars::schema_for!(AppProjectSpec))
+            .expect("schema must serialize");
+        assert!(
+            schema["properties"]["policyRules"].is_object(),
+            "policyRules must be in the generated schema"
+        );
+        let defs = schema["$defs"].as_object().expect("definitions");
+        let enforcement =
+            serde_json::to_value(defs["PolicyEnforcement"].clone()).expect("enum schema");
+        let variants: Vec<&str> = enforcement["oneOf"]
+            .as_array()
+            .expect("a string enum schema")
+            .iter()
+            .filter_map(|variant| variant["const"].as_str())
+            .collect();
+        assert_eq!(variants, vec!["Enforce", "Warn"]);
+
+        // The `Display` impl (used by the CLI banner and by every message) must never drift from
+        // the serde wire form: they are two renderings of the same label.
+        for enforcement in [PolicyEnforcement::Enforce, PolicyEnforcement::Warn] {
+            let wire = serde_json::to_value(enforcement).expect("unit variant serializes");
+            assert_eq!(enforcement.to_string(), wire, "{enforcement:?}");
+        }
+        assert!(PolicyEnforcement::Enforce.is_blocking());
+        assert!(!PolicyEnforcement::Warn.is_blocking());
+    }
+
+    /// A rendered `policyRules` entry with no expression is refused by the API server's schema:
+    /// `expression` is required, because a rule that says nothing is not a rule.
+    #[test]
+    fn a_policy_rule_requires_an_expression() {
+        let schema = serde_json::to_value(schemars::schema_for!(PolicyRuleSpec))
+            .expect("schema must serialize");
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required list")
+            .iter()
+            .filter_map(|entry| entry.as_str())
+            .collect();
+        assert!(required.contains(&"name"), "{required:?}");
+        assert!(required.contains(&"expression"), "{required:?}");
+        assert!(
+            !required.contains(&"enforcement"),
+            "enforcement defaults to Enforce instead of being required"
+        );
     }
 
     #[test]

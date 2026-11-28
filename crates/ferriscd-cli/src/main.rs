@@ -13,6 +13,12 @@ pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
 /// Exit code for "the application is out of sync" (`ferriscd app diff`), so CI can gate on it.
 pub const EXIT_OUT_OF_SYNC: u8 = 2;
+/// Exit code for "a policy rule refuses this bundle" (`ferriscd app diff`, `T20.2`).
+///
+/// Distinct from [`EXIT_OUT_OF_SYNC`] so a CI pipeline can branch on a policy refusal separately;
+/// the value is defined next to the command that returns it
+/// ([`commands::app::EXIT_POLICY_VIOLATION`]) and reaches here through `App`'s own exit code.
+pub const EXIT_POLICY_VIOLATION: u8 = commands::app::EXIT_POLICY_VIOLATION;
 
 #[derive(Debug, Parser)]
 #[command(name = "ferriscd", version, about = "FerrisCD GitOps CLI")]

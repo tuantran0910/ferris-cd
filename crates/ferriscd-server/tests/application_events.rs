@@ -177,6 +177,7 @@ impl DiffSource for NoDiff {
                 summary: DiffSummary::from_diffs(&[]),
                 desired: 0,
                 would_sync: false,
+                policy_violations: Vec::new(),
                 diffs: Vec::new(),
             })
         })

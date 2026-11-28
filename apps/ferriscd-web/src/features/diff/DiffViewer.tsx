@@ -10,7 +10,13 @@ import {
   ShieldAlert,
 } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { DiffChange, DiffPayload, DiffResource } from "../../api/types";
+import type {
+  DiffChange,
+  DiffPayload,
+  DiffResource,
+  PolicyViolation,
+} from "../../api/types";
+import { isBlockingEnforcement } from "../../api/types";
 import { EmptyState } from "../../ui/EmptyState";
 import {
   containsRedactedMarker,
@@ -312,6 +318,93 @@ function ResourceDiffCard({
   );
 }
 
+/**
+ * `T20.2` pre-sync policy gate banner.
+ *
+ * A blocking violation means the next sync will be refused, so it is rendered above every other
+ * affordance on the page; an advisory only says the bundle would deploy with a warning. Both come
+ * from the server's `DiffView.policyViolations`, which never carries a `Secret` value.
+ */
+function PolicyViolationsBanner({
+  violations,
+}: {
+  violations: PolicyViolation[];
+}) {
+  if (violations.length === 0) return null;
+  const blocking = violations.filter((v) =>
+    isBlockingEnforcement(v.enforcement),
+  );
+  const advisories = violations.filter(
+    (v) => !isBlockingEnforcement(v.enforcement),
+  );
+  const isBlocking = blocking.length > 0;
+  return (
+    <section
+      data-testid="policy-violations-banner"
+      aria-labelledby="policy-violations-heading"
+      className={`rounded-xl border px-4 py-3 ${
+        isBlocking
+          ? "border-rose-500/50 bg-rose-950/30"
+          : "border-amber-500/40 bg-amber-950/20"
+      }`}
+    >
+      <h2
+        id="policy-violations-heading"
+        className="flex items-center gap-2 text-sm font-semibold"
+      >
+        {isBlocking ? (
+          <ShieldAlert
+            className="h-4 w-4 shrink-0 text-rose-400"
+            aria-hidden="true"
+          />
+        ) : (
+          <AlertTriangle
+            className="h-4 w-4 shrink-0 text-amber-400"
+            aria-hidden="true"
+          />
+        )}
+        <span className={isBlocking ? "text-rose-200" : "text-amber-200"}>
+          Policy Violations
+        </span>
+        <span className="rounded-full border border-slate-700 bg-slate-950 px-2 py-0.5 text-[11px] font-medium text-slate-300">
+          {isBlocking
+            ? `${blocking.length} blocking`
+            : `${advisories.length} advisory`}
+        </span>
+      </h2>
+      <p className="mt-1 text-xs text-slate-300">
+        {isBlocking
+          ? "The sync is refused until these manifests comply: nothing is applied and nothing is pruned."
+          : "The sync proceeds; these rules only advise."}
+      </p>
+      <ul className="mt-2 space-y-1.5">
+        {violations.map((violation) => (
+          <li
+            key={`${violation.rule}-${violation.resourceKey}-${violation.message}`}
+            data-testid="policy-violation"
+            className="flex flex-wrap items-baseline gap-2 rounded-lg border border-slate-800 bg-slate-950/70 px-2.5 py-1.5 text-xs"
+          >
+            <span
+              className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                isBlockingEnforcement(violation.enforcement)
+                  ? "bg-rose-500/20 text-rose-200"
+                  : "bg-amber-500/20 text-amber-200"
+              }`}
+            >
+              {violation.enforcement}
+            </span>
+            <code className="font-mono text-indigo-300">{violation.rule}</code>
+            <code className="break-all font-mono text-slate-400">
+              {violation.resourceKey}
+            </code>
+            <span className="text-slate-200">{violation.message}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 export interface DiffViewerProps {
   diff: DiffPayload;
   initialSearch?: string;
@@ -347,6 +440,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
 
   return (
     <div className="space-y-4">
+      <PolicyViolationsBanner violations={diff.policyViolations ?? []} />
       <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4 lg:grid-cols-7">
         <SummaryStat label="Total" value={summary.total} tone="slate" />
         <SummaryStat label="Synced" value={summary.synced} tone="emerald" />

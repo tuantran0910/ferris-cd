@@ -1543,6 +1543,13 @@
             "description": "How many resources the rendered bundle contains.",
             "minimum": 0
           },
+          "policyViolations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PolicyViolationView"
+            },
+            "description": "Pre-sync policy gate violations (`T20.2`), blockings and advisories alike.\n\nEmpty when no rule is in force or every rule passed. `wouldSync` is `false` whenever one of\nthese is `Enforce`: the payload *shows* a refused bundle rather than hiding it behind an\nerror, which is what makes `ferriscd app diff` (exit code `3`) a CI gate."
+          },
           "resources": {
             "type": "array",
             "items": {
@@ -1705,6 +1712,34 @@
           "startedAt": {
             "type": "string",
             "description": "When it started (RFC 3339)."
+          }
+        }
+      },
+      "PolicyViolationView": {
+        "type": "object",
+        "description": "One pre-sync policy gate violation (`T20.2`).",
+        "required": [
+          "rule",
+          "enforcement",
+          "resourceKey",
+          "message"
+        ],
+        "properties": {
+          "enforcement": {
+            "type": "string",
+            "description": "`Enforce` (blocks the sync) or `Warn` (advisory only).\n\nTyped, not a `String`: every consumer (`ferriscd app diff`, the web UI) branches on it, and a\nstringly-typed comparison against a literal is one typo away from treating a blocking\nviolation as an advisory. The wire form is unchanged (`\"Enforce\"`/`\"Warn\"`)."
+          },
+          "message": {
+            "type": "string",
+            "description": "The operator-facing, `Secret`-scrubbed explanation."
+          },
+          "resourceKey": {
+            "type": "string",
+            "description": "Version-agnostic GKNN of the rejected resource, or `*` for a whole-bundle finding (a rule\nthat cannot be compiled, a budget overflow)."
+          },
+          "rule": {
+            "type": "string",
+            "description": "The policy rule that rejected the resource."
           }
         }
       },

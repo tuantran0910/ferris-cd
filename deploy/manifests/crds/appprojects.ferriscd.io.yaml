@@ -110,6 +110,63 @@ spec:
                   - kind
                   type: object
                 type: array
+              policyRules:
+                description: |-
+                  Pre-sync policy rules enforced on every rendered resource of this project (`T20.2`).
+
+                  Additive and optional: a project that lists none behaves exactly as before `T20.2`. Each
+                  rule's `expression` is an invariant that **must hold** — a resource the expression rejects
+                  is a violation. `enforcement: Enforce` refuses the sync before anything is applied or
+                  pruned; `enforcement: Warn` surfaces an advisory condition and lets it proceed.
+                items:
+                  description: One pre-sync policy rule (`T20.2`).
+                  properties:
+                    enforcement:
+                      default: Enforce
+                      description: "`Enforce` (default) or `Warn`."
+                      enum:
+                      - Enforce
+                      - Warn
+                      type: string
+                    engine:
+                      description: Which expression engine evaluates a policy rule.
+                      enum:
+                      - Cel
+                      - Rego
+                      nullable: true
+                      type: string
+                    expression:
+                      description: |-
+                        The invariant that must hold for every matching resource.
+
+                        A `false` result is a violation, the Kubernetes `x-kubernetes-validations` convention: write
+                        `!object.spec.template.spec.containers.exists(c, has(c.securityContext) &&
+                        c.securityContext.privileged == true)` to forbid privileged containers.
+                      type: string
+                    matchKinds:
+                      description: |-
+                        GroupKind globs the rule applies to (`*`, `Kind`, `group/Kind`, `group/*`).
+
+                        Empty means "every rendered resource"; a hook is a rendered resource too.
+                      items:
+                        type: string
+                      type: array
+                    message:
+                      description: >-
+                        Operator-facing violation text; a generated sentence naming the rule is used
+                        when unset.
+                      nullable: true
+                      type: string
+                    name:
+                      description: >-
+                        Rule name; appears verbatim in every violation message and in
+                        `status.conditions`.
+                      type: string
+                  required:
+                  - expression
+                  - name
+                  type: object
+                type: array
               sourceNamespaces:
                 default:
                 - ferriscd-system

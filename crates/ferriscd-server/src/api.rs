@@ -388,6 +388,26 @@ pub struct DiffSummaryView {
     pub field_conflicts: usize,
 }
 
+/// One pre-sync policy gate violation (`T20.2`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyViolationView {
+    /// The policy rule that rejected the resource.
+    pub rule: String,
+    /// `Enforce` (blocks the sync) or `Warn` (advisory only).
+    ///
+    /// Typed, not a `String`: every consumer (`ferriscd app diff`, the web UI) branches on it, and a
+    /// stringly-typed comparison against a literal is one typo away from treating a blocking
+    /// violation as an advisory. The wire form is unchanged (`"Enforce"`/`"Warn"`).
+    #[schema(value_type = String)]
+    pub enforcement: ferriscd_crd::project::PolicyEnforcement,
+    /// Version-agnostic GKNN of the rejected resource, or `*` for a whole-bundle finding (a rule
+    /// that cannot be compiled, a budget overflow).
+    pub resource_key: String,
+    /// The operator-facing, `Secret`-scrubbed explanation.
+    pub message: String,
+}
+
 /// `GET /api/v1/applications/{namespace}/{name}/diff` body.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -403,6 +423,13 @@ pub struct DiffView {
     /// One entry per resource in `desired ∪ status.inventory`.
     #[serde(default)]
     pub resources: Vec<DiffResourceView>,
+    /// Pre-sync policy gate violations (`T20.2`), blockings and advisories alike.
+    ///
+    /// Empty when no rule is in force or every rule passed. `wouldSync` is `false` whenever one of
+    /// these is `Enforce`: the payload *shows* a refused bundle rather than hiding it behind an
+    /// error, which is what makes `ferriscd app diff` (exit code `3`) a CI gate.
+    #[serde(default)]
+    pub policy_violations: Vec<PolicyViolationView>,
 }
 
 /// `POST .../sync` request body.
@@ -1245,6 +1272,11 @@ pub async fn get_diff(
             field_conflicts: preview.summary.field_conflicts,
         },
         resources: preview.diffs.iter().map(diff_resource_view).collect(),
+        policy_violations: preview
+            .policy_violations
+            .iter()
+            .map(policy_violation_view)
+            .collect(),
     }))
 }
 
@@ -2060,6 +2092,18 @@ fn diff_resource_view(diff: &ResourceDiff) -> DiffResourceView {
             })
             .collect(),
         truncated: diff.is_truncated(),
+    }
+}
+
+/// The wire form of one engine policy violation.
+fn policy_violation_view(
+    violation: &ferriscd_engine::policy::PolicyViolation,
+) -> PolicyViolationView {
+    PolicyViolationView {
+        rule: violation.rule.clone(),
+        enforcement: violation.enforcement,
+        resource_key: violation.resource_key.clone(),
+        message: violation.message.clone(),
     }
 }
 

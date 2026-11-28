@@ -277,13 +277,35 @@ jobs:
         if: steps.workspace.outputs.has_cargo == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run Clippy (engine test-utils feature)
+      - name: Run Clippy (engine test-utils + opa-policy features)
         if: steps.workspace.outputs.has_cargo == 'true'
-        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-engine --features test-utils --all-targets -- -D warnings
+        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-engine --features test-utils,opa-policy --all-targets -- -D warnings
+
+      - name: Run Clippy (controller opa-policy feature)
+        if: steps.workspace.outputs.has_cargo == 'true'
+        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-controller --features opa-policy --all-targets -- -D warnings
 
       - name: Run tests
         if: steps.workspace.outputs.has_cargo == 'true'
         run: cargo test --workspace
+
+      # The embedded OPA/Rego engine (`T20.2`) is default-off, so it is only compiled — and only
+      # audited — in a feature build. These lines are what keep it from rotting.
+      - name: Run tests (embedded Rego engine)
+        if: steps.workspace.outputs.has_cargo == 'true'
+        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo test -p ferriscd-engine --features opa-policy
+
+      - name: Run tests (controller with the Rego engine wired)
+        if: steps.workspace.outputs.has_cargo == 'true'
+        run: cargo test -p ferriscd-controller --features opa-policy
+
+      # `T20.2` finding H3: the feature has to be reachable from the **shipped binary**, and an
+      # unreachable feature is one that rots. `ferriscd-cli` forwards `opa-policy` to the controller
+      # (and the engine), which is what the image's `FERRISCD_FEATURES` build arg turns on; without
+      # this line nothing in CI would notice if that forwarding broke.
+      - name: Check the shipped binary with the Rego engine (`opa-policy`)
+        if: steps.workspace.outputs.has_cargo == 'true'
+        run: cargo check -p ferriscd-cli --features opa-policy
 
   web-ui:
     name: Web UI Typecheck, Test & Build

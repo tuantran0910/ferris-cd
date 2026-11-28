@@ -18,12 +18,21 @@ test:
 # Single pre-review gate: mirrors the CI workflow exactly.
 # The `crd generate --check` step is the deterministic CRD drift check (finding M-10):
 # regenerating the committed manifests must be a no-op.
+# The `opa-policy` lines (findings M4, H3) compile and test the optional embedded Rego engine
+# (`ferriscd-engine/opa-policy` -> `regorus`, and the controller wiring on top of it). It is
+# default-off, so a feature build is the only way CI sees that code — and a policy engine that is
+# never compiled in CI is a policy engine nobody has audited. The `ferriscd-cli` check is what keeps
+# the feature reachable from the shipped binary (the image's `FERRISCD_FEATURES` build arg).
 gate:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
-	K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-engine --features test-utils --all-targets -- -D warnings
+	K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-engine --features test-utils,opa-policy --all-targets -- -D warnings
+	K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-controller --features opa-policy --all-targets -- -D warnings
 	cargo run -q -p ferriscd-cli -- crd generate --check
 	cargo test --workspace
+	K8S_OPENAPI_ENABLED_VERSION=1.35 cargo test -p ferriscd-engine --features opa-policy
+	cargo test -p ferriscd-controller --features opa-policy
+	cargo check -p ferriscd-cli --features opa-policy
 
 # Fast inner-loop check: formatting + lints only (no test run).
 gate-fast:

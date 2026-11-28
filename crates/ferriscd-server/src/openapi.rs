@@ -65,6 +65,7 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
         crate::api::DiffResourceView,
         crate::api::DiffChangeView,
         crate::api::DiffConflictView,
+        crate::api::PolicyViolationView,
         crate::api::SyncRequestBody,
         crate::api::RollbackRequestBody,
         crate::api::OperationResponse,

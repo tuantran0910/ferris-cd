@@ -14,6 +14,19 @@
 ARG RUST_VERSION=1.100
 ARG DEBIAN_SUITE=bookworm
 
+# Optional Cargo features for the shipped binary (`T20.2`).
+#
+# Empty by default: the released image carries the built-in CEL policy engine and nothing else. A
+# site that wants the embedded OPA/Rego engine builds its own image with
+#
+#     docker build --build-arg FERRISCD_FEATURES=opa-policy .
+#
+# (`ferriscd-cli/opa-policy` -> `ferriscd-controller/opa-policy` -> `ferriscd-engine/opa-policy` ->
+# the pure-Rust `regorus` interpreter; no network, filesystem, clock or environment builtins are
+# compiled in). Without it a `Rego` policy rule fails closed as a compile error rather than being
+# skipped, which is why enabling it is a build-time decision and not a command-line flag.
+ARG FERRISCD_FEATURES=
+
 # Pinned external renderer versions and official SHA-256 release digests
 ARG HELM_VERSION=v4.3.2
 ARG HELM_SHA256_AMD64=d1c0278d46beab79582d7e50f5b3dc206944ba8e577cde618513fd07daa53983
@@ -27,6 +40,9 @@ ARG KUSTOMIZE_SHA256_ARM64=9867b76482cfc6d25b546abc1d2b5a32bd137505aba640649b4b3
 # Stage 1: Rust workspace builder (cached dependency layer + release binary)
 # -----------------------------------------------------------------------------
 FROM rust:${RUST_VERSION}-slim-${DEBIAN_SUITE} AS builder
+
+# Re-declared after `FROM` so the value is visible in this stage (see the top of the file).
+ARG FERRISCD_FEATURES=
 
 # Native C/CMake toolchain required by `aws-lc-sys` and `ring` during compile
 RUN apt-get update \
@@ -55,7 +71,7 @@ RUN set -eux; \
     done; \
     mkdir -p crates/ferriscd-cli/src; \
     printf 'fn main() {}\n' > crates/ferriscd-cli/src/main.rs; \
-    cargo build --release --locked -p ferriscd-cli; \
+    cargo build --release --locked -p ferriscd-cli ${FERRISCD_FEATURES:+--features $FERRISCD_FEATURES}; \
     cargo clean --release \
         -p ferriscd-crd \
         -p ferriscd-engine \
@@ -68,7 +84,7 @@ RUN set -eux; \
 COPY crates ./crates
 
 RUN set -eux; \
-    cargo build --release --locked -p ferriscd-cli; \
+    cargo build --release --locked -p ferriscd-cli ${FERRISCD_FEATURES:+--features $FERRISCD_FEATURES}; \
     strip /src/target/release/ferriscd; \
     /src/target/release/ferriscd --version | grep -Eq '^ferriscd '
 

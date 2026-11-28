@@ -17,6 +17,132 @@ anything: project lookups are **never** treated as permissive, and the failure n
 
 ---
 
+## Pre-sync policy rules (`T20.2`): `ConfigMap/ferriscd-policies-cm`
+
+Manifest invariants (`privileged: true`, an unapproved registry, a missing cost-center label) are
+enforced **before** anything is applied or pruned. Two additive sources are in force, and the union
+of both counts against one `32`-rule budget:
+
+1. `AppProject.spec.policyRules[]` — per project, tenant-visible, reviewed with the project;
+2. `ConfigMap/ferriscd-policies-cm` — cluster-wide, for rules a security team wants on **every**
+   `Application` without editing each project.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ferriscd-policies-cm
+  namespace: ferriscd-system          # the control-plane namespace, never a tenant one
+  labels:
+    app.kubernetes.io/name: ferriscd
+data:
+  # One entry per rule. The key **is** the rule name; the value is a rule document.
+  #
+  # `matchKinds` and `expression` must agree. `object` is *the matched resource*, so a rule that
+  # reads a field the kind does not have (`Pod` keeps its containers at `spec.containers`; a workload
+  # keeps them at `spec.template.spec.containers`) fails to evaluate — and an evaluation failure is a
+  # **blocking** finding, even when the rule is `enforcement: Warn`. Guard an optional path with
+  # `has(...)` instead of letting one kind in the list break the rule for the others.
+  no-privileged-containers: |
+    enforcement: Enforce              # Enforce (default) refuses the sync, Warn advises
+    matchKinds: ["apps/Deployment", "apps/StatefulSet", "apps/DaemonSet"]
+    expression: "!object.spec.template.spec.containers.exists(c, has(c.securityContext) && c.securityContext.privileged == true)"
+    message: privileged containers are forbidden
+  no-privileged-pods: |
+    enforcement: Enforce
+    matchKinds: ["Pod"]
+    expression: "!object.spec.containers.exists(c, has(c.securityContext) && c.securityContext.privileged == true)"
+    message: privileged pods are forbidden
+  prefer-approved-registry: |
+    enforcement: Warn
+    matchKinds: ["apps/Deployment", "apps/StatefulSet", "apps/DaemonSet"]
+    expression: "object.spec.template.spec.containers.all(c, c.image.startsWith(\"ghcr.io/example/\"))"
+    message: prefer the approved registry
+```
+
+How it behaves, and what an operator has to know:
+
+| Behaviour | Detail |
+|---|---|
+| Read cost | exactly **one** namespaced `GET` of the `ConfigMap` per reconcile pass, no watch and no cache. A `404` means "no cluster-wide rules"; a `ConfigMap` that exists but does not parse is a **terminal** `Ready=False` (never "no rules"). A policy edit therefore takes effect on the next reconcile of each `Application`. |
+| Rule budget | the union of project + `ConfigMap` rules must fit in `32`; over the budget the pass is refused with a blocking `<rule-budget>` finding (never a silently narrowed rule set). |
+| Engine | `expression` is the built-in, offline CEL subset (`object`, `app`, `size`, `startsWith`, `all`/`exists`/`filter`/`map`, …). Anything outside the subset is a **compile error**, and a rule that does not compile blocks even when it is `enforcement: Warn` — a policy that cannot run must never look like a policy that passed. |
+| `matchKinds` | `Kind`, `group/Kind`, `group/*`, or `*`; an empty list matches every rendered resource, hooks included. A manifest-shaped `v1/Secret` is normalized to `Secret`; a pattern that names only an `apiVersion` (`v1`, `apps/v1`) is **refused**, because a rule that matches nothing would allow everything. |
+| Missing fields | `object` is the matched resource, so an expression that reads a field the kind does not carry (`spec.containers` on a `Deployment`, `spec.template.…` on a `Pod`) does not "not match" — it **fails to evaluate**, and a failure is a blocking finding even when the rule is `enforcement: Warn`. Keep one rule per shape, or guard the path with `has(...)`. |
+| Secrets | a `v1/Secret` reaches the engine with every `data`/`stringData` value replaced by `<redacted>` (metadata, `type` and key names stay visible), and every violation message is scrubbed against the payloads again before it is written to `Application.status`. |
+| Where the verdict shows up | a terminal `Ready=False, reason=PolicyGateViolation` with zero applies and zero prunes; the blocking + advisory violations in `GET …/diff`; exit code `3` from `ferriscd app diff` (so CI can gate on policy, separately from drift); the `PolicyAdvisory` condition for `Warn` rules; and the "Policy violations" banner in the web UI. |
+| Bounds | `32` rules, `2000` rendered resources, `32` reported violations, `512`-char messages, `20 000` JSON nodes per resource, `2 000 000` CEL steps per pass. Every one fails **closed**: crossing a bound refuses the bundle instead of skipping the resource it could not check. |
+
+### Optional OPA/Rego engine (`opa-policy`) — build-time, opt-in
+
+A team with existing Rego libraries sets `engine: Rego` on a rule (`AppProject.spec.policyRules[]`
+or the `ConfigMap` above) and names the rule after the Rego rule it should evaluate
+(`no-privileged` → `no_privileged`). The embedded interpreter is **off by default**, because it is a
+build-time dependency:
+
+```bash
+# the released image carries only the CEL engine; build your own with the Rego engine compiled in
+docker build --build-arg FERRISCD_FEATURES=opa-policy -t registry.example.com/ferriscd:opa .
+
+# ... or build/run it locally
+cargo build --release -p ferriscd-cli --features opa-policy
+```
+
+* A Cargo feature is a property of the **binary**, not a flag: `ferriscd controller --features
+  opa-policy` does not exist. A binary built without it refuses a `Rego` rule as a terminal compile
+  error (`Ready=False`), it never skips it — a `Rego` policy can never silently stop applying.
+* The interpreter is Microsoft's pure-Rust `regorus`, compiled with no `http`/`net`/`time`/`crypto`/
+  `regex` builtin modules, plus an explicit builtin allowlist (a policy calling `http.send`,
+  `time.now_ns`, `opa.runtime`, … is refused before it is parsed) and a bounded policy size, input
+  size, per-evaluation timer and per-pass timer. Rego has no fuel counter, so those timers are its
+  step bound; the per-pass budget is owned by the pass, so two `Application`s reconciling at the same
+  time cannot spend or reset each other's allowance.
+* Audited and compiled policies are cached per worker (bounded, keyed by the policy source), so a
+  rule set is not re-parsed once per rendered resource.
+
+### RBAC for the policy `ConfigMap`
+
+The controller reads it with its own identity, in the control-plane namespace — and that is a
+**namespaced** grant, exactly like the credential `Secret` grants below (`deploy/helm/ferriscd/
+templates/rbac.yaml` ships the same control-plane `Role`). Do **not** express it as a rule on the
+`ferriscd-controller` `ClusterRole`: a `ClusterRole` rule has no namespace, so it grants the verb in
+every tenant namespace too, and redefining that object (`kubectl apply`) would replace the existing
+role's rules instead of adding one.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferriscd-policy-rules
+  namespace: ferriscd-system          # the control-plane namespace, never a tenant one
+rules:
+  # --- Pre-sync policy rules (`T20.2`): one `get` per reconcile, no watch ------------
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferriscd-policy-rules
+  namespace: ferriscd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferriscd-policy-rules
+subjects:
+  - kind: ServiceAccount
+    name: ferriscd-controller
+    namespace: ferriscd-system
+```
+
+No `list`/`watch` is needed: the read is a scoped, per-reconcile `GET`. The controller `ClusterRole`
+below already carries `configmaps` verbs for the *destination*-namespace applies, which also
+authorizes this `GET`; keep the `Role` anyway — it is the least-privilege form, and it is what
+remains sufficient if those workload verbs move to the impersonated tenant identity.
+
+---
+
 ## Controller `ClusterRole`
 
 The controller authenticates as its own ServiceAccount. Everything below is required by the

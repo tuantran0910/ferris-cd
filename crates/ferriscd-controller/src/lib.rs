@@ -20,6 +20,7 @@ pub mod impersonation;
 pub mod leader_election;
 pub mod live_state;
 pub mod metrics;
+pub mod policy_rules;
 pub mod predicate;
 pub mod project;
 pub mod prune;
@@ -102,6 +103,7 @@ pub use metrics::{
     RECONCILE_TOTAL, RENDER_CACHE_TOTAL, RbacReloadOutcome, ReconcileGuard, ReconcileResult,
     SYNC_STATUS_VALUES,
 };
+pub use policy_rules::{ApiPolicyRuleSource, PolicyRuleSource};
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
 pub use project::{ApiProjectSource, ProjectSource};
 pub use prune::{
@@ -110,8 +112,8 @@ pub use prune::{
 pub use readiness::ControlPlaneReadiness;
 pub use reconcile::{
     ApiStatusWriter, ApplyOutcome, CleanupDisposition, CleanupMode, CleanupOutcome,
-    ControllerError, DiffPreview, FINALIZER, ReconcileContext, ReconcileError, StatusWriter,
-    SyncPipeline, apply_once_with_events, cleanup_once_with_events,
+    ControllerError, DiffPreview, FINALIZER, PolicyGateRefusal, ReconcileContext, ReconcileError,
+    StatusWriter, SyncPipeline, apply_once_with_events, cleanup_once_with_events,
 };
 pub use scope::{ClusterNamespacePolicy, InBundleCrd, ScopeError, normalize_scopes};
 pub use sharding::{
@@ -956,6 +958,14 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         // `T12.1`: every `Application` is validated against its `AppProject`, which is read from
         // the control-plane namespace (never from the `Application`'s own namespace).
         .with_project_source(Arc::new(ApiProjectSource::new(
+            client.clone(),
+            &config.namespace,
+        )))
+        // `T20.2`: cluster-wide pre-sync policy rules, read per reconcile from
+        // `ConfigMap/ferriscd-policies-cm` in the control-plane namespace (a scoped `GET`, never a
+        // cluster-wide informer). `AppProject.spec.policyRules[]` is enforced either way, and a
+        // rule that cannot be compiled refuses the sync instead of being skipped.
+        .with_policy_rule_source(Arc::new(policy_rules::ApiPolicyRuleSource::new(
             client.clone(),
             &config.namespace,
         )))
