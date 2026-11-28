@@ -694,6 +694,11 @@ pub struct InventorySyncPipeline {
     metrics: Option<crate::metrics::Metrics>,
     /// `T17.2`: optional compliance audit logger for `controller.impersonation` resolutions.
     audit: Option<crate::audit::AuditLogger>,
+    /// `T18.1`: what ownership stamp every permanent resource receives before the diff and the
+    /// apply. The default (`StampOptions::tracking_id_only`) is the `v1.0` behaviour; the opt-in
+    /// `--enable-drift-watcher` adds the `ferriscd.io/managed-by` / `ferriscd.io/app-hash` label
+    /// pair a label-scoped `DriftWatcher` selects on (`T18.2`).
+    stamp: ferriscd_engine::inventory::StampOptions,
     mutating_applies: Arc<AtomicUsize>,
 }
 
@@ -753,6 +758,7 @@ impl InventorySyncPipeline {
             clusters: None,
             metrics: None,
             audit: None,
+            stamp: ferriscd_engine::inventory::StampOptions::tracking_id_only(),
             mutating_applies: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -773,6 +779,24 @@ impl InventorySyncPipeline {
     pub fn with_audit(mut self, audit: crate::audit::AuditLogger) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// Selects what the ownership stamp writes (`T18.1`).
+    ///
+    /// [`StampOptions::tracking_id_only`] (the default) stamps the `ferriscd.io/tracking-id`
+    /// annotation only. [`StampOptions::with_drift_labels`] additionally stamps the
+    /// `ferriscd.io/managed-by` and `ferriscd.io/app-hash` labels, which is what lets a
+    /// label-scoped `DriftWatcher` filter server-side (`T18.2`, `--enable-drift-watcher`).
+    #[must_use]
+    pub fn with_stamp_options(mut self, stamp: ferriscd_engine::inventory::StampOptions) -> Self {
+        self.stamp = stamp;
+        self
+    }
+
+    /// The ownership stamp this pipeline applies (`T18.1`).
+    #[must_use]
+    pub fn stamp_options(&self) -> ferriscd_engine::inventory::StampOptions {
+        self.stamp
     }
 
     /// Number of mutating Server-Side Apply calls this pipeline has issued so far.
@@ -1443,7 +1467,7 @@ impl InventorySyncPipeline {
         // Stamp ownership *after* scope normalization, because the marker is rendered from the
         // final GKNN key (Phase 05 mirrors the effective namespace onto the key) — and only onto
         // the permanent half: a hook is never prunable inventory.
-        stamp_ownership(bundle.hooks.permanent_mut(), &owner)?;
+        stamp_ownership(bundle.hooks.permanent_mut(), &owner, self.stamp)?;
         // The wave plan owns clones of the permanent resources, so it has to be re-derived from the
         // stamped half — a plan built before the stamp would apply every wave member without its
         // `ferriscd.io/tracking-id` and report that annotation as permanent drift.
@@ -2897,21 +2921,23 @@ fn log_hooks(request: &PassRequest<'_>, step: SyncStep, run: &HookRun) {
     );
 }
 
-/// Stamps `ferriscd.io/tracking-id` onto every **permanent** desired resource.
+/// Stamps `ferriscd.io/tracking-id` (and, when opted in, the `T18.1` ownership labels) onto every
+/// **permanent** desired resource.
 ///
 /// Called with `HookPartition::permanent_mut()`, so a lifecycle hook is never stamped and nothing
 /// that is created imperatively ends up looking prunable (`T10.3`).
 fn stamp_ownership(
     resources: &mut [DesiredResource],
     owner: &TrackingOwner,
+    options: ferriscd_engine::inventory::StampOptions,
 ) -> Result<(), ReconcileError> {
     for resource in resources.iter_mut() {
         let key = resource.key.canonical();
-        inventory::stamp_tracking_id(resource, &owner.namespace, &owner.name).map_err(|err| {
-            ReconcileError::Invalid {
+        inventory::stamp_tracking_id(resource, &owner.namespace, &owner.name, options).map_err(
+            |err| ReconcileError::Invalid {
                 message: format!("{key}: {err}"),
-            }
-        })?;
+            },
+        )?;
     }
     Ok(())
 }
@@ -4947,6 +4973,27 @@ spec:
         }
     }
 
+    /// Returns `fixture` with the `T18.1` ownership-stamp option wired into its pipeline.
+    ///
+    /// `InventorySyncPipeline::with_stamp_options` consumes the pipeline, so the fixture is taken
+    /// apart and put back together (same reason as [`with_metrics`]).
+    fn with_stamp_options(
+        fixture: Fixture,
+        stamp: ferriscd_engine::inventory::StampOptions,
+    ) -> Fixture {
+        Fixture {
+            pipeline: fixture.pipeline.with_stamp_options(stamp),
+            git: fixture.git,
+            cluster: fixture.cluster,
+            discovery: fixture.discovery,
+            dry_run: fixture.dry_run,
+            projects: fixture.projects,
+            impersonation: fixture.impersonation,
+            repo_url: fixture.repo_url,
+            _temp: fixture._temp,
+        }
+    }
+
     impl Fixture {
         /// Impersonated users the pipeline resolved, in order (`T12.3`).
         fn identities(&self) -> Vec<String> {
@@ -5212,6 +5259,87 @@ spec:
             fixture.cluster.applied_tracking_ids(),
             vec!["ferriscd-system/payments:/ConfigMap:payments/settings".to_owned()],
             "the applied body must carry the ownership marker"
+        );
+    }
+
+    /// **`T18.1`:** the opt-in ownership labels reach the applied body, and the default never
+    /// changes it (`--enable-drift-watcher` is off by default, so `v1.0` behaviour is untouched).
+    #[tokio::test]
+    async fn the_drift_label_option_reaches_the_applied_body() {
+        let plain = fixture(FakeCluster::default().with_namespace("payments"));
+        plain.commit(&[("configmap.yaml", CONFIGMAP)]);
+        assert_eq!(
+            plain.pipeline.stamp_options(),
+            ferriscd_engine::inventory::StampOptions::tracking_id_only(),
+            "the default pipeline must stamp the annotation only: `--enable-drift-watcher` is off"
+        );
+        plain
+            .pipeline
+            .apply(&plain.app("."))
+            .await
+            .expect("apply must succeed");
+        let applied = plain
+            .cluster
+            .applied_objects
+            .lock()
+            .expect("applied objects")
+            .first()
+            .cloned()
+            .expect("the ConfigMap was applied");
+        assert!(
+            applied
+                .metadata
+                .labels
+                .as_ref()
+                .is_none_or(|labels| labels.is_empty()),
+            "without the opt-in the applied body must carry no FerrisCD label: {:?}",
+            applied.metadata.labels
+        );
+
+        // With `--enable-drift-watcher` the same pass stamps the pair a `DriftWatcher` selects on.
+        let opted_in = with_stamp_options(
+            fixture(FakeCluster::default().with_namespace("payments")),
+            ferriscd_engine::inventory::StampOptions::with_drift_labels(),
+        );
+        assert_eq!(
+            opted_in.pipeline.stamp_options(),
+            ferriscd_engine::inventory::StampOptions::with_drift_labels(),
+            "the opt-in must reach the pipeline's stamp, not only the flag"
+        );
+        opted_in.commit(&[("configmap.yaml", CONFIGMAP)]);
+        opted_in
+            .pipeline
+            .apply(&opted_in.app("."))
+            .await
+            .expect("apply must succeed");
+        let applied = opted_in
+            .cluster
+            .applied_objects
+            .lock()
+            .expect("applied objects")
+            .first()
+            .cloned()
+            .expect("the ConfigMap was applied");
+        let labels = applied.metadata.labels.expect("the label set exists");
+        assert_eq!(
+            labels
+                .get(annotations::LABEL_MANAGED_BY)
+                .map(String::as_str),
+            Some(annotations::MANAGED_BY_FERRISCD),
+            "the watch selector value must be on every managed object"
+        );
+        assert_eq!(
+            labels.get(annotations::LABEL_APP_HASH).map(String::as_str),
+            Some(ferriscd_engine::inventory::app_hash("ferriscd-system", "payments").as_str()),
+            "the hash must identify the owning Application"
+        );
+        assert!(
+            applied
+                .metadata
+                .annotations
+                .as_ref()
+                .is_some_and(|anns| anns.contains_key(annotations::TRACKING_ID)),
+            "the ownership annotation is still stamped: the labels are additive"
         );
     }
 

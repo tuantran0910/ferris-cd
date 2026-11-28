@@ -620,6 +620,42 @@ pub struct ApplicationEventView {
     pub first_observed_at: Option<String>,
 }
 
+/// `GET /api/v1/auth/config` body (`T19.1`).
+///
+/// Served from the **public** group: the SPA and `ferriscd login --oidc` must learn how to
+/// authenticate before they have a token, so this carries only what a stranger may know — the auth
+/// mode, the issuer, the public client id and the scopes (`T19.2` consumes it).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthConfigView {
+    /// `token-review`, `oidc`, `token-review-or-oidc`, `pass-through` or `deny-all`.
+    pub auth_mode: String,
+    /// The configured OIDC issuer. **Absent** when OIDC is disabled; never `null`.
+    //
+    // Finding `N4`: the field is absent — never `null` — when OIDC is off, so the published schema
+    // says "an optional string" instead of `string | null`, a third state the server cannot produce.
+    // `value_type` keeps the Rust field an `Option` (serde still omits it) while the schema is a
+    // plain optional string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String)]
+    pub issuer: Option<String>,
+    /// The configured OAuth client id. **Absent** when OIDC is disabled; never `null`.
+    //
+    // Absent, never `null`, exactly like `issuer` (finding `N4`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String)]
+    pub client_id: Option<String>,
+    /// The scopes the client should request from the IdP. Always present (`[]` when OIDC is off).
+    //
+    // Finding `N4`: the handler always emits this field, so the contract marks it **required**
+    // (`scopes: string[]`, not `scopes?: string[]`). That is why there is no `#[serde(default)]`
+    // here: the attribute would mark the field optional in the published schema while every
+    // response carries it.
+    pub scopes: Vec<String>,
+    /// Whether the optional server-side (BFF cookie) session mode is enabled (`T19.2`).
+    pub bff_enabled: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -673,7 +709,11 @@ pub fn router(state: AppState) -> Router {
 
     let public = Router::new()
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz));
+        .route("/readyz", get(readyz))
+        // `T19.1`: the sign-in discovery endpoint. It must be reachable **before** a caller has a
+        // credential (that is its whole purpose), so it is registered here, in the public group, and
+        // never behind the middleware above.
+        .route("/api/v1/auth/config", get(auth_config));
 
     let webhooks = Router::new()
         .route("/api/v1/webhooks/github", post(webhooks::github))
@@ -745,6 +785,45 @@ pub async fn readyz(State(state): State<AppState>) -> axum::response::Response {
         )
             .into_response()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: authentication discovery
+// ---------------------------------------------------------------------------
+
+/// Publishes how a caller can authenticate, so the Web UI and the CLI can pick a sign-in flow
+/// (`T19.1`; `T19.2` consumes it with PKCE).
+///
+/// Unauthenticated by design: a client cannot present a credential for a flow it does not know yet.
+/// The payload is therefore the *public* half of the configuration only — no CA bundle, no client
+/// secret, no token — and [`crate::oidc::OidcConfig`] is not rendered here at all.
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/config",
+    description = "How to authenticate against this server: the auth mode (token-review, oidc, token-review-or-oidc, ...), plus the OIDC issuer, public client id and scopes when OIDC is enabled. Public by design — a client needs it before it has a credential.",
+    tag = "auth",
+    responses((status = 200, description = "The authentication configuration", body = AuthConfigView)),
+)]
+pub async fn auth_config(State(state): State<AppState>) -> Json<AuthConfigView> {
+    // Finding `N4a`: `authMode` is a promise. Publishing `oidc` with no issuer and no client id
+    // tells every Web UI and CLI to start a sign-in flow that cannot complete, so an `AppState`
+    // built as `with_auth(AuthPolicy::Oidc)` without the matching `with_auth_config` is a builder
+    // bug. The binary cannot produce it (`--oidc-issuer`/`--oidc-client-id` are required and the
+    // server refuses to start), so this is asserted in debug builds only — where a test or an
+    // embedder's own suite runs — and is a no-op in a release binary that never reaches it.
+    debug_assert!(
+        state.auth_config_matches_policy(),
+        "with_auth(AuthPolicy::{}) must be paired with with_auth_config(PublicAuthConfig::oidc(..)): \
+         GET /api/v1/auth/config would publish an OIDC sign-in mode with no issuer and no client id",
+        state.auth.as_str()
+    );
+    Json(AuthConfigView {
+        auth_mode: state.auth.as_str().to_owned(),
+        issuer: state.auth_config.issuer.clone(),
+        client_id: state.auth_config.client_id.clone(),
+        scopes: state.auth_config.scopes.clone(),
+        bff_enabled: state.auth_config.bff_enabled,
+    })
 }
 
 // ---------------------------------------------------------------------------

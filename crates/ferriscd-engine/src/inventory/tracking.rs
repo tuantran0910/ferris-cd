@@ -23,6 +23,25 @@
 //! Control-plane object names, namespaces, groups, and kinds never contain `:` or `/`
 //! (Kubernetes DNS/qualified-name rules), which is what makes the three-part split
 //! unambiguous.
+//!
+//! # Opt-in ownership labels (`T18.1`)
+//!
+//! An annotation cannot be used in a Kubernetes **watch label selector**, so an on-demand
+//! scoped fetch can never be accelerated by one: [`StampOptions::with_drift_labels`] additionally
+//! stamps two bounded top-level labels, which is what lets the opt-in `DriftWatcher` (`T18.2`)
+//! filter `ferriscd.io/managed-by=ferriscd` server-side and resolve
+//! `ferriscd.io/app-hash` back to an `Application` without ever reading an object body:
+//!
+//! | Label | Value |
+//! |---|---|
+//! | [`annotations::LABEL_MANAGED_BY`] | [`annotations::MANAGED_BY_FERRISCD`] (a constant) |
+//! | [`annotations::LABEL_APP_HASH`] | [`app_hash`]: first 16 lowercase hex chars of `SHA-256("<app-ns>/<app-name>")` |
+//!
+//! Stamping is **additive and idempotent**: it never removes a label, never rewrites an existing
+//! label the user wrote, and re-stamping writes the same values. It is also strictly confined to
+//! top-level `metadata.labels` — `spec.selector.matchLabels` and
+//! `spec.template.metadata.labels` are immutable in `Deployment`/`StatefulSet`/`DaemonSet`, so
+//! stamping them would turn every later apply into a `422 Immutable` failure (trap guard).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -236,12 +255,103 @@ pub fn tracking_id_for(app_namespace: &str, app_name: &str, key: &ResourceKey) -
     TrackingId::new(app_namespace, app_name, key.clone()).to_string()
 }
 
-/// Stamps `ferriscd.io/tracking-id` onto a desired resource's `metadata.annotations`.
+/// Number of lowercase hex characters in [`app_hash`] (64 bits).
+///
+/// Fixed by contract, not a tuning knob: 16 hex characters can never exceed the 63-character
+/// Kubernetes label-value limit, whatever the `Application` name and namespace length are.
+pub const APP_HASH_HEX_CHARS: usize = 16;
+
+/// The `ferriscd.io/app-hash` value of the `Application` named `app_namespace`/`app_name`.
+///
+/// The first [`APP_HASH_HEX_CHARS`] lowercase hex characters of
+/// `SHA-256("<app-namespace>/<app-name>")`, computed with
+/// [`sha256::digest`](crate::diff::sha256::digest) — the workspace's only SHA-256.
+///
+/// # Why hash at all (`T18.1`, Finding M5)
+///
+/// A label value must be a valid Kubernetes label values string of at most 63 characters, while
+/// an `Application` name may be 253. Hashing both identity segments into one fixed-width value
+/// solves the length problem and, because `/` cannot appear in either DNS segment, also keeps
+/// `ns-a/app` and `ns-b/app` apart — a bare `ferriscd.io/app=<name>` label would collide across
+/// namespaces under Apps-in-any-namespace.
+///
+/// The result is pure and deterministic (no clock, no allocation identity, no case folding), so
+/// the same `Application` hashes identically on every replica and in every process. 64 bits is a
+/// *hint*, never ownership: a `DriftWatcher` hit only triggers a reconcile, which still verifies
+/// the exact [`TrackingId`] before touching anything.
+///
+/// # Examples
+///
+/// ```
+/// # use ferriscd_engine::inventory::app_hash;
+/// let hash = app_hash("ferriscd-system", "payments");
+/// assert_eq!(hash, "056646ef98cff795");
+/// assert_eq!(hash.len(), 16);
+/// assert!(hash.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+/// ```
+#[must_use]
+pub fn app_hash(app_namespace: &str, app_name: &str) -> String {
+    // `<ns>/<name>` is the hashed identity: the separator is unrepresentable in either DNS
+    // segment, so the two-part identity cannot be re-split ambiguously.
+    let identity = format!("{app_namespace}/{app_name}");
+    crate::diff::sha256::hex_digest_prefix(identity.as_bytes(), APP_HASH_HEX_CHARS)
+}
+
+/// What [`stamp_tracking_id`] writes onto a managed resource.
+///
+/// The ownership **annotation** is always stamped; the `T18.1` label pair is opt-in, because it
+/// is only useful (and only worth a label slot on every object in the fleet) once a
+/// `DriftWatcher` selects on it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StampOptions {
+    stamp_drift_labels: bool,
+}
+
+impl StampOptions {
+    /// Only `ferriscd.io/tracking-id` — the `v1.0` behaviour, and the default.
+    #[must_use]
+    pub const fn tracking_id_only() -> Self {
+        Self {
+            stamp_drift_labels: false,
+        }
+    }
+
+    /// Also stamp `ferriscd.io/managed-by` and `ferriscd.io/app-hash`.
+    #[must_use]
+    pub const fn with_drift_labels() -> Self {
+        Self {
+            stamp_drift_labels: true,
+        }
+    }
+
+    /// Maps an operator flag (`--enable-drift-watcher`, default `false`) onto the option.
+    #[must_use]
+    pub const fn from_flag(stamp_drift_labels: bool) -> Self {
+        Self { stamp_drift_labels }
+    }
+
+    /// Whether the `T18.1` label pair is stamped.
+    #[must_use]
+    pub const fn stamps_drift_labels(&self) -> bool {
+        self.stamp_drift_labels
+    }
+}
+
+/// Stamps `ferriscd.io/tracking-id` (and, when opted in, the `T18.1` ownership labels) onto a
+/// desired resource's `metadata`.
 ///
 /// Lifecycle hooks (`PreSync`, `Sync`, `PostSync`, `SyncFail` — any non-empty
 /// `ferriscd.io/hook`) are **never** stamped: hooks are created imperatively, never enter
-/// `status.inventory`, and must not become prunable orphans. Other annotations are
+/// `status.inventory`, and must not become prunable orphans. Other annotations and labels are
 /// preserved byte-for-byte, and re-stamping is idempotent.
+///
+/// With [`StampOptions::with_drift_labels`] two top-level labels are added —
+/// `ferriscd.io/managed-by=ferriscd` and `ferriscd.io/app-hash=<16 hex>` ([`app_hash`]) — which is
+/// what a `DriftWatcher` can select on server-side (`T18.2`). Both live on the object's own
+/// `metadata.labels` only: immutable `spec.selector.matchLabels` and
+/// `spec.template.metadata.labels` are never touched (trap guard), and stamping is additive, so
+/// turning the flag off never strips a label from the desired body (Self-Apply converges the
+/// removal, once, on the next sync).
 ///
 /// `resource.key` must already be the final, cluster-scope-normalized GKNN identity
 /// (Phase 05's `ScopeNormalizer` mirrors the effective namespace onto both the key and
@@ -251,23 +361,44 @@ pub fn tracking_id_for(app_namespace: &str, app_name: &str, key: &ResourceKey) -
 ///
 /// Returns [`TrackingIdError::EmptySegment`] when `app_namespace` or `app_name` is empty;
 /// stamping an unparseable identifier would silently disable ownership verification for
-/// that object.
+/// that object. Nothing is written when the call fails.
 ///
 /// # Examples
 ///
 /// ```
-/// # use ferriscd_engine::inventory::tracking_id_for;
-/// # use ferriscd_engine::manifest::ResourceKey;
-/// let key = ResourceKey::new("apps", "Deployment", Some("payments".to_owned()), "api");
+/// # use ferriscd_engine::inventory::{StampOptions, stamp_tracking_id};
+/// # use ferriscd_engine::manifest::{DesiredResource, GroupVersionKind, ResourceKey};
+/// let object: kube::api::DynamicObject = serde_json::from_value(serde_json::json!({
+///     "apiVersion": "apps/v1",
+///     "kind": "Deployment",
+///     "metadata": { "name": "api", "namespace": "payments" },
+/// }))
+/// .expect("a valid DynamicObject");
+/// let mut resource = DesiredResource {
+///     key: ResourceKey::new("apps", "Deployment", Some("payments".to_owned()), "api"),
+///     gvk: GroupVersionKind::parse("apps/v1", "Deployment").expect("a valid apiVersion"),
+///     object,
+///     source_file: "fixture.yaml".to_owned(),
+/// };
+/// let stamped = stamp_tracking_id(
+///     &mut resource,
+///     "ferriscd-system",
+///     "payments",
+///     StampOptions::with_drift_labels(),
+/// )
+/// .expect("a named application stamps")
+/// .expect("a plain resource is stamped");
+/// assert_eq!(stamped, "ferriscd-system/payments:apps/Deployment:payments/api");
 /// assert_eq!(
-///     tracking_id_for("ferriscd-system", "payments", &key),
-///     "ferriscd-system/payments:apps/Deployment:payments/api"
+///     resource.object.metadata.labels.as_ref().expect("labels")["ferriscd.io/app-hash"],
+///     "056646ef98cff795"
 /// );
 /// ```
 pub fn stamp_tracking_id(
     resource: &mut DesiredResource,
     app_namespace: &str,
     app_name: &str,
+    options: StampOptions,
 ) -> Result<Option<String>, TrackingIdError> {
     if is_hook(resource) {
         return Ok(None);
@@ -282,6 +413,21 @@ pub fn stamp_tracking_id(
         .annotations
         .get_or_insert_with(BTreeMap::new)
         .insert(annotations::TRACKING_ID.to_owned(), rendered.clone());
+    if options.stamps_drift_labels() {
+        let labels = resource
+            .object
+            .metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new);
+        labels.insert(
+            annotations::LABEL_MANAGED_BY.to_owned(),
+            annotations::MANAGED_BY_FERRISCD.to_owned(),
+        );
+        labels.insert(
+            annotations::LABEL_APP_HASH.to_owned(),
+            app_hash(app_namespace, app_name),
+        );
+    }
     Ok(Some(rendered))
 }
 
@@ -417,9 +563,14 @@ mod tests {
             })),
         );
 
-        let stamped = stamp_tracking_id(&mut resource, "ferriscd-system", "payments")
-            .expect("stamping must succeed")
-            .expect("a non-hook resource is stamped");
+        let stamped = stamp_tracking_id(
+            &mut resource,
+            "ferriscd-system",
+            "payments",
+            StampOptions::default(),
+        )
+        .expect("stamping must succeed")
+        .expect("a non-hook resource is stamped");
 
         assert_eq!(
             stamped, "ferriscd-system/payments:apps/Deployment:payments/api",
@@ -440,8 +591,13 @@ mod tests {
         );
 
         // Re-stamping is idempotent: same value, no duplicate annotation entries.
-        let again = stamp_tracking_id(&mut resource, "ferriscd-system", "payments")
-            .expect("re-stamping must succeed");
+        let again = stamp_tracking_id(
+            &mut resource,
+            "ferriscd-system",
+            "payments",
+            StampOptions::default(),
+        )
+        .expect("re-stamping must succeed");
         assert_eq!(again, Some(stamped.clone()));
         let map = resource
             .object
@@ -460,8 +616,13 @@ mod tests {
     #[test]
     fn stamping_creates_the_annotation_map_when_absent() {
         let mut resource = desired("", "ConfigMap", Some("payments"), "cfg", "v1", None);
-        let stamped = stamp_tracking_id(&mut resource, "ferriscd-system", "payments")
-            .expect("stamping must succeed");
+        let stamped = stamp_tracking_id(
+            &mut resource,
+            "ferriscd-system",
+            "payments",
+            StampOptions::default(),
+        )
+        .expect("stamping must succeed");
         assert_eq!(
             stamped.as_deref(),
             Some("ferriscd-system/payments:/ConfigMap:payments/cfg"),
@@ -510,8 +671,20 @@ mod tests {
             None,
         );
         assert_eq!(
-            stamp_tracking_id(&mut v1beta1, "ferriscd-system", "payments").expect("stamp"),
-            stamp_tracking_id(&mut v1, "ferriscd-system", "payments").expect("stamp"),
+            stamp_tracking_id(
+                &mut v1beta1,
+                "ferriscd-system",
+                "payments",
+                StampOptions::default()
+            )
+            .expect("stamp"),
+            stamp_tracking_id(
+                &mut v1,
+                "ferriscd-system",
+                "payments",
+                StampOptions::default()
+            )
+            .expect("stamp"),
         );
         assert_eq!(v1beta1.gvk.version, "v1beta1");
         assert_eq!(v1.gvk.version, "v1");
@@ -532,8 +705,13 @@ mod tests {
                 })),
             );
 
-            let stamped = stamp_tracking_id(&mut resource, "ferriscd-system", "payments")
-                .expect("hook stamping must not error");
+            let stamped = stamp_tracking_id(
+                &mut resource,
+                "ferriscd-system",
+                "payments",
+                StampOptions::default(),
+            )
+            .expect("hook stamping must not error");
             assert_eq!(stamped, None, "hook phase {phase} must not be stamped");
             assert_eq!(
                 annotation(&resource, annotations::TRACKING_ID),
@@ -556,9 +734,14 @@ mod tests {
             Some(json!({ "ferriscd.io/hook": "  " })),
         );
         assert!(
-            stamp_tracking_id(&mut blank, "ferriscd-system", "payments")
-                .expect("stamp")
-                .is_some(),
+            stamp_tracking_id(
+                &mut blank,
+                "ferriscd-system",
+                "payments",
+                StampOptions::default()
+            )
+            .expect("stamp")
+            .is_some(),
             "a blank hook annotation is not a hook"
         );
 
@@ -572,9 +755,14 @@ mod tests {
             Some(json!({ "ferriscd.io/hook-delete-policy": "hook-succeeded" })),
         );
         assert!(
-            stamp_tracking_id(&mut policy, "ferriscd-system", "payments")
-                .expect("stamp")
-                .is_some()
+            stamp_tracking_id(
+                &mut policy,
+                "ferriscd-system",
+                "payments",
+                StampOptions::default()
+            )
+            .expect("stamp")
+            .is_some()
         );
     }
 
@@ -582,13 +770,20 @@ mod tests {
     fn stamping_rejects_an_empty_application_reference() {
         let mut resource = desired("apps", "Deployment", Some("payments"), "api", "v1", None);
         assert_eq!(
-            stamp_tracking_id(&mut resource, "", "payments").expect_err("empty app namespace"),
+            stamp_tracking_id(&mut resource, "", "payments", StampOptions::default())
+                .expect_err("empty app namespace"),
             TrackingIdError::EmptySegment {
                 field: "application namespace"
             }
         );
         assert_eq!(
-            stamp_tracking_id(&mut resource, "ferriscd-system", " ").expect_err("blank app name"),
+            stamp_tracking_id(
+                &mut resource,
+                "ferriscd-system",
+                " ",
+                StampOptions::default()
+            )
+            .expect_err("blank app name"),
             TrackingIdError::EmptySegment {
                 field: "application name"
             }
@@ -836,9 +1031,14 @@ mod tests {
             "v1beta1",
             None,
         );
-        let stamped = stamp_tracking_id(&mut resource, "ferriscd-system", "payments")
-            .expect("stamp")
-            .expect("non-hook");
+        let stamped = stamp_tracking_id(
+            &mut resource,
+            "ferriscd-system",
+            "payments",
+            StampOptions::default(),
+        )
+        .expect("stamp")
+        .expect("non-hook");
 
         // The applied object carries the stamped annotation; recovery compares it back.
         assert_eq!(
@@ -860,6 +1060,310 @@ mod tests {
                 )
             ),
             Ownership::OwnedByForeign(stamped)
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `T18.1`: the opt-in ownership labels
+    // -----------------------------------------------------------------
+
+    /// A `Deployment` whose immutable `spec.selector.matchLabels` and pod-template labels mirror
+    /// its own top-level labels — the trap guard's fixture.
+    fn deployment_with_immutable_selectors() -> DesiredResource {
+        let object = serde_json::from_value(json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "api",
+                "namespace": "payments",
+                "labels": {
+                    "app.kubernetes.io/name": "api",
+                    "example.com/keep": "unchanged",
+                },
+            },
+            "spec": {
+                "replicas": 2,
+                "selector": {
+                    "matchLabels": { "app.kubernetes.io/name": "api" },
+                },
+                "template": {
+                    "metadata": { "labels": { "app.kubernetes.io/name": "api" } },
+                    "spec": { "containers": [ { "name": "api", "image": "ghcr.io/example/api:v1" } ] },
+                },
+            },
+        }))
+        .expect("valid DynamicObject");
+
+        DesiredResource {
+            key: ResourceKey::new("apps", "Deployment", Some("payments".to_owned()), "api"),
+            gvk: GroupVersionKind::parse("apps/v1", "Deployment").expect("valid apiVersion"),
+            object,
+            source_file: "fixture.yaml".to_owned(),
+        }
+    }
+
+    fn label(resource: &DesiredResource, key: &str) -> Option<String> {
+        resource
+            .object
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|map| map.get(key))
+            .cloned()
+    }
+
+    /// Stamping the label pair is **opt-in**: the default writes the annotation only, so a
+    /// pre-`v1.2` `Application` applies a byte-identical body.
+    #[test]
+    fn drift_labels_are_opt_in_and_additive() {
+        let mut resource = deployment_with_immutable_selectors();
+        assert_eq!(label(&resource, annotations::LABEL_MANAGED_BY), None);
+
+        stamp_tracking_id(
+            &mut resource,
+            "ferriscd-system",
+            "payments",
+            StampOptions::default(),
+        )
+        .expect("stamp")
+        .expect("non-hook");
+        assert!(
+            resource.object.metadata.labels.as_ref().is_some_and(|map| {
+                !map.contains_key(annotations::LABEL_MANAGED_BY)
+                    && !map.contains_key(annotations::LABEL_APP_HASH)
+            }),
+            "the default must not stamp a label: {:?}",
+            resource.object.metadata.labels
+        );
+        assert!(!StampOptions::default().stamps_drift_labels());
+        assert!(!StampOptions::from_flag(false).stamps_drift_labels());
+        assert!(StampOptions::from_flag(true).stamps_drift_labels());
+
+        // Opting in adds exactly the two documented labels — never replaces the user's own.
+        stamp_tracking_id(
+            &mut resource,
+            "ferriscd-system",
+            "payments",
+            StampOptions::with_drift_labels(),
+        )
+        .expect("stamp")
+        .expect("non-hook");
+        assert_eq!(
+            label(&resource, annotations::LABEL_MANAGED_BY).as_deref(),
+            Some(annotations::MANAGED_BY_FERRISCD)
+        );
+        assert_eq!(
+            label(&resource, annotations::LABEL_APP_HASH).as_deref(),
+            Some("056646ef98cff795"),
+            "the hash of `<app-ns>/<app-name>` is pinned"
+        );
+        assert_eq!(
+            label(&resource, "example.com/keep").as_deref(),
+            Some("unchanged"),
+            "a label FerrisCD does not own must survive stamping"
+        );
+        assert_eq!(
+            resource
+                .object
+                .metadata
+                .labels
+                .as_ref()
+                .expect("labels")
+                .len(),
+            4,
+            "exactly two labels are added (re-stamping adds none)"
+        );
+
+        // Additive: switching the flag off never strips what an opted-in sync already applied (the
+        // next Server-Side Apply owns the removal, so toggling cannot fight the cluster).
+        stamp_tracking_id(
+            &mut resource,
+            "ferriscd-system",
+            "payments",
+            StampOptions::tracking_id_only(),
+        )
+        .expect("stamp");
+        assert_eq!(
+            label(&resource, annotations::LABEL_MANAGED_BY).as_deref(),
+            Some(annotations::MANAGED_BY_FERRISCD)
+        );
+        assert_eq!(
+            annotation(&resource, annotations::TRACKING_ID).as_deref(),
+            Some("ferriscd-system/payments:apps/Deployment:payments/api"),
+            "the ownership annotation is always stamped, whatever the label option is"
+        );
+    }
+
+    /// **Acceptance criterion (1):** a 253-character `Application` name (and a 63-character
+    /// namespace, the Kubernetes maxima) still produces exactly 16 lowercase hex characters, so the
+    /// value is always valid under the 63-character label-value limit (Finding M5).
+    #[test]
+    fn app_hash_is_bounded_and_valid_for_the_longest_names() {
+        let longest_name = "a".repeat(253);
+        let longest_namespace = "n".repeat(63);
+
+        for (namespace, name, expected) in [
+            ("ferriscd-system", "payments", "056646ef98cff795"),
+            ("ferriscd-system", longest_name.as_str(), "cc029a55ae61ef1e"),
+            (
+                longest_namespace.as_str(),
+                longest_name.as_str(),
+                "54001513e80cd734",
+            ),
+        ] {
+            let hash = app_hash(namespace, name);
+            assert_eq!(hash, expected, "hash for {namespace:?}/{name:?}");
+            assert_eq!(hash.len(), APP_HASH_HEX_CHARS);
+            assert!(
+                hash.chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "a label value must be lowercase hex, never upper case: {hash}"
+            );
+            assert!(
+                hash.len() <= 63,
+                "a Kubernetes label value is at most 63 characters: {hash}"
+            );
+            // Pure and deterministic: no clock, no per-process state.
+            assert_eq!(hash, app_hash(namespace, name));
+        }
+    }
+
+    /// **Acceptance criterion (2):** the hash binds the namespace and the name together, so
+    /// `ns-a/app` and `ns-b/app` never collide (the Apps-in-any-namespace case Finding M5 names).
+    #[test]
+    fn app_hash_is_distinct_per_namespace() {
+        assert_eq!(app_hash("ns-a", "app"), "245f1eab9952fdbe");
+        assert_eq!(app_hash("ns-b", "app"), "0a84585af4bffa6f");
+        assert_ne!(app_hash("ns-a", "app"), app_hash("ns-b", "app"));
+
+        // The namespace and the name are hashed as one `<ns>/<name>` string, and `/` is not a legal
+        // character in either DNS segment, so no two legal `(namespace, name)` pairs can produce
+        // the same string. Two pairs built from the legal character set — dots included — therefore
+        // hash differently.
+        assert_ne!(app_hash("a.b", "c"), app_hash("a", "b.c"));
+        assert_ne!(app_hash("a", "app"), app_hash("b", "app"));
+        assert_ne!(app_hash("a", "app"), app_hash("a", "app2"));
+
+        // Every resource of one `Application` carries the same hash, whatever it manages.
+        let mut service = desired("", "Service", Some("payments"), "api", "v1", None);
+        let mut deployment = deployment_with_immutable_selectors();
+        for resource in [&mut service, &mut deployment] {
+            stamp_tracking_id(
+                resource,
+                "ferriscd-system",
+                "payments",
+                StampOptions::with_drift_labels(),
+            )
+            .expect("stamp");
+        }
+        assert_eq!(
+            label(&service, annotations::LABEL_APP_HASH),
+            label(&deployment, annotations::LABEL_APP_HASH),
+            "the hash identifies the Application, not the resource"
+        );
+    }
+
+    /// **Acceptance criterion (3):** a lifecycle hook is never stamped — with the labels either.
+    /// A hook that carried them would look managed to a `DriftWatcher` and prunable to the pruner.
+    #[test]
+    fn drift_labels_are_never_stamped_onto_a_lifecycle_hook() {
+        for phase in ["PreSync", "Sync", "PostSync", "SyncFail"] {
+            let mut hook = desired(
+                "batch",
+                "Job",
+                Some("payments"),
+                "migrate",
+                "v1",
+                Some(json!({ "ferriscd.io/hook": phase })),
+            );
+            assert_eq!(
+                stamp_tracking_id(
+                    &mut hook,
+                    "ferriscd-system",
+                    "payments",
+                    StampOptions::with_drift_labels()
+                )
+                .expect("a hook is not an error"),
+                None,
+                "hook phase {phase} must not be stamped"
+            );
+            assert_eq!(hook.object.metadata.labels, None, "hook phase {phase}");
+            assert_eq!(
+                hook.object.metadata.annotations.as_ref().map(BTreeMap::len),
+                Some(1),
+                "hook phase {phase} keeps only the annotation the manifest itself declared"
+            );
+        }
+    }
+
+    /// **Acceptance criterion (4) / trap guard:** only the top-level `metadata.labels` are written.
+    /// `spec.selector.matchLabels` and `spec.template.metadata.labels` are immutable on
+    /// `Deployment`/`StatefulSet`/`DaemonSet`, so a label there would turn every later apply into a
+    /// `422 Immutable` failure.
+    #[test]
+    fn drift_labels_never_reach_a_selector_or_a_pod_template() {
+        let mut resource = deployment_with_immutable_selectors();
+        let before = serde_json::to_value(&resource.object).expect("serialize");
+
+        stamp_tracking_id(
+            &mut resource,
+            "ferriscd-system",
+            "payments",
+            StampOptions::with_drift_labels(),
+        )
+        .expect("stamp")
+        .expect("non-hook");
+
+        let after = serde_json::to_value(&resource.object).expect("serialize");
+        assert_eq!(
+            after["spec"], before["spec"],
+            "the whole spec — selector.matchLabels and the pod template included — must be \
+             byte-identical after stamping"
+        );
+        let spec = serde_json::to_string(&after["spec"]).expect("serialize spec");
+        for key in annotations::MANAGED_RESOURCE_LABELS {
+            assert!(
+                !spec.contains(key),
+                "{key} must never appear anywhere under /spec: {spec}"
+            );
+        }
+        // The labels land where a watch label selector can filter on them: the object's own
+        // metadata.
+        assert_eq!(
+            after["metadata"]["labels"][annotations::LABEL_MANAGED_BY],
+            json!(annotations::MANAGED_BY_FERRISCD)
+        );
+        assert_eq!(
+            after["metadata"]["labels"][annotations::LABEL_APP_HASH],
+            json!("056646ef98cff795")
+        );
+    }
+
+    /// A rejected stamp writes nothing at all — not the annotation, and not the label pair.
+    #[test]
+    fn a_rejected_stamp_never_writes_a_drift_label() {
+        let mut resource = deployment_with_immutable_selectors();
+        let labels_before = resource.object.metadata.labels.clone();
+
+        assert_eq!(
+            stamp_tracking_id(
+                &mut resource,
+                "",
+                "payments",
+                StampOptions::with_drift_labels()
+            )
+            .expect_err("an empty namespace cannot be stamped"),
+            TrackingIdError::EmptySegment {
+                field: "application namespace"
+            }
+        );
+        assert_eq!(
+            resource.object.metadata.labels, labels_before,
+            "a failed stamp must not add a label"
+        );
+        assert_eq!(
+            resource.object.metadata.annotations, None,
+            "a failed stamp must not add an annotation"
         );
     }
 }

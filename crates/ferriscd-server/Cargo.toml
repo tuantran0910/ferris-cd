@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 axum.workspace = true
+# `T19.1`: JOSE decoding of the JWT/JWKS documents the IdP serves (already a workspace dependency).
+base64.workspace = true
 ferriscd-controller.workspace = true
 ferriscd-crd.workspace = true
 # The shared diff engine (`ferriscd_engine::diff`) and `ResourceKey`: the API never re-implements
@@ -22,6 +24,12 @@ futures.workspace = true
 # decides, exactly as for `ferriscd-crd`/`ferriscd-engine`.
 k8s-openapi.workspace = true
 kube.workspace = true
+# `T19.1`: the OIDC discovery + JWKS fetches (async rustls, bounded timeouts, no redirects). The
+# same `reqwest` the CLI already uses; no second HTTP stack.
+reqwest.workspace = true
+# `T19.1`: RS256/ES256/ES384/EdDSA signature verification. `ring` is the workspace's pinned
+# `rustls` provider, so no new package enters the build.
+ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Constant-time HMAC/token comparison (`T14.2`); already in the lock file.
