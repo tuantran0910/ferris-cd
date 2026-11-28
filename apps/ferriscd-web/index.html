@@ -10,6 +10,20 @@
     />
     <link rel="icon" type="image/svg+xml" href="/ferriscd-mark.svg" />
     <title>FerrisCD — GitOps Control Plane</title>
+    <script>
+      try {
+        const stored = localStorage.getItem("ferriscd-theme");
+        const theme =
+          stored === "light" || stored === "dark"
+            ? stored
+            : window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark";
+        document.documentElement.dataset.theme = theme;
+      } catch {
+        document.documentElement.dataset.theme = "dark";
+      }
+    </script>
   </head>
   <body class="bg-slate-950 text-slate-100 antialiased">
     <div id="root"></div>

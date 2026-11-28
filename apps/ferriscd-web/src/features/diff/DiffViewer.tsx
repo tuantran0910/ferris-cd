@@ -500,7 +500,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
               viewMode === "side-by-side"
                 ? "bg-indigo-600 text-white"
-                : "text-slate-300 hover:text-white"
+                : "text-slate-300 hover:text-slate-100"
             }`}
           >
             <Columns2 className="h-3.5 w-3.5" />
@@ -513,7 +513,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
               viewMode === "unified"
                 ? "bg-indigo-600 text-white"
-                : "text-slate-300 hover:text-white"
+                : "text-slate-300 hover:text-slate-100"
             }`}
           >
             <Rows3 className="h-3.5 w-3.5" />

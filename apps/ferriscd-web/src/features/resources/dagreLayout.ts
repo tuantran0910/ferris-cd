@@ -148,8 +148,8 @@ export function buildResourceGraphElements(
       style: {
         stroke:
           derivedHealth === "Degraded" || derivedHealth === "Missing"
-            ? "#f43f5e"
-            : "#475569",
+            ? "var(--color-rose-500)"
+            : "var(--color-slate-600)",
         strokeWidth: 1.5,
       },
     });

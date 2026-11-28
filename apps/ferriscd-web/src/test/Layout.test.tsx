@@ -68,6 +68,23 @@ describe("Layout accessibility (T17.3)", () => {
     expect(nav.querySelectorAll('[aria-current="page"]')).toHaveLength(1);
   });
 
+  it("toggles the theme and persists the choice", async () => {
+    const user = userEvent.setup();
+    document.documentElement.dataset.theme = "dark";
+    renderShell();
+
+    await user.click(screen.getByTestId("theme-toggle"));
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(window.localStorage.getItem("ferriscd-theme")).toBe("light");
+    expect(screen.getByTestId("theme-toggle")).toHaveAttribute(
+      "aria-label",
+      "Switch to dark theme",
+    );
+
+    await user.click(screen.getByTestId("theme-toggle"));
+    expect(document.documentElement.dataset.theme).toBe("dark");
+  });
+
   it("offers Insights-free primary navigation to Applications, Projects and Clusters", () => {
     renderShell();
 

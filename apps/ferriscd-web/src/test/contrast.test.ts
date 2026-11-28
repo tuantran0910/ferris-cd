@@ -121,3 +121,51 @@ describe("WCAG 2.2 AA contrast (T17.3)", () => {
     expect(contrast("slate-400", "slate-900")).toBeGreaterThanOrEqual(4.5);
   });
 });
+
+/**
+ * The light theme remaps the same Tailwind tokens (see `index.css`), so the
+ * pairs above must be re-proven against the remapped sRGB values.
+ */
+const LIGHT: Record<string, string> = {
+  "slate-950": "#f8fafc",
+  "slate-900": "#ffffff",
+  "slate-300": "#334155",
+  "slate-400": "#475569",
+  "slate-500": "#64748b",
+  "slate-100": "#0f172a",
+  "indigo-300": "#4338ca",
+  "emerald-300": "#047857",
+  "rose-200": "#be123c",
+  "amber-200": "#b45309",
+  "sky-300": "#0369a1",
+  "violet-300": "#6d28d9",
+  "fuchsia-300": "#a21caf",
+};
+
+function lightContrast(foreground: keyof typeof LIGHT, background: keyof typeof LIGHT): number {
+  const fg = luminance(LIGHT[foreground]!);
+  const bg = luminance(LIGHT[background]!);
+  return (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05);
+}
+
+describe("WCAG 2.2 AA contrast (light theme)", () => {
+  it("keeps text pairs at >= 4.5:1 on the remapped palette", () => {
+    const pairs: [keyof typeof LIGHT, keyof typeof LIGHT][] = [
+      ["slate-100", "slate-950"],
+      ["slate-300", "slate-950"],
+      ["slate-400", "slate-900"],
+      ["slate-500", "slate-900"],
+      ["indigo-300", "slate-900"],
+      ["emerald-300", "slate-900"],
+      ["rose-200", "slate-900"],
+      ["amber-200", "slate-950"],
+      ["sky-300", "slate-900"],
+      ["violet-300", "slate-900"],
+      ["fuchsia-300", "slate-900"],
+    ];
+    for (const [foreground, background] of pairs) {
+      const ratio = lightContrast(foreground, background);
+      expect(ratio, `${foreground} on ${background} is ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+});

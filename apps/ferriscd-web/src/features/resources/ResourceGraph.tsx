@@ -193,7 +193,7 @@ export function ResourceGraph({
             className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
               viewMode === "graph"
                 ? "bg-indigo-600 text-white"
-                : "text-slate-300 hover:text-white"
+                : "text-slate-300 hover:text-slate-100"
             }`}
           >
             <GitFork className="h-3.5 w-3.5" />
@@ -206,7 +206,7 @@ export function ResourceGraph({
             className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
               viewMode === "table"
                 ? "bg-indigo-600 text-white"
-                : "text-slate-300 hover:text-white"
+                : "text-slate-300 hover:text-slate-100"
             }`}
           >
             <Table2 className="h-3.5 w-3.5" />
@@ -286,7 +286,7 @@ export function ResourceGraph({
               }
             }}
           >
-            <Background color="#1e293b" gap={20} />
+            <Background color="var(--color-slate-800)" gap={20} />
             <Controls />
             <MiniMap
               nodeColor={(n) => {

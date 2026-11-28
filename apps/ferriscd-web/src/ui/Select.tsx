@@ -197,7 +197,7 @@ export function Select({
                 className={cx(
                   "flex cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-xs",
                   index === activeIndex
-                    ? "bg-slate-800 text-white"
+                    ? "bg-slate-800 text-slate-100"
                     : "text-slate-300",
                   isSelected && "text-indigo-200",
                 )}

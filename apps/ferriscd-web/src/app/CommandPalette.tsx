@@ -278,7 +278,7 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => activate(item)}
                       className={`flex cursor-pointer items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-xs ${
-                        active ? "bg-slate-800 text-white" : "text-slate-200"
+                        active ? "bg-slate-800 text-slate-100" : "text-slate-200"
                       }`}
                     >
                       <span className="flex min-w-0 items-center gap-2">

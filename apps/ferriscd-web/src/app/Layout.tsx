@@ -1,4 +1,4 @@
-import { FolderGit2, Layers, LogOut, Search, Server } from "lucide-react";
+import { FolderGit2, Layers, LogOut, Moon, Search, Server, Sun } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
@@ -8,6 +8,7 @@ import {
   COMMAND_PALETTE_HINT,
   useCommandPaletteShortcut,
 } from "./CommandPalette";
+import { applyTheme, currentTheme, nextTheme, type Theme } from "./theme";
 
 const NAV_ITEMS = [
   { to: "/", label: "Applications", icon: Layers, end: true },
@@ -37,8 +38,14 @@ export function Layout() {
   const { baseUrl, logout, sessionStatus, beginSsoLogin, ssoAvailable } = useAuth();
   const { pathname } = useLocation();
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [theme, setTheme] = useState<Theme>(currentTheme);
 
   const togglePalette = useCallback(() => setPaletteOpen((open) => !open), []);
+  const toggleTheme = useCallback(() => {
+    const next = nextTheme(theme);
+    applyTheme(next);
+    setTheme(next);
+  }, [theme]);
   useCommandPaletteShortcut(togglePalette);
 
   // A new route starts at the top of the page. Assigning `scrollTop` (rather
@@ -65,7 +72,7 @@ export function Layout() {
           <div className="flex items-center gap-6">
             <Link
               to="/"
-              className="flex items-center gap-2.5 font-semibold tracking-tight text-slate-100 transition-colors hover:text-white"
+              className="flex items-center gap-2.5 font-semibold tracking-tight text-slate-100 transition-colors hover:text-slate-100"
             >
               <img
                 src="/ferriscd-mark.svg"
@@ -85,8 +92,8 @@ export function Layout() {
                   className={({ isActive }) =>
                     `inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
                       isActive
-                        ? "bg-slate-800 text-white"
-                        : "text-slate-200 hover:bg-slate-800/80 hover:text-white"
+                        ? "bg-slate-800 text-slate-100"
+                        : "text-slate-200 hover:bg-slate-800/80 hover:text-slate-100"
                     }`
                   }
                 >
@@ -98,6 +105,20 @@ export function Layout() {
           </div>
 
           <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={toggleTheme}
+              aria-label={`Switch to ${nextTheme(theme)} theme`}
+              title={`Switch to ${nextTheme(theme)} theme`}
+              data-testid="theme-toggle"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-700 bg-slate-900 text-slate-300 transition-colors hover:border-slate-600 hover:bg-slate-800 hover:text-slate-100"
+            >
+              {theme === "light" ? (
+                <Moon aria-hidden="true" className="h-4 w-4" />
+              ) : (
+                <Sun aria-hidden="true" className="h-4 w-4" />
+              )}
+            </button>
             <button
               type="button"
               onClick={() => setPaletteOpen(true)}
