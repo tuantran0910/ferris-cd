@@ -1,5 +1,6 @@
 import { FolderGit2, Layers, LogOut, Moon, Search, Server, Sun } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { Button } from "../ui/Button";
@@ -8,7 +9,13 @@ import {
   COMMAND_PALETTE_HINT,
   useCommandPaletteShortcut,
 } from "./CommandPalette";
-import { applyTheme, currentTheme, nextTheme, type Theme } from "./theme";
+import {
+  applyTheme,
+  applyThemeTransition,
+  currentTheme,
+  nextTheme,
+  type Theme,
+} from "./theme";
 
 const NAV_ITEMS = [
   { to: "/", label: "Applications", icon: Layers, end: true },
@@ -43,8 +50,10 @@ export function Layout() {
   const togglePalette = useCallback(() => setPaletteOpen((open) => !open), []);
   const toggleTheme = useCallback(() => {
     const next = nextTheme(theme);
-    applyTheme(next);
-    setTheme(next);
+    applyThemeTransition(() => {
+      applyTheme(next);
+      flushSync(() => setTheme(next));
+    });
   }, [theme]);
   useCommandPaletteShortcut(togglePalette);
 

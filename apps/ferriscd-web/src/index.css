@@ -143,3 +143,17 @@
   border: 1px solid var(--color-slate-700);
   border-radius: 0.5rem;
 }
+
+/* One 180ms cross-fade for the theme switch (View Transitions API). */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 180ms;
+  animation-timing-function: var(--motion-ease-standard, ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+  }
+}
