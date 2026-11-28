@@ -21,6 +21,7 @@ function LocationProbe() {
 
 function renderClustersPage(
   overrides: Parameters<typeof createMockApiClient>[0] = {},
+  entry = "/clusters",
 ) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -30,7 +31,7 @@ function renderClustersPage(
   return render(
     <QueryClientProvider client={queryClient}>
       <AuthProvider clientOverride={mockClient}>
-        <MemoryRouter initialEntries={["/clusters"]}>
+        <MemoryRouter initialEntries={[entry]}>
           <Routes>
             <Route path="/clusters" element={<ClustersPage />} />
             <Route path="/" element={<div>applications-list</div>} />
@@ -128,5 +129,26 @@ describe("ClustersPage (T17.3)", () => {
     expect(
       await screen.findByText(/No destination clusters are visible to your identity/i),
     ).toBeInTheDocument();
+  });
+
+  it("filters by ?q and explains an empty match with a way back", async () => {
+    renderClustersPage({}, "/clusters?q=nope");
+    expect(await screen.findByText(/No cluster matches/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/0 of 2 clusters match “nope”/i),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /clear the filter/i })).toHaveAttribute(
+      "href",
+      "/clusters",
+    );
+  });
+
+  it("uses singular agreement when one of one cluster matches", async () => {
+    renderClustersPage({}, "/clusters?q=in-cluster");
+    expect(
+      await screen.findByText(/1 of 2 clusters matches “in-cluster”/i),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("cluster-card-in-cluster")).toBeInTheDocument();
+    expect(screen.queryByTestId("cluster-card-prod-us-east")).not.toBeInTheDocument();
   });
 });

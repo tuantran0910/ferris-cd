@@ -113,7 +113,7 @@ export function ClustersPage() {
             : filter
               ? `${clusters.length} of ${allClusters.length} ${
                   allClusters.length === 1 ? "cluster" : "clusters"
-                } match “${filter}”`
+                } ${clusters.length === 1 ? "matches" : "match"} “${filter}”`
               : clusters.length === 1
                 ? "1 destination cluster visible to your identity"
                 : `${clusters.length} destination clusters visible to your identity`}

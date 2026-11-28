@@ -52,7 +52,15 @@ test.describe("applications", () => {
       return { border: style.borderTopColor, shadow: style.boxShadow };
     });
     await search.focus();
-    await page.waitForTimeout(250); // border-colour transition
+    await expect
+      .poll(
+        () =>
+          search.evaluate(
+            (element) => getComputedStyle(element).borderTopColor,
+          ),
+        { timeout: 2000 },
+      )
+      .not.toBe(blurred.border);
     const focused = await search.evaluate((element) => {
       const style = getComputedStyle(element);
       return { border: style.borderTopColor, shadow: style.boxShadow };
@@ -179,9 +187,15 @@ test.describe("navigation", () => {
     // One focus indicator: the border is the indicator, not border + outline.
     const focusStyle = await input.evaluate((element) => {
       const style = getComputedStyle(element);
-      return { outline: style.outlineStyle, border: style.borderTopColor };
+      return {
+        outline: style.outlineStyle,
+        border: style.borderTopColor,
+        shadow: style.boxShadow,
+      };
     });
     expect(focusStyle.outline).toBe("none");
+    expect(focusStyle.shadow).not.toBe("none");
+    expect(focusStyle.border).toMatch(/rgb\(/);
 
     await input.fill("Projects");
     await dialog

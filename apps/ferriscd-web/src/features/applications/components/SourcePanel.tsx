@@ -138,7 +138,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
                   rel="noopener noreferrer"
                   aria-label={`Open repository ${repositoryName(app.source.repoUrl)} in a new tab`}
                   title={`Open ${app.source.repoUrl}`}
-                  className="shrink-0 rounded p-1 text-ink-muted transition-colors hover:bg-elevated hover:text-accent"
+                  className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-muted transition-colors hover:bg-elevated hover:text-accent"
                 >
                   <ExternalLink aria-hidden="true" className="h-3.5 w-3.5" />
                 </a>

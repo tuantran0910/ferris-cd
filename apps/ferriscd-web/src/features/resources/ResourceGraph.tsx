@@ -251,6 +251,20 @@ export function ResourceGraph({
         </div>
       )}
 
+      {narrowScreen && !isLargeGraph && !userPickedMode && (
+        <div
+          role="status"
+          data-testid="narrow-graph-hint"
+          className="flex items-center gap-2 rounded-lg border border-line bg-elevated px-4 py-2 text-xs text-ink-muted"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0 text-ink-muted" />
+          <span>
+            Narrow viewport: showing the searchable Resource Table. Switch to
+            Graph View to see the topology.
+          </span>
+        </div>
+      )}
+
       {graph.truncated && (
         <div
           role="status"

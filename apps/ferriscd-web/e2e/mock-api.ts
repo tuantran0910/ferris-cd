@@ -7,7 +7,7 @@ import type { Page } from "@playwright/test";
  * cluster, token or seed data is required to run it.
  */
 const responses: Record<string, unknown> = JSON.parse(
-  readFileSync("e2e/fixtures/api.json", "utf8"),
+  readFileSync(new URL("./fixtures/api.json", import.meta.url), "utf8"),
 );
 
 export async function mockApi(page: Page): Promise<void> {
@@ -15,11 +15,20 @@ export async function mockApi(page: Page): Promise<void> {
     const { pathname } = new URL(route.request().url());
     const body = responses[pathname];
     if (body === undefined) {
-      // The SSE stream is optional; a 404 makes the UI fall back to polling.
+      // Only the SSE stream is optional: a 404 makes the UI poll instead.
+      if (pathname.endsWith("/applications/stream")) {
+        await route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: "stream disabled in tests" }),
+        });
+        return;
+      }
+      console.error(`[mock-api] unmocked endpoint: ${pathname}`);
       await route.fulfill({
-        status: 404,
+        status: 500,
         contentType: "application/json",
-        body: JSON.stringify({ detail: "not mocked" }),
+        body: JSON.stringify({ detail: "unmocked endpoint" }),
       });
       return;
     }

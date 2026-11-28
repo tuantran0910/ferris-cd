@@ -17,6 +17,7 @@
  * and is intentionally not changed here.
  */
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 
 /** sRGB values of the Tailwind tokens used by the UI. */
 const PALETTE: Record<string, string> = {
@@ -103,7 +104,7 @@ describe("WCAG 2.2 AA contrast (T17.3)", () => {
   });
 
   it("keeps the focus indicator at >= 3:1 on every surface it can appear on", () => {
-    // `--color-accent` (#a5b4fc) is the shared `:focus-visible` outline in `index.css`.
+    // `--color-accent` (#a5b4fc) is the shared `:focus-visible` ring in `index.css`.
     for (const background of ["slate-950", "slate-900", "slate-800", "slate-700"]) {
       const ratio = contrast("indigo-300", background);
       expect(
@@ -227,5 +228,18 @@ describe("WCAG 2.2 AA contrast (semantic tokens, both themes)", () => {
   it("would catch a regression: the old muted shade is not text-safe", () => {
     expect(ratioOn(LIGHT, "line-strong", "surface")).toBeLessThan(4.5);
     expect(ratioOn(DARK, "line-strong", "surface")).toBeLessThan(4.5);
+  });
+});
+
+describe("palette drift", () => {
+  it("keeps the asserted light tokens in step with index.css", () => {
+    const css = readFileSync("src/index.css", "utf8");
+    const light = css.slice(css.indexOf(':root[data-theme="light"]'));
+    for (const [name, value] of Object.entries(LIGHT)) {
+      const match = light.match(
+        new RegExp(`--color-${name}:\\s*(#[0-9a-fA-F]{6});`),
+      );
+      expect(match?.[1], name).toBe(value);
+    }
   });
 });

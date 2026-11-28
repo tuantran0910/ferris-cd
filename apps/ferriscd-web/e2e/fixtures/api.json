@@ -40,7 +40,7 @@
         "project": "default",
         "source": {
           "sourceType": "git",
-          "repoUrl": "/private/tmp/commandcode-501/-Users-tranngoctuan0910-Workspaces-PersonalRepo-ferris-cd/d9b22162-82f1-4e32-a822-3ea5ba3805f5/scratchpad/demo-repo",
+          "repoUrl": "/repos/demo-repo",
           "path": "basic-checkout",
           "targetRevision": "main",
           "renderer": "auto"
@@ -78,7 +78,7 @@
         "project": "default",
         "source": {
           "sourceType": "git",
-          "repoUrl": "/private/tmp/commandcode-501/-Users-tranngoctuan0910-Workspaces-PersonalRepo-ferris-cd/d9b22162-82f1-4e32-a822-3ea5ba3805f5/scratchpad/demo-repo",
+          "repoUrl": "/repos/demo-repo",
           "path": "helm",
           "targetRevision": "main",
           "renderer": "helm"
@@ -110,7 +110,7 @@
         "project": "default",
         "source": {
           "sourceType": "git",
-          "repoUrl": "/private/tmp/commandcode-501/-Users-tranngoctuan0910-Workspaces-PersonalRepo-ferris-cd/d9b22162-82f1-4e32-a822-3ea5ba3805f5/scratchpad/demo-repo",
+          "repoUrl": "/repos/demo-repo",
           "path": "basic",
           "targetRevision": "main",
           "renderer": "auto"
@@ -179,7 +179,7 @@
       "project": "default",
       "source": {
         "sourceType": "git",
-        "repoUrl": "/private/tmp/commandcode-501/-Users-tranngoctuan0910-Workspaces-PersonalRepo-ferris-cd/d9b22162-82f1-4e32-a822-3ea5ba3805f5/scratchpad/demo-repo",
+        "repoUrl": "/repos/demo-repo",
         "path": "basic",
         "targetRevision": "main",
         "renderer": "auto"
