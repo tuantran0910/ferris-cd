@@ -277,13 +277,12 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
           <div className="flex justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Cluster</dt>
             <dd className="min-w-0 text-right font-mono text-ink">
-              <Link
-                to={`/clusters?q=${encodeURIComponent(app.destination.cluster)}`}
-                title={`Show cluster ${app.destination.cluster}`}
-                className="break-all hover:text-accent hover:underline"
-              >
-                {app.destination.cluster}
-              </Link>
+              <CopyText
+                value={app.destination.cluster}
+                label="cluster"
+                feedback
+                className="break-all"
+              />
             </dd>
           </div>
           <div className="flex justify-between gap-3">
