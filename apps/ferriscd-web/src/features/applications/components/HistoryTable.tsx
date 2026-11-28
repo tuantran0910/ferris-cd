@@ -31,13 +31,13 @@ export function HistoryTable({
     <section
       aria-label="Deployment history"
       data-testid="history-table"
-      className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-900/70"
+      className="overflow-x-auto rounded-xl border border-default bg-surface/70"
     >
       {history.length === 0 ? (
         <EmptyState bordered={false}>No deployment history recorded yet.</EmptyState>
       ) : (
         <table className="w-full text-left text-xs">
-          <thead className="border-b border-slate-800 bg-slate-900 text-[11px] uppercase tracking-wider text-slate-400">
+          <thead className="border-b border-default bg-surface text-[11px] uppercase tracking-wider text-muted">
             <tr>
               <th className="px-4 py-3">ID</th>
               <th className="px-4 py-3">Revision</th>
@@ -45,18 +45,18 @@ export function HistoryTable({
               <th className="px-4 py-3 text-right">Action</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-slate-800/80">
+          <tbody className="divide-y divide-default/80">
             {[...history]
               .sort((a, b) => b.id - a.id)
               .map((entry) => {
                 const revisionUrl = commitWebUrl(repoUrl, entry.revision);
                 return (
-                  <tr key={entry.id} className="hover:bg-slate-800/50">
-                    <td className="px-4 py-3 font-mono font-semibold text-slate-100">
+                  <tr key={entry.id} className="hover:bg-elevated/50">
+                    <td className="px-4 py-3 font-mono font-semibold text-strong">
                       #{entry.id}
                     </td>
                     <td
-                      className="max-w-[280px] truncate px-4 py-3 font-mono text-indigo-300"
+                      className="max-w-[280px] truncate px-4 py-3 font-mono text-accent"
                       title={entry.revision ?? undefined}
                     >
                       {revisionUrl ? (
@@ -64,7 +64,7 @@ export function HistoryTable({
                           href={revisionUrl}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="underline decoration-indigo-500/40 decoration-dotted underline-offset-2 hover:text-indigo-200 hover:decoration-indigo-300"
+                          className="underline decoration-indigo-500/40 decoration-dotted underline-offset-2 hover:text-accent hover:decoration-indigo-300"
                         >
                           {shortRevision(entry.revision, 12)}
                         </a>
@@ -72,7 +72,7 @@ export function HistoryTable({
                         shortRevision(entry.revision, 12)
                       )}
                     </td>
-                    <td className="whitespace-nowrap px-4 py-3 font-mono text-slate-400">
+                    <td className="whitespace-nowrap px-4 py-3 font-mono text-muted">
                       <time dateTime={entry.deployedAt} title={entry.deployedAt}>
                         {formatTimestamp(entry.deployedAt)}
                       </time>

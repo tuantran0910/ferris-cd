@@ -13,19 +13,24 @@
     <script>
       try {
         const stored = localStorage.getItem("ferriscd-theme");
-        const theme =
-          stored === "light" || stored === "dark"
+        const mode =
+          stored === "light" || stored === "dark" || stored === "system"
             ? stored
-            : window.matchMedia("(prefers-color-scheme: light)").matches
+            : "system";
+        const theme =
+          mode === "system"
+            ? window.matchMedia("(prefers-color-scheme: light)").matches
               ? "light"
-              : "dark";
+              : "dark"
+            : mode;
         document.documentElement.dataset.theme = theme;
+        document.documentElement.dataset.themeMode = mode;
       } catch {
         document.documentElement.dataset.theme = "dark";
       }
     </script>
   </head>
-  <body class="bg-slate-950 text-slate-100 antialiased">
+  <body class="bg-canvas text-strong antialiased">
     <div id="root"></div>
     <script type="module" src="/src/app/main.tsx"></script>
   </body>

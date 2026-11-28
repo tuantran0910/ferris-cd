@@ -83,10 +83,10 @@ export function ProjectsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight text-slate-100">
+        <h1 className="text-2xl font-bold tracking-tight text-strong">
           Projects
         </h1>
-        <p className="mt-1 text-xs text-slate-300">
+        <p className="mt-1 text-xs text-body">
           {projects.length === 1
             ? "1 AppProject visible to your identity"
             : `${projects.length} AppProjects visible to your identity`}
@@ -108,7 +108,7 @@ export function ProjectsPage() {
       <div className="relative max-w-md">
         <Search
           aria-hidden="true"
-          className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400"
+          className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted"
         />
         <input
           type="search"
@@ -116,7 +116,7 @@ export function ProjectsPage() {
           value={search}
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search by project, repo, namespace, cluster, ServiceAccount, or schedule..."
-          className="w-full rounded-lg border border-slate-700 bg-slate-950 py-2 pl-9 pr-3 text-xs text-slate-100 transition-colors placeholder-slate-400 focus:border-indigo-400 focus:outline-none"
+          className="w-full rounded-lg border border-strong bg-canvas py-2 pl-9 pr-3 text-xs text-strong transition-colors placeholder-hint focus:border-indigo-400 focus:outline-none"
         />
       </div>
 
@@ -173,8 +173,8 @@ function ProjectCard({
     <Card className="flex h-full flex-col gap-4">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
-          <h2 className="flex items-center gap-2 text-base font-semibold text-slate-100">
-            <FolderGit2 aria-hidden="true" className="h-4 w-4 text-indigo-400" />
+          <h2 className="flex items-center gap-2 text-base font-semibold text-strong">
+            <FolderGit2 aria-hidden="true" className="h-4 w-4 text-accent" />
             <Link
               to={applicationsLink}
               className="truncate rounded hover:underline"
@@ -184,7 +184,7 @@ function ProjectCard({
             </Link>
           </h2>
           {project.description && (
-            <p className="mt-1 break-words text-xs text-slate-300">
+            <p className="mt-1 break-words text-xs text-body">
               {project.description}
             </p>
           )}
@@ -196,7 +196,7 @@ function ProjectCard({
 
       <dl className="grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
         <FactList
-          icon={<Workflow aria-hidden="true" className="h-3.5 w-3.5 text-sky-300" />}
+          icon={<Workflow aria-hidden="true" className="h-3.5 w-3.5 text-info" />}
           title="Source repositories"
           values={project.sourceRepos ?? []}
           testId={`project-source-repos-${project.name}`}
@@ -207,7 +207,7 @@ function ProjectCard({
           testId={`project-source-namespaces-${project.name}`}
         />
         <FactList
-          icon={<ShieldCheck aria-hidden="true" className="h-3.5 w-3.5 text-emerald-300" />}
+          icon={<ShieldCheck aria-hidden="true" className="h-3.5 w-3.5 text-success" />}
           title="Destinations"
           values={project.destinations ?? []}
           testId={`project-destinations-${project.name}`}
@@ -226,10 +226,10 @@ function ProjectCard({
         />
       </dl>
 
-      <p className="mt-auto text-xs text-slate-300">
+      <p className="mt-auto text-xs text-body">
         {counts && counts.outOfSync > 0 ? (
           <>
-            <span className="font-semibold text-amber-200">
+            <span className="font-semibold text-warning">
               {counts.outOfSync} out of sync
             </span>
             {" of "}
@@ -240,7 +240,7 @@ function ProjectCard({
         )}
         <Link
           to={applicationsLink}
-          className="font-medium text-indigo-300 hover:underline"
+          className="font-medium text-accent hover:underline"
         >
           View applications
         </Link>
@@ -271,18 +271,18 @@ function FactList({
 }) {
   return (
     <div data-testid={testId}>
-      <dt className="flex items-center gap-1.5 font-medium text-slate-200">
+      <dt className="flex items-center gap-1.5 font-medium text-primary">
         {icon}
         {title}
       </dt>
       <dd className="mt-1">
         {values.length === 0 ? (
-          <span className="text-slate-400">none</span>
+          <span className="text-muted">none</span>
         ) : (
           <ul className="flex flex-wrap gap-1.5">
             {values.map((value) => (
               <li key={value}>
-                <code className="break-all rounded border border-slate-700 bg-slate-950 px-1.5 py-0.5 font-mono text-[11px] text-slate-200">
+                <code className="break-all rounded border border-strong bg-canvas px-1.5 py-0.5 font-mono text-[11px] text-primary">
                   {value}
                 </code>
               </li>

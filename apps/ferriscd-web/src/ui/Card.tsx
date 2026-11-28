@@ -4,12 +4,12 @@ import { cx } from "../utils/cx";
 /** Surface shared by every card in the UI. Exported for card-shaped callers
  *  that must render a different element (e.g. a router `Link`). */
 export const CARD_SURFACE_CLASS =
-  "rounded-xl border border-slate-800 bg-slate-900/70";
+  "rounded-xl border border-default bg-surface/70";
 
 /** Hover treatment for cards that are themselves clickable. The 2px lift is
  *  CSS-only and is neutralised under `prefers-reduced-motion`. */
 export const CARD_INTERACTIVE_CLASS =
-  "motion-interactive motion-lift hover:-translate-y-0.5 hover:border-indigo-500/60 hover:bg-slate-900";
+  "motion-interactive motion-lift hover:-translate-y-0.5 hover:border-indigo-500/60 hover:bg-surface";
 
 export interface CardProps extends HTMLAttributes<HTMLDivElement> {
   /** Adds the hover lift + border/background transition. */

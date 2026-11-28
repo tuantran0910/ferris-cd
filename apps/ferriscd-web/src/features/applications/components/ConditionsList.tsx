@@ -21,19 +21,19 @@ export function ConditionsList({ conditions }: { conditions: ConditionView[] }) 
       {conditions.length === 0 ? (
         <EmptyState bordered={false}>No status conditions recorded yet.</EmptyState>
       ) : (
-        <ol className="relative space-y-3 border-l border-slate-800 pl-6">
+        <ol className="relative space-y-3 border-l border-default pl-6">
           {conditions.map((cond, idx) => {
             const isTrue = cond.status === "True";
             return (
               <li
                 key={`${cond.type}-${cond.lastTransitionTime}-${idx}`}
-                className="relative rounded-xl border border-slate-800 bg-slate-900/70 p-4 text-xs"
+                className="relative rounded-xl border border-default bg-surface/70 p-4 text-xs"
               >
                 <span
                   className={`absolute -left-[33px] top-4 flex h-5 w-5 items-center justify-center rounded-full border ${
                     isTrue
-                      ? "border-emerald-500/50 bg-emerald-950 text-emerald-400"
-                      : "border-rose-500/50 bg-rose-950 text-rose-400"
+                      ? "border-emerald-500/50 bg-success-tint text-success"
+                      : "border-rose-500/50 bg-danger-tint text-danger"
                   }`}
                 >
                   {isTrue ? (
@@ -44,25 +44,25 @@ export function ConditionsList({ conditions }: { conditions: ConditionView[] }) 
                 </span>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-semibold text-slate-100">
+                    <span className="font-semibold text-strong">
                       {cond.type}
                     </span>
-                    <span className="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[11px] text-slate-300">
+                    <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[11px] text-body">
                       status={cond.status}
                     </span>
-                    <span className="max-w-full truncate rounded bg-indigo-500/15 px-1.5 py-0.5 font-mono text-[11px] text-indigo-300">
+                    <span className="max-w-full truncate rounded bg-indigo-500/15 px-1.5 py-0.5 font-mono text-[11px] text-accent">
                       {cond.reason}
                     </span>
                   </div>
                   <time
                     dateTime={cond.lastTransitionTime}
                     title={cond.lastTransitionTime}
-                    className="font-mono text-[11px] text-slate-400"
+                    className="font-mono text-[11px] text-muted"
                   >
                     {formatTimestamp(cond.lastTransitionTime)}
                   </time>
                 </div>
-                <p className="mt-2 break-words leading-relaxed text-slate-300">
+                <p className="mt-2 break-words leading-relaxed text-body">
                   {cond.message}
                 </p>
               </li>

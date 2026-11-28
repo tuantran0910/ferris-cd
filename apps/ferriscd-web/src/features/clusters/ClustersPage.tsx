@@ -93,10 +93,10 @@ export function ClustersPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight text-slate-100">
+        <h1 className="text-2xl font-bold tracking-tight text-strong">
           Clusters
         </h1>
-        <p className="mt-1 text-xs text-slate-300">
+        <p className="mt-1 text-xs text-body">
           {clusters.length === 1
             ? "1 destination cluster visible to your identity"
             : `${clusters.length} destination clusters visible to your identity`}
@@ -179,8 +179,8 @@ function ClusterCard({
   return (
     <Card className="flex h-full flex-col gap-4" data-testid={`cluster-card-${cluster.name}`}>
       <div className="flex flex-wrap items-start justify-between gap-2">
-        <h2 className="flex min-w-0 items-center gap-2 text-base font-semibold text-slate-100">
-          <Server aria-hidden="true" className="h-4 w-4 text-emerald-300" />
+        <h2 className="flex min-w-0 items-center gap-2 text-base font-semibold text-strong">
+          <Server aria-hidden="true" className="h-4 w-4 text-success" />
           <Link
             to={filterLink}
             className="truncate rounded hover:underline"
@@ -212,9 +212,9 @@ function ClusterCard({
       </dl>
 
       <div className="mt-auto flex flex-wrap items-center gap-2 text-xs">
-        <span className="text-slate-300">Rollup:</span>
+        <span className="text-body">Rollup:</span>
         {rollup.total === 0 ? (
-          <span className="text-slate-300">no visible applications</span>
+          <span className="text-body">no visible applications</span>
         ) : (
           <>
             <SyncStatusBadge status={worstSync} compact />
@@ -224,11 +224,11 @@ function ClusterCard({
       </div>
 
       {/* The per-application breakdown stays textual: a colour alone is never the only signal. */}
-      <ul className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-slate-300">
+      <ul className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-body">
         {healthBreakdown(rollup).map(({ status, count }) => (
           <li key={status} data-testid={`cluster-health-${status.toLowerCase()}`}>
             {status}:{" "}
-            <span className="font-mono text-slate-200" data-testid="count">
+            <span className="font-mono text-primary" data-testid="count">
               {count}
             </span>
           </li>
@@ -236,7 +236,7 @@ function ClusterCard({
       </ul>
 
       <p className="text-xs">
-        <Link to={filterLink} className="font-medium text-indigo-300 hover:underline">
+        <Link to={filterLink} className="font-medium text-accent hover:underline">
           View applications on this cluster
         </Link>
       </p>
@@ -267,14 +267,14 @@ function Metric({
 }) {
   return (
     <div>
-      <dt className="text-slate-300">{label}</dt>
+      <dt className="text-body">{label}</dt>
       <dd
         data-testid={`cluster-metric-${testId}`}
         className={`mt-0.5 flex items-center gap-1 font-mono text-sm ${
-          emphasize ? "text-amber-200" : "text-slate-100"
+          emphasize ? "text-warning" : "text-strong"
         }`}
       >
-        <Layers aria-hidden="true" className="h-3.5 w-3.5 text-slate-400" />
+        <Layers aria-hidden="true" className="h-3.5 w-3.5 text-muted" />
         {value}
       </dd>
     </div>

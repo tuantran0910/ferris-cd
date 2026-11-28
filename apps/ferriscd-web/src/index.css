@@ -5,66 +5,69 @@
 @import "./motion/motion.css";
 
 /*
- * Light theme: Tailwind v4 reads every palette utility from these custom
- * properties, so remapping the slate ramp (and the accent shades used as text
- * on dark surfaces) restyles the whole app without duplicating `dark:` classes.
+ * Semantic design tokens (dark defaults). Components use these through
+ * Tailwind utilities (`bg-surface`, `text-body`, ...), so a theme only remaps
+ * tokens instead of reinterpreting the brand palette.
  */
+@theme {
+  --color-canvas: #020617;
+  --color-surface: #0f172a;
+  --color-elevated: #1e293b;
+  --color-muted: #475569;
+  --color-border-subtle: #0f172a;
+  --color-border-default: #1e293b;
+  --color-border-strong: #334155;
+  --color-border-emphasis: #475569;
+  --color-text-strong: #f1f5f9;
+  --color-text-primary: #e2e8f0;
+  --color-text-body: #cbd5e1;
+  --color-text-muted: #94a3b8;
+  --color-text-subtle: #64748b;
+  --color-accent: #a5b4fc;
+  --color-accent-alt: #f0abfc;
+  --color-success: #6ee7b7;
+  --color-warning: #fde68a;
+  --color-danger: #fecdd3;
+  --color-info: #7dd3fc;
+  --color-accent-tint: #1e1b4b;
+  --color-success-tint: #022c22;
+  --color-warning-tint: #451a03;
+  --color-danger-tint: #4c0519;
+  --color-info-tint: #082f49;
+  --color-hint: #94a3b8;
+}
+
 :root[data-theme="dark"] {
   color-scheme: dark;
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --color-slate-950: #f8fafc;
-  --color-slate-900: #ffffff;
-  --color-slate-800: #e2e8f0;
-  --color-slate-700: #cbd5e1;
-  --color-slate-600: #94a3b8;
-  --color-slate-500: #64748b;
-  --color-slate-400: #475569;
-  --color-slate-300: #334155;
-  --color-slate-200: #1e293b;
-  --color-slate-100: #0f172a;
-  --color-slate-50: #020617;
-  --color-indigo-200: #3730a3;
-  --color-indigo-300: #4338ca;
-  --color-indigo-400: #4f46e5;
-  --color-emerald-200: #047857;
-  --color-emerald-300: #047857;
-  --color-emerald-400: #059669;
-  --color-rose-200: #be123c;
-  --color-rose-300: #be123c;
-  --color-rose-400: #e11d48;
-  --color-amber-200: #b45309;
-  --color-amber-300: #b45309;
-  --color-amber-400: #d97706;
-  --color-sky-200: #075985;
-  --color-sky-300: #0369a1;
-  --color-sky-400: #0284c7;
-  --color-cyan-300: #0e7490;
-  --color-cyan-400: #0891b2;
-  --color-violet-300: #6d28d9;
-  --color-violet-400: #7c3aed;
-  --color-fuchsia-300: #a21caf;
-  --color-fuchsia-400: #c026d3;
-  /* Deep tints used as translucent surfaces and as headings on them. */
-  --color-rose-950: #fecdd3;
-  --color-rose-900: #ffe4e6;
-  --color-rose-100: #881337;
-  --color-amber-950: #fde68a;
-  --color-amber-900: #fef3c7;
-  --color-amber-100: #78350f;
-  --color-emerald-950: #a7f3d0;
-  --color-emerald-900: #d1fae5;
-  --color-emerald-100: #064e3b;
-  --color-sky-950: #bae6fd;
-  --color-sky-900: #e0f2fe;
-  --color-sky-100: #0c4a6e;
-  --color-indigo-950: #c7d2fe;
-  --color-indigo-900: #e0e7ff;
-  --color-indigo-100: #312e81;
-  --color-violet-950: #ddd6fe;
-  --color-fuchsia-950: #f5d0fe;
+  --color-canvas: #f8fafc;
+  --color-surface: #ffffff;
+  --color-elevated: #e2e8f0;
+  --color-muted: #64748b;
+  --color-border-subtle: #e2e8f0;
+  --color-border-default: #e2e8f0;
+  --color-border-strong: #cbd5e1;
+  --color-border-emphasis: #94a3b8;
+  --color-text-strong: #0f172a;
+  --color-text-primary: #1e293b;
+  --color-text-body: #334155;
+  --color-text-muted: #475569;
+  --color-text-subtle: #64748b;
+  --color-accent: #4338ca;
+  --color-accent-alt: #a21caf;
+  --color-success: #047857;
+  --color-warning: #b45309;
+  --color-danger: #be123c;
+  --color-info: #0369a1;
+  --color-accent-tint: #c7d2fe;
+  --color-success-tint: #a7f3d0;
+  --color-warning-tint: #fde68a;
+  --color-danger-tint: #fecdd3;
+  --color-info-tint: #bae6fd;
+  --color-hint: #64748b;
 }
 
 @layer base {
@@ -118,20 +121,20 @@
     textarea,
     [tabindex]:not([tabindex="-1"])
   ):focus-visible {
-    outline: 2px solid var(--color-indigo-400);
+    outline: 2px solid var(--color-accent);
     outline-offset: 2px;
   }
 }
 
 /* React Flow dark theme adjustments */
 .react-flow__controls button {
-  background-color: var(--color-slate-800);
-  border-color: var(--color-slate-700);
-  color: var(--color-slate-200);
+  background-color: var(--color-elevated);
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
 }
 
 .react-flow__controls button:hover {
-  background-color: var(--color-slate-700);
+  background-color: var(--color-border-strong);
 }
 
 .react-flow__controls button path {
@@ -139,8 +142,8 @@
 }
 
 .react-flow__minimap {
-  background-color: var(--color-slate-900);
-  border: 1px solid var(--color-slate-700);
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
   border-radius: 0.5rem;
 }
 

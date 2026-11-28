@@ -37,20 +37,20 @@ export function ApplicationCard({ app, listState, index = 0 }: ApplicationCardPr
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <p
-              className="truncate font-mono text-[11px] text-slate-400"
+              className="truncate font-mono text-[11px] text-muted"
               title={app.namespace}
             >
               {app.namespace}
             </p>
             <h2
-              className="truncate text-base font-semibold text-slate-100 group-hover:text-indigo-300"
+              className="truncate text-base font-semibold text-strong group-hover:text-accent"
               title={app.name}
             >
               {app.name}
             </h2>
           </div>
           <span
-            className="max-w-[45%] shrink-0 truncate rounded-md border border-slate-700 bg-slate-950 px-2 py-0.5 font-mono text-[11px] text-slate-300"
+            className="max-w-[45%] shrink-0 truncate rounded-md border border-strong bg-canvas px-2 py-0.5 font-mono text-[11px] text-body"
             title={app.project}
           >
             {app.project}
@@ -89,19 +89,19 @@ export function ApplicationCard({ app, listState, index = 0 }: ApplicationCardPr
             `definition-list`). */}
         <ul
           aria-label="Source and destination"
-          className="mt-4 space-y-1.5 text-xs text-slate-300"
+          className="mt-4 space-y-1.5 text-xs text-body"
         >
           <li className="flex items-center gap-2">
-            <FolderGit2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+            <FolderGit2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-muted" />
             <span
-              className="min-w-0 truncate font-mono text-slate-300"
+              className="min-w-0 truncate font-mono text-body"
               title={app.source.repoUrl}
             >
               {app.source.repoUrl}
             </span>
           </li>
           <li className="flex items-center gap-2">
-            <GitBranch aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+            <GitBranch aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-muted" />
             <span
               className="min-w-0 truncate font-mono"
               title={`${app.source.targetRevision} @ ${app.sync?.revision ?? "unknown revision"}`}
@@ -110,7 +110,7 @@ export function ApplicationCard({ app, listState, index = 0 }: ApplicationCardPr
             </span>
           </li>
           <li className="flex items-center gap-2">
-            <Server aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+            <Server aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-muted" />
             <span className="min-w-0 truncate font-mono">
               {app.destination.cluster} / {app.destination.namespace}
             </span>
@@ -118,12 +118,12 @@ export function ApplicationCard({ app, listState, index = 0 }: ApplicationCardPr
         </ul>
       </div>
 
-      <div className="mt-4 flex items-center justify-between border-t border-slate-800/80 pt-3 text-[11px] text-slate-300">
+      <div className="mt-4 flex items-center justify-between border-t border-default/80 pt-3 text-[11px] text-body">
         <span className="inline-flex items-center gap-1">
-          <Box aria-hidden="true" className="h-3.5 w-3.5 text-slate-400" />
+          <Box aria-hidden="true" className="h-3.5 w-3.5 text-muted" />
           {app.resourceCount} resources
         </span>
-        <span className="font-mono text-slate-300">{app.source.renderer}</span>
+        <span className="font-mono text-body">{app.source.renderer}</span>
       </div>
     </Link>
   );

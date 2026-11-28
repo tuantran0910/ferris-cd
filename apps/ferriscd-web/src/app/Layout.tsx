@@ -1,4 +1,4 @@
-import { FolderGit2, Layers, LogOut, Moon, Search, Server, Sun } from "lucide-react";
+import { FolderGit2, Layers, LogOut, Monitor, Moon, Search, Server, Sun } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { flushSync } from "react-dom";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
@@ -10,11 +10,13 @@ import {
   useCommandPaletteShortcut,
 } from "./CommandPalette";
 import {
-  applyTheme,
+  applyMode,
   applyThemeTransition,
-  currentTheme,
-  nextTheme,
+  nextMode,
+  readMode,
+  resolveMode,
   type Theme,
+  type ThemeMode,
 } from "./theme";
 
 const NAV_ITEMS = [
@@ -45,16 +47,35 @@ export function Layout() {
   const { baseUrl, logout, sessionStatus, beginSsoLogin, ssoAvailable } = useAuth();
   const { pathname } = useLocation();
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [theme, setTheme] = useState<Theme>(currentTheme);
+  const [mode, setMode] = useState<ThemeMode>(readMode);
+  const [theme, setTheme] = useState<Theme>(() => resolveMode(readMode()));
 
   const togglePalette = useCallback(() => setPaletteOpen((open) => !open), []);
   const toggleTheme = useCallback(() => {
-    const next = nextTheme(theme);
+    const next = nextMode(mode);
     applyThemeTransition(() => {
-      applyTheme(next);
-      flushSync(() => setTheme(next));
+      const resolved = applyMode(next);
+      flushSync(() => {
+        setMode(next);
+        setTheme(resolved);
+      });
     });
-  }, [theme]);
+  }, [mode]);
+
+  // `system` must follow the OS live, not just at first paint.
+  useEffect(() => {
+    if (mode !== "system" || typeof window.matchMedia !== "function") {
+      return;
+    }
+    const query = window.matchMedia("(prefers-color-scheme: light)");
+    const onChange = () => {
+      const resolved = resolveMode("system");
+      document.documentElement.dataset.theme = resolved;
+      setTheme(resolved);
+    };
+    query.addEventListener?.("change", onChange);
+    return () => query.removeEventListener?.("change", onChange);
+  }, [mode]);
   useCommandPaletteShortcut(togglePalette);
 
   // A new route starts at the top of the page. Assigning `scrollTop` (rather
@@ -67,7 +88,7 @@ export function Layout() {
   }, [pathname]);
 
   return (
-    <div className="flex min-h-screen flex-col bg-slate-950 text-slate-100">
+    <div className="flex min-h-screen flex-col bg-canvas text-strong">
       <a
         href="#main-content"
         data-testid="skip-to-content"
@@ -76,12 +97,12 @@ export function Layout() {
         Skip to main content
       </a>
 
-      <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-950/90 backdrop-blur">
+      <header className="sticky top-0 z-30 border-b border-default bg-canvas/90 backdrop-blur">
         <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4 sm:px-6">
           <div className="flex items-center gap-6">
             <Link
               to="/"
-              className="flex items-center gap-2.5 font-semibold tracking-tight text-slate-100 transition-colors hover:text-slate-100"
+              className="flex items-center gap-2.5 font-semibold tracking-tight text-strong transition-colors hover:text-strong"
             >
               <img
                 src="/ferriscd-mark.svg"
@@ -101,12 +122,12 @@ export function Layout() {
                   className={({ isActive }) =>
                     `inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
                       isActive
-                        ? "bg-slate-800 text-slate-100"
-                        : "text-slate-200 hover:bg-slate-800/80 hover:text-slate-100"
+                        ? "bg-elevated text-strong"
+                        : "text-primary hover:bg-elevated/80 hover:text-strong"
                     }`
                   }
                 >
-                  <item.icon className="h-4 w-4 text-indigo-300" aria-hidden="true" />
+                  <item.icon className="h-4 w-4 text-accent" aria-hidden="true" />
                   {item.label}
                 </NavLink>
               ))}
@@ -117,12 +138,14 @@ export function Layout() {
             <button
               type="button"
               onClick={toggleTheme}
-              aria-label={`Switch to ${nextTheme(theme)} theme`}
-              title={`Switch to ${nextTheme(theme)} theme`}
+              aria-label={`Theme: ${mode}. Switch to ${nextMode(mode)}.`}
+              title={`Theme: ${mode}. Switch to ${nextMode(mode)}.`}
               data-testid="theme-toggle"
-              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-700 bg-slate-900 text-slate-300 transition-colors hover:border-slate-600 hover:bg-slate-800 hover:text-slate-100"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-strong bg-surface text-body transition-colors hover:border-emphasis hover:bg-elevated hover:text-strong"
             >
-              {theme === "light" ? (
+              {mode === "system" ? (
+                <Monitor aria-hidden="true" className="h-4 w-4" />
+              ) : theme === "light" ? (
                 <Moon aria-hidden="true" className="h-4 w-4" />
               ) : (
                 <Sun aria-hidden="true" className="h-4 w-4" />
@@ -133,19 +156,19 @@ export function Layout() {
               onClick={() => setPaletteOpen(true)}
               aria-keyshortcuts="Meta+K Control+K"
               title={`Search everything (${COMMAND_PALETTE_HINT})`}
-              className="hidden items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-200 transition-colors hover:border-slate-600 hover:bg-slate-800 sm:inline-flex"
+              className="hidden items-center gap-2 rounded-lg border border-strong bg-surface px-2.5 py-1.5 text-xs text-primary transition-colors hover:border-emphasis hover:bg-elevated sm:inline-flex"
             >
-              <Search aria-hidden="true" className="h-3.5 w-3.5 text-slate-300" />
+              <Search aria-hidden="true" className="h-3.5 w-3.5 text-body" />
               <span>Search</span>
-              <kbd className="rounded border border-slate-600 bg-slate-950 px-1 py-0.5 font-mono text-[10px] text-slate-200">
+              <kbd className="rounded border border-emphasis bg-canvas px-1 py-0.5 font-mono text-[10px] text-primary">
                 ⌘K
               </kbd>
             </button>
             <span
-              className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-slate-800 bg-slate-900 px-2.5 py-1 font-mono text-xs text-slate-300 sm:inline-flex"
+              className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-default bg-surface px-2.5 py-1 font-mono text-xs text-body sm:inline-flex"
               title={`Connected FerrisCD API endpoint: ${baseUrl || "same-origin"}`}
             >
-              <Server className="h-3.5 w-3.5 shrink-0 text-emerald-300" aria-hidden="true" />
+              <Server className="h-3.5 w-3.5 shrink-0 text-success" aria-hidden="true" />
               <span className="truncate">{baseUrl || "same-origin"}</span>
             </span>
             <Button
@@ -166,7 +189,7 @@ export function Layout() {
       {sessionStatus === "expiring" && (
         <div
           role="status"
-          className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-200 sm:px-6"
+          className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-warning sm:px-6"
         >
           <div className="mx-auto flex max-w-7xl items-center justify-between gap-3">
             <span>
@@ -177,7 +200,7 @@ export function Layout() {
               <button
                 type="button"
                 onClick={() => void beginSsoLogin()}
-                className="shrink-0 rounded-md border border-amber-400/50 bg-amber-500/20 px-2.5 py-1 font-semibold text-amber-100 transition-colors hover:bg-amber-500/30"
+                className="shrink-0 rounded-md border border-amber-400/50 bg-amber-500/20 px-2.5 py-1 font-semibold text-warning transition-colors hover:bg-amber-500/30"
               >
                 Re-authenticate
               </button>

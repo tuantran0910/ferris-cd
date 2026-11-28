@@ -39,17 +39,17 @@ type DiffStatusFilter =
 function getDiffStatusBadge(status: string): string {
   switch (status) {
     case "Synced":
-      return "border-emerald-500/40 bg-emerald-500/15 text-emerald-300";
+      return "border-emerald-500/40 bg-emerald-500/15 text-success";
     case "OutOfSync":
-      return "border-amber-500/40 bg-amber-500/15 text-amber-300";
+      return "border-amber-500/40 bg-amber-500/15 text-warning";
     case "Missing":
-      return "border-sky-500/40 bg-sky-500/15 text-sky-300";
+      return "border-sky-500/40 bg-sky-500/15 text-info";
     case "Orphaned":
-      return "border-rose-500/40 bg-rose-500/15 text-rose-300";
+      return "border-rose-500/40 bg-rose-500/15 text-danger";
     case "OwnershipConflict":
-      return "border-fuchsia-500/40 bg-fuchsia-500/15 text-fuchsia-300";
+      return "border-fuchsia-500/40 bg-fuchsia-500/15 text-accent-alt";
     default:
-      return "border-slate-600 bg-slate-800 text-slate-300";
+      return "border-emphasis bg-elevated text-body";
   }
 }
 
@@ -64,9 +64,9 @@ function RenderedDiffValue({
     return (
       <span
         data-testid="redacted-secret-badge"
-        className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/50 bg-amber-500/15 px-2 py-0.5 font-mono text-xs font-semibold text-amber-200"
+        className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/50 bg-amber-500/15 px-2 py-0.5 font-mono text-xs font-semibold text-warning"
       >
-        <Lock className="h-3 w-3 shrink-0 text-amber-400" aria-hidden="true" />
+        <Lock className="h-3 w-3 shrink-0 text-warning" aria-hidden="true" />
         {value}
       </span>
     );
@@ -76,17 +76,17 @@ function RenderedDiffValue({
   const hasInlineRedacted = containsRedactedMarker(value);
   const toneClass =
     tone === "live"
-      ? "text-rose-200"
+      ? "text-danger"
       : tone === "predicted"
-        ? "text-emerald-200"
-        : "text-slate-200";
+        ? "text-success"
+        : "text-primary";
 
   return (
     <div className="space-y-1">
       {hasInlineRedacted && (
         <span
           data-testid="redacted-secret-badge"
-          className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-200"
+          className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-warning"
         >
           <Lock className="h-2.5 w-2.5" aria-hidden="true" />
           Secret Redacted
@@ -105,43 +105,43 @@ function SideBySideChanges({ changes }: { changes: DiffChange[] }) {
   return (
     <div
       data-testid="diff-side-by-side"
-      className="overflow-x-auto rounded-lg border border-slate-800"
+      className="overflow-x-auto rounded-lg border border-default"
     >
       <table className="w-full table-fixed text-left text-xs">
-        <thead className="border-b border-slate-800 bg-slate-950/90 text-[11px] uppercase tracking-wider text-slate-400">
+        <thead className="border-b border-default bg-canvas/90 text-[11px] uppercase tracking-wider text-muted">
           <tr>
             <th className="w-1/4 px-3 py-2">Field Path</th>
-            <th className="w-[37.5%] border-l border-slate-800 px-3 py-2 text-rose-300">
+            <th className="w-[37.5%] border-l border-default px-3 py-2 text-danger">
               Live (Cluster)
             </th>
-            <th className="w-[37.5%] border-l border-slate-800 px-3 py-2 text-emerald-300">
+            <th className="w-[37.5%] border-l border-default px-3 py-2 text-success">
               Predicted (Git / SSA Dry-Run)
             </th>
           </tr>
         </thead>
-        <tbody className="divide-y divide-slate-800/80">
+        <tbody className="divide-y divide-default/80">
           {changes.map((change, idx) => (
             <tr key={`${change.path}-${idx}`} className="align-top">
               <td className="px-3 py-2.5">
-                <div className="break-all font-mono text-xs text-slate-200">
+                <div className="break-all font-mono text-xs text-primary">
                   {change.path}
                 </div>
-                <span className="mt-1 inline-block rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] uppercase text-slate-400">
+                <span className="mt-1 inline-block rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] uppercase text-muted">
                   {change.kind}
                 </span>
               </td>
-              <td className="border-l border-slate-800 bg-rose-950/15 px-3 py-2.5">
+              <td className="border-l border-default bg-danger-tint/15 px-3 py-2.5">
                 {change.kind === "added" ? (
-                  <span className="font-mono text-xs italic text-slate-500">
+                  <span className="font-mono text-xs italic text-subtle">
                     (absent)
                   </span>
                 ) : (
                   <RenderedDiffValue value={change.live} tone="live" />
                 )}
               </td>
-              <td className="border-l border-slate-800 bg-emerald-950/15 px-3 py-2.5">
+              <td className="border-l border-default bg-success-tint/15 px-3 py-2.5">
                 {change.kind === "removed" ? (
-                  <span className="font-mono text-xs italic text-slate-500">
+                  <span className="font-mono text-xs italic text-subtle">
                     (removed)
                   </span>
                 ) : (
@@ -160,29 +160,29 @@ function UnifiedChanges({ changes }: { changes: DiffChange[] }) {
   return (
     <div
       data-testid="diff-unified"
-      className="divide-y divide-slate-800 rounded-lg border border-slate-800 bg-slate-950 font-mono text-xs"
+      className="divide-y divide-default rounded-lg border border-default bg-canvas font-mono text-xs"
     >
       {changes.map((change, idx) => (
         <div key={`${change.path}-${idx}`} className="p-3">
-          <div className="mb-1.5 flex items-center gap-2 text-slate-400">
-            <span className="font-semibold text-indigo-300">
+          <div className="mb-1.5 flex items-center gap-2 text-muted">
+            <span className="font-semibold text-accent">
               @@ {change.path} @@
             </span>
-            <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] uppercase">
+            <span className="rounded bg-elevated px-1.5 py-0.5 text-[10px] uppercase">
               {change.kind}
             </span>
           </div>
           {change.kind !== "added" && (
-            <div className="flex items-start gap-2 rounded bg-rose-950/35 px-2.5 py-1.5 text-rose-200">
-              <span className="select-none font-bold text-rose-400">-</span>
+            <div className="flex items-start gap-2 rounded bg-danger-tint/35 px-2.5 py-1.5 text-danger">
+              <span className="select-none font-bold text-danger">-</span>
               <div className="min-w-0 flex-1">
                 <RenderedDiffValue value={change.live} tone="live" />
               </div>
             </div>
           )}
           {change.kind !== "removed" && (
-            <div className="mt-1 flex items-start gap-2 rounded bg-emerald-950/35 px-2.5 py-1.5 text-emerald-200">
-              <span className="select-none font-bold text-emerald-400">+</span>
+            <div className="mt-1 flex items-start gap-2 rounded bg-success-tint/35 px-2.5 py-1.5 text-success">
+              <span className="select-none font-bold text-success">+</span>
               <div className="min-w-0 flex-1">
                 <RenderedDiffValue value={change.predicted} tone="predicted" />
               </div>
@@ -214,11 +214,11 @@ function ResourceDiffCard({
   return (
     <article
       data-testid={`diff-resource-${resource.key}`}
-      className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 motion-fade-in"
+      className="rounded-xl border border-default bg-surface/70 p-4 motion-fade-in"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <code className="break-all font-mono text-xs font-semibold text-slate-100">
+          <code className="break-all font-mono text-xs font-semibold text-strong">
             {resource.key}
           </code>
           <span
@@ -231,20 +231,20 @@ function ResourceDiffCard({
           {conflicts.length > 0 && (
             <span
               data-testid="field-conflict-badge"
-              className="inline-flex items-center gap-1 rounded-full border border-rose-500/50 bg-rose-500/20 px-2 py-0.5 text-[11px] font-medium text-rose-200"
+              className="inline-flex items-center gap-1 rounded-full border border-rose-500/50 bg-rose-500/20 px-2 py-0.5 text-[11px] font-medium text-danger"
             >
               <ShieldAlert className="h-3 w-3" />
               FieldConflict ({conflicts.length})
             </span>
           )}
           {hasRedactedValues && (
-            <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-200">
+            <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-warning">
               <Lock className="h-3 w-3" />
               Secret Redacted
             </span>
           )}
           {resource.truncated && (
-            <span className="inline-flex items-center gap-1 rounded-full border border-slate-600 bg-slate-800 px-2 py-0.5 text-[11px] text-slate-300">
+            <span className="inline-flex items-center gap-1 rounded-full border border-emphasis bg-elevated px-2 py-0.5 text-[11px] text-body">
               <FileWarning className="h-3 w-3" />
               Diff Truncated
             </span>
@@ -253,8 +253,8 @@ function ResourceDiffCard({
       </div>
 
       {resource.status === "OwnershipConflict" && resource.owner && (
-        <div className="mt-3 flex items-center gap-2 rounded-lg border border-fuchsia-500/40 bg-fuchsia-500/10 px-3 py-2 text-xs text-fuchsia-200">
-          <AlertOctagon className="h-4 w-4 shrink-0 text-fuchsia-400" />
+        <div className="mt-3 flex items-center gap-2 rounded-lg border border-fuchsia-500/40 bg-fuchsia-500/10 px-3 py-2 text-xs text-accent-alt">
+          <AlertOctagon className="h-4 w-4 shrink-0 text-accent-alt" />
           <span>
             Owned by another FerrisCD application:{" "}
             <code className="font-mono font-semibold">{resource.owner}</code>
@@ -265,22 +265,22 @@ function ResourceDiffCard({
       {conflicts.length > 0 && (
         <div
           data-testid="field-conflict-list"
-          className="mt-3 rounded-lg border border-rose-500/40 bg-rose-950/30 p-3 text-xs"
+          className="mt-3 rounded-lg border border-rose-500/40 bg-danger-tint/30 p-3 text-xs"
         >
-          <p className="flex items-center gap-1.5 font-semibold text-rose-200">
-            <AlertTriangle className="h-4 w-4 text-rose-400" />
+          <p className="flex items-center gap-1.5 font-semibold text-danger">
+            <AlertTriangle className="h-4 w-4 text-danger" />
             Server-Side Apply Field-Ownership Conflicts
           </p>
           <ul className="mt-2 space-y-1.5">
             {conflicts.map((conflict, idx) => (
               <li
                 key={`${conflict.field ?? "field"}-${conflict.manager ?? "mgr"}-${idx}`}
-                className="flex flex-wrap items-center gap-2 font-mono text-rose-100"
+                className="flex flex-wrap items-center gap-2 font-mono text-danger"
               >
-                <span className="rounded bg-rose-500/25 px-1.5 py-0.5 text-[11px] font-semibold text-rose-200">
+                <span className="rounded bg-rose-500/25 px-1.5 py-0.5 text-[11px] font-semibold text-danger">
                   manager: {conflict.manager ?? "unknown"}
                 </span>
-                <span className="break-all text-slate-200">
+                <span className="break-all text-primary">
                   {conflict.field ?? "(unspecified field)"}
                 </span>
               </li>
@@ -298,17 +298,17 @@ function ResourceDiffCard({
           )}
         </div>
       ) : resource.status === "Synced" ? (
-        <p className="mt-2 flex items-center gap-1.5 text-xs text-emerald-300/90">
+        <p className="mt-2 flex items-center gap-1.5 text-xs text-success/90">
           <CheckCircle2 className="h-3.5 w-3.5" />
           Live cluster state matches SSA dry-run prediction.
         </p>
       ) : resource.status === "Missing" ? (
-        <p className="mt-2 text-xs text-sky-300/90">
+        <p className="mt-2 text-xs text-info/90">
           Resource does not exist in the destination cluster yet and will be
           created on sync.
         </p>
       ) : resource.status === "Orphaned" ? (
-        <p className="mt-2 text-xs text-rose-300/90">
+        <p className="mt-2 text-xs text-danger/90">
           Tracked in inventory but no longer rendered from Git. Will be pruned
           if <code className="font-mono">syncPolicy.automated.prune</code> is
           enabled.
@@ -344,8 +344,8 @@ function PolicyViolationsBanner({
       aria-labelledby="policy-violations-heading"
       className={`rounded-xl border px-4 py-3 ${
         isBlocking
-          ? "border-rose-500/50 bg-rose-950/30"
-          : "border-amber-500/40 bg-amber-950/20"
+          ? "border-rose-500/50 bg-danger-tint/30"
+          : "border-amber-500/40 bg-warning-tint/20"
       }`}
     >
       <h2
@@ -354,25 +354,25 @@ function PolicyViolationsBanner({
       >
         {isBlocking ? (
           <ShieldAlert
-            className="h-4 w-4 shrink-0 text-rose-400"
+            className="h-4 w-4 shrink-0 text-danger"
             aria-hidden="true"
           />
         ) : (
           <AlertTriangle
-            className="h-4 w-4 shrink-0 text-amber-400"
+            className="h-4 w-4 shrink-0 text-warning"
             aria-hidden="true"
           />
         )}
-        <span className={isBlocking ? "text-rose-200" : "text-amber-200"}>
+        <span className={isBlocking ? "text-danger" : "text-warning"}>
           Policy Violations
         </span>
-        <span className="rounded-full border border-slate-700 bg-slate-950 px-2 py-0.5 text-[11px] font-medium text-slate-300">
+        <span className="rounded-full border border-strong bg-canvas px-2 py-0.5 text-[11px] font-medium text-body">
           {isBlocking
             ? `${blocking.length} blocking`
             : `${advisories.length} advisory`}
         </span>
       </h2>
-      <p className="mt-1 text-xs text-slate-300">
+      <p className="mt-1 text-xs text-body">
         {isBlocking
           ? "The sync is refused until these manifests comply: nothing is applied and nothing is pruned."
           : "The sync proceeds; these rules only advise."}
@@ -382,22 +382,22 @@ function PolicyViolationsBanner({
           <li
             key={`${violation.rule}-${violation.resourceKey}-${violation.message}`}
             data-testid="policy-violation"
-            className="flex flex-wrap items-baseline gap-2 rounded-lg border border-slate-800 bg-slate-950/70 px-2.5 py-1.5 text-xs"
+            className="flex flex-wrap items-baseline gap-2 rounded-lg border border-default bg-canvas/70 px-2.5 py-1.5 text-xs"
           >
             <span
               className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
                 isBlockingEnforcement(violation.enforcement)
-                  ? "bg-rose-500/20 text-rose-200"
-                  : "bg-amber-500/20 text-amber-200"
+                  ? "bg-rose-500/20 text-danger"
+                  : "bg-amber-500/20 text-warning"
               }`}
             >
               {violation.enforcement}
             </span>
-            <code className="font-mono text-indigo-300">{violation.rule}</code>
-            <code className="break-all font-mono text-slate-400">
+            <code className="font-mono text-accent">{violation.rule}</code>
+            <code className="break-all font-mono text-muted">
               {violation.resourceKey}
             </code>
-            <span className="text-slate-200">{violation.message}</span>
+            <span className="text-primary">{violation.message}</span>
           </li>
         ))}
       </ul>
@@ -463,12 +463,12 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
         />
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-xs">
-        <div className="flex flex-wrap items-center gap-3 text-slate-300">
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-default bg-surface/60 px-4 py-3 text-xs">
+        <div className="flex flex-wrap items-center gap-3 text-body">
           <span className="min-w-0">
             Revision:{" "}
             <code
-              className="break-all rounded bg-slate-950 px-1.5 py-0.5 font-mono text-indigo-300"
+              className="break-all rounded bg-canvas px-1.5 py-0.5 font-mono text-accent"
               title={diff.revision}
             >
               {diff.revision}
@@ -476,12 +476,12 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
           </span>
           <span>
             Desired resources:{" "}
-            <strong className="text-slate-100">{diff.desired}</strong>
+            <strong className="text-strong">{diff.desired}</strong>
           </span>
           <span>
             Would sync:{" "}
             <strong
-              className={diff.wouldSync ? "text-amber-300" : "text-emerald-300"}
+              className={diff.wouldSync ? "text-warning" : "text-success"}
             >
               {diff.wouldSync ? "Yes" : "No"}
             </strong>
@@ -491,7 +491,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
         <div
           role="group"
           aria-label="Diff display mode"
-          className="inline-flex rounded-lg border border-slate-700 bg-slate-950 p-0.5"
+          className="inline-flex rounded-lg border border-strong bg-canvas p-0.5"
         >
           <button
             type="button"
@@ -500,7 +500,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
               viewMode === "side-by-side"
                 ? "bg-indigo-600 text-white"
-                : "text-slate-300 hover:text-slate-100"
+                : "text-body hover:text-strong"
             }`}
           >
             <Columns2 className="h-3.5 w-3.5" />
@@ -513,7 +513,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
               viewMode === "unified"
                 ? "bg-indigo-600 text-white"
-                : "text-slate-300 hover:text-slate-100"
+                : "text-body hover:text-strong"
             }`}
           >
             <Rows3 className="h-3.5 w-3.5" />
@@ -524,14 +524,14 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
 
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative min-w-[220px] flex-1">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
           <input
             type="search"
             aria-label="Filter diff resources"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Filter resources by GKNN key..."
-            className="w-full rounded-lg border border-slate-700 bg-slate-900 py-2 pl-9 pr-3 text-xs text-slate-100 transition-colors placeholder-slate-500 focus:border-indigo-500 focus:outline-none"
+            className="w-full rounded-lg border border-strong bg-surface py-2 pl-9 pr-3 text-xs text-strong transition-colors placeholder-hint focus:border-indigo-500 focus:outline-none"
           />
         </div>
         <Select
@@ -578,16 +578,16 @@ function SummaryStat({
   tone: "slate" | "emerald" | "amber" | "sky" | "rose" | "fuchsia";
 }) {
   const colorMap: Record<typeof tone, string> = {
-    slate: "text-slate-100",
-    emerald: "text-emerald-300",
-    amber: "text-amber-300",
-    sky: "text-sky-300",
-    rose: "text-rose-300",
-    fuchsia: "text-fuchsia-300",
+    slate: "text-strong",
+    emerald: "text-success",
+    amber: "text-warning",
+    sky: "text-info",
+    rose: "text-danger",
+    fuchsia: "text-accent-alt",
   };
   return (
-    <div className="rounded-lg border border-slate-800 bg-slate-900/80 px-3 py-2">
-      <p className="text-[11px] text-slate-400">{label}</p>
+    <div className="rounded-lg border border-default bg-surface/80 px-3 py-2">
+      <p className="text-[11px] text-muted">{label}</p>
       <p className={`mt-0.5 text-lg font-semibold ${colorMap[tone]}`}>
         {value}
       </p>

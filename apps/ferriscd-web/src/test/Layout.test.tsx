@@ -70,19 +70,21 @@ describe("Layout accessibility (T17.3)", () => {
 
   it("toggles the theme and persists the choice", async () => {
     const user = userEvent.setup();
-    document.documentElement.dataset.theme = "dark";
+    window.localStorage.setItem("ferriscd-theme", "light");
+    document.documentElement.dataset.theme = "light";
     renderShell();
+
+    await user.click(screen.getByTestId("theme-toggle"));
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(window.localStorage.getItem("ferriscd-theme")).toBe("dark");
+
+    await user.click(screen.getByTestId("theme-toggle"));
+    expect(document.documentElement.dataset.themeMode).toBe("system");
+    expect(window.localStorage.getItem("ferriscd-theme")).toBe("system");
 
     await user.click(screen.getByTestId("theme-toggle"));
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(window.localStorage.getItem("ferriscd-theme")).toBe("light");
-    expect(screen.getByTestId("theme-toggle")).toHaveAttribute(
-      "aria-label",
-      "Switch to dark theme",
-    );
-
-    await user.click(screen.getByTestId("theme-toggle"));
-    expect(document.documentElement.dataset.theme).toBe("dark");
   });
 
   it("offers Insights-free primary navigation to Applications, Projects and Clusters", () => {

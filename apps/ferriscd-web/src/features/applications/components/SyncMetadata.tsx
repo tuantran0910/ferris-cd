@@ -38,15 +38,15 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
 
   return (
     <Card className="text-xs">
-      <p className="flex items-center gap-1.5 font-semibold uppercase tracking-wider text-slate-400">
-        <GitBranch className="h-3.5 w-3.5 text-amber-400" />
+      <p className="flex items-center gap-1.5 font-semibold uppercase tracking-wider text-muted">
+        <GitBranch className="h-3.5 w-3.5 text-warning" />
         Sync Metadata
       </p>
       <dl className="mt-3 space-y-1.5">
         <div className="flex justify-between gap-3">
-          <dt className="shrink-0 text-slate-500">Rendered Revision</dt>
+          <dt className="shrink-0 text-subtle">Rendered Revision</dt>
           <dd
-            className="min-w-0 break-all text-right font-mono text-slate-200"
+            className="min-w-0 break-all text-right font-mono text-primary"
             title={app.sync?.revision ?? undefined}
           >
             {renderedRevision ? (
@@ -54,7 +54,7 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
                 href={renderedRevision}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-indigo-300 hover:decoration-indigo-400"
+                className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-accent hover:decoration-indigo-400"
               >
                 {shortRevision(app.sync?.revision, 12)}
               </a>
@@ -64,9 +64,9 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
           </dd>
         </div>
         <div className="flex justify-between gap-3">
-          <dt className="shrink-0 text-slate-500">Last Synced Revision</dt>
+          <dt className="shrink-0 text-subtle">Last Synced Revision</dt>
           <dd
-            className="min-w-0 break-all text-right font-mono text-slate-200"
+            className="min-w-0 break-all text-right font-mono text-primary"
             title={app.sync?.lastSyncedRevision ?? undefined}
           >
             {lastSyncedRevision ? (
@@ -74,7 +74,7 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
                 href={lastSyncedRevision}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-indigo-300 hover:decoration-indigo-400"
+                className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-accent hover:decoration-indigo-400"
               >
                 {shortRevision(app.sync?.lastSyncedRevision, 12)}
               </a>
@@ -84,9 +84,9 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
           </dd>
         </div>
         <div className="flex justify-between gap-3">
-          <dt className="shrink-0 text-slate-500">Last Synced At</dt>
+          <dt className="shrink-0 text-subtle">Last Synced At</dt>
           <dd
-            className="text-right font-mono text-slate-200"
+            className="text-right font-mono text-primary"
             title={app.sync?.lastSyncedAt ?? undefined}
           >
             {formatTimestamp(app.sync?.lastSyncedAt)}
@@ -95,9 +95,9 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
         {showPerSource ? (
           <div
             data-testid="per-source-revisions"
-            className="border-t border-slate-700/60 pt-1.5"
+            className="border-t border-strong/60 pt-1.5"
           >
-            <p className="text-slate-500">Source Revisions</p>
+            <p className="text-subtle">Source Revisions</p>
             <ul aria-label="Source revisions" className="mt-1 space-y-1">
               {perSource.map((revision, index) => {
                 // The API reports the revisions in `spec.sources` declaration
@@ -113,11 +113,11 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
                     data-testid={`source-revision-${index}`}
                     className="flex justify-between gap-3"
                   >
-                    <span className="shrink-0 font-mono text-slate-400">
+                    <span className="shrink-0 font-mono text-muted">
                       {alias ?? `source ${index + 1}`}
                     </span>
                     <span
-                      className="min-w-0 break-all text-right font-mono text-slate-200"
+                      className="min-w-0 break-all text-right font-mono text-primary"
                       title={revision}
                     >
                       {href ? (
@@ -125,7 +125,7 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
                           href={href}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-indigo-300 hover:decoration-indigo-400"
+                          className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-accent hover:decoration-indigo-400"
                         >
                           {shortRevision(revision, 12)}
                         </a>

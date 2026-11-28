@@ -14,14 +14,14 @@ export type BadgeTone =
 export type BadgeSize = "sm" | "md";
 
 const TONE_CLASSES: Record<BadgeTone, string> = {
-  neutral: "border-slate-600/60 bg-slate-800 text-slate-300",
-  info: "border-sky-500/40 bg-sky-500/15 text-sky-300",
-  success: "border-emerald-500/40 bg-emerald-500/15 text-emerald-300",
-  warning: "border-amber-500/40 bg-amber-500/15 text-amber-300",
+  neutral: "border-emphasis/60 bg-elevated text-body",
+  info: "border-sky-500/40 bg-sky-500/15 text-info",
+  success: "border-emerald-500/40 bg-emerald-500/15 text-success",
+  warning: "border-amber-500/40 bg-amber-500/15 text-warning",
   orange: "border-orange-500/40 bg-orange-500/15 text-orange-300",
-  danger: "border-rose-500/40 bg-rose-500/15 text-rose-300",
-  violet: "border-violet-500/40 bg-violet-500/15 text-violet-300",
-  fuchsia: "border-fuchsia-500/40 bg-fuchsia-500/15 text-fuchsia-300",
+  danger: "border-rose-500/40 bg-rose-500/15 text-danger",
+  violet: "border-violet-500/40 bg-violet-500/15 text-accent-alt",
+  fuchsia: "border-fuchsia-500/40 bg-fuchsia-500/15 text-accent-alt",
 };
 
 const SIZE_CLASSES: Record<BadgeSize, string> = {

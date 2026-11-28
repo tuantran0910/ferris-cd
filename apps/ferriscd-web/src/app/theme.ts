@@ -1,31 +1,58 @@
 export type Theme = "light" | "dark";
+export type ThemeMode = Theme | "system";
 
 const STORAGE_KEY = "ferriscd-theme";
 
-/** The theme the page was painted with, falling back to the OS preference. */
-export function currentTheme(): Theme {
-  const applied = document.documentElement.dataset.theme;
-  if (applied === "light" || applied === "dark") {
-    return applied;
-  }
+function systemTheme(): Theme {
   const prefersLight =
     typeof window.matchMedia === "function" &&
     window.matchMedia("(prefers-color-scheme: light)").matches;
   return prefersLight ? "light" : "dark";
 }
 
-/** Applies a theme and remembers the explicit choice for the next visit. */
-export function applyTheme(theme: Theme): void {
-  document.documentElement.dataset.theme = theme;
+/** The explicit choice (or `system` when the operator never chose). */
+export function readMode(): ThemeMode {
   try {
-    window.localStorage.setItem(STORAGE_KEY, theme);
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    if (stored === "light" || stored === "dark" || stored === "system") {
+      return stored;
+    }
   } catch {
-    // Private mode / blocked storage: the theme still applies for this page.
+    // Storage blocked: fall back to the OS preference.
   }
+  return "system";
 }
 
-export function nextTheme(theme: Theme): Theme {
-  return theme === "light" ? "dark" : "light";
+export function resolveMode(mode: ThemeMode): Theme {
+  return mode === "system" ? systemTheme() : mode;
+}
+
+/** The theme currently painted on the document. */
+export function currentTheme(): Theme {
+  const applied = document.documentElement.dataset.theme;
+  if (applied === "light" || applied === "dark") {
+    return applied;
+  }
+  return resolveMode(readMode());
+}
+
+/** Applies a mode, remembers it, and returns the resolved theme. */
+export function applyMode(mode: ThemeMode): Theme {
+  const resolved = resolveMode(mode);
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.dataset.themeMode = mode;
+  try {
+    window.localStorage.setItem(STORAGE_KEY, mode);
+  } catch {
+    // The theme still applies for this page.
+  }
+  return resolved;
+}
+
+export function nextMode(mode: ThemeMode): ThemeMode {
+  if (mode === "light") return "dark";
+  if (mode === "dark") return "system";
+  return "light";
 }
 
 /**

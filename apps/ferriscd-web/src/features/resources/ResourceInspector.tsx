@@ -68,14 +68,14 @@ export function ResourceInspector({
       <aside
         aria-label="Resource Inspector"
         data-testid="resource-inspector"
-        className="motion-slide-in-right fixed inset-y-0 right-0 z-40 flex w-full max-w-md flex-col border-l border-slate-800 bg-slate-900 shadow-2xl"
+        className="motion-slide-in-right fixed inset-y-0 right-0 z-40 flex w-full max-w-md flex-col border-l border-default bg-surface shadow-2xl"
       >
-      <div className="flex items-start justify-between gap-3 border-b border-slate-800 px-5 py-4">
+      <div className="flex items-start justify-between gap-3 border-b border-default px-5 py-4">
         <div className="min-w-0">
-          <p className="text-xs font-medium uppercase tracking-wider text-indigo-400">
+          <p className="text-xs font-medium uppercase tracking-wider text-accent">
             {resource.kind}
           </p>
-          <h3 className="truncate text-lg font-semibold text-slate-100">
+          <h3 className="truncate text-lg font-semibold text-strong">
             {resource.name}
           </h3>
         </div>
@@ -83,7 +83,7 @@ export function ResourceInspector({
           type="button"
           onClick={onClose}
           aria-label="Close resource inspector"
-          className="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-100"
+          className="rounded-lg p-1.5 text-muted transition-colors hover:bg-elevated hover:text-strong"
         >
           <X className="h-4 w-4" />
         </button>
@@ -96,13 +96,13 @@ export function ResourceInspector({
         </div>
 
         <section className="space-y-2">
-          <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+          <h4 className="text-xs font-semibold uppercase tracking-wider text-muted">
             Version-Agnostic GKNN Key
           </h4>
-          <div className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950 px-3 py-2">
+          <div className="flex items-center justify-between gap-2 rounded-lg border border-default bg-canvas px-3 py-2">
             <code
               data-testid="inspector-gknn"
-              className="break-all font-mono text-xs text-slate-200"
+              className="break-all font-mono text-xs text-primary"
             >
               {resource.key}
             </code>
@@ -110,10 +110,10 @@ export function ResourceInspector({
               type="button"
               onClick={handleCopyKey}
               aria-label="Copy GKNN key"
-              className="shrink-0 rounded p-1 text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-100"
+              className="shrink-0 rounded p-1 text-muted transition-colors hover:bg-elevated hover:text-strong"
             >
               {copied ? (
-                <Check className="h-3.5 w-3.5 text-emerald-400" />
+                <Check className="h-3.5 w-3.5 text-success" />
               ) : (
                 <Copy className="h-3.5 w-3.5" />
               )}
@@ -125,65 +125,65 @@ export function ResourceInspector({
         </section>
 
         <section className="space-y-2">
-          <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+          <h4 className="text-xs font-semibold uppercase tracking-wider text-muted">
             Metadata
           </h4>
-          <dl className="divide-y divide-slate-800/80 rounded-lg border border-slate-800 bg-slate-950/60 text-xs">
+          <dl className="divide-y divide-default/80 rounded-lg border border-default bg-canvas/60 text-xs">
             <div className="flex justify-between gap-4 px-3 py-2">
-              <dt className="shrink-0 text-slate-400">API Group</dt>
-              <dd className="min-w-0 break-all text-right font-mono text-slate-200">
+              <dt className="shrink-0 text-muted">API Group</dt>
+              <dd className="min-w-0 break-all text-right font-mono text-primary">
                 {resource.group || "core (v1)"}
               </dd>
             </div>
             <div className="flex justify-between gap-4 px-3 py-2">
-              <dt className="shrink-0 text-slate-400">Kind</dt>
-              <dd className="min-w-0 break-all text-right font-mono text-slate-200">
+              <dt className="shrink-0 text-muted">Kind</dt>
+              <dd className="min-w-0 break-all text-right font-mono text-primary">
                 {resource.kind}
               </dd>
             </div>
             <div className="flex justify-between gap-4 px-3 py-2">
-              <dt className="shrink-0 text-slate-400">Namespace</dt>
-              <dd className="min-w-0 break-all text-right font-mono text-slate-200">
+              <dt className="shrink-0 text-muted">Namespace</dt>
+              <dd className="min-w-0 break-all text-right font-mono text-primary">
                 {resource.namespace ?? "(cluster-scoped)"}
               </dd>
             </div>
             <div className="flex justify-between gap-4 px-3 py-2">
-              <dt className="shrink-0 text-slate-400">Name</dt>
-              <dd className="min-w-0 break-all text-right font-mono text-slate-200">
+              <dt className="shrink-0 text-muted">Name</dt>
+              <dd className="min-w-0 break-all text-right font-mono text-primary">
                 {resource.name}
               </dd>
             </div>
             <div className="flex justify-between gap-4 px-3 py-2">
-              <dt className="shrink-0 text-slate-400">Sync Wave</dt>
+              <dt className="shrink-0 text-muted">Sync Wave</dt>
               <dd
                 data-testid="inspector-sync-wave"
-                className="font-mono text-slate-400"
+                className="font-mono text-muted"
               >
                 — (not reported by API)
               </dd>
             </div>
             <div className="flex justify-between gap-4 px-3 py-2">
-              <dt className="shrink-0 text-slate-400">Present in Cluster</dt>
-              <dd className="font-mono text-slate-200">
+              <dt className="shrink-0 text-muted">Present in Cluster</dt>
+              <dd className="font-mono text-primary">
                 {resource.present ? "Yes" : "No (Missing)"}
               </dd>
             </div>
             <div className="flex justify-between gap-4 px-3 py-2">
-              <dt className="flex shrink-0 items-center gap-1 text-slate-400">
+              <dt className="flex shrink-0 items-center gap-1 text-muted">
                 <Shield className="h-3.5 w-3.5" />
                 Ownership
               </dt>
-              <dd className="min-w-0 break-all text-right font-mono text-slate-200">
+              <dd className="min-w-0 break-all text-right font-mono text-primary">
                 {resource.ownership ?? "Owned / Inherited"}
               </dd>
             </div>
             {resource.parent && (
               <div className="flex flex-col gap-1 px-3 py-2">
-                <dt className="flex items-center gap-1 text-slate-400">
+                <dt className="flex items-center gap-1 text-muted">
                   <Layers className="h-3.5 w-3.5" />
                   Owner Reference (Parent)
                 </dt>
-                <dd className="break-all font-mono text-slate-200">
+                <dd className="break-all font-mono text-primary">
                   {resource.parent}
                 </dd>
               </div>
@@ -192,12 +192,12 @@ export function ResourceInspector({
         </section>
 
         <section className="space-y-2">
-          <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+          <h4 className="text-xs font-semibold uppercase tracking-wider text-muted">
             Health Message
           </h4>
           <div
             data-testid="inspector-health-message"
-            className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs leading-relaxed text-slate-300"
+            className="rounded-lg border border-default bg-canvas/60 p-3 text-xs leading-relaxed text-body"
           >
             {resource.healthMessage
               ? resource.healthMessage
@@ -209,13 +209,13 @@ export function ResourceInspector({
       </div>
 
       {onInspectDiff && (
-        <div className="border-t border-slate-800 px-5 py-3">
+        <div className="border-t border-default px-5 py-3">
           <Button
             variant="secondary"
             size="md"
             onClick={() => onInspectDiff(resource.key)}
             icon={<FileDiff className="h-4 w-4" aria-hidden="true" />}
-            className="w-full border-indigo-500/40 bg-indigo-500/15 text-indigo-200 hover:bg-indigo-500/25"
+            className="w-full border-indigo-500/40 bg-indigo-500/15 text-accent hover:bg-indigo-500/25"
           >
             View Resource in Diff
           </Button>

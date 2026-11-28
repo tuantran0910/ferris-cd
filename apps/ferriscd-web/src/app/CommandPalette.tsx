@@ -229,8 +229,8 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
         Command palette
       </h2>
 
-      <div className="flex items-center gap-2 border-b border-slate-800 px-4 py-3">
-        <Search aria-hidden="true" className="h-4 w-4 shrink-0 text-slate-300" />
+      <div className="flex items-center gap-2 border-b border-default px-4 py-3">
+        <Search aria-hidden="true" className="h-4 w-4 shrink-0 text-body" />
         <input
           // No `autoFocus`: the focus trap focuses the first focusable element (this input) when the
           // dialog opens and records *what was focused before* to restore on close. An `autoFocus`
@@ -251,9 +251,9 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
             setActiveIndex(0);
           }}
           onKeyDown={onKeyDown}
-          className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 transition-colors placeholder-slate-400 focus:border-indigo-400 focus:outline-none"
+          className="w-full rounded-lg border border-strong bg-canvas px-3 py-2 text-sm text-strong transition-colors placeholder-hint focus:border-indigo-400 focus:outline-none"
         />
-        <kbd className="hidden shrink-0 rounded border border-slate-700 bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-slate-300 sm:block">
+        <kbd className="hidden shrink-0 rounded border border-strong bg-surface px-1.5 py-0.5 font-mono text-[10px] text-body sm:block">
           Esc
         </kbd>
       </div>
@@ -278,16 +278,16 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => activate(item)}
                       className={`flex cursor-pointer items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-xs ${
-                        active ? "bg-slate-800 text-slate-100" : "text-slate-200"
+                        active ? "bg-elevated text-strong" : "text-primary"
                       }`}
                     >
                       <span className="flex min-w-0 items-center gap-2">
-                        <span aria-hidden="true" className="shrink-0 text-slate-300">
+                        <span aria-hidden="true" className="shrink-0 text-body">
                           {item.icon}
                         </span>
                         <span className="truncate font-medium">{item.label}</span>
                       </span>
-                      <span className="shrink-0 text-[11px] text-slate-300">{item.hint}</span>
+                      <span className="shrink-0 text-[11px] text-body">{item.hint}</span>
                     </li>
                   );
                 })}
@@ -302,7 +302,7 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
               role="option"
               aria-disabled="true"
               aria-selected="false"
-              className="px-3 py-6 text-center text-xs text-slate-200"
+              className="px-3 py-6 text-center text-xs text-primary"
             >
               No applications, projects, clusters, or views match “{query}”.
             </li>
@@ -314,7 +314,7 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
         role="status"
         aria-live="polite"
         data-testid="command-palette-status"
-        className="border-t border-slate-800 px-4 py-2 text-[11px] text-slate-300"
+        className="border-t border-default px-4 py-2 text-[11px] text-body"
       >
         {items.length === 0
           ? "No results."

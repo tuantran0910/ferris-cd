@@ -18,10 +18,10 @@ export interface OperationBannerProps {
 export function OperationBanner({ operation, repoUrl }: OperationBannerProps) {
   const tone =
     operation.phase === "Failed" || operation.phase === "Error"
-      ? "border-rose-500/40 bg-rose-950/30 text-rose-100"
+      ? "border-rose-500/40 bg-danger-tint/30 text-danger"
       : operation.phase === "Succeeded"
-        ? "border-emerald-500/40 bg-emerald-950/25 text-emerald-100"
-        : "border-indigo-500/40 bg-indigo-950/30 text-indigo-100";
+        ? "border-emerald-500/40 bg-success-tint/25 text-success"
+        : "border-indigo-500/40 bg-accent-tint/30 text-accent";
   const revisionUrl = commitWebUrl(repoUrl, operation.revision);
 
   return (
@@ -43,7 +43,7 @@ export function OperationBanner({ operation, repoUrl }: OperationBannerProps) {
                 href={revisionUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="font-mono underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-indigo-200"
+                className="font-mono underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-accent"
                 title={`${operation.revision} — open commit`}
               >
                 {shortRevision(operation.revision, 12)}

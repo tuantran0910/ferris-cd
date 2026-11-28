@@ -150,7 +150,7 @@ function ApplicationDetailContent({
       <div className="space-y-4">
         <Link
           to={{ pathname: "/", search: listSearch }}
-          className="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-400 transition-colors hover:text-indigo-300"
+          className="inline-flex items-center gap-1.5 text-xs font-medium text-accent transition-colors hover:text-accent"
         >
           <ArrowLeft className="h-3.5 w-3.5" />
           Back to Applications
@@ -187,7 +187,7 @@ function ApplicationDetailContent({
         <div className="space-y-2">
           <Link
             to={{ pathname: "/", search: listSearch }}
-            className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-400 transition-colors hover:text-indigo-300"
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-muted transition-colors hover:text-accent"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
             Applications
@@ -195,15 +195,15 @@ function ApplicationDetailContent({
 
           <div className="flex flex-wrap items-center gap-3">
             <h1
-              className="max-w-full break-all text-2xl font-bold tracking-tight text-slate-100"
+              className="max-w-full break-all text-2xl font-bold tracking-tight text-strong"
               title={app.name}
             >
               {app.name}
             </h1>
-            <span className="max-w-full truncate rounded-md border border-slate-700 bg-slate-900 px-2 py-0.5 font-mono text-xs text-slate-300">
+            <span className="max-w-full truncate rounded-md border border-strong bg-surface px-2 py-0.5 font-mono text-xs text-body">
               {app.namespace}
             </span>
-            <span className="max-w-full truncate rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 font-mono text-xs text-indigo-300">
+            <span className="max-w-full truncate rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 font-mono text-xs text-accent">
               project: {app.project}
             </span>
           </div>
@@ -214,7 +214,7 @@ function ApplicationDetailContent({
             <HealthStatusBadge status={app.health?.status} />
             <SyncWindowBadge syncWindow={syncWindow} />
             {app.health?.message && (
-              <span className="text-xs text-slate-400">
+              <span className="text-xs text-muted">
                 — {app.health.message}
               </span>
             )}
@@ -263,9 +263,9 @@ function ApplicationDetailContent({
         <div
           role="status"
           data-testid="detail-rbac-readonly-notice"
-          className="flex items-center gap-2 rounded-xl border border-rose-500/40 bg-rose-950/30 px-4 py-2.5 text-xs text-rose-200 motion-fade-in"
+          className="flex items-center gap-2 rounded-xl border border-rose-500/40 bg-danger-tint/30 px-4 py-2.5 text-xs text-danger motion-fade-in"
         >
-          <ShieldOff className="h-4 w-4 shrink-0 text-rose-400" />
+          <ShieldOff className="h-4 w-4 shrink-0 text-danger" />
           <span>
             Read-only RBAC mode: one or more mutation actions were denied (HTTP
             403 Forbidden) and have been disabled.
@@ -286,7 +286,7 @@ function ApplicationDetailContent({
       <div
         role="tablist"
         aria-label="Application detail sections"
-        className="flex flex-wrap gap-1 border-b border-slate-800"
+        className="flex flex-wrap gap-1 border-b border-default"
       >
         <TabButton
           active={activeTab === "resources"}
@@ -508,8 +508,8 @@ function TabButton({
       onClick={onClick}
       className={`inline-flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-xs font-semibold transition-colors ${
         active
-          ? "border-indigo-500 text-indigo-300"
-          : "border-transparent text-slate-400 hover:border-slate-700 hover:text-slate-200"
+          ? "border-indigo-500 text-accent"
+          : "border-transparent text-muted hover:border-strong hover:text-primary"
       }`}
     >
       {icon}
