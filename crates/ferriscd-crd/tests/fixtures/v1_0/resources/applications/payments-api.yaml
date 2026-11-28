@@ -1,0 +1,56 @@
+# A `v1.0` `Application`: single Git source, plain-YAML renderer, fully spelled-out sync policy.
+#
+# Every defaulted field is written out on purpose: the parity test asserts that each of these keys
+# survives deserialization and serialization unchanged, and an omitted key would prove nothing.
+apiVersion: ferriscd.io/v1alpha1
+kind: Application
+metadata:
+  name: payments-api
+  namespace: ferriscd-system
+  labels:
+    app.kubernetes.io/part-of: payments
+  annotations:
+    example.com/owner: payments-team
+spec:
+  project: payments
+  source:
+    git:
+      repoURL: https://github.com/example/payments.git
+      targetRevision: main
+      path: deploy/production
+    renderer:
+      plainYaml:
+        recursive: true
+  destination:
+    cluster: in-cluster
+    namespace: payments
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      createNamespace: false
+      pruneLast: true
+      pruneCRDs: false
+      pruneNamespaces: false
+      serverSideForce: false
+      applyOutOfSyncOnly: true
+      takeoverFieldManagers:
+        - kubectl-client-side-apply
+    retry:
+      limit: 5
+      backoff:
+        durationSeconds: 5
+        factor: 2
+        maxDurationSeconds: 180
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      namespace: payments
+      name: payments-api
+      jsonPointers:
+        - /spec/replicas
+      managedFieldsManagers:
+        - kube-controller-manager
+  requeueAfterSeconds: 180
+  revisionHistoryLimit: 10

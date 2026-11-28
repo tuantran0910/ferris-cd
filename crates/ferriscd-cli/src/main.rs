@@ -33,6 +33,8 @@ enum Commands {
     Apply(commands::apply::ApplyArgs),
     /// Apply a single Kubernetes YAML manifest via Server-Side Apply.
     ApplyFile(commands::apply_file::ApplyFileArgs),
+    /// Export or restore a secret-free disaster-recovery bundle (`T20.4`).
+    Backup(commands::backup::BackupArgs),
     /// Generate or verify the committed FerrisCD CustomResourceDefinition manifests.
     Crd(commands::crd::CrdArgs),
     /// Run the Kubernetes controller (watch `Application` CRs and sync them).
@@ -86,6 +88,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
     match cli.command {
         Commands::Apply(args) => commands::apply::run(args).await.map(|()| EXIT_OK),
         Commands::ApplyFile(args) => commands::apply_file::run(args).await.map(|()| EXIT_OK),
+        Commands::Backup(args) => commands::backup::run(args).await.map(|()| EXIT_OK),
         Commands::Crd(args) => commands::crd::run(args).await.map(|()| EXIT_OK),
         Commands::Controller(args) => commands::controller::run(*args).await.map(|()| EXIT_OK),
         Commands::Server(args) => commands::server::run(*args).await.map(|()| EXIT_OK),

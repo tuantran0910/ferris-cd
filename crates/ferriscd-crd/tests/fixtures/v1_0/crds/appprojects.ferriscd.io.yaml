@@ -1,0 +1,196 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: appprojects.ferriscd.io
+spec:
+  group: ferriscd.io
+  names:
+    kind: AppProject
+    plural: appprojects
+    shortNames:
+    - proj
+    singular: appproject
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: >-
+          Tenancy boundary describing the repositories, clusters, namespaces, GroupKinds,
+          and ServiceAccounts an Application may use
+        properties:
+          spec:
+            description: "`AppProject` custom resource (`ferriscd.io/v1alpha1`)."
+            properties:
+              allowedServiceAccounts:
+                default: []
+                description: |-
+                  ServiceAccounts (`namespace/name` or `namespace:*`) a project may impersonate.
+
+                  Empty means "no impersonation allowed"; an `Application` that sets
+                  `spec.serviceAccountName` is rejected unless its project lists it here.
+                items:
+                  type: string
+                type: array
+              clusterResourceWhitelist:
+                default: []
+                description: "Cluster-scoped GroupKinds this project may manage (`group: \"*\"`, `kind: \"*\"` wildcards)."
+                items:
+                  description: Group/Kind pair used by project allow/deny lists.
+                  properties:
+                    group:
+                      default: ""
+                      description: >-
+                        API group; the empty string means the core group, [`WILDCARD`] matches every
+                        group.
+                      type: string
+                    kind:
+                      description: Kind, or [`WILDCARD`].
+                      type: string
+                  required:
+                  - kind
+                  type: object
+                type: array
+              description:
+                description: Free-form description of the project.
+                nullable: true
+                type: string
+              destinations:
+                default: []
+                description: "Allowed `(cluster, namespace)` destinations. `namespace: \"*\"` allows any namespace."
+                items:
+                  description: Cluster/namespace destination allowed by a project.
+                  properties:
+                    cluster:
+                      default: in-cluster
+                      description: "Target cluster: `in-cluster` or a FerrisCD cluster Secret name (`*` for any)."
+                      type: string
+                    namespace:
+                      description: Target namespace (`*` for any namespace).
+                      type: string
+                  required:
+                  - namespace
+                  type: object
+                type: array
+              namespaceResourceBlacklist:
+                default: []
+                description: Namespaced GroupKinds explicitly denied even if a whitelist would allow them.
+                items:
+                  description: Group/Kind pair used by project allow/deny lists.
+                  properties:
+                    group:
+                      default: ""
+                      description: >-
+                        API group; the empty string means the core group, [`WILDCARD`] matches every
+                        group.
+                      type: string
+                    kind:
+                      description: Kind, or [`WILDCARD`].
+                      type: string
+                  required:
+                  - kind
+                  type: object
+                type: array
+              namespaceResourceWhitelist:
+                default: []
+                description: Namespaced GroupKinds this project may manage.
+                items:
+                  description: Group/Kind pair used by project allow/deny lists.
+                  properties:
+                    group:
+                      default: ""
+                      description: >-
+                        API group; the empty string means the core group, [`WILDCARD`] matches every
+                        group.
+                      type: string
+                    kind:
+                      description: Kind, or [`WILDCARD`].
+                      type: string
+                  required:
+                  - kind
+                  type: object
+                type: array
+              sourceNamespaces:
+                default:
+                - ferriscd-system
+                description: |-
+                  Namespaces allowed to host `Application` objects that reference this project.
+
+                  Defaults to `["ferriscd-system"]`; widening it is what enables Phase 12
+                  Apps-in-any-namespace, which then requires `allowedServiceAccounts`.
+                items:
+                  type: string
+                type: array
+              sourceRepos:
+                default: []
+                description: Allowed source repositories (`*` matches everything, `!prefix` denies).
+                items:
+                  type: string
+                type: array
+            type: object
+          status:
+            description: |-
+              `AppProject` `/status` subresource.
+
+              Kept intentionally small: policy evaluation errors are surfaced as `Ready`
+              conditions so a broken project is never silent.
+            nullable: true
+            properties:
+              conditions:
+                description: Standard conditions describing project validity.
+                items:
+                  description: |-
+                    Wire-compatible mirror of `metav1.Condition`.
+
+                    Field names and values match the Kubernetes API so `kubectl wait --for=condition=Ready`
+                    and `kubectl describe` behave exactly as for built-in resources.
+                  properties:
+                    lastTransitionTime:
+                      description: When `status` last changed. Preserved while `status` is unchanged.
+                      format: date-time
+                      type: string
+                    message:
+                      default: ""
+                      description: >-
+                        Human-readable message; always present on the wire for `metav1.Condition`
+                        parity.
+                      type: string
+                    observedGeneration:
+                      description: "`metadata.generation` observed when the condition was computed."
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      description: CamelCase machine-readable reason for the current status.
+                      type: string
+                    status:
+                      description: Whether the condition currently holds.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: Condition type (e.g. [`CONDITION_READY`]).
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                description: "`metadata.generation` observed by the last policy evaluation."
+                format: int64
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: AppProject
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

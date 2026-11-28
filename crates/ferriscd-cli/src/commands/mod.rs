@@ -1,6 +1,7 @@
 pub mod app;
 pub mod apply;
 pub mod apply_file;
+pub mod backup;
 pub mod controller;
 pub mod crd;
 pub mod login;

@@ -23,3 +23,10 @@ serde-saphyr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# The test target needs a Kubernetes version feature for the `Application`/`AppProject` types, and
+# a library crate must not enable one for its consumers (ADR-002 §3) — the same dev-dependency-only
+# arrangement `ferriscd-server` uses. `serde-saphyr`/`serde_json` are deliberately **not** repeated
+# here: they are normal dependencies of this crate, so the test target already links them.
+k8s-openapi = { workspace = true, features = ["v1_35"] }

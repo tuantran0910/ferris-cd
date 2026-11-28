@@ -431,14 +431,18 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// Restricts `path` to `mode` (a no-op off unix).
+///
+/// Shared with the other place the CLI writes a credential-bearing file
+/// (`commands::backup::write_bundle_file`), so "private from the first byte" is one implementation
+/// rather than two that can drift.
 #[cfg(unix)]
-fn restrict_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
+pub(crate) fn restrict_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-fn restrict_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
+pub(crate) fn restrict_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
