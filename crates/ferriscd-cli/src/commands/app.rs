@@ -721,6 +721,7 @@ mod tests {
             conditions: Vec::new(),
             resource_count: 2,
             observed_generation: Some(3),
+            applicationset: None,
         }
     }
 

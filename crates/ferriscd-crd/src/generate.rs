@@ -17,6 +17,7 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
 use kube::CustomResourceExt;
 
 use crate::application::Application;
+use crate::applicationset::ApplicationSet;
 use crate::project::AppProject;
 
 /// Repository-relative directory holding the generated CRD manifests.
@@ -27,6 +28,9 @@ pub const APPLICATION_CRD_FILE_NAME: &str = "applications.ferriscd.io.yaml";
 
 /// File name of the generated `AppProject` CRD.
 pub const APPPROJECT_CRD_FILE_NAME: &str = "appprojects.ferriscd.io.yaml";
+
+/// File name of the generated `ApplicationSet` CRD.
+pub const APPLICATIONSET_CRD_FILE_NAME: &str = "applicationsets.ferriscd.io.yaml";
 
 /// CEL rule (`T18.3`): exactly one of `spec.source.git` / `spec.source.oci`.
 ///
@@ -154,7 +158,13 @@ pub fn appproject_crd() -> CustomResourceDefinition {
     AppProject::crd()
 }
 
-/// Renders both CRD manifests in a stable order (`Application`, then `AppProject`).
+/// Returns the generated `ApplicationSet` CRD object.
+#[must_use]
+pub fn applicationset_crd() -> CustomResourceDefinition {
+    ApplicationSet::crd()
+}
+
+/// Renders every CRD manifest in a stable order (`Application`, `AppProject`, `ApplicationSet`).
 pub fn crd_documents() -> Result<Vec<CrdDocument>, CrdGenerationError> {
     Ok(vec![
         CrdDocument {
@@ -164,6 +174,10 @@ pub fn crd_documents() -> Result<Vec<CrdDocument>, CrdGenerationError> {
         CrdDocument {
             file_name: APPPROJECT_CRD_FILE_NAME,
             manifest: render_crd(APPPROJECT_CRD_FILE_NAME, &appproject_crd())?,
+        },
+        CrdDocument {
+            file_name: APPLICATIONSET_CRD_FILE_NAME,
+            manifest: render_crd(APPLICATIONSET_CRD_FILE_NAME, &applicationset_crd())?,
         },
     ])
 }
@@ -208,9 +222,10 @@ mod tests {
         let first = crd_documents().expect("generation must succeed");
         let second = crd_documents().expect("generation must succeed");
         assert_eq!(first, second);
-        assert_eq!(first.len(), 2);
+        assert_eq!(first.len(), 3);
         assert_eq!(first[0].file_name, APPLICATION_CRD_FILE_NAME);
         assert_eq!(first[1].file_name, APPPROJECT_CRD_FILE_NAME);
+        assert_eq!(first[2].file_name, APPLICATIONSET_CRD_FILE_NAME);
 
         let value: Value = serde_saphyr::from_str(&first[0].manifest).expect("manifest must parse");
         let metadata = value["metadata"]
@@ -436,6 +451,88 @@ mod tests {
             assert!(
                 properties.get(expected).is_some(),
                 "generated schema is missing {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn applicationset_crd_is_structurally_complete() {
+        let manifest = render_crd(APPLICATIONSET_CRD_FILE_NAME, &applicationset_crd())
+            .expect("rendering must succeed");
+        let crd = parse_crd(&manifest);
+
+        assert_eq!(crd.spec.group, "ferriscd.io");
+        assert_eq!(crd.spec.scope, "Namespaced");
+        assert_eq!(crd.spec.names.kind, "ApplicationSet");
+        assert_eq!(crd.spec.names.plural, "applicationsets");
+        assert_eq!(
+            crd.spec.names.short_names.as_deref(),
+            Some(&["appset".to_owned()][..])
+        );
+        assert_eq!(
+            crd.metadata.name.as_deref(),
+            Some("applicationsets.ferriscd.io")
+        );
+        assert!(crd.status.is_none());
+        // The API server rejects a CRD whose schema contains a JSON reference pointer ("`$ref` is
+        // not supported"), so a recursive type would produce a manifest that cannot even be applied.
+        // The matrix child enum exists to keep the schema structural; this is the guard that keeps
+        // it that way.
+        assert!(
+            !manifest.contains("$ref"),
+            "a CRD schema may not contain $ref, and this one does:\n{manifest}"
+        );
+
+        let version = &crd.spec.versions[0];
+        assert_eq!(version.name, "v1alpha1");
+        assert!(version.served);
+        assert!(version.storage);
+        assert!(
+            version
+                .subresources
+                .as_ref()
+                .is_some_and(|subresources| subresources.status.is_some()),
+            "ApplicationSet CRD must enable the /status subresource"
+        );
+
+        let value: Value = serde_json::to_value(&crd).expect("crd must serialize");
+        let schema = &value["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"];
+        let spec = &schema["spec"]["properties"];
+        for expected in [
+            "generators",
+            "template",
+            "syncPolicy",
+            "requeueAfterSeconds",
+            "maxGeneratedApplications",
+        ] {
+            assert!(
+                spec.get(expected).is_some(),
+                "generated ApplicationSet schema is missing spec.{expected}"
+            );
+        }
+        // The non-destructive default must be encoded in the schema itself, so a client that omits
+        // `syncPolicy` is filled in by the API server rather than by controller convention.
+        assert_eq!(
+            spec["syncPolicy"]["default"]["preserveResourcesOnDeletion"],
+            Value::Bool(true)
+        );
+        assert_eq!(spec["syncPolicy"]["default"]["prune"], Value::Bool(false));
+        assert_eq!(
+            spec["maxGeneratedApplications"]["maximum"].as_f64(),
+            Some(f64::from(
+                i32::try_from(crate::applicationset::MAX_GENERATED_APPLICATIONS)
+                    .expect("the ceiling fits in i32")
+            ))
+        );
+        let template = &spec["template"]["properties"];
+        assert!(template.get("metadata").is_some());
+        assert!(template.get("spec").is_some());
+
+        let status = &schema["status"]["properties"];
+        for expected in ["observedGeneration", "conditions", "generatedCount"] {
+            assert!(
+                status.get(expected).is_some(),
+                "generated ApplicationSet status schema is missing {expected}"
             );
         }
     }

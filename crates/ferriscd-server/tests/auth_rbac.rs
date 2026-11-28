@@ -408,12 +408,14 @@ async fn post_as(
     (status, response)
 }
 
-const PROTECTED: [&str; 7] = [
+const PROTECTED: [&str; 8] = [
     "/api/v1/applications",
     "/api/v1/applications/ferriscd-system/payments-api",
     "/api/v1/applications/ferriscd-system/payments-api/resources",
     "/api/v1/applications/ferriscd-system/payments-api/diff",
     "/api/v1/projects",
+    // `T19.3`: the read-only `ApplicationSet` view is protected exactly like the rest.
+    "/api/v1/applicationsets",
     "/api/v1/clusters",
     "/api/v1/openapi.json",
 ];

@@ -29,6 +29,9 @@ export type ProjectSyncWindowView =
 export type SyncWindowGateView = components["schemas"]["SyncWindowGateView"];
 export type ClusterListView = components["schemas"]["ClusterListView"];
 export type ClusterView = components["schemas"]["ClusterView"];
+export type ApplicationSetListView =
+  components["schemas"]["ApplicationSetListView"];
+export type ApplicationSetView = components["schemas"]["ApplicationSetView"];
 export type ApplicationEventListView =
   components["schemas"]["ApplicationEventListView"];
 export type ApplicationEventView = components["schemas"]["ApplicationEventView"];

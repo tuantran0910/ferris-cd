@@ -8,6 +8,7 @@ use std::time::Duration;
 use ferriscd_crd::Application;
 use kube::{Api, Client, ResourceExt};
 
+pub mod applicationset_controller;
 pub mod audit;
 pub mod cluster_manager;
 pub mod controller;
@@ -35,6 +36,14 @@ pub mod sync_recovery;
 pub mod telemetry;
 pub mod waves;
 
+pub use applicationset_controller::{
+    ApplicationAuthorizer, ApplicationSetController, ApplicationSetControllerError,
+    ApplicationSetEvent, ApplicationSetReconciler, ApplicationSetSource, ApplicationSetStore,
+    ApplicationSetTrigger, ApplicationSetWatchError, ClusterApplicationSetTrigger,
+    ClusterManagerParamSource, DEFAULT_APPLICATIONSET_INTERVAL, KubeApplicationSetSource,
+    KubeApplicationSetStore, NoTrigger, ProjectPolicyAuthorizer, ReconcileReport,
+    RepoCacheParamSource, TriggerEvent,
+};
 pub use audit::{
     AUDIT_CATEGORIES, AUDIT_OUTCOMES, AUDIT_SCHEMA_VERSION, AUDIT_TRACING_TARGET, AuditActor,
     AuditCategory, AuditEmitResult, AuditEvent, AuditLogger, AuditOutcome, AuditSink,
@@ -45,10 +54,10 @@ pub use audit::{
 pub use cluster_manager::{
     CLUSTER_EVENT_CAPACITY, ClusterAuth, ClusterChange, ClusterError, ClusterHandle,
     ClusterHandleBuilder, ClusterLifecycleEvent, ClusterManager, ClusterName, ClusterOptions,
-    ClusterSecret, ClusterSecretEvent, ClusterSecretSource, ClusterSource, ClusterTarget,
-    ClusterWatchError, IN_CLUSTER, KEY_BEARER_TOKEN, KEY_CA_CRT, KEY_INSECURE_SKIP_TLS_VERIFY,
-    KEY_KUBECONFIG, KEY_SERVER, KEY_TLS_CRT, KEY_TLS_KEY, KubeClusterBuilder, SECRET_TYPE_CLUSTER,
-    SecretClusterSource,
+    ClusterRegistrationInfo, ClusterSecret, ClusterSecretEvent, ClusterSecretSource, ClusterSource,
+    ClusterTarget, ClusterWatchError, IN_CLUSTER, KEY_BEARER_TOKEN, KEY_CA_CRT,
+    KEY_INSECURE_SKIP_TLS_VERIFY, KEY_KUBECONFIG, KEY_SERVER, KEY_TLS_CRT, KEY_TLS_KEY,
+    KubeClusterBuilder, SECRET_TYPE_CLUSTER, SecretClusterSource,
 };
 pub use controller::{
     APPLICATION_NAMESPACES_ENV, ApplicationControllers, BackoffTracker, ConfigError,
@@ -172,6 +181,13 @@ pub const LOG_FORMAT_ENV: &str = "FERRISCD_LOG_FORMAT";
 /// spec). Default `false`: nothing about the `v1.0` apply body changes until an operator opts in.
 pub const DRIFT_WATCHER_ENV: &str = "FERRISCD_ENABLE_DRIFT_WATCHER";
 
+/// Environment variable enabling the opt-in `ApplicationSet` controller (`T19.3`).
+///
+/// Default `false`: without it no `ApplicationSet` is read, generated from, or written back, so an
+/// upgrade never starts creating `Application`s an operator did not ask for. The env fallback
+/// mirrors the flag (a pod spec is at least scoped; argv is world-readable).
+pub const APPLICATIONSET_ENV: &str = "FERRISCD_ENABLE_APPLICATIONSETS";
+
 /// Returns the controller identifier string.
 #[must_use]
 pub fn controller_name() -> &'static str {
@@ -239,6 +255,16 @@ pub struct RunOptions {
     /// allows `replicas: 2` without two reconcilers fighting over the same objects.
     pub leader_election: Option<LeaderElectionOptions>,
 
+    /// Run the opt-in `ApplicationSet` controller (`T19.3`).
+    ///
+    /// Off by default. When enabled, the controller watches `ApplicationSet` objects in the
+    /// control-plane namespace, evaluates their generator (list / Git / clusters / matrix), and
+    /// creates or converges the generated `Application`s **in that namespace**, authorized by the
+    /// same `AppProject` policy as a hand-authored `Application`. Deleting an `ApplicationSet`
+    /// orphans its generated `Application`s unless `spec.syncPolicy.preserveResourcesOnDeletion` is
+    /// explicitly `false`.
+    pub enable_applicationsets: bool,
+
     /// Deterministic `Application` sharding (`T13.3`).
     ///
     /// Both halves unset (the default) means "no sharding": this replica reconciles every
@@ -281,6 +307,7 @@ impl std::fmt::Debug for RunOptions {
             .field("work_root", &self.work_root)
             .field("allow_insecure_clusters", &self.allow_insecure_clusters)
             .field("enable_drift_watcher", &self.enable_drift_watcher)
+            .field("enable_applicationsets", &self.enable_applicationsets)
             .field("drift_watcher_kinds", &self.drift_watcher_kinds)
             .field("leader_election", &self.leader_election)
             .field("shard", &self.shard)
@@ -599,6 +626,10 @@ pub struct ControlPlane {
     telemetry: telemetry::TelemetryGuard,
     /// `T17.1`: lock-free startup readiness barrier shared with `/readyz`.
     readiness: ControlPlaneReadiness,
+    /// `T19.3`: the opt-in `ApplicationSet` controller (`--enable-applicationsets`).
+    ///
+    /// `None` (the default) means no `ApplicationSet` object is watched or generated from.
+    applicationsets: Option<Arc<applicationset_controller::ApplicationSetController>>,
     /// `T17.2`: external audit sinks whose queued records are flushed on shutdown.
     audit_file: Option<Arc<audit::JsonlFileAuditSink>>,
     audit_webhook: Option<Arc<audit::WebhookAuditSink>>,
@@ -752,23 +783,41 @@ impl ControlPlane {
         let result: anyhow::Result<()> = match self.leader_election.clone() {
             // The non-leader path reuses the public per-term driver: it treats the token as its only
             // shutdown input, which is precisely the contract this method promises.
-            None => controller::run_as_leader_with_readiness_and_drift(
-                self.client.clone(),
-                self.config.clone(),
-                self.ctx.clone(),
-                stop.clone(),
-                self.readiness.clone(),
-                self.drift.clone(),
-            )
-            .await
-            .map_err(anyhow::Error::from),
+            None => {
+                // `T19.3`: the opt-in `ApplicationSet` loop runs beside the `Application` loop and
+                // shares the one shutdown token, so a stop drains both.
+                let applicationsets = self
+                    .applicationsets
+                    .clone()
+                    .map(|controller| tokio::spawn(controller.run(stop.clone())));
+                // `T18.2`: the drift watcher, when configured, rides the same term and the same
+                // token — so a lost lease or a `SIGTERM` stops the metadata watches with the pumps.
+                let result = controller::run_as_leader_with_readiness_and_drift(
+                    self.client.clone(),
+                    self.config.clone(),
+                    self.ctx.clone(),
+                    stop.clone(),
+                    self.readiness.clone(),
+                    self.drift.clone(),
+                )
+                .await
+                .map_err(anyhow::Error::from);
+                if let Some(task) = applicationsets {
+                    stop.cancel();
+                    await_terminated(task, "ApplicationSet controller").await;
+                }
+                result
+            }
             Some(leader) => {
                 run_as_leader(
                     self.client.clone(),
                     self.config.clone(),
                     self.ctx.clone(),
                     leader,
-                    self.readiness.clone(),
+                    TermHooks {
+                        readiness: self.readiness.clone(),
+                        applicationsets: self.applicationsets.clone(),
+                    },
                     self.cluster_stop.clone(),
                     stop.clone(),
                     self.drift.clone(),
@@ -1124,6 +1173,66 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     let impersonation_source: Arc<dyn impersonation::ImpersonationSource> =
         Arc::new(impersonation::ImpersonatingAccess::new(pool.clone()));
 
+    // `T19.3`: the opt-in `ApplicationSet` controller shares the ONE `RepoCache` (so a generator
+    // checkout and a sync checkout of the same commit cost one fetch), the ONE `ClusterManager`
+    // (so the `clusters` generator reads the lifecycle-tracked registry, never a `Secret`), the same
+    // namespaced credential store, and the same `AppProject` policy/scope.
+    let applicationsets = if options.enable_applicationsets {
+        tracing::warn!(
+            namespace = %config.namespace,
+            "ApplicationSet controller enabled (--enable-applicationsets): ApplicationSets in the \
+             control-plane namespace generate Applications in that same namespace. Generated \
+             Applications pass the same AppProject policy, and deleting an ApplicationSet orphans \
+             them unless spec.syncPolicy.preserveResourcesOnDeletion is false"
+        );
+        let reconciler = applicationset_controller::ApplicationSetReconciler::new(
+            config.namespace.clone(),
+            Arc::new(applicationset_controller::ClusterManagerParamSource::new(
+                clusters.clone(),
+            )),
+            Arc::new(applicationset_controller::RepoCacheParamSource::new(
+                repos.clone(),
+                Arc::new(credentials::SecretCredentialStore::new(
+                    client.clone(),
+                    &config.namespace,
+                )),
+                url_policy,
+            )),
+            Arc::new(applicationset_controller::KubeApplicationSetStore::new(
+                client.clone(),
+                config.namespace.clone(),
+            )),
+            Arc::new(applicationset_controller::ProjectPolicyAuthorizer::new(
+                Arc::new(ApiProjectSource::new(client.clone(), &config.namespace)),
+                config.application_scope(),
+                config.namespace.clone(),
+            )),
+        );
+        Some(Arc::new(
+            applicationset_controller::ApplicationSetController::new(
+                Arc::new(reconciler),
+                Arc::new(applicationset_controller::KubeApplicationSetSource::new(
+                    client.clone(),
+                    config.namespace.clone(),
+                )),
+                config.namespace.clone(),
+            )
+            // `T19.3` (finding M3): react to cluster-registry changes and to generated
+            // `Application` drift instead of only to the periodic requeue. Both sources are the ones
+            // the rest of the loop already trusts: the `T18.1` lifecycle broadcast and a plain
+            // `ferriscd.io/applicationset`-labelled watch.
+            .with_triggers(Arc::new(
+                applicationset_controller::ClusterApplicationSetTrigger::new(
+                    clusters.clone(),
+                    client.clone(),
+                    config.namespace.clone(),
+                ),
+            )),
+        ))
+    } else {
+        None
+    };
+
     // `T18.2`: the self-echo cache is created only when the drift watcher is enabled, and shared
     // between the pipeline (which records every confirmed write) and the watcher (which suppresses
     // the resulting metadata event). Disabled means no cache and no recording at all.
@@ -1313,6 +1422,7 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         metrics_addr,
         telemetry,
         readiness,
+        applicationsets,
         cluster_stop,
         cluster_watch,
         audit_file,
@@ -1443,6 +1553,14 @@ impl AuditSinkHandles {
     }
 }
 
+/// The optional per-term collaborators [`run_as_leader`] starts beside the `Application` loops.
+struct TermHooks {
+    /// `T17.1`: the startup readiness barrier the leader clears.
+    readiness: ControlPlaneReadiness,
+    /// `T19.3`: the opt-in `ApplicationSet` controller, spawned per leadership term.
+    applicationsets: Option<Arc<applicationset_controller::ApplicationSetController>>,
+}
+
 /// Runs the active/standby loop (`T13.2`).
 ///
 /// The standby waits for the `Lease`; the leader runs the controller set until the lease is lost
@@ -1454,7 +1572,7 @@ async fn run_as_leader(
     config: ControllerConfig,
     ctx: Arc<ReconcileContext>,
     leader: LeaderElectionConfig,
-    readiness: ControlPlaneReadiness,
+    hooks: TermHooks,
     cluster_stop: tokio_util::sync::CancellationToken,
     stop: tokio_util::sync::CancellationToken,
     drift: Option<drift_watcher::DriftRuntime>,
@@ -1462,6 +1580,10 @@ async fn run_as_leader(
     // Eight arguments, one over clippy's soft limit: every one of them is an independent process
     // collaborator (client, config, context, lease, readiness, two tokens, drift). Bundling them
     // into a struct would only move the list to the call site.
+    let TermHooks {
+        readiness,
+        applicationsets,
+    } = hooks;
     use anyhow::Context as _;
 
     let election = LeaderElection::from_client(client.clone(), leader)?;
@@ -1493,6 +1615,12 @@ async fn run_as_leader(
         };
         readiness.clear_standby_serving();
         let token = term.token();
+        // `T19.3`: the `ApplicationSet` loop is leader-only, like every other writer. It is spawned
+        // per term and stopped with the term token, so a standby replica never generates (or
+        // orphans) an `Application`.
+        let applicationset_task = applicationsets
+            .clone()
+            .map(|controller| tokio::spawn(controller.run(token.clone())));
         // Boxed so one `select!` can poll both halves without moving either: the controller set has
         // to be awaited *after* the term ends, so in-flight passes drain like a `SIGTERM`.
         let mut controllers = Box::pin(controller::run_as_leader_with_readiness_and_drift(
@@ -1535,6 +1663,9 @@ async fn run_as_leader(
                 outcome
             }
         };
+        if let Some(task) = applicationset_task {
+            await_terminated(task, "ApplicationSet controller").await;
+        }
         if outcome == HoldOutcome::Lost {
             tracing::warn!("standing by: another replica will take the leader lease");
             continue;
@@ -1543,6 +1674,15 @@ async fn run_as_leader(
     }
     cluster_stop.cancel();
     Ok(())
+}
+
+/// Waits for a stopped background loop and reports a panic instead of swallowing it.
+async fn await_terminated(task: tokio::task::JoinHandle<()>, name: &str) {
+    match task.await {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => tracing::warn!(error = %error, "{name} task ended abnormally"),
+    }
 }
 
 /// Creates the `reconcile` span carrying the application identity.

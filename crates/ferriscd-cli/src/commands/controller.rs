@@ -96,6 +96,57 @@ pub struct ControllerArgs {
     )]
     pub enable_drift_watcher: bool,
 
+    /// Run the opt-in `ApplicationSet` controller (`T19.3`): generate `Application`s from
+    /// `ApplicationSet` generators.
+    ///
+    /// Off by default. When enabled, this controller watches `ApplicationSet` objects
+    /// (`ferriscd.io/v1alpha1`, shortname `appset`) in `--namespace` and creates/converges the
+    /// generated `Application`s **in that same namespace** (cross-namespace `ownerReferences` are
+    /// invalid and a privilege-escalation path, so they are never produced). Each generated
+    /// `Application` is validated against the exact same `AppProject` policy and application scope
+    /// as a hand-authored one before it is written.
+    ///
+    /// Deletion is non-destructive by default: deleting an `ApplicationSet` or an `Application`
+    /// orphans the generated `Application`s/workloads unless a `syncPolicy` explicitly opts in
+    /// (`preserveResourcesOnDeletion: false`).
+    ///
+    /// Generators: `list`, `git` (directories or parameter files), `clusters`, and a two-way
+    /// `matrix`. The `clusters` generator only ever yields **registered remote clusters**: the
+    /// reserved `in-cluster` name is never a parameter, because generating an `Application` that
+    /// targets the control plane's own client is not a fleet (list it in the template instead).
+    /// Everything is bounded: `MAX_GENERATED_APPS = 200`, a 20 000-entry worktree walk, a 1 MiB
+    /// parameter-file budget, and no template language beyond flat `{{key}}` substitution.
+    ///
+    /// RBAC (beyond the `Application` rules above; the `deploy/manifests` Role, the Helm chart's
+    /// `rbac.applicationsets` value, and `deploy/README.md` carry the same grants), all in
+    /// `--namespace`:
+    ///
+    ///   apiGroups: ["ferriscd.io"]
+    ///     resources: ["applicationsets"]
+    ///     verbs: ["get", "list", "watch", "patch"]
+    ///     resources: ["applicationsets/status"]
+    ///     verbs: ["get", "patch", "update"]
+    ///     resources: ["applications"]
+    ///     verbs: ["get", "list", "watch", "patch", "create"]
+    ///
+    /// Note the verb shapes. The finalizer is added and removed with a **merge `patch`** on
+    /// `metadata.finalizers` of the `ApplicationSet` object, so `applicationsets` needs `patch` —
+    /// the `finalizers` subresource is never touched. Generated `Application`s are written with
+    /// **Server-Side Apply**, which Kubernetes authorizes as `patch` on an existing object and
+    /// `create` on a new one, hence `patch` *and* `create` on `applications` (not `update`).
+    ///
+    /// Falls back to `FERRISCD_ENABLE_APPLICATIONSETS` (must be exactly `true` or `false`).
+    ///
+    /// Disabling the feature (`--enable-applicationsets=false`) leaves the finalizer it added in
+    /// place: an `ApplicationSet` deleted afterwards stays in `Terminating`, and its generated
+    /// `Application`s keep their `ownerReference`, until the flag is turned back on (so the
+    /// finalizer runs) or an operator removes `ferriscd.io/applicationset-cleanup` by hand.
+    #[arg(
+        long = "enable-applicationsets",
+        env = ferriscd_controller::APPLICATIONSET_ENV
+    )]
+    pub enable_applicationsets: bool,
+
     /// Restrict the drift watcher to a comma-separated list of `Kind` or `group/Kind`.
     ///
     /// Only meaningful with `--enable-drift-watcher`: without it the controller keeps using Model 1
@@ -335,6 +386,7 @@ impl std::fmt::Debug for ControllerArgs {
                 &self.allow_insecure_cluster_tls,
             )
             .field("enable_drift_watcher", &self.enable_drift_watcher)
+            .field("enable_applicationsets", &self.enable_applicationsets)
             .field("drift_watcher_kinds", &self.drift_watcher_kinds)
             .field("leader_election", &self.leader_election)
             .field(
@@ -413,6 +465,8 @@ pub(crate) fn run_options(args: ControllerArgs) -> ferriscd_controller::RunOptio
         // `T18.1`: `--enable-drift-watcher` / `FERRISCD_ENABLE_DRIFT_WATCHER`. Off means the apply
         // body keeps only the `ferriscd.io/tracking-id` annotation, exactly as before `v1.2`.
         enable_drift_watcher: args.enable_drift_watcher,
+        // `T19.3`: the `ApplicationSet` controller is opt-in, like every other writer.
+        enable_applicationsets: args.enable_applicationsets,
         // `T18.2`: the optional kind allow-list. Parsed by the controller (a malformed value is a
         // startup error, never a silent "watch everything").
         drift_watcher_kinds: args.drift_watcher_kinds,
@@ -462,6 +516,45 @@ mod tests {
         match harness.command {
             Command::Controller(args) => args,
         }
+    }
+
+    /// **`T19.3`:** the `ApplicationSet` controller stays off unless an operator opts in, and the
+    /// flag reaches `RunOptions` verbatim.
+    #[test]
+    fn applicationsets_are_opt_in_and_reach_run_options() {
+        assert!(!run_options(parse(&["ferriscd", "controller"])).enable_applicationsets);
+        assert!(!ferriscd_controller::RunOptions::default().enable_applicationsets);
+        let enabled = parse(&["ferriscd", "controller", "--enable-applicationsets"]);
+        assert!(enabled.enable_applicationsets);
+        assert!(run_options(enabled).enable_applicationsets);
+        assert_eq!(
+            ferriscd_controller::APPLICATIONSET_ENV,
+            "FERRISCD_ENABLE_APPLICATIONSETS"
+        );
+        // The flag is a plain bool, so clap parses the environment fallback as a bool too: a typo
+        // is a usage error rather than a truthiness test (same rule as `--enable-drift-watcher`).
+        let mut command = Harness::command();
+        let controller = command
+            .find_subcommand_mut("controller")
+            .expect("the controller subcommand exists");
+        let argument = controller
+            .get_arguments()
+            .find(|argument| argument.get_id() == "enable_applicationsets")
+            .expect("the --enable-applicationsets argument exists");
+        assert!(
+            matches!(argument.get_action(), clap::ArgAction::SetTrue),
+            "a Set/Count action would let any non-empty env value enable the controller, got {:?}",
+            argument.get_action()
+        );
+        assert_eq!(
+            argument.get_env().and_then(|value| value.to_str()),
+            Some(ferriscd_controller::APPLICATIONSET_ENV)
+        );
+        assert_eq!(
+            argument.get_default_values().len(),
+            0,
+            "a bool flag with no default is `false`: generation stays opt-in"
+        );
     }
 
     #[test]
@@ -1061,7 +1154,8 @@ mod tests {
         );
     }
 
-    /// **Finding T12-M1:** the RBAC an operator has to grant for multi-tenancy is in the flag help, not    /// only in a doc file nobody reads before turning the flag on.
+    /// **Finding T12-M1:** the RBAC an operator has to grant for multi-tenancy is in the flag help,
+    /// not only in a doc file nobody reads before turning the flag on.
     #[test]
     fn the_application_namespaces_help_documents_the_required_rbac() {
         let mut command = Harness::command();
@@ -1120,11 +1214,32 @@ mod tests {
             "FERRISCD_ENABLE_DRIFT_WATCHER",
             "ferriscd.io/managed-by",
             "ferriscd.io/app-hash",
+            // `T19.3` (finding H1): the `ApplicationSet` grants must be the ones the code actually
+            // uses — `patch` on `applicationsets` (a merge patch sets the finalizer), Server-Side
+            // Apply on `applications` (so `patch` **and** `create`), and never the finalizers
+            // subresource. The reserved `in-cluster` exclusion and the stuck-finalizer caveat are
+            // operator-visible too.
+            "--enable-applicationsets",
+            "FERRISCD_ENABLE_APPLICATIONSETS",
+            "applicationsets/status",
+            "resources: [\"applicationsets\"]",
+            "verbs: [\"get\", \"list\", \"watch\", \"patch\"]",
+            "verbs: [\"get\", \"patch\", \"update\"]",
+            "verbs: [\"get\", \"list\", \"watch\", \"patch\", \"create\"]",
+            "in-cluster",
+            "applicationset-cleanup",
+            "Terminating",
         ] {
             assert!(
                 help.contains(expected),
                 "the flag help must document {expected:?}: {help}"
             );
         }
+        // The unused grant must be *absent*: a merge patch on the object sets the finalizer, so a
+        // documented `applicationsets/finalizers` rule would be a permission nothing needs.
+        assert!(
+            !help.contains("resources: [\"applicationsets/finalizers\"]"),
+            "the loop never touches the finalizers subresource: {help}"
+        );
     }
 }

@@ -20,6 +20,7 @@
 //!             POST /api/v1/applications/{ns}/{name}/sync
 //!             POST /api/v1/applications/{ns}/{name}/rollback
 //!             GET  /api/v1/projects
+//!             GET  /api/v1/applicationsets
 //!             GET  /api/v1/clusters
 //!             GET  /api/v1/openapi.json
 //! ```
@@ -156,6 +157,10 @@ pub struct ApplicationSummary {
     /// `status.observedGeneration`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+    /// `metadata.labels["ferriscd.io/applicationset"]`: the `ApplicationSet` that generated this
+    /// `Application` (`T19.3`). Absent for a hand-authored one, which is what the web UI badges on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicationset: Option<String>,
 }
 
 /// `spec.source` summary.
@@ -587,6 +592,45 @@ pub struct ClusterView {
     pub in_cluster: bool,
 }
 
+/// `GET /api/v1/applicationsets` body (`T19.3`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApplicationSetListView {
+    /// Every `ApplicationSet` of the control-plane namespace.
+    pub items: Vec<ApplicationSetView>,
+}
+
+/// One `ApplicationSet`, reduced to its generation facts.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplicationSetView {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// `spec.generators[0]`'s kind (`list`, `git`, `clusters`, `matrix`).
+    pub generator: String,
+    /// For a `matrix`, the two child generator kinds (empty otherwise).
+    #[serde(default)]
+    pub matrix: Vec<String>,
+    /// `spec.template.spec.project`.
+    pub project: String,
+    /// `spec.syncPolicy.preserveResourcesOnDeletion` (always present, defaults to `true`).
+    pub preserve_resources_on_deletion: bool,
+    /// `spec.syncPolicy.prune` (defaults to `false`).
+    pub prune: bool,
+    /// `status.generatedCount`.
+    pub generated_count: u32,
+    /// `status.conditions`, newest last.
+    #[serde(default)]
+    pub conditions: Vec<ConditionView>,
+    /// `status.observedGeneration`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    /// `status` `Ready` condition, `True`/`False`/`Unknown` (absent before the first pass).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
+}
+
 /// `GET /api/v1/applications/{namespace}/{name}/events` body (`T17.3`).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApplicationEventListView {
@@ -701,6 +745,9 @@ pub fn router(state: AppState) -> Router {
             post(rollback_application),
         )
         .route("/api/v1/projects", get(list_projects))
+        // `T19.3`: the read-only `ApplicationSet` view. Generation itself is opt-in in the
+        // controller; the API only reports what exists.
+        .route("/api/v1/applicationsets", get(list_applicationsets))
         .route("/api/v1/clusters", get(list_clusters))
         .route("/api/v1/openapi.json", get(openapi_document))
         // The `T14.3` seam: one layer installed on the group before it is merged. `axum`'s
@@ -1936,6 +1983,43 @@ pub async fn list_projects(
     }))
 }
 
+/// Lists `ApplicationSet` objects (`T19.3`).
+///
+/// Read-only: generation happens in the opt-in controller loop, never in an API request. A caller
+/// sees an `ApplicationSet` only when at least one `AppProject` visible to them
+/// (`actor.can_see(project)`) is the project its template targets.
+///
+/// # Errors
+///
+/// [`ApiError::Backend`] when the `ApplicationSet` catalog cannot be listed.
+#[utoipa::path(
+    get,
+    path = "/api/v1/applicationsets",
+    description = "Every `ApplicationSet` of the control-plane namespace whose template targets an `AppProject` the caller may see, with its generator kinds, deletion/prune policy, and generation count.",
+    tag = "platform",
+    responses(
+        (status = 200, description = "Every visible ApplicationSet", body = ApplicationSetListView),
+        (status = 401, description = "Authentication required", body = ApiErrorBody),
+        (status = 502, description = "The cluster could not be read", body = ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn list_applicationsets(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
+) -> Result<Json<ApplicationSetListView>, ApiError> {
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
+    let applicationsets = state.applicationsets.list().await?;
+    Ok(Json(ApplicationSetListView {
+        items: applicationsets
+            .iter()
+            .filter(|appset| actor.can_see(&appset.spec.template.spec.project))
+            .map(applicationset_view)
+            .collect(),
+    }))
+}
+
 /// Lists addressable clusters visible to the caller's authorized `AppProject`s (`T13.1`, `T17.1`).
 ///
 /// An authenticated caller sees `in-cluster` or a registered remote cluster only when at least one
@@ -2105,6 +2189,74 @@ fn authorize(
     })
 }
 
+/// Maps an `ApplicationSet` to its read-view representation.
+fn applicationset_view(appset: &ferriscd_crd::ApplicationSet) -> ApplicationSetView {
+    let status = appset.status.as_ref();
+    let (generator, matrix) = appset
+        .spec
+        .generators
+        .first()
+        .map(generator_labels)
+        .unwrap_or_else(|| ("unknown".to_owned(), Vec::new()));
+    ApplicationSetView {
+        namespace: appset.namespace().unwrap_or_default(),
+        name: appset.name_any(),
+        generator,
+        matrix,
+        project: appset.spec.template.spec.project.clone(),
+        preserve_resources_on_deletion: appset.spec.sync_policy.preserve_resources_on_deletion,
+        prune: appset.spec.sync_policy.prune,
+        generated_count: status.map_or(0, |status| status.generated_count),
+        conditions: status
+            .map(|status| status.conditions.iter().map(condition_view).collect())
+            .unwrap_or_default(),
+        observed_generation: status.and_then(|status| status.observed_generation),
+        ready: status
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.type_ == ferriscd_crd::status::CONDITION_READY)
+            })
+            .map(|condition| {
+                match condition.status {
+                    ConditionStatus::True => "True",
+                    ConditionStatus::False => "False",
+                    ConditionStatus::Unknown => "Unknown",
+                }
+                .to_owned()
+            }),
+    }
+}
+
+/// The generator kind labels of one `ApplicationSet` generator (and, for a matrix, its children).
+fn generator_labels(generator: &ferriscd_crd::ApplicationSetGenerator) -> (String, Vec<String>) {
+    use ferriscd_crd::ApplicationSetGenerator as Generator;
+    match generator {
+        Generator::List(_) => ("list".to_owned(), Vec::new()),
+        Generator::Git(_) => ("git".to_owned(), Vec::new()),
+        Generator::Clusters(_) => ("clusters".to_owned(), Vec::new()),
+        Generator::Matrix(matrix) => (
+            "matrix".to_owned(),
+            matrix
+                .generators
+                .iter()
+                .map(|child| child_generator_label(child).to_owned())
+                .collect(),
+        ),
+    }
+}
+
+/// The kind label of one matrix child (the child type has no `matrix` variant by construction).
+fn child_generator_label(generator: &ferriscd_crd::MatrixChildGenerator) -> &'static str {
+    use ferriscd_crd::MatrixChildGenerator as Child;
+    match generator {
+        Child::List(_) => "list",
+        Child::Git(_) => "git",
+        Child::Clusters(_) => "clusters",
+    }
+}
+
 /// Maps an `Application` to its list representation.
 fn application_summary(app: &Application) -> ApplicationSummary {
     let status = app.status.as_ref();
@@ -2140,6 +2292,10 @@ fn application_summary(app: &Application) -> ApplicationSummary {
             .unwrap_or_default(),
         resource_count: status.map_or(0, |status| status.inventory.len()),
         observed_generation: status.and_then(|status| status.observed_generation),
+        applicationset: app
+            .labels()
+            .get(ferriscd_crd::APPLICATIONSET_LABEL)
+            .cloned(),
     }
 }
 

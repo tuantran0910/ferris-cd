@@ -164,6 +164,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/applicationsets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Lists `ApplicationSet` objects (`T19.3`).
+         * @description Every `ApplicationSet` of the control-plane namespace whose template targets an `AppProject` the caller may see, with its generator kinds, deletion/prune policy, and generation count.
+         */
+        get: operations["list_applicationsets"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/callback": {
         parameters: {
             query?: never;
@@ -467,8 +487,49 @@ export interface components {
             /** @description Every watched `Application`. */
             items: components["schemas"]["ApplicationSummary"][];
         };
+        /** @description `GET /api/v1/applicationsets` body (`T19.3`). */
+        ApplicationSetListView: {
+            /** @description Every `ApplicationSet` of the control-plane namespace. */
+            items: components["schemas"]["ApplicationSetView"][];
+        };
+        /** @description One `ApplicationSet`, reduced to its generation facts. */
+        ApplicationSetView: {
+            /** @description `status.conditions`, newest last. */
+            conditions?: components["schemas"]["ConditionView"][];
+            /**
+             * Format: int32
+             * @description `status.generatedCount`.
+             */
+            generatedCount: number;
+            /** @description `spec.generators[0]`'s kind (`list`, `git`, `clusters`, `matrix`). */
+            generator: string;
+            /** @description For a `matrix`, the two child generator kinds (empty otherwise). */
+            matrix?: string[];
+            /** @description `metadata.name`. */
+            name: string;
+            /** @description `metadata.namespace`. */
+            namespace: string;
+            /**
+             * Format: int64
+             * @description `status.observedGeneration`.
+             */
+            observedGeneration?: number | null;
+            /** @description `spec.syncPolicy.preserveResourcesOnDeletion` (always present, defaults to `true`). */
+            preserveResourcesOnDeletion: boolean;
+            /** @description `spec.template.spec.project`. */
+            project: string;
+            /** @description `spec.syncPolicy.prune` (defaults to `false`). */
+            prune: boolean;
+            /** @description `status` `Ready` condition, `True`/`False`/`Unknown` (absent before the first pass). */
+            ready?: string | null;
+        };
         /** @description One `Application`, reduced to what a UI/CLI lists. */
         ApplicationSummary: {
+            /**
+             * @description `metadata.labels["ferriscd.io/applicationset"]`: the `ApplicationSet` that generated this
+             *     `Application` (`T19.3`). Absent for a hand-authored one, which is what the web UI badges on.
+             */
+            applicationset?: string | null;
             /** @description `status.conditions`, newest last, exactly as the controller wrote them. */
             conditions?: components["schemas"]["ConditionView"][];
             /** @description `spec.destination`. */
@@ -1352,6 +1413,44 @@ export interface operations {
             };
             /** @description The request cannot be honoured */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    list_applicationsets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every visible ApplicationSet */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApplicationSetListView"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The cluster could not be read */
+            502: {
                 headers: {
                     [name: string]: unknown;
                 };
