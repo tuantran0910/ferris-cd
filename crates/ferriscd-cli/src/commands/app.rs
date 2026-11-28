@@ -57,8 +57,12 @@ pub struct ConnectionArgs {
 
 impl ConnectionArgs {
     /// Builds the client from the flags, the environment, or the stored configuration.
-    fn client(&self) -> Result<Client> {
-        Client::connect(self.server_url.as_deref(), self.token.as_deref())
+    ///
+    /// Async since `T19.2`: the stored credential is read on the blocking pool instead of on an
+    /// executor thread (the `docs/REVIEW_LOG.md` §`v1.0` follow-up).
+    async fn client(&self) -> Result<Client> {
+        Client::connect_async(self.server_url.as_deref(), self.token.as_deref())
+            .await
             .context("cannot connect to ferriscd-server")
     }
 }
@@ -219,7 +223,7 @@ pub struct HistoryArgs {
 ///
 /// Any client or serialization failure; the caller maps it onto exit code `1`.
 pub async fn run(args: AppArgs) -> Result<u8> {
-    let client = args.connection.client()?;
+    let client = args.connection.client().await?;
     match args.command {
         AppCommand::List(list) => list_applications(&client, list).await,
         AppCommand::Get(get) => get_application(&client, get).await,
@@ -449,10 +453,18 @@ pub fn detail_table(detail: &ApplicationDetailView) -> String {
     let mut rendered = String::new();
     rendered.push_str(&format!("Application   {}/{}\n", app.namespace, app.name));
     rendered.push_str(&format!("Project       {}\n", app.project));
+    // `T18.4`: an OCI source names its kind and, when pinned, the immutable digest — the two facts
+    // an operator needs to answer "which artifact is deployed?" without reading the CR.
     rendered.push_str(&format!(
-        "Source        {} ({}, {})\n",
-        app.source.repo_url, app.source.path, app.source.target_revision
+        "Source        {} ({}, {}) [{}]\n",
+        app.source.repo_url, app.source.path, app.source.target_revision, app.source.source_type
     ));
+    if let Some(tag) = app.source.tag.as_deref() {
+        rendered.push_str(&format!("OCI tag       {tag}\n"));
+    }
+    if let Some(digest) = app.source.digest.as_deref() {
+        rendered.push_str(&format!("OCI digest    {digest}\n"));
+    }
     rendered.push_str(&format!(
         "Destination   {}/{}\n",
         app.destination.cluster, app.destination.namespace
@@ -754,9 +766,12 @@ mod tests {
             name: "payments-api".to_owned(),
             project: "payments".to_owned(),
             source: SourceView {
+                source_type: "git".to_owned(),
                 repo_url: "https://github.com/example/payments.git".to_owned(),
                 path: "deploy".to_owned(),
                 target_revision: "main".to_owned(),
+                tag: None,
+                digest: None,
                 renderer: "plainYaml".to_owned(),
             },
             destination: DestinationView {
@@ -776,6 +791,7 @@ mod tests {
             conditions: Vec::new(),
             resource_count: 2,
             observed_generation: Some(3),
+            applicationset: None,
         }
     }
 
@@ -937,6 +953,7 @@ mod tests {
     #[test]
     fn the_detail_and_history_views_carry_the_server_values() {
         let detail = ApplicationDetailView {
+            sync_window: None,
             application: summary(),
             history: vec![HistoryView {
                 id: 7,
@@ -964,6 +981,7 @@ mod tests {
     #[test]
     fn watching_settles_on_the_operations_terminal_phase() {
         let mut detail = ApplicationDetailView {
+            sync_window: None,
             application: summary(),
             history: Vec::new(),
             operation: Some(OperationView {

@@ -42,7 +42,7 @@ jobs:
 
       - name: Check CRD sync (deploy/crds vs Helm & Kustomize)
         run: |
-          for crd in applications.ferriscd.io.yaml appprojects.ferriscd.io.yaml; do
+          for crd in applications.ferriscd.io.yaml appprojects.ferriscd.io.yaml applicationsets.ferriscd.io.yaml; do
             diff -u "deploy/crds/${crd}" "deploy/helm/ferriscd/crds/${crd}"
             diff -u "deploy/crds/${crd}" "deploy/manifests/crds/${crd}"
           done

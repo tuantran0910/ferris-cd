@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use ferriscd_crd::{Application, annotations};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::ResourceExt;
 use kube::runtime::Predicate;
 
 /// Control annotations whose value changes must always trigger a reconcile.
@@ -108,6 +109,49 @@ pub fn predicate() -> ApplicationPredicate {
     ApplicationPredicate
 }
 
+/// Per-object memory of the last observed composite hash for `ApplicationSet` (`T19.3`).
+///
+/// The `ApplicationSet` loop consumes a raw watch (`Apply`/`Delete`/`InitDone`), not a
+/// `kube::runtime::Controller`, so nothing else suppresses a self-triggered pass. That matters more
+/// here than for `Application`: **every** pass patches `/status`, the API server reports the patch
+/// as another `Apply` event, and without this guard the loop reconciles back-to-back forever (a live
+/// `kind` run measured about ten passes per second, each listing the namespace's `Application`s and
+/// re-running the generators).
+///
+/// The hash is the shared [`composite_hash`], so a spec change, `metadata.finalizers` (the deletion
+/// hook), a `metadata.deletionTimestamp`, or a control annotation still triggers a pass, while a
+/// status-only, label-only, or `resourceVersion`-only update does not — the periodic requeue covers
+/// anything else.
+#[derive(Debug, Default)]
+pub struct ApplicationSetChangeTracker {
+    seen: HashMap<String, u64>,
+}
+
+impl ApplicationSetChangeTracker {
+    /// Builds an empty tracker.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `appset` and returns whether the observation must trigger a pass.
+    ///
+    /// The first observation of a name always triggers, so a controller that starts mid-flight (or
+    /// a watch reconnect, which replays every object) still reconciles.
+    pub fn observe(&mut self, appset: &ferriscd_crd::ApplicationSet) -> bool {
+        let hash = composite_hash(&appset.metadata);
+        match self.seen.insert(appset.name_any(), hash) {
+            Some(previous) => previous != hash,
+            None => true,
+        }
+    }
+
+    /// Forgets a deleted object, so a later re-creation always triggers.
+    pub fn forget(&mut self, name: &str) {
+        self.seen.remove(name);
+    }
+}
+
 /// Per-object memory of the last observed hash.
 ///
 /// Mirrors what `kube`'s `PredicateFilter` does internally (cache keyed by
@@ -137,6 +181,12 @@ impl PredicateTracker {
             None => true,
         }
     }
+
+    /// Forgets a deleted object, so a re-created object of the same name always reconciles.
+    pub fn forget(&mut self, namespace: Option<&str>, name: &str) {
+        self.seen
+            .remove(&(namespace.map(str::to_owned), name.to_owned()));
+    }
 }
 
 #[cfg(test)]
@@ -164,11 +214,12 @@ mod tests {
             project: DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
             source: SourceSpec {
-                git: GitSourceSpec {
+                git: Some(GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "HEAD".to_owned(),
                     path: String::new(),
-                },
+                }),
+                oci: None,
                 renderer: RendererSpec::default(),
             },
             destination: DestinationSpec {
@@ -345,6 +396,103 @@ mod tests {
         let expected = composite_hash(&app.metadata);
         assert_eq!(predicate().hash_property(&app), Some(expected));
         assert_eq!(ApplicationPredicate.hash_property(&app), Some(expected));
+    }
+
+    /// **`T19.3`:** the `ApplicationSet` change tracker suppresses the pass's own `/status` patch —
+    /// otherwise the loop re-triggers itself on every status write — while still reacting to a
+    /// spec bump, the finalizer we add, the deletion we must act on, and a refresh annotation.
+    #[test]
+    fn the_applicationset_tracker_ignores_status_and_reacts_to_everything_that_matters() {
+        let spec: ferriscd_crd::ApplicationSetSpec = serde_saphyr::from_str(
+            r#"
+generators:
+  - list:
+      elements:
+        - env: prod
+template:
+  metadata:
+    name: api-{{env}}
+  spec:
+    project: default
+    source:
+      git:
+        repoURL: https://github.com/example/payments.git
+    destination:
+      cluster: in-cluster
+      namespace: payments
+"#,
+        )
+        .expect("the fixture spec must parse");
+        let appset = ferriscd_crd::ApplicationSet::new("fleet", spec);
+        let mut tracker = ApplicationSetChangeTracker::new();
+        assert!(
+            tracker.observe(&appset),
+            "the first observation always runs"
+        );
+
+        // A status-only write (what every pass does) must NOT re-trigger the loop.
+        let mut status_only = appset.clone();
+        status_only.status = Some(ferriscd_crd::ApplicationSetStatus {
+            observed_generation: Some(1),
+            generated_count: 2,
+            ..ferriscd_crd::ApplicationSetStatus::default()
+        });
+        status_only.metadata.resource_version = Some("999".to_owned());
+        status_only
+            .metadata
+            .labels
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .insert("team".to_owned(), "payments".to_owned());
+        assert!(
+            !tracker.observe(&status_only),
+            "a /status patch, a label edit, or a resourceVersion bump must not reconcile"
+        );
+        assert!(
+            !tracker.observe(&status_only),
+            "and it must stay suppressed on every later identical observation"
+        );
+
+        // Every field the loop reads from the object must trigger a pass.
+        let mut spec_changed = appset.clone();
+        spec_changed.metadata.generation = Some(2);
+        assert!(
+            tracker.observe(&spec_changed),
+            "a spec change must reconcile"
+        );
+
+        let mut finalized = appset.clone();
+        finalized
+            .metadata
+            .finalizers
+            .get_or_insert_with(Vec::new)
+            .push(ferriscd_crd::APPLICATIONSET_FINALIZER.to_owned());
+        assert!(
+            tracker.observe(&finalized),
+            "our finalizer is the deletion hook and must reconcile"
+        );
+
+        let mut deleted = appset.clone();
+        deleted.metadata.deletion_timestamp = Some(timestamp("2026-11-28T00:00:00Z"));
+        assert!(tracker.observe(&deleted), "a deletion must reconcile");
+
+        let mut refreshed = appset.clone();
+        refreshed
+            .metadata
+            .annotations
+            .get_or_insert_with(std::collections::BTreeMap::new)
+            .insert(annotations::REFRESH.to_owned(), "now".to_owned());
+        assert!(
+            tracker.observe(&refreshed),
+            "a ferriscd.io/refresh annotation must force a pass"
+        );
+
+        // A deletion forgets the object, so a re-created `ApplicationSet` of the same name with the
+        // same generation always reconciles again.
+        tracker.forget("fleet");
+        assert!(
+            tracker.observe(&appset),
+            "a re-created object must reconcile even with an unchanged hash"
+        );
     }
 
     #[test]

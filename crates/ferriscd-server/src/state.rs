@@ -16,7 +16,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use ferriscd_crd::{AppProject, Application};
+use ferriscd_crd::{AppProject, Application, ApplicationSet};
 use ferriscd_engine::manifest::ResourceKey;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -225,10 +225,47 @@ pub trait ApplicationSource: Send + Sync + 'static {
     fn get(&self, namespace: &str, name: &str) -> SeamFuture<'_, Option<Application>>;
 }
 
-/// Reads `AppProject` objects (`GET /api/v1/projects`).
+/// Reads `AppProject` objects (`GET /api/v1/projects`, and the sync-window verdict of
+/// `GET /api/v1/applications/{namespace}/{name}`).
 pub trait ProjectCatalog: Send + Sync + 'static {
     /// Lists every `AppProject` of the control-plane namespace.
     fn list(&self) -> SeamFuture<'_, Vec<AppProject>>;
+
+    /// Reads one `AppProject`, or `Ok(None)` when it does not exist (finding M-4).
+    ///
+    /// The application-detail path needs exactly one project — the one its `spec.project` names — so
+    /// it must not list (and deserialize) the whole catalogue to find it. The default implementation
+    /// is that listing, which keeps every test fake honest without an extra method; the production
+    /// adapter ([`crate::kube::KubeProjectCatalog`]) overrides it with a single `Api::get_opt`.
+    fn get(&self, name: &str) -> SeamFuture<'_, Option<AppProject>> {
+        let name = name.to_owned();
+        Box::pin(async move {
+            Ok(self
+                .list()
+                .await?
+                .into_iter()
+                .find(|project| project.metadata.name.as_deref() == Some(name.as_str())))
+        })
+    }
+}
+
+/// Reads `ApplicationSet` objects (`GET /api/v1/applicationsets`, `T19.3`).
+pub trait ApplicationSetCatalog: Send + Sync + 'static {
+    /// Lists every `ApplicationSet` of the control-plane namespace.
+    fn list(&self) -> SeamFuture<'_, Vec<ApplicationSet>>;
+}
+
+/// No `ApplicationSet` catalog is configured: the read view is empty.
+///
+/// This is the default so a control plane that never opted into `--enable-applicationsets` still
+/// serves a valid (empty) page instead of failing the whole API.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoApplicationSets;
+
+impl ApplicationSetCatalog for NoApplicationSets {
+    fn list(&self) -> SeamFuture<'_, Vec<ApplicationSet>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 /// The most Kubernetes `Event`s one `GET .../events` response carries (`T17.3`).
@@ -495,6 +532,40 @@ impl Readiness for NotReady {
     }
 }
 
+/// The secret-free facts `GET /api/v1/auth/config` publishes to the Web UI and the CLI (`T19.1`).
+///
+/// Deliberately not the [`crate::oidc::OidcConfig`]: this type is what an **unauthenticated** caller
+/// may learn, so it carries no CA bundle, no secret and no prefix that would let an IdP claim be
+/// forged offline. `bff_enabled` is published now and wired by `T19.2` (the cookie session flow).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublicAuthConfig {
+    /// The configured issuer, when OIDC is enabled.
+    pub issuer: Option<String>,
+    /// The configured OAuth client id, when OIDC is enabled.
+    pub client_id: Option<String>,
+    /// The scopes the SPA/CLI should request.
+    pub scopes: Vec<String>,
+    /// Whether the optional server-side (BFF cookie) session mode is available (`T19.2`).
+    pub bff_enabled: bool,
+}
+
+impl PublicAuthConfig {
+    /// The OIDC facts for `issuer` + `client_id`.
+    #[must_use]
+    pub fn oidc(
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+        scopes: Vec<String>,
+    ) -> Self {
+        Self {
+            issuer: Some(issuer.into()),
+            client_id: Some(client_id.into()),
+            scopes,
+            bff_enabled: false,
+        }
+    }
+}
+
 /// Everything the router needs.
 ///
 /// Deliberately a bag of seams: one `AppState` is built by [`crate::Server`] from the shared
@@ -506,6 +577,8 @@ pub struct AppState {
     pub applications: Arc<dyn ApplicationSource>,
     /// `AppProject` reads.
     pub projects: Arc<dyn ProjectCatalog>,
+    /// `ApplicationSet` reads (`T19.3`).
+    pub applicationsets: Arc<dyn ApplicationSetCatalog>,
     /// Kubernetes `Event` reads for the `Application` events timeline (`T17.3`).
     pub events: Arc<dyn EventSource>,
     /// The SSE snapshot feed (`GET /api/v1/applications/stream`, `T17.3`).
@@ -528,6 +601,10 @@ pub struct AppState {
     pub tokens: Arc<dyn TokenAuthenticator>,
     /// `T14.3` positive-only `TokenReview` cache, keyed by token SHA-256.
     pub identities: Arc<IdentityCache>,
+    /// `T19.1` secret-free OIDC facts `GET /api/v1/auth/config` publishes.
+    pub auth_config: PublicAuthConfig,
+    /// `T19.2` optional server-side (BFF) session flow. `None` = the SPA does its own PKCE flow.
+    pub bff: Option<Arc<crate::auth_bff::BffState>>,
     /// `T14.4` / `T17.1` live-reloading project-scoped authorization policy store (empty = deny
     /// every authenticated caller).
     pub rbac: RbacPolicyStore,
@@ -556,6 +633,7 @@ impl fmt::Debug for AppState {
             .field("rbac_rules", &self.rbac.rule_count())
             .field("webhooks", &self.webhooks)
             .field("readiness", &self.readiness.is_ready())
+            .field("bff_enabled", &self.bff.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -584,6 +662,7 @@ impl AppState {
         Self {
             applications,
             projects,
+            applicationsets: Arc::new(NoApplicationSets),
             events: Arc::new(NoEvents),
             snapshots: Arc::new(NoSnapshots),
             clusters,
@@ -595,6 +674,8 @@ impl AppState {
             auth: AuthPolicy::default(),
             tokens: Arc::new(UnconfiguredTokenAuthenticator),
             identities: Arc::new(IdentityCache::default()),
+            auth_config: PublicAuthConfig::default(),
+            bff: None,
             rbac: RbacPolicyStore::empty(),
             rbac_namespace: crate::rbac::DEFAULT_RBAC_NAMESPACE.to_owned(),
             webhooks,
@@ -626,6 +707,17 @@ impl AppState {
     }
 
     /// Replaces the authentication seam.
+    ///
+    /// **Finding `N4a`:** an [`AuthPolicy::Oidc`] or [`AuthPolicy::TokenReviewOrOidc`] policy must be
+    /// paired with [`Self::with_auth_config`] (built by [`PublicAuthConfig::oidc`]). The policy is
+    /// what `GET /api/v1/auth/config` publishes as `authMode`, so an `oidc` policy with no issuer
+    /// and no client id tells every Web UI and CLI to start an SSO sign-in it cannot complete.
+    ///
+    /// The binary cannot reach that state — `--oidc-issuer` and `--oidc-client-id` are required for
+    /// an OIDC policy and the server refuses to start without them — but a library embedder builds
+    /// an `AppState` by hand. [`Self::auth_config_matches_policy`] is the predicate the discovery
+    /// handler `debug_assert!`s, so the mismatch fails in tests rather than in a browser; call
+    /// either builder in either order, but call both.
     #[must_use]
     pub fn with_auth(mut self, auth: AuthPolicy) -> Self {
         self.auth = auth;
@@ -646,6 +738,45 @@ impl AppState {
         self
     }
 
+    /// Publishes the secret-free OIDC facts on `GET /api/v1/auth/config` (`T19.1`).
+    ///
+    /// Required whenever [`Self::with_auth`] selected an OIDC policy (finding `N4a`): see
+    /// [`Self::auth_config_matches_policy`].
+    #[must_use]
+    pub fn with_auth_config(mut self, auth_config: PublicAuthConfig) -> Self {
+        self.auth_config = auth_config;
+        self
+    }
+
+    /// Enables the optional server-side (BFF) session flow (`T19.2`).
+    ///
+    /// Turns on `GET /api/v1/auth/login`, `GET /api/v1/auth/callback`, `POST /api/v1/auth/logout`, the
+    /// CSRF middleware on mutating routes, cookie authentication in [`crate::auth::authenticate`], and
+    /// the `bffEnabled` flag `GET /api/v1/auth/config` publishes.
+    ///
+    /// Call it **after** [`Self::with_auth_config`]: this sets `bffEnabled` on that value, so calling
+    /// it first would let the later `with_auth_config` publish `bffEnabled: false` for a server that
+    /// really answers the cookie flow.
+    #[must_use]
+    pub fn with_bff(mut self, bff: Arc<crate::auth_bff::BffState>) -> Self {
+        self.auth_config.bff_enabled = true;
+        self.bff = Some(bff);
+        self
+    }
+
+    /// Whether `GET /api/v1/auth/config` can publish an honest answer for the selected policy.
+    ///
+    /// `true` for every policy that does not require OIDC, and — for [`AuthPolicy::Oidc`] and
+    /// [`AuthPolicy::TokenReviewOrOidc`] — only once [`Self::with_auth_config`] supplied both the
+    /// issuer and the client id (`PublicAuthConfig::oidc`). Finding `N4a`: an embedder cannot
+    /// publish `authMode: "oidc"` with no issuer and no client id without this returning `false`,
+    /// which the discovery handler `debug_assert!`s.
+    #[must_use]
+    pub fn auth_config_matches_policy(&self) -> bool {
+        !self.auth.requires_oidc()
+            || (self.auth_config.issuer.is_some() && self.auth_config.client_id.is_some())
+    }
+
     /// Replaces the project-scoped authorization policy (`T14.4`).
     #[must_use]
     pub fn with_rbac(mut self, rbac: Arc<RbacPolicy>) -> Self {
@@ -664,6 +795,16 @@ impl AppState {
     #[must_use]
     pub fn with_rbac_namespace(mut self, namespace: impl Into<String>) -> Self {
         self.rbac_namespace = namespace.into();
+        self
+    }
+
+    /// Replaces the `ApplicationSet` catalog (`T19.3`).
+    #[must_use]
+    pub fn with_applicationset_catalog(
+        mut self,
+        applicationsets: Arc<dyn ApplicationSetCatalog>,
+    ) -> Self {
+        self.applicationsets = applicationsets;
         self
     }
 

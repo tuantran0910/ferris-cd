@@ -7,6 +7,7 @@ anything:
 |---|---|
 | `crds/applications.ferriscd.io.yaml` | `Application` CRD (`ferriscd.io/v1alpha1`) |
 | `crds/appprojects.ferriscd.io.yaml` | `AppProject` CRD — the multi-tenancy boundary (`T12.1`) |
+| `crds/applicationsets.ferriscd.io.yaml` | `ApplicationSet` CRD — opt-in fleet generation (`T19.3`, `--enable-applicationsets`) |
 | `manifests/default-project.yaml` | the permissive single-tenant `default` project every `Application` falls back to |
 | `kind-config.yaml` | local development cluster definition (`make kind-up`) |
 
@@ -14,6 +15,25 @@ Both CRDs must be installed. A cluster that does not serve `AppProject` cannot r
 anything: project lookups are **never** treated as permissive, and the failure names
 `deploy/crds/appprojects.ferriscd.io.yaml` instead of pretending the project is missing
 (finding M3).
+
+### Kubernetes version floor: `>= 1.29`
+
+The `Application` CRD validates `spec.source.oci` with a CEL rule written in the optional-field
+form (`self.?tag.hasValue() || self.?digest.hasValue()`, see `deploy/crds/applications.ferriscd.io.yaml`).
+CEL optional chaining arrived in Kubernetes **1.29**: an older API server cannot compile that rule
+and refuses the *CRD itself* at `kubectl apply` time — nothing installs, with an error naming the
+rule. Newer is fine (the project targets `1.35`; `deploy/kind-config.yaml` and the `k8s-openapi`
+version feature agree). The rule is what makes `oci: {}` — an OCI source with neither a `tag` nor a
+`digest` — fail admission instead of reaching the controller and failing every reconcile; do not
+"fix" an install error by deleting it.
+
+```bash
+kubectl apply -f deploy/crds/
+kubectl wait --for=condition=Established crd/applications.ferriscd.io --timeout=120s
+# The installed rule really is the current one (a CRD left by an earlier revision is not upgraded
+# by a failed apply):
+kubectl get crd applications.ferriscd.io -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.source.properties.oci.x-kubernetes-validations[0].rule}'
+```
 
 ---
 
@@ -422,6 +442,141 @@ the object has not been deleted yet.
 `spec.destination.cluster` is still checked against `AppProject.spec.destinations` **before** the
 registry is consulted, so a tenant cannot use an `Application` to probe which clusters exist.
 
+### OIDC / SSO sign-in (`T19.1`) — optional private CA Secret
+
+`ferriscd server` can authenticate the protected API with corporate IdP tokens instead of (or as well
+as) Kubernetes `ServiceAccount` tokens:
+
+```text
+ferriscd server \
+  --auth-policy oidc \
+  --oidc-issuer https://login.example.com \
+  --oidc-client-id ferriscd
+```
+
+* `--auth-policy oidc` accepts **only** OIDC JWTs; `--auth-policy token-review-or-oidc` accepts an
+  OIDC JWT **or** a `ServiceAccount` token (OIDC first, and a token carrying this server's issuer is
+  never forwarded to the API server). The default, `token-review`, is unchanged.
+* Verification is local against the IdP's published JWKS (RS256/ES256/ES384/EdDSA only), so there is
+  **no client secret** to store and no per-request round trip to the IdP. `--oidc-username-prefix`
+  and `--oidc-groups-prefix` (both default `oidc:`) are what keep an IdP claim from becoming a
+  Kubernetes identity such as `system:masters`.
+* `--oidc-insecure-http` exists for a local Dex on `kind` and nothing else.
+
+An internal IdP signed by a **private** CA is trusted through one optional `Secret` in the
+control-plane namespace (`--namespace`, default `ferriscd-system`):
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ferriscd-oidc
+  namespace: ferriscd-system
+  labels:
+    ferriscd.io/secret-type: oidc
+type: Opaque
+data:
+  # A PEM bundle: the CA that signed the IdP's TLS certificate (and its chain).
+  ca.crt: <base64 PEM>
+```
+
+* The file **must** be named `ca.crt`, and the label `ferriscd.io/secret-type: oidc` is the opt-in
+  (an unlabelled `ferriscd-oidc` is ignored with a warning, so an unrelated `Secret` of that name is
+  never trusted by accident).
+* **Fallback:** with no `ferriscd-oidc` `Secret`, the IdP's certificate must chain to the **system
+  roots** bundled in the image. A missing `Secret` is logged (`the OIDC Secret could not be read;
+  the IdP must be trusted by the system roots`) and is not a startup failure.
+* The bundle is read **once, at startup** — rotate it and restart the server. Its contents are never
+  logged, and `Debug` renders it as a byte count.
+* **No RBAC change is needed:** the control plane already reads `Secret`s in its own namespace for
+  repository credentials (see the namespaced `Role`/`RoleBinding` above), and this `Secret` is read
+  under that same namespaced grant — never cluster-wide.
+
+#### Registering the redirect URI (`T19.2`)
+
+Both sign-in modes are OAuth 2.1 **public clients** (Authorization Code + PKCE `S256`, no client
+secret), so each needs exactly **one** redirect URI registered at the IdP. Register these exact
+strings — a wildcard is not needed and must not be used (it is the open redirect the exact-match
+allowlist exists to prevent):
+
+| Mode | Redirect URI to register |
+|---|---|
+| Web UI, SPA in-memory token (`--auth-policy oidc` / `token-review-or-oidc`) | `https://<ferriscd-web-host>/auth/callback` |
+| Web UI, server-side cookie (`--oidc-bff-enabled`) | the value of `--oidc-bff-redirect-uri`, normally `https://<ferriscd-web-host>/api/v1/auth/callback` |
+| `ferriscd login --oidc` (CLI) | none — it uses an ephemeral `http://127.0.0.1:<random-port>/callback` loopback redirect (RFC 8252). Register `http://127.0.0.1` as an allowed loopback redirect if your IdP requires an entry (Auth0/Okta accept any port on an exact loopback URI). |
+
+* The SPA redirect URI is **fixed** (`origin + /auth/callback`), not `origin + <current route>`, so the
+  page an operator was on is carried through the sign-in transaction and restored afterwards. The
+  static host therefore has to serve `index.html` for `/auth/callback` exactly as it already does for
+  `/applications/...` deep links.
+* The BFF redirect URI is compared **byte for byte** against `--oidc-bff-redirect-uri`; a request that
+  supplies any other `redirect_uri` to `GET /api/v1/auth/login` is refused before anything is sent to
+  the IdP.
+* Optional but recommended for the BFF flow: enable `--oidc-bff-enabled` with
+  `--oidc-bff-redirect-uri` and `--oidc-bff-session-key-file` (the `sessionKey` entry of the
+  `ferriscd.io/secret-type: oidc` `Secret`, at least 32 bytes). The cookies it issues are all
+  `__Host-` prefixed, `Secure`, `SameSite=Lax` and `Path=/`, so they need an **https** origin (a
+  loopback `http://` dev setup works in Chromium/Firefox, which treat `localhost` as trustworthy).
+
+##### One sign-in at a time per browser (`T19.2`)
+
+The BFF flow binds each pending sign-in to the browser that started it with a **single-valued**
+`__Host-ferriscd_oidc_state` cookie, so a browser profile holds at most one pending sign-in:
+
+* Starting a second sign-in in **another tab or window of the same browser** replaces that cookie, and
+  the first tab's callback is then refused (`400`, "this browser did not start the sign-in"). The
+  first tab has to start again — nothing is signed in and no token was ever exchanged, so the only
+  cost is the click.
+* Two operators on two machines, or two different browser profiles, are unrelated: each has its own
+  cookie jar and its own pending transaction.
+* A sign-in left unfinished simply expires after five minutes (`DEFAULT_TRANSACTION_TTL`, 300 s; the
+  pending transaction has no flag of its own) and can be restarted.
+
+This is a deliberate trade: a per-tab `state` store would need either a cookie per transaction or a
+server-side tab identifier, and the single-use cookie is what makes login CSRF / account swap
+impossible (see `docs/REVIEW_LOG.md`, `T19.2` finding `H1`).
+
+##### CSRF and cross-site sign-out (`T19.2`)
+
+Cookie mode adds two browser-side defences, and both leave one residual worth knowing about:
+
+* **Double-submit CSRF on every mutating request.** A request that carries the session cookie must
+  also echo the sealed CSRF token in the `x-ferriscd-csrf` header **and** in the readable
+  `__Host-ferriscd_csrf` cookie (`403` otherwise). A `Bearer` request is exempt: the CLI and CI cannot
+  be forged by a page, so demanding the header would only break scripted syncs.
+* **A cross-site sign-out is refused.** `SameSite=Lax` withholds the session cookie from a cross-site
+  `POST`, so such a `/api/v1/auth/logout` request has nothing to authenticate — but answering it would
+  still store its `Max-Age=0` cookies, i.e. any page on the internet could sign an operator out. A
+  logout the browser itself labelled `Sec-Fetch-Site: cross-site` is therefore refused `403` before
+  the cookie is looked at; `same-origin`, `none`, and a client that sends no Fetch Metadata header at
+  all (curl, the CLI, an older browser) still work.
+* **`same-site` is deliberately allowed, not an oversight.** The web UI and the API are separate
+  origins in a split-origin deployment (`https://ferriscd.example.com` for the SPA,
+  `https://ferriscd-api.example.com` for the server, or two ports on the same host), and a request
+  between them is labelled `same-site`, not `same-origin`. Refusing it would break every such
+  deployment, so only `cross-site` is refused. The residual, stated plainly: a page on a **sibling
+  subdomain** of the same registrable domain (any other team's app on `*.example.com`) is `same-site`,
+  so its `POST /api/v1/auth/logout` reaches the double-submit check instead of the Fetch Metadata one.
+  With a **usable** session cookie it is still refused `403` (it cannot set the `x-ferriscd-csrf`
+  header, and `Set-Cookie` is never sent on a refusal). What it can still reach is the dead-cookie
+  path: a request with no usable session cookie is let through to the handler, so a sibling subdomain
+  can clear cookies that were already dead — a restart click, nothing signed in, no code exchanged.
+  Host the control plane on its own registrable domain if sibling subdomains are not trusted.
+
+##### Cookie mode has no "am I signed in?" probe (`T19.2`)
+
+A BFF deployment holds the credential in an `HttpOnly` cookie the SPA cannot read, and the server
+exposes no session probe on purpose: `GET /api/v1/auth/login` starts a flow, `POST /api/v1/auth/logout`
+ends one, and nothing answers "is this cookie still good?" — such a route would exist only to be a
+`200`/`401` oracle, and the `401` on any real read already says the same thing.
+
+The cost, stated plainly: on a **cold load with an expired (or rotated-key) cookie** the SPA renders
+the authenticated shell first and only discovers the dead session when its first API call answers
+`401`, at which point the existing `401 → logout` path clears the dead cookie and returns to the
+sign-in screen. That flash of the authenticated shell is the trade for keeping the token in exactly
+one place (an `HttpOnly` cookie, never JavaScript memory or `localStorage`). SPA in-memory mode does
+not have it — it can read the token's `exp` and show the re-auth banner before it expires.
+
 ### HA: `Lease` leader election (`T13.2`) — opt-in
 
 By default the controller runs as a single replica: run exactly one. Two replicas without leader
@@ -626,6 +781,207 @@ Operational notes:
   publishing errors are logged as warnings and never fail reconciliation. Grant
   `apiGroups: ["events.k8s.io"], resources: ["events"], verbs: ["create", "patch", "get", "list"]` (included in
   the `ClusterRole` above).
+
+### Ownership labels for the opt-in drift watcher (`T18.1`)
+
+Under Model 1 a `DriftWatcher` (opt-in, `--enable-drift-watcher`) can only be *label*-scoped: the
+Kubernetes API server cannot filter a watch on annotations. `--enable-drift-watcher`
+(`FERRISCD_ENABLE_DRIFT_WATCHER`, default `false`) therefore also stamps two bounded top-level
+labels onto every **non-hook** managed resource, alongside the existing
+`ferriscd.io/tracking-id` annotation:
+
+| Label | Value | Why |
+|---|---|---|
+| `ferriscd.io/managed-by` | `ferriscd` | the server-side selector (`ferriscd.io/managed-by=ferriscd`) so unmanaged objects never cross the wire |
+| `ferriscd.io/app-hash` | 16 lowercase hex characters | first 16 hex chars (64 bits) of `SHA-256("<app-namespace>/<app-name>")` — identifies the owning `Application` without a 253-character name overflowing the **63-character** label-value limit, and without `ns-a/app` colliding with `ns-b/app` (Finding M5) |
+
+Operational notes:
+
+* **The env value is exactly `true` or `false`.** `FERRISCD_ENABLE_DRIFT_WATCHER` is parsed as a
+  bool, not tested for truthiness: unset (or the flag absent) means **off**, and any other value —
+  including the empty string and `1`/`yes`/`True` — is a **usage error** that stops the controller at
+  startup instead of silently leaving the labels off. In the Helm chart this is
+  `driftWatcher.enabled: true` (which renders `--enable-drift-watcher`); `server.extraArgs` and
+  `server.extraEnv` remain the escape hatch for anything the chart has no value for.
+* **Off by default, and additive when on.** With the flag off the apply body is unchanged (the
+  annotation only). Turning it on adds the pair; turning it back off removes nothing from the
+  desired body and the next sync's Server-Side Apply converges the two labels away — one no-op diff
+  per resource, never a drift loop.
+* **Never in an immutable selector.** The labels go on the object's own `metadata.labels` only.
+  `spec.selector.matchLabels` and `spec.template.metadata.labels` are untouched: they are immutable
+  on `Deployment`/`StatefulSet`/`DaemonSet`, so writing there would fail every later apply with
+  `422 Immutable`.
+* **Lifecycle hooks are never stamped.** A stamped hook would look prunable to the pruner even
+  though its lifetime belongs to its `ferriscd.io/hook-delete-policy`.
+* **No extra RBAC is needed for the labels themselves** — they ride on objects the controller
+  already applies. The metadata *watch* needs its own read grant; see
+  [Opt-in drift watcher (`T18.2`)](#opt-in-drift-watcher-t182) below.
+* **Cluster lifecycle is broadcast internally.** `ClusterManager` publishes `Added`, `Rebuilt` and
+  `Removed` events on a bounded (64) channel for `ferriscd.io/secret-type=cluster` secrets —
+  including a cluster whose `Secret` vanished while the watch was reconnecting, which Kubernetes
+  never reports as a delete. A subscriber that falls behind is told so (`Lagged`) and resynchronises
+  against the registry's live name set; the registry never waits for a consumer.
+
+### `ApplicationSet` controller (`T19.3`) — opt-in, namespaced grants
+
+`--enable-applicationsets` (`FERRISCD_ENABLE_APPLICATIONSETS`, default `false`) starts an
+independent loop that turns `ApplicationSet` objects (`ferriscd.io/v1alpha1`, `kubectl get appset`)
+into ordinary `Application`s **in the `ApplicationSet`'s own namespace** — the control-plane
+namespace — passing every one of them through the same `AppProject` policy as a hand-authored
+`Application`.
+
+Nothing is granted for it by default: the shipped Role in `deploy/manifests/rbac.yaml` keeps the
+opt-in rules commented out, and the Helm chart gates them behind `rbac.applicationsets: false`. Add
+exactly these three rules (control-plane namespace only) before turning the flag on:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferriscd-applicationsets
+  namespace: ferriscd-system
+rules:
+  # `patch` (not `update`): the finalizer is set and cleared with a merge patch on
+  # `metadata.finalizers` of the ApplicationSet object itself. The `applicationsets/finalizers`
+  # subresource is never used, so granting it would be a permission nothing needs.
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applicationsets"]
+    verbs: ["get", "list", "watch", "patch"]
+  # `/status` is patched on every pass (`Ready`, `observedGeneration`, `generatedCount`).
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applicationsets/status"]
+    verbs: ["get", "patch", "update"]
+  # Server-Side Apply on the generated Applications: `patch` for an existing object, `create`
+  # for a new one. Never `update` (SSA does not use it).
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "patch", "create"]
+```
+
+**`delete` is a second, separate opt-in (`rbac.applicationsetPrune`).** The two verbs above are
+everything a *non-destructive* `ApplicationSet` needs. Two features do delete generated
+`Application`s, and each is opt-in per object: `spec.syncPolicy.prune: true` (drop the Applications
+a generator no longer produces) and `spec.syncPolicy.preserveResourcesOnDeletion: false` (delete
+them when the `ApplicationSet` itself is deleted). Add `delete` to the `applications` rule **only**
+if some `ApplicationSet` sets one of them:
+
+```yaml
+  - apiGroups: ["ferriscd.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "patch", "create", "delete"]
+```
+
+With Helm, that is `rbac.applicationsets: true` plus `rbac.applicationsetPrune: true` (both default
+`false`: the chart widens the `applications` grant — and only that rule — when the second is on).
+The Kustomize manifest keeps the `delete`-bearing rule commented out for the same reason: it is a
+namespace-wide grant, so it applies to *every* `ApplicationSet` in the control-plane namespace, not
+just the one that opted in.
+
+With Kustomize, patch the shipped Role instead of adding a second one:
+
+```yaml
+patches:
+  - target:
+      kind: Role
+      name: ferriscd
+    patch: |-
+      - op: add
+        path: /rules/-
+        value:
+          apiGroups: ["ferriscd.io"]
+          resources: ["applicationsets"]
+          verbs: ["get", "list", "watch", "patch"]
+      - op: add
+        path: /rules/-
+        value:
+          apiGroups: ["ferriscd.io"]
+          resources: ["applicationsets/status"]
+          verbs: ["get", "patch", "update"]
+      - op: add
+        path: /rules/-
+        value:
+          apiGroups: ["ferriscd.io"]
+          resources: ["applications"]
+          verbs: ["get", "list", "watch", "patch", "create"]
+```
+
+Operational notes:
+
+* **The `clusters` generator never yields `in-cluster`.** The reserved pseudo-cluster is not a
+  registration `Secret`, so it is not a generator parameter: an `ApplicationSet` that wants a
+  control-plane `Application` writes it in the template instead of relying on a cluster match.
+* **Deletion is non-destructive by default.** Deleting an `ApplicationSet` *orphans* the generated
+  `Application`s (their `ownerReference` is dropped, the objects and their workloads stay) unless
+  `spec.syncPolicy.preserveResourcesOnDeletion: false`. Pruning a stale generated `Application` is
+  separately opt-in (`spec.syncPolicy.prune: true`).
+* **Turning the flag off with `ApplicationSet`s in place wedges their deletion.** The controller
+  adds `ferriscd.io/applicationset-cleanup` to every `ApplicationSet` it manages; if the feature is
+  disabled afterwards, nothing runs that finalizer, so deleting an `ApplicationSet` leaves it
+  `Terminating` and its generated `Application`s owned. Re-enable the flag (the finalizer then runs
+  and orphans them) or remove the finalizer by hand
+  (`kubectl patch applicationset <name> --type=merge -p '{"metadata":{"finalizers":null}}'`).
+* **Changes are event-driven, not timer-driven.** A cluster registration appearing/changing/
+  disappearing (`T18.1` broadcast) or a generated `Application` being created/edited/deleted
+  re-runs the pass immediately; `spec.requeueAfterSeconds` (default 180) and the 10-minute re-list
+  are backstops, not the reaction time.
+
+### Opt-in drift watcher (`T18.2`)
+
+Under Model 1 an out-of-band `kubectl edit` / `kubectl delete` is noticed on the next periodic
+reconcile (`spec.requeueAfterSeconds`, default `180s`). `--enable-drift-watcher`
+(`FERRISCD_ENABLE_DRIFT_WATCHER`, default `false`) adds an **opt-in trigger source**: a
+label-scoped, metadata-only watch of the kinds the fleet actually owns, which enqueues a reconcile
+of the owning `Application` within about **2 s** (`2 s` trailing debounce, `5 s` maximum wait).
+Model 1 keeps running underneath, so the watcher is a latency optimisation, never a dependency.
+
+| Flag / env | Default | Meaning |
+|---|---|---|
+| `--enable-drift-watcher` / `FERRISCD_ENABLE_DRIFT_WATCHER` | `false` | turns the watcher (and the `T18.1` ownership labels it selects on) on |
+| `--drift-watcher-kinds` / `FERRISCD_DRIFT_WATCHER_KINDS` | empty (all) | comma-separated allow-list of `Kind` or `group/Kind`; `/Kind` restricts to the core group |
+
+Operational notes:
+
+* **What is watched.** Strictly what the fleet reports in `Application.status.inventory`, resolved
+  through the discovery cache, deduplicated per `(cluster, group, kind)` and capped at
+  `MAX_DRIFT_WATCHES = 64` per cluster (the excess stays on Model 1 polling, with one warning).
+  Nothing is watched before an `Application` has reported an inventory, and nothing is watched
+  cluster-wide beyond those kinds.
+* **Metadata only, label scoped.** Every request asks for
+  `Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1` (the list asks for
+  `as=PartialObjectMetadataList`) with `labelSelector=ferriscd.io/managed-by=ferriscd`, so the API
+  server never sends `.spec`, `.status` or `Secret.data`, and objects FerrisCD does not manage never
+  cross the wire.
+* **`--drift-watcher-kinds` is an RBAC and blast-radius lever.** Restrict it to the kinds you grant
+  below (e.g. `Deployment,/ConfigMap`) if the cluster's watch budget or your RBAC policy cannot
+  afford all of them. A malformed list is a **startup error**, never a silent "watch everything" —
+  and that is true whether or not the watcher itself is on: the value is parsed and validated at
+  startup unconditionally, so a typo stops the controller even when `--enable-drift-watcher=false`.
+  Only a **well-formed** list is tolerated while the watcher is off, where it is ignored with a
+  warning (`--drift-watcher-kinds` set, `--enable-drift-watcher` off: only Model 1 periodic polling
+  runs).
+* **Required RBAC (cluster-wide reads).** The watches are cluster-scoped
+  (`Api::all_with`), so grants must come from the controller's `ClusterRole`:
+  `apiGroups: [""]` (`configmaps`, `services`, `serviceaccounts`, `persistentvolumeclaims`,
+  `namespaces`), `apps` (`deployments`, `statefulsets`, `daemonsets`, `replicasets`), `batch`
+  (`jobs`, `cronjobs`) and `networking.k8s.io` (`ingresses`, `networkpolicies`) all need
+  `get`, `list`, `watch`. **`secrets` is deliberately not included**: the watcher never needs it
+  and a `ClusterRole` must not grant it. The Helm chart adds exactly these rules when
+  `driftWatcher.enabled=true`; the shipped `ClusterRole` already covers them through its workload
+  rules, so a manifest-based install needs no change unless it narrows `rbac.workloadRules`.
+* **`403`/`404`/`405` is a fallback, not an outage.** A watch the API server refuses permanently
+  logs **one** structured warning, increments
+  `ferriscd_drift_watcher_fallback_total{reason="forbidden|not_found|method_not_allowed"}`, and
+  parks that `(cluster, kind)` on a `15m` cooldown — Model 1 polling detects the drift the whole
+  time. Nothing is marked `Ready=False`, nothing panics, and one refused kind never disables the
+  others. Transient errors (`429`, `500`, `410 Gone`, a dropped connection) are retried by the
+  client and never park a watcher.
+* **Metrics.** `ferriscd_drift_watcher_events_total{outcome}` (`suppressed`, `unmapped`,
+  `filtered`, `debounced`, `ignored`, `dropped`), `ferriscd_drift_watcher_triggers_total`
+  (reconciles a drift trigger actually enqueued), `ferriscd_drift_watcher_fallback_total{reason}`
+  and `ferriscd_drift_watcher_active_watches`. All label sets are fixed: never a cluster name, a
+  GVK, an object name or an error message. `active_watches` is **sampled** at the end of each
+  supervisor refresh (a lifecycle event or the `30s` plan refresh), so a watch that starts or dies
+  in between shows up one interval later: treat it as a capacity signal, not a per-event counter.
 
 ### Multi-tenancy RBAC matrix
 

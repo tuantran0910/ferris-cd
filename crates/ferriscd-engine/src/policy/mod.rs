@@ -19,6 +19,9 @@ pub mod gate;
 pub mod namespace_scope;
 #[cfg(feature = "opa-policy")]
 pub mod rego;
+// `T17.4`: deployment-governance windows — a pure evaluation of `AppProject.spec.syncWindows`
+// against an **injected** `jiff::Timestamp` (never a wall-clock read inside the engine).
+pub mod sync_windows;
 
 pub use app_project::{AppProjectPolicy, PolicyError, wildcard_matches};
 pub use cel::{CelBudget, CelError, CelFailure, Program};
@@ -38,3 +41,7 @@ pub use namespace_scope::{
 };
 #[cfg(feature = "opa-policy")]
 pub use rego::{RegoLimits, RegorusEvaluator};
+pub use sync_windows::{
+    InvalidSyncWindow, SyncWindowDenial, SyncWindowDenialReason, SyncWindowSet, SyncWindowStatus,
+    SyncWindowTarget, SyncWindowVerdict,
+};

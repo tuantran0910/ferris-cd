@@ -36,9 +36,16 @@ enum Commands {
     /// Generate or verify the committed FerrisCD CustomResourceDefinition manifests.
     Crd(commands::crd::CrdArgs),
     /// Run the Kubernetes controller (watch `Application` CRs and sync them).
-    Controller(commands::controller::ControllerArgs),
+    ///
+    /// Boxed for the same reason as `Server`: the `T18.4` OCI registry flags otherwise make this
+    /// variant large enough for `clippy::large_enum_variant`, and `clap` accepts a boxed subcommand
+    /// payload.
+    Controller(Box<commands::controller::ControllerArgs>),
     /// Run the controller **and** the in-process REST API/webhook server in one process.
-    Server(commands::server::ServerArgs),
+    ///
+    /// Boxed because `ServerArgs` (with the `T19.1` OIDC flags) otherwise makes this enum large enough
+    /// for `clippy::large_enum_variant`; `clap` accepts a boxed subcommand payload.
+    Server(Box<commands::server::ServerArgs>),
     /// Store the API server URL and a Kubernetes bearer token (`~/.config/ferriscd/config.json`).
     Login(commands::login::LoginArgs),
     /// Inspect and operate `Application`s through `ferriscd-server` (list/get/diff/sync/rollback).
@@ -80,8 +87,8 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
         Commands::Apply(args) => commands::apply::run(args).await.map(|()| EXIT_OK),
         Commands::ApplyFile(args) => commands::apply_file::run(args).await.map(|()| EXIT_OK),
         Commands::Crd(args) => commands::crd::run(args).await.map(|()| EXIT_OK),
-        Commands::Controller(args) => commands::controller::run(args).await.map(|()| EXIT_OK),
-        Commands::Server(args) => commands::server::run(args).await.map(|()| EXIT_OK),
+        Commands::Controller(args) => commands::controller::run(*args).await.map(|()| EXIT_OK),
+        Commands::Server(args) => commands::server::run(*args).await.map(|()| EXIT_OK),
         Commands::Login(args) => commands::login::run(args).await.map(|()| EXIT_OK),
         Commands::App(args) => commands::app::run(args).await,
         Commands::Project(args) => commands::platform::run_project(args).await,

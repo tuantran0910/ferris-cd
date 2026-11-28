@@ -8,11 +8,13 @@ use std::time::Duration;
 use ferriscd_crd::Application;
 use kube::{Api, Client, ResourceExt};
 
+pub mod applicationset_controller;
 pub mod audit;
 pub mod cluster_manager;
 pub mod controller;
 pub mod credentials;
 pub mod discovery;
+pub mod drift_watcher;
 pub mod dry_run;
 pub mod events;
 pub mod hooks;
@@ -20,6 +22,7 @@ pub mod impersonation;
 pub mod leader_election;
 pub mod live_state;
 pub mod metrics;
+pub mod notifications;
 pub mod policy_rules;
 pub mod predicate;
 pub mod project;
@@ -34,6 +37,14 @@ pub mod sync_recovery;
 pub mod telemetry;
 pub mod waves;
 
+pub use applicationset_controller::{
+    ApplicationAuthorizer, ApplicationSetController, ApplicationSetControllerError,
+    ApplicationSetEvent, ApplicationSetReconciler, ApplicationSetSource, ApplicationSetStore,
+    ApplicationSetTrigger, ApplicationSetWatchError, ClusterApplicationSetTrigger,
+    ClusterManagerParamSource, DEFAULT_APPLICATIONSET_INTERVAL, KubeApplicationSetSource,
+    KubeApplicationSetStore, NoTrigger, ProjectPolicyAuthorizer, ReconcileReport,
+    RepoCacheParamSource, TriggerEvent,
+};
 pub use audit::{
     AUDIT_CATEGORIES, AUDIT_OUTCOMES, AUDIT_SCHEMA_VERSION, AUDIT_TRACING_TARGET, AuditActor,
     AuditCategory, AuditEmitResult, AuditEvent, AuditLogger, AuditOutcome, AuditSink,
@@ -42,9 +53,10 @@ pub use audit::{
     WebhookAuditSink,
 };
 pub use cluster_manager::{
-    ClusterAuth, ClusterChange, ClusterError, ClusterHandle, ClusterHandleBuilder, ClusterManager,
-    ClusterName, ClusterOptions, ClusterSecret, ClusterSecretEvent, ClusterSecretSource,
-    ClusterSource, ClusterTarget, ClusterWatchError, IN_CLUSTER, KEY_BEARER_TOKEN, KEY_CA_CRT,
+    CLUSTER_EVENT_CAPACITY, ClusterAuth, ClusterChange, ClusterError, ClusterHandle,
+    ClusterHandleBuilder, ClusterLifecycleEvent, ClusterManager, ClusterName, ClusterOptions,
+    ClusterRegistrationInfo, ClusterSecret, ClusterSecretEvent, ClusterSecretSource, ClusterSource,
+    ClusterTarget, ClusterWatchError, IN_CLUSTER, KEY_BEARER_TOKEN, KEY_CA_CRT,
     KEY_INSECURE_SKIP_TLS_VERIFY, KEY_KUBECONFIG, KEY_SERVER, KEY_TLS_CRT, KEY_TLS_KEY,
     KubeClusterBuilder, SECRET_TYPE_CLUSTER, SecretClusterSource,
 };
@@ -61,6 +73,15 @@ pub use credentials::{
     templates_from_secrets,
 };
 pub use discovery::{CachedDiscovery, DiscoveryCache, DiscoveryError, ScopeLookup};
+pub use drift_watcher::{
+    AppHashIndex, DRIFT_DEBOUNCE, DRIFT_MAX_DEBOUNCE, DRIFT_TRIGGER_CAPACITY,
+    DRIFT_WATCHER_KINDS_ENV, DriftClock, DriftConfigError, DriftDebouncer, DriftDecision,
+    DriftKindFilter, DriftRouter, DriftRuntime, DriftStreamOutcome, DriftTriggerChannels,
+    DriftWatcher, DriftWatcherConfig, FALLBACK_COOLDOWN, GroupKind, MAX_DRIFT_WATCHES,
+    ObservedResource, SELF_ECHO_CAPACITY, SELF_ECHO_TTL, SWEEP_INTERVAL, SelfEcho, SelfEchoCache,
+    SystemDriftClock, TriggerDelivery, WATCH_REFRESH_INTERVAL, WatchPlan, WatchRequest,
+    WatchTarget, label_selector, plan_watch_requests, resolve_watch_targets,
+};
 pub use dry_run::{
     DRY_RUN_CONCURRENCY, DryRunApi, DryRunError, DryRunEvaluator, DryRunFuture, DryRunOutcome,
     DryRunTarget, DynamicDryRunApi, MAX_FIELD_CONFLICTS, parse_conflict_status,
@@ -97,15 +118,24 @@ pub use live_state::{
 pub use metrics::{
     ACTIVE_RECONCILES, APP_HEALTH_STATUS, APP_SYNC_STATUS, AUDIT_DROPPED_COUNTER,
     AUDIT_DROPPED_TOTAL, AUDIT_EVENTS_COUNTER, AUDIT_EVENTS_TOTAL, CACHE_OUTCOMES,
-    DEFAULT_METRICS_ADDR, GIT_FETCH_DURATION_SECONDS, METRICS_ADDR_ENV, METRICS_PATH, Metrics,
+    DEFAULT_METRICS_ADDR, DRIFT_ACTIVE_WATCHES, DRIFT_EVENT_OUTCOMES, DRIFT_EVENTS_TOTAL,
+    DRIFT_FALLBACK_REASONS, DRIFT_FALLBACK_TOTAL, DRIFT_TRIGGERS_TOTAL, DriftFallbackReason,
+    DriftWatchOutcome, GIT_FETCH_DURATION_SECONDS, METRICS_ADDR_ENV, METRICS_PATH, Metrics,
     MetricsEncodeError, MetricsServeError, MetricsStatusWriter, RBAC_RELOAD_COUNTER,
     RBAC_RELOAD_OUTCOMES, RBAC_RELOAD_TOTAL, RECONCILE_DURATION_SECONDS, RECONCILE_RESULTS,
     RECONCILE_TOTAL, RENDER_CACHE_TOTAL, RbacReloadOutcome, ReconcileGuard, ReconcileResult,
     SYNC_STATUS_VALUES,
 };
+pub use notifications::{
+    BlockReason, EgressConfigError, EgressPolicy, NotificationObserver, NotificationService,
+    NotificationWorkerHandle, OpenTenantAllowlist, SsrfError,
+};
 pub use policy_rules::{ApiPolicyRuleSource, PolicyRuleSource};
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
-pub use project::{ApiProjectSource, ProjectSource};
+pub use project::{
+    ApiProjectSource, ApiProjectStatusSink, ProjectSource, ProjectStatusSink,
+    REASON_SYNC_WINDOW_INVALID, sync_window_condition,
+};
 pub use prune::{
     OwnershipVerifiedPruner, PruneResult, ResourcePruner, RetainReason, prune_opted_out, prune_rail,
 };
@@ -146,6 +176,20 @@ pub use waves::{BundleWaves, merge_hook_records, step_health};
 /// Environment variable selecting the log format (`json` or `pretty`).
 pub const LOG_FORMAT_ENV: &str = "FERRISCD_LOG_FORMAT";
 
+/// Environment variable enabling the opt-in drift watcher and its ownership labels (`T18.1`).
+///
+/// The `--enable-drift-watcher` flag defaults to it, so a Deployment can opt in without changing
+/// argv (a flag is world-readable in `ps`, an environment variable is at least scoped to the pod
+/// spec). Default `false`: nothing about the `v1.0` apply body changes until an operator opts in.
+pub const DRIFT_WATCHER_ENV: &str = "FERRISCD_ENABLE_DRIFT_WATCHER";
+
+/// Environment variable enabling the opt-in `ApplicationSet` controller (`T19.3`).
+///
+/// Default `false`: without it no `ApplicationSet` is read, generated from, or written back, so an
+/// upgrade never starts creating `Application`s an operator did not ask for. The env fallback
+/// mirrors the flag (a pod spec is at least scoped; argv is world-readable).
+pub const APPLICATIONSET_ENV: &str = "FERRISCD_ENABLE_APPLICATIONSETS";
+
 /// Returns the controller identifier string.
 #[must_use]
 pub fn controller_name() -> &'static str {
@@ -170,11 +214,17 @@ pub struct RunOptions {
     /// namespace; the control-plane namespace is always watched.
     pub application_namespaces: Option<String>,
 
-    /// Accept `file://` URLs and local filesystem paths as Git sources.
+    /// Accept `file://` URLs and local filesystem paths as Git sources, **and** plaintext `http://`
+    /// OCI registries.
     ///
-    /// Off by default: production only allows `https://`/`ssh://`/SCP-style remotes, so an
-    /// `Application` can never read the controller pod's filesystem. Tests and local `kind`
-    /// demos must opt in explicitly (see `docs/lessons/06-inventory-tracking-and-live-state.md`).
+    /// Off by default: production only allows `https://`/`ssh://`/SCP-style Git remotes and
+    /// HTTPS-only registry transports (`oci://`/`https://`), so an `Application` can never read the
+    /// controller pod's filesystem or dial a registry in the clear. One flag relaxes both source
+    /// kinds because both exist for the same local-development reason (a `kind` demo with
+    /// `file://` fixtures and an in-cluster `registry:2`), and each relaxation is logged at
+    /// `warn!` on startup. Tests and local demos must opt in explicitly (see
+    /// `docs/lessons/06-inventory-tracking-and-live-state.md` and
+    /// `docs/lessons/18-drift-watchers-and-oci-gitops-sources.md`).
     pub allow_local_repos: bool,
 
     /// Directory holding the Git mirror cache and materialized worktrees.
@@ -189,12 +239,50 @@ pub struct RunOptions {
     /// unverified connection, where anything on the path can read and rewrite them.
     pub allow_insecure_clusters: bool,
 
+    /// Extra hosts (as `host` or `host:port`) allowed to act as an OCI registry's **token service**
+    /// (`T18.4`, finding M5).
+    ///
+    /// Empty by default, which means "the registry's own authority only". A `401` challenge names
+    /// the token endpoint (`WWW-Authenticate: Bearer realm=…`), and answering it is the one place a
+    /// `Secret`'s registry credential is sent to a host the registry chose — so a realm on another
+    /// authority is refused unless it is listed here. Docker Hub (`auth.docker.io`) is allowed
+    /// out of the box; anything else (a corporate proxy in front of ECR/GAR, a Harbor deployment
+    /// with an external token service) has to be named by the operator.
+    pub oci_token_service_hosts: Vec<String>,
+
+    /// Stamp the `ferriscd.io/managed-by` / `ferriscd.io/app-hash` ownership labels (`T18.1`).
+    ///
+    /// Off by default. Enabling it (`--enable-drift-watcher`, `FERRISCD_ENABLE_DRIFT_WATCHER`) is
+    /// what makes every managed resource selectable by a Kubernetes **watch label selector**, which
+    /// the opt-in `DriftWatcher` (`T18.2`) needs in order to watch metadata only. The label pair is
+    /// additive and idempotent: turning the flag off removes nothing from the desired body, and the
+    /// next sync's Server-Side Apply converges the two labels away (they are fields FerrisCD owns),
+    /// so toggling the flag costs exactly one no-op diff per resource — never a drift loop.
+    pub enable_drift_watcher: bool,
+
+    /// Restrict the drift watcher to these kinds (`--drift-watcher-kinds`, `T18.2`).
+    ///
+    /// A comma-separated list of `Kind` or `group/Kind`; `None` (the default) watches every kind the
+    /// fleet reports in `status.inventory`. Only meaningful with [`Self::enable_drift_watcher`]: an
+    /// allow-list without the watcher is ignored (and warned about), never an error.
+    pub drift_watcher_kinds: Option<String>,
+
     /// Run `coordination.k8s.io/v1` `Lease` leader election (`T13.2`).
     ///
     /// `None` (the default) keeps the pre-Phase-13 single-replica behaviour: exactly one controller
     /// replica may run. Setting it makes this replica an active/standby candidate, which is what
     /// allows `replicas: 2` without two reconcilers fighting over the same objects.
     pub leader_election: Option<LeaderElectionOptions>,
+
+    /// Run the opt-in `ApplicationSet` controller (`T19.3`).
+    ///
+    /// Off by default. When enabled, the controller watches `ApplicationSet` objects in the
+    /// control-plane namespace, evaluates their generator (list / Git / clusters / matrix), and
+    /// creates or converges the generated `Application`s **in that namespace**, authorized by the
+    /// same `AppProject` policy as a hand-authored `Application`. Deleting an `ApplicationSet`
+    /// orphans its generated `Application`s unless `spec.syncPolicy.preserveResourcesOnDeletion` is
+    /// explicitly `false`.
+    pub enable_applicationsets: bool,
 
     /// Deterministic `Application` sharding (`T13.3`).
     ///
@@ -221,6 +309,12 @@ pub struct RunOptions {
 
     /// Optional async batched HTTPS audit webhook URL (`--audit-webhook-url`, `T17.2`).
     pub audit_webhook_url: Option<String>,
+
+    /// Opt-in event-driven notifications (`--enable-notifications`, `T19.4`).
+    ///
+    /// Off by default: with it off, nothing in the process opens a socket to a notification
+    /// destination and the `/status` writer chain is exactly the pre-Phase-19 one.
+    pub notifications: NotificationOptions,
 }
 
 impl std::fmt::Debug for RunOptions {
@@ -231,6 +325,9 @@ impl std::fmt::Debug for RunOptions {
             .field("allow_local_repos", &self.allow_local_repos)
             .field("work_root", &self.work_root)
             .field("allow_insecure_clusters", &self.allow_insecure_clusters)
+            .field("enable_drift_watcher", &self.enable_drift_watcher)
+            .field("enable_applicationsets", &self.enable_applicationsets)
+            .field("drift_watcher_kinds", &self.drift_watcher_kinds)
             .field("leader_election", &self.leader_election)
             .field("shard", &self.shard)
             .field("metrics_addr", &self.metrics_addr)
@@ -242,7 +339,108 @@ impl std::fmt::Debug for RunOptions {
                     .as_deref()
                     .map(audit::redact_audit_url),
             )
+            .field("notifications", &self.notifications)
             .finish()
+    }
+}
+
+/// The `T19.4` knobs [`RunOptions::notifications`] carries.
+///
+/// `Debug` is derived: neither field is a credential (the destinations live in `Secret`s that this
+/// struct never sees).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationOptions {
+    /// Attach the notification observer and start the delivery worker.
+    pub enabled: bool,
+
+    /// CIDRs whose **private** destinations the SSRF egress guard may reach
+    /// (`--notifications-allow-private-cidrs 10.20.0.0/16,...`).
+    ///
+    /// Loopback, link-local/cloud metadata, multicast and unspecified addresses stay blocked even
+    /// when they fall inside an allowlisted CIDR.
+    pub allow_private_cidrs: Option<String>,
+
+    /// Namespaces whose `Application`s may opt in at all
+    /// (`--notifications-allowed-namespaces team-a,team-b`).
+    ///
+    /// `None` (the default) keeps the historical behaviour: any namespace may subscribe through its
+    /// annotations. An explicit list is the tenancy boundary (finding **R1-M6**): a tenant outside it
+    /// cannot page another team's channel in the control-plane namespace, nor spend the controller's
+    /// delivery budget and rate-limit tokens.
+    pub allowed_namespaces: Option<String>,
+
+    /// PEM CA bundle whose certificates are **added** to the trust roots of the notification client
+    /// (`--notifications-ca-file`).
+    ///
+    /// The supported way to deliver to an internal HTTPS receiver signed by a private CA. It adds
+    /// roots; it never disables verification and never enables plaintext, so the SSRF guard and TLS
+    /// are unchanged.
+    pub ca_file: Option<std::path::PathBuf>,
+}
+
+impl NotificationOptions {
+    /// Resolves the egress policy from [`Self::allow_private_cidrs`].
+    ///
+    /// # Errors
+    ///
+    /// [`notifications::EgressConfigError`] for a malformed or over-broad CIDR.
+    pub fn egress_policy(
+        &self,
+    ) -> Result<notifications::EgressPolicy, notifications::EgressConfigError> {
+        notifications::EgressPolicy::from_allowlist_spec(self.allow_private_cidrs.as_deref())
+    }
+
+    /// Resolves the tenant allowlist from [`Self::allowed_namespaces`].
+    ///
+    /// # Errors
+    ///
+    /// [`notifications::TenantScopeError`] for a blank entry or a list above
+    /// [`notifications::MAX_ALLOWED_NAMESPACES`].
+    pub fn allowed_namespaces(
+        &self,
+    ) -> Result<Option<Vec<String>>, notifications::TenantScopeError> {
+        notifications::parse_allowed_namespaces(self.allowed_namespaces.as_deref())
+    }
+
+    /// The startup warning this configuration deserves, if any (finding **P19-M2**).
+    ///
+    /// Notifications are on, no tenant allowlist was given, and the controller watches
+    /// `Application`s beyond the control-plane namespace: every one of those tenants may page any
+    /// channel `Secret` in the control plane through an annotation. That combination is announced
+    /// once at startup rather than left to be discovered, because the default-open allowlist is a
+    /// compatibility decision, not a recommendation.
+    ///
+    /// `allowed_namespaces` is the **parsed** list ([`Self::allowed_namespaces`]) so that a malformed
+    /// flag is a startup error on its own path and this predicate stays infallible. `None` (or an
+    /// empty list) means "no allowlist configured".
+    #[must_use]
+    pub fn open_tenant_allowlist_warning(
+        &self,
+        application_scope: &ApplicationScope,
+        allowed_namespaces: Option<&[String]>,
+    ) -> Option<notifications::OpenTenantAllowlist> {
+        if !self.enabled {
+            return None;
+        }
+        notifications::open_tenant_allowlist_warning(application_scope, allowed_namespaces)
+    }
+
+    /// Loads [`Self::ca_file`] into the root certificates the notification client adds.
+    ///
+    /// `Ok(None)` when no file is configured (the platform trust store alone). The read is async and
+    /// fails closed: a missing or unusable CA file is a startup error, because the alternative — a
+    /// controller that starts and then fails TLS on every alert — is strictly worse.
+    ///
+    /// # Errors
+    ///
+    /// [`notifications::TransportError`] when the file cannot be read or holds no PEM certificate.
+    pub async fn root_certificates(
+        &self,
+    ) -> Result<Option<Vec<reqwest::Certificate>>, notifications::TransportError> {
+        let Some(path) = self.ca_file.as_deref() else {
+            return Ok(None);
+        };
+        notifications::load_root_certificates(path).await.map(Some)
     }
 }
 
@@ -447,12 +645,20 @@ pub struct ControlPlane {
     telemetry: telemetry::TelemetryGuard,
     /// `T17.1`: lock-free startup readiness barrier shared with `/readyz`.
     readiness: ControlPlaneReadiness,
+    /// `T19.3`: the opt-in `ApplicationSet` controller (`--enable-applicationsets`).
+    ///
+    /// `None` (the default) means no `ApplicationSet` object is watched or generated from.
+    applicationsets: Option<Arc<applicationset_controller::ApplicationSetController>>,
     /// `T17.2`: external audit sinks whose queued records are flushed on shutdown.
     audit_file: Option<Arc<audit::JsonlFileAuditSink>>,
     audit_webhook: Option<Arc<audit::WebhookAuditSink>>,
+    /// `T18.2`: the opt-in drift watcher's collaborators, or `None` when it is disabled.
+    drift: Option<drift_watcher::DriftRuntime>,
     cluster_stop: tokio_util::sync::CancellationToken,
     cluster_watch: tokio::task::JoinHandle<()>,
     audit: audit::AuditLogger,
+    /// `T19.4`: the notification delivery worker (`None` when notifications are disabled).
+    notifications: Option<notifications::NotificationWorkerHandle>,
 }
 
 impl std::fmt::Debug for ControlPlane {
@@ -467,6 +673,7 @@ impl std::fmt::Debug for ControlPlane {
             .field("leader_election", &self.leader_election.is_some())
             .field("metrics_addr", &self.metrics_addr)
             .field("otlp_enabled", &self.telemetry.otlp_enabled())
+            .field("notifications", &self.notifications.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -595,24 +802,44 @@ impl ControlPlane {
         let result: anyhow::Result<()> = match self.leader_election.clone() {
             // The non-leader path reuses the public per-term driver: it treats the token as its only
             // shutdown input, which is precisely the contract this method promises.
-            None => controller::run_as_leader_with_readiness(
-                self.client.clone(),
-                self.config.clone(),
-                self.ctx.clone(),
-                stop.clone(),
-                self.readiness.clone(),
-            )
-            .await
-            .map_err(anyhow::Error::from),
+            None => {
+                // `T19.3`: the opt-in `ApplicationSet` loop runs beside the `Application` loop and
+                // shares the one shutdown token, so a stop drains both.
+                let applicationsets = self
+                    .applicationsets
+                    .clone()
+                    .map(|controller| tokio::spawn(controller.run(stop.clone())));
+                // `T18.2`: the drift watcher, when configured, rides the same term and the same
+                // token — so a lost lease or a `SIGTERM` stops the metadata watches with the pumps.
+                let result = controller::run_as_leader_with_readiness_and_drift(
+                    self.client.clone(),
+                    self.config.clone(),
+                    self.ctx.clone(),
+                    stop.clone(),
+                    self.readiness.clone(),
+                    self.drift.clone(),
+                )
+                .await
+                .map_err(anyhow::Error::from);
+                if let Some(task) = applicationsets {
+                    stop.cancel();
+                    await_terminated(task, "ApplicationSet controller").await;
+                }
+                result
+            }
             Some(leader) => {
                 run_as_leader(
                     self.client.clone(),
                     self.config.clone(),
                     self.ctx.clone(),
                     leader,
-                    self.readiness.clone(),
+                    TermHooks {
+                        readiness: self.readiness.clone(),
+                        applicationsets: self.applicationsets.clone(),
+                    },
                     self.cluster_stop.clone(),
                     stop.clone(),
+                    self.drift.clone(),
                 )
                 .await
             }
@@ -626,6 +853,13 @@ impl ControlPlane {
                 tracing::warn!(error = %err, "cluster registry watcher panicked during shutdown")
             }
             Err(_) => tracing::warn!("cluster registry watcher did not stop before the deadline"),
+        }
+        // `T19.4`: stop the notification worker once the reconcile loops have drained. Shutdown
+        // cancels *before* it drains, so notifications still **queued** are dropped (and logged);
+        // only a delivery already in flight gets the bounded grace period, which is what keeps a
+        // hung receiver from holding shutdown open.
+        if let Some(notifications) = self.notifications.take() {
+            notifications.shutdown().await;
         }
         // The controller has drained: stop the listener too (idempotent — a `SIGTERM` already
         // cancelled the token) and report its outcome, so a dead `/metrics` endpoint can never be
@@ -788,10 +1022,25 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     let plan = options.ha_plan(&namespace)?;
     let leader_election = plan.leader_election;
     let shard = plan.shard;
+    // `T18.2`: the opt-in drift watcher. A malformed `--drift-watcher-kinds` value is a startup
+    // error, exactly like a malformed `--application-namespaces`: a typo must never silently watch
+    // a different set of kinds than the operator asked for.
+    let drift_kinds = drift_watcher::DriftKindFilter::parse(options.drift_watcher_kinds.as_deref())
+        .context("--drift-watcher-kinds is malformed")?;
+    if !options.enable_drift_watcher && drift_kinds.kinds().is_some() {
+        tracing::warn!(
+            kinds = ?drift_kinds.kinds(),
+            "`--drift-watcher-kinds` is set but `--enable-drift-watcher` is off; the allow-list is \
+             ignored and only Model 1 periodic polling runs"
+        );
+    }
+    let drift_watcher = drift_watcher::DriftWatcherConfig::from_flag(options.enable_drift_watcher)
+        .with_kinds(drift_kinds);
     let config = ControllerConfig {
         namespace,
         application_namespaces,
         shard,
+        drift_watcher,
         ..ControllerConfig::default()
     };
     if let Some(shard) = shard {
@@ -853,15 +1102,61 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     } else {
         ferriscd_engine::repo::RepoUrlPolicy::Production
     };
+    // `T18.4`: one policy governs both source kinds. The flag is a *local-development* opt-in —
+    // plaintext Git remotes and plaintext OCI registries — because that is what a `kind` demo needs
+    // (`file://` fixtures and an in-cluster `registry:2`); in production both stay HTTPS-only, so
+    // an `Application` can never make the controller dial a plaintext endpoint it does not own.
+    let oci_url_policy = if options.allow_local_repos {
+        tracing::warn!(
+            "allowing plaintext http:// OCI registries (--allow-local-repos) for OCI artifact \
+             sources (spec.source.oci); never use this in production"
+        );
+        ferriscd_engine::repo::OciUrlPolicy::AllowLocal
+    } else {
+        ferriscd_engine::repo::OciUrlPolicy::Production
+    };
     let git = ferriscd_engine::repo::GixGitClient::new(
         ferriscd_engine::repo::GixGitClientConfig::new()
             .with_url_policy(url_policy)
             .with_work_root(&work_root),
     );
+    // One `RepoCacheConfig` for both sources: the OCI client extracts into the same work root and
+    // charges the same `WorktreeLimits`, so a deployment that sized its `emptyDir` (and any future
+    // `--worktree-*` flag) covers Git worktrees and OCI extractions with one number.
+    let repo_config = ferriscd_engine::repo::RepoCacheConfig::new(&work_root);
     let repos = Arc::new(ferriscd_engine::repo::RepoCache::new(
         Arc::new(git),
-        ferriscd_engine::repo::RepoCacheConfig::new(&work_root),
+        repo_config.clone(),
     ));
+    // `T18.4`: the live registry transport. Built eagerly so a broken TLS configuration is a
+    // startup failure instead of an `Application` that fails forever, and bounded by the same work
+    // root and budgets as the Git cache.
+    let oci = Arc::new(
+        ferriscd_engine::repo::RegistryOciClient::new(
+            ferriscd_engine::repo::RegistryOciClientConfig::new(&work_root)
+                .with_url_policy(oci_url_policy)
+                .with_worktree_limits(repo_config.worktree_limits)
+                // `T18.4`, finding M5: a token service on another authority is refused unless the
+                // operator named it. Never a wildcard — this is where the registry credential goes.
+                .with_token_service_hosts(options.oci_token_service_hosts.iter().cloned()),
+        )
+        .context("failed to build the OCI registry client for spec.source.oci")?,
+    );
+    if !options.oci_token_service_hosts.is_empty() {
+        tracing::warn!(
+            token_service_hosts = ?options.oci_token_service_hosts,
+            "accepting OCI token services on additional hosts (--oci-token-service-hosts): \
+             registry credentials may be sent to them when a registry advertises them"
+        );
+    }
+    tracing::info!(
+        work_root = %work_root.display(),
+        max_files = repo_config.worktree_limits.max_files,
+        max_bytes = repo_config.worktree_limits.max_bytes,
+        allow_local = oci_url_policy == ferriscd_engine::repo::OciUrlPolicy::AllowLocal,
+        token_service_hosts = options.oci_token_service_hosts.len(),
+        "OCI artifact sources (spec.source.oci): digest-pinned, HTTPS-only registry transport"
+    );
 
     // `T12.3`: ONE shared HTTP/TLS connector for every impersonated identity, built once from the
     // controller's own `kube::Config` (see `impersonation::ImpersonationPool`). It is created
@@ -943,54 +1238,233 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
     let impersonation_source: Arc<dyn impersonation::ImpersonationSource> =
         Arc::new(impersonation::ImpersonatingAccess::new(pool.clone()));
 
+    // `T19.3`: the opt-in `ApplicationSet` controller shares the ONE `RepoCache` (so a generator
+    // checkout and a sync checkout of the same commit cost one fetch), the ONE `ClusterManager`
+    // (so the `clusters` generator reads the lifecycle-tracked registry, never a `Secret`), the same
+    // namespaced credential store, and the same `AppProject` policy/scope.
+    let applicationsets = if options.enable_applicationsets {
+        tracing::warn!(
+            namespace = %config.namespace,
+            "ApplicationSet controller enabled (--enable-applicationsets): ApplicationSets in the \
+             control-plane namespace generate Applications in that same namespace. Generated \
+             Applications pass the same AppProject policy, and deleting an ApplicationSet orphans \
+             them unless spec.syncPolicy.preserveResourcesOnDeletion is false"
+        );
+        let reconciler = applicationset_controller::ApplicationSetReconciler::new(
+            config.namespace.clone(),
+            Arc::new(applicationset_controller::ClusterManagerParamSource::new(
+                clusters.clone(),
+            )),
+            Arc::new(applicationset_controller::RepoCacheParamSource::new(
+                repos.clone(),
+                Arc::new(credentials::SecretCredentialStore::new(
+                    client.clone(),
+                    &config.namespace,
+                )),
+                url_policy,
+            )),
+            Arc::new(applicationset_controller::KubeApplicationSetStore::new(
+                client.clone(),
+                config.namespace.clone(),
+            )),
+            Arc::new(applicationset_controller::ProjectPolicyAuthorizer::new(
+                Arc::new(ApiProjectSource::new(client.clone(), &config.namespace)),
+                config.application_scope(),
+                config.namespace.clone(),
+            )),
+        );
+        Some(Arc::new(
+            applicationset_controller::ApplicationSetController::new(
+                Arc::new(reconciler),
+                Arc::new(applicationset_controller::KubeApplicationSetSource::new(
+                    client.clone(),
+                    config.namespace.clone(),
+                )),
+                config.namespace.clone(),
+            )
+            // `T19.3` (finding M3): react to cluster-registry changes and to generated
+            // `Application` drift instead of only to the periodic requeue. Both sources are the ones
+            // the rest of the loop already trusts: the `T18.1` lifecycle broadcast and a plain
+            // `ferriscd.io/applicationset`-labelled watch.
+            .with_triggers(Arc::new(
+                applicationset_controller::ClusterApplicationSetTrigger::new(
+                    clusters.clone(),
+                    client.clone(),
+                    config.namespace.clone(),
+                ),
+            )),
+        ))
+    } else {
+        None
+    };
+
+    // `T18.2`: the self-echo cache is created only when the drift watcher is enabled, and shared
+    // between the pipeline (which records every confirmed write) and the watcher (which suppresses
+    // the resulting metadata event). Disabled means no cache and no recording at all.
+    let self_echo = options
+        .enable_drift_watcher
+        .then(|| Arc::new(config.drift_watcher.echo_cache()));
     // `T14.1`: the pipeline is held as `Arc<dyn SyncPipeline>` so the API server can compute a live
     // diff through the *same* object the controller reconciles with (`SyncPipeline::diff`).
-    let pipeline: Arc<dyn SyncPipeline> = Arc::new(
-        sync::InventorySyncPipeline::new(
-            repos,
-            DiscoveryCache::new(client.clone()),
-            Arc::new(DynamicApiSource::new(client.clone())),
-            Arc::new(DynamicApiApplier::new(client.clone())),
-            // The dry-run half of drift detection (T07.1): `dryRun=All` PATCHes per resource.
-            Arc::new(DynamicDryRunApi::new(client.clone())),
-        )
-        .with_url_policy(url_policy)
-        // `T12.1`: every `Application` is validated against its `AppProject`, which is read from
-        // the control-plane namespace (never from the `Application`'s own namespace).
-        .with_project_source(Arc::new(ApiProjectSource::new(
-            client.clone(),
-            &config.namespace,
-        )))
-        // `T20.2`: cluster-wide pre-sync policy rules, read per reconcile from
-        // `ConfigMap/ferriscd-policies-cm` in the control-plane namespace (a scoped `GET`, never a
-        // cluster-wide informer). `AppProject.spec.policyRules[]` is enforced either way, and a
-        // rule that cannot be compiled refuses the sync instead of being skipped.
-        .with_policy_rule_source(Arc::new(policy_rules::ApiPolicyRuleSource::new(
-            client.clone(),
-            &config.namespace,
-        )))
-        // `T12.2`: the same scope the watcher uses, so a tenant `Application` is refused here even
-        // if it somehow reaches a reconcile.
-        .with_application_scope(config.application_scope())
-        // `T12.3`: one pooled connector for every impersonated ServiceAccount. Building it reads
-        // the CA bundle, so it is moved off the async workers; it happens exactly once.
-        .with_impersonation_source(impersonation_source)
-        // `T12.4`: Git credentials come from `ferriscd.io/secret-type=repository` Secrets in the
-        // control-plane namespace only. The store holds a *namespaced* `Api<Secret>`, so no code
-        // path can ask for a cluster-wide `Secret` read (trap guard for `T12.4`); no match means
-        // anonymous, which keeps public repositories working unchanged.
-        .with_credential_source(Arc::new(credentials::SecretCredentialStore::new(
-            client.clone(),
-            &config.namespace,
-        )))
-        // `T13.1`: `spec.destination.cluster` is resolved through the registry. Without this every
-        // non-`in-cluster` destination is a terminal error, which is the pre-Phase-13 behaviour.
-        .with_cluster_source(clusters.clone())
-        // `T15.1`: Git fetch latency and the render-cache hit/miss bridge.
-        .with_metrics(metrics.clone())
-        // `T17.2`: compliance audit emission for ServiceAccount impersonation resolutions.
-        .with_audit(audit.clone()),
-    );
+    let mut pipeline = sync::InventorySyncPipeline::new(
+        repos,
+        DiscoveryCache::new(client.clone()),
+        Arc::new(DynamicApiSource::new(client.clone())),
+        Arc::new(DynamicApiApplier::new(client.clone())),
+        // The dry-run half of drift detection (T07.1): `dryRun=All` PATCHes per resource.
+        Arc::new(DynamicDryRunApi::new(client.clone())),
+    )
+    .with_url_policy(url_policy)
+    // `T12.1`: every `Application` is validated against its `AppProject`, which is read from
+    // the control-plane namespace (never from the `Application`'s own namespace).
+    .with_project_source(Arc::new(ApiProjectSource::new(
+        client.clone(),
+        &config.namespace,
+    )))
+    // `T17.4`: an unusable `spec.syncWindows` entry is deny-all at runtime; this is the one
+    // `AppProject` `/status` write that explains it (skipped unless the condition changed).
+    .with_project_status(Arc::new(ApiProjectStatusSink::new(
+        client.clone(),
+        &config.namespace,
+    )))
+    // `T20.2`: cluster-wide pre-sync policy rules, read per reconcile from
+    // `ConfigMap/ferriscd-policies-cm` in the control-plane namespace (a scoped `GET`, never a
+    // cluster-wide informer). `AppProject.spec.policyRules[]` is enforced either way, and a
+    // rule that cannot be compiled refuses the sync instead of being skipped.
+    .with_policy_rule_source(Arc::new(policy_rules::ApiPolicyRuleSource::new(
+        client.clone(),
+        &config.namespace,
+    )))
+    // `T12.2`: the same scope the watcher uses, so a tenant `Application` is refused here even
+    // if it somehow reaches a reconcile.
+    .with_application_scope(config.application_scope())
+    // `T12.3`: one pooled connector for every impersonated ServiceAccount. Building it reads
+    // the CA bundle, so it is moved off the async workers; it happens exactly once.
+    .with_impersonation_source(impersonation_source)
+    // `T12.4`: Git credentials come from `ferriscd.io/secret-type=repository` Secrets in the
+    // control-plane namespace only. The store holds a *namespaced* `Api<Secret>`, so no code
+    // path can ask for a cluster-wide `Secret` read (trap guard for `T12.4`); no match means
+    // anonymous, which keeps public repositories working unchanged.
+    .with_credential_source(Arc::new(credentials::SecretCredentialStore::new(
+        client.clone(),
+        &config.namespace,
+    )))
+    // `T13.1`: `spec.destination.cluster` is resolved through the registry. Without this every
+    // non-`in-cluster` destination is a terminal error, which is the pre-Phase-13 behaviour.
+    .with_cluster_source(clusters.clone())
+    // `T18.4`: `spec.source.oci` is materialized through the bounded registry transport, under the
+    // same local-development opt-in that governs the Git remote policy.
+    .with_oci_client(oci)
+    .with_oci_url_policy(oci_url_policy)
+    // `T15.1`: Git fetch latency and the render-cache hit/miss bridge.
+    .with_metrics(metrics.clone())
+    // `T17.2`: compliance audit emission for ServiceAccount impersonation resolutions.
+    .with_audit(audit.clone())
+    // `T18.1`: the opt-in ownership label pair (`--enable-drift-watcher`). Default off keeps the
+    // `v1.0` body byte-for-byte identical (annotation only).
+    .with_stamp_options(ferriscd_engine::inventory::StampOptions::from_flag(
+        options.enable_drift_watcher,
+    ));
+    // `T18.2`: record every confirmed apply/prune so the watcher can drop its own echo. Wired only
+    // when the flag is on, so the disabled path stays exactly as it was.
+    if let Some(echo) = self_echo.clone() {
+        pipeline = pipeline.with_self_echo(echo);
+    }
+    let pipeline: Arc<dyn SyncPipeline> = Arc::new(pipeline);
+    // `T19.4`: opt-in event-driven notifications. The observer decorates the `/status` writer (so it
+    // sees exactly the status a pass persisted, with zero extra API reads), and the delivery worker
+    // runs on its own task behind a bounded queue: a hung receiver can delay alerts, never a
+    // reconcile. Both the templates (`ConfigMap`) and the destinations (labelled `Secret`s) are
+    // read once at startup; a missing/`unusable` ConfigMap falls back to the built-in templates
+    // rather than failing the controller.
+    let status_before_notifications: Arc<dyn StatusWriter> = status;
+    // Validated whether or not notifications are enabled: a typo in the allowlist must fail startup
+    // now, not silently become "no allowlist" on the day somebody flips the feature on.
+    let notification_policy = options
+        .notifications
+        .egress_policy()
+        .context("failed to parse --notifications-allow-private-cidrs")?;
+    // Same for the tenancy boundary (finding R1-M6): a typo must fail startup, not silently widen
+    // (or narrow) which tenants may page.
+    let notification_namespaces = options
+        .notifications
+        .allowed_namespaces()
+        .context("failed to parse --notifications-allowed-namespaces")?;
+    // `--notifications-ca-file` is read (async, once) before the branch for the same reason: a
+    // missing or non-PEM file is a startup error, never a controller that comes up and then fails
+    // TLS on the first real alert. Only a *configured* file is read.
+    let notification_roots = options
+        .notifications
+        .root_certificates()
+        .await
+        .context("failed to load --notifications-ca-file")?
+        .unwrap_or_default();
+    let (status, notifications) = if options.notifications.enabled {
+        let policy = notification_policy;
+        // Finding P19-M2: the tenant allowlist is default-open for compatibility, so the one combination
+        // that makes it dangerous — tenants outside the control plane, no allowlist — is announced
+        // before the first alert rather than discovered by the first tenant that pages another team.
+        let application_scope = config.application_scope();
+        if let Some(open) = options
+            .notifications
+            .open_tenant_allowlist_warning(&application_scope, notification_namespaces.as_deref())
+        {
+            tracing::warn!(
+                control_plane_namespace = %open.control_plane,
+                application_namespaces = %open.application_scope,
+                "--notifications-allowed-namespaces is unset, so every namespace whose Application is \
+                 reconciled may subscribe to notifications and name any channel Secret in the \
+                 control-plane namespace: set it to the tenants you actually trust, or keep \
+                 --application-namespaces at the control-plane default"
+            );
+        }
+        tracing::info!(
+            namespace = %config.namespace,
+            config_map = notifications::CONFIG_MAP_NAME,
+            selector = %notifications::channel_label_selector(),
+            allowed_namespaces = ?notification_namespaces,
+            allowlisted_networks = ?policy
+                .allowlisted_networks()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ca_file = ?options.notifications.ca_file,
+            custom_root_certificates = notification_roots.len(),
+            queue_capacity = notifications::DEFAULT_QUEUE_CAPACITY,
+            request_timeout_seconds = notifications::DEFAULT_REQUEST_TIMEOUT.as_secs(),
+            max_attempts = notifications::DEFAULT_MAX_ATTEMPTS,
+            "event-driven notifications enabled: destinations are read from labelled Secrets in the \
+             control-plane namespace only, every delivery is SSRF-checked (HTTPS only, no redirects), \
+             and a full bounded queue drops the notification instead of delaying a reconcile"
+        );
+        let config_document = notifications::load_config(client.clone(), &config.namespace).await;
+        let channels: Arc<dyn notifications::ChannelSource> = Arc::new(
+            notifications::SecretChannelSource::new(client.clone(), &config.namespace),
+        );
+        let transport: Arc<dyn notifications::NotificationTransport> = Arc::new(
+            notifications::ReqwestTransport::build_with_root_certificates(
+                policy.clone(),
+                notification_roots,
+            )
+            .context("failed to build the SSRF-guarded notification HTTPS client")?,
+        );
+        let (notifier, worker) = notifications::observer::spawn_worker(
+            config_document,
+            channels,
+            transport,
+            policy,
+            metrics.clone(),
+            notification_namespaces,
+        );
+        let decorated: Arc<dyn StatusWriter> = Arc::new(notifications::NotificationObserver::new(
+            status_before_notifications,
+            notifier,
+        ));
+        (decorated, Some(worker))
+    } else {
+        (status_before_notifications, None)
+    };
+
     // `T15.2`: rate-limited Kubernetes Events on `Application` CRs (deduplicates identical
     // consecutive `Warning` reasons within 5 minutes before calling `Recorder::publish`).
     let events = events::EventRecorder::for_client(client.clone());
@@ -1005,6 +1479,14 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
             .with_events(events),
     );
 
+    // `T18.2`: only a replica that opted in carries the supervisor's collaborators; the `T18.1`
+    // labels and this runtime are turned on by the same flag, so a watched label can never exist
+    // without the watcher that selects on it.
+    let drift = self_echo.map(|echo| drift_watcher::DriftRuntime {
+        clusters: clusters.clone(),
+        echo,
+        metrics: Some(metrics.clone()),
+    });
     Ok(ControlPlane {
         client,
         config,
@@ -1017,11 +1499,17 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         metrics_addr,
         telemetry,
         readiness,
+        applicationsets,
         cluster_stop,
         cluster_watch,
         audit_file,
         audit_webhook,
+        // `T18.2`: only a replica that opted in carries the supervisor's collaborators; the
+        // `T18.1` labels and this runtime are turned on by the same flag, so a watched label can
+        // never exist without the watcher that selects on it.
+        drift,
         audit,
+        notifications,
     })
 }
 
@@ -1142,20 +1630,37 @@ impl AuditSinkHandles {
     }
 }
 
+/// The optional per-term collaborators [`run_as_leader`] starts beside the `Application` loops.
+struct TermHooks {
+    /// `T17.1`: the startup readiness barrier the leader clears.
+    readiness: ControlPlaneReadiness,
+    /// `T19.3`: the opt-in `ApplicationSet` controller, spawned per leadership term.
+    applicationsets: Option<Arc<applicationset_controller::ApplicationSetController>>,
+}
+
 /// Runs the active/standby loop (`T13.2`).
 ///
 /// The standby waits for the `Lease`; the leader runs the controller set until the lease is lost
 /// (then it becomes a standby again) or the process is asked to stop (then it releases the lease
 /// voluntarily, so the standby takes over at once).
+#[allow(clippy::too_many_arguments)]
 async fn run_as_leader(
     client: Client,
     config: ControllerConfig,
     ctx: Arc<ReconcileContext>,
     leader: LeaderElectionConfig,
-    readiness: ControlPlaneReadiness,
+    hooks: TermHooks,
     cluster_stop: tokio_util::sync::CancellationToken,
     stop: tokio_util::sync::CancellationToken,
+    drift: Option<drift_watcher::DriftRuntime>,
 ) -> anyhow::Result<()> {
+    // Eight arguments, one over clippy's soft limit: every one of them is an independent process
+    // collaborator (client, config, context, lease, readiness, two tokens, drift). Bundling them
+    // into a struct would only move the list to the call site.
+    let TermHooks {
+        readiness,
+        applicationsets,
+    } = hooks;
     use anyhow::Context as _;
 
     let election = LeaderElection::from_client(client.clone(), leader)?;
@@ -1187,14 +1692,21 @@ async fn run_as_leader(
         };
         readiness.clear_standby_serving();
         let token = term.token();
+        // `T19.3`: the `ApplicationSet` loop is leader-only, like every other writer. It is spawned
+        // per term and stopped with the term token, so a standby replica never generates (or
+        // orphans) an `Application`.
+        let applicationset_task = applicationsets
+            .clone()
+            .map(|controller| tokio::spawn(controller.run(token.clone())));
         // Boxed so one `select!` can poll both halves without moving either: the controller set has
         // to be awaited *after* the term ends, so in-flight passes drain like a `SIGTERM`.
-        let mut controllers = Box::pin(controller::run_as_leader_with_readiness(
+        let mut controllers = Box::pin(controller::run_as_leader_with_readiness_and_drift(
             client.clone(),
             config.clone(),
             ctx.clone(),
             token.clone(),
             readiness.clone(),
+            drift.clone(),
         ));
         let mut hold = Box::pin(term.hold(&stop));
         let outcome = match race_term(&mut controllers, &mut hold, &token).await {
@@ -1228,6 +1740,9 @@ async fn run_as_leader(
                 outcome
             }
         };
+        if let Some(task) = applicationset_task {
+            await_terminated(task, "ApplicationSet controller").await;
+        }
         if outcome == HoldOutcome::Lost {
             tracing::warn!("standing by: another replica will take the leader lease");
             continue;
@@ -1236,6 +1751,15 @@ async fn run_as_leader(
     }
     cluster_stop.cancel();
     Ok(())
+}
+
+/// Waits for a stopped background loop and reports a panic instead of swallowing it.
+async fn await_terminated(task: tokio::task::JoinHandle<()>, name: &str) {
+    match task.await {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => tracing::warn!(error = %error, "{name} task ended abnormally"),
+    }
 }
 
 /// Creates the `reconcile` span carrying the application identity.
@@ -1493,6 +2017,124 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// **`T19.4`:** notifications are opt-in, and the private-CIDR allowlist fails closed — a
+    /// malformed or over-broad entry is an error, never a silently disabled guard.
+    #[test]
+    fn notifications_are_opt_in_and_the_egress_allowlist_fails_closed() {
+        let default = RunOptions::default();
+        assert!(
+            !default.notifications.enabled,
+            "notifications must stay opt-in: with them off nothing opens a socket to a receiver"
+        );
+        assert_eq!(default.notifications.allow_private_cidrs, None);
+        assert!(
+            default
+                .notifications
+                .egress_policy()
+                .expect("the default policy is valid")
+                .is_strict(),
+            "the default egress policy refuses every private destination"
+        );
+
+        let allowlisted = NotificationOptions {
+            enabled: true,
+            allow_private_cidrs: Some("10.20.0.0/16".to_owned()),
+            allowed_namespaces: None,
+            ca_file: None,
+        };
+        assert_eq!(
+            allowlisted
+                .egress_policy()
+                .expect("a valid allowlist")
+                .allowlisted_networks()
+                .len(),
+            1
+        );
+        // Finding R1-M6: an unset tenant list means "no restriction", and the explicit list is parsed
+        // and bounded (see `notifications::parse_allowed_namespaces`).
+        assert_eq!(
+            allowlisted
+                .allowed_namespaces()
+                .expect("no tenant allowlist is fine"),
+            None
+        );
+
+        // A malformed allowlist fails even with notifications **off**: `prepare` validates it before
+        // the enablement branch, so a typo cannot sit dormant until the feature is switched on.
+        for malformed in [
+            "10.0.0.0",
+            "0.0.0.0/0",
+            "::/0",
+            "10.0.0.0/33",
+            "10.0.0.0/8,",
+        ] {
+            assert!(
+                NotificationOptions {
+                    enabled: true,
+                    allow_private_cidrs: Some(malformed.to_owned()),
+                    allowed_namespaces: None,
+                    ca_file: None,
+                }
+                .egress_policy()
+                .is_err(),
+                "{malformed:?} must be refused at startup"
+            );
+        }
+
+        // The options never carry a credential, so their `Debug` is safe to log.
+        let printed = format!("{allowlisted:?}");
+        assert!(printed.contains("10.20.0.0/16"), "{printed}");
+    }
+
+    /// **`T19.4` finding P19-M2:** the tenant allowlist is default-open, so the option wiring announces
+    /// the combination that makes it dangerous — notifications on, no allowlist, `Application`s
+    /// outside the control-plane namespace — and stays silent in every other shape.
+    #[test]
+    fn an_open_tenant_allowlist_is_warned_about_through_the_options() {
+        let wider = ApplicationScope::new(
+            ferriscd_crd::CONTROL_PLANE_NAMESPACE,
+            ApplicationNamespaces::All,
+        );
+        let control_plane_only = ApplicationScope::default();
+        let tenant_only = ApplicationScope::new(
+            ferriscd_crd::CONTROL_PLANE_NAMESPACE,
+            ApplicationNamespaces::Listed(vec!["team-a".to_owned()]),
+        );
+
+        let enabled = NotificationOptions {
+            enabled: true,
+            ..NotificationOptions::default()
+        };
+        let warning = enabled
+            .open_tenant_allowlist_warning(&wider, None)
+            .expect("an open allowlist over a wider scope must be warned about");
+        assert_eq!(warning.control_plane, ferriscd_crd::CONTROL_PLANE_NAMESPACE);
+        assert_eq!(warning.application_scope, "*");
+        assert!(
+            enabled
+                .open_tenant_allowlist_warning(&tenant_only, None)
+                .is_some(),
+            "a listed tenant namespace is already wider than the control plane"
+        );
+
+        // Notifications off: nothing opens a socket, so nothing is warned about.
+        assert_eq!(
+            NotificationOptions::default().open_tenant_allowlist_warning(&wider, None),
+            None
+        );
+        // The safe scope: every subscriber lives in the control-plane namespace.
+        assert_eq!(
+            enabled.open_tenant_allowlist_warning(&control_plane_only, None),
+            None
+        );
+        // An explicit allowlist: the operator chose the boundary.
+        let allowlist = vec!["team-a".to_owned()];
+        assert_eq!(
+            enabled.open_tenant_allowlist_warning(&wider, Some(&allowlist)),
+            None
+        );
+    }
 
     #[test]
     fn controller_name_matches_field_manager() {

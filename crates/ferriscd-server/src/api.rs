@@ -1,10 +1,14 @@
 //! The REST API: routes, handlers, and the DTOs the OpenAPI contract freezes.
 //!
-//! Three route groups, deliberately disjoint (see [`crate::auth`]):
+//! Four route groups, deliberately disjoint (see [`crate::auth`]):
 //!
 //! ```text
 //! public      GET  /healthz
 //!             GET  /readyz
+//!             GET  /api/v1/auth/config             (T19.1 sign-in discovery)
+//! sessions    GET  /api/v1/auth/login              (T19.2 BFF; 404 unless --oidc-bff-enabled)
+//!             GET  /api/v1/auth/callback           (state cookie must match the query parameter)
+//!             POST /api/v1/auth/logout             (CSRF double-submit required)
 //! webhooks    POST /api/v1/webhooks/github         (HMAC-authenticated, T14.2)
 //!             POST /api/v1/webhooks/gitlab         (token-authenticated, T14.2)
 //! protected   GET  /api/v1/applications
@@ -16,6 +20,7 @@
 //!             POST /api/v1/applications/{ns}/{name}/sync
 //!             POST /api/v1/applications/{ns}/{name}/rollback
 //!             GET  /api/v1/projects
+//!             GET  /api/v1/applicationsets
 //!             GET  /api/v1/clusters
 //!             GET  /api/v1/openapi.json
 //! ```
@@ -56,8 +61,10 @@ use ferriscd_crd::status::{
 use ferriscd_crd::{AppProject, Application};
 use ferriscd_engine::diff::ResourceDiff;
 use ferriscd_engine::manifest::ResourceKey;
+use ferriscd_engine::policy::{SyncWindowSet, SyncWindowTarget};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
+use k8s_openapi::jiff::Timestamp;
 use kube::ResourceExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -67,6 +74,7 @@ use crate::audit::{
     self, AuditOutcome, RequestId, TokenFingerprint, record_api_operation, record_rbac_denied,
 };
 use crate::auth::{self, AuthenticatedIdentity};
+use crate::auth_bff;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::openapi;
 use crate::rbac::{Action, Actor, RbacPolicyStore};
@@ -149,18 +157,55 @@ pub struct ApplicationSummary {
     /// `status.observedGeneration`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+    /// `metadata.labels["ferriscd.io/applicationset"]`: the `ApplicationSet` that generated this
+    /// `Application` (`T19.3`). Absent for a hand-authored one, which is what the web UI badges on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicationset: Option<String>,
+}
+
+/// The `sourceType` value assumed for a payload that predates the field (`T18.4`).
+///
+/// A `v1.1` server only serves Git sources, so `git` is the honest default rather than an error
+/// that would make an upgraded CLI unusable against a not-yet-upgraded control plane.
+fn git_source_type() -> String {
+    "git".to_owned()
 }
 
 /// `spec.source` summary.
+///
+/// `T18.4` added the source **kind** and, for an OCI artifact, its `tag` and pinned `digest`. The
+/// fields are additive: a Git `Application` keeps `sourceType: "git"` with no `tag`/`digest` key at
+/// all, so an existing client sees exactly the payload it saw before.
+///
+/// **Client/server skew (finding M6).** `sourceType` is *new*, so a `v1.1` server does not send it.
+/// Deserializing therefore defaults to `"git"` (the only source kind that version could serve)
+/// instead of failing the whole response, while the **response** schema keeps the field required
+/// (`#[schema(required = true)]`) — a `v1.2` server always fills it in, and the generated
+/// TypeScript client must keep treating it as present.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceView {
-    /// Repository URL, redacted (a remote URL may carry a token).
+    /// Source kind (`git` or `oci`).
+    ///
+    /// Defaults to `git` when absent: an older server has no OCI support, so every source it can
+    /// report *is* a Git source.
+    #[serde(default = "git_source_type")]
+    #[schema(required = true)]
+    pub source_type: String,
+    /// Repository or registry URL, redacted (a remote URL may carry a token).
     pub repo_url: String,
-    /// Path inside the repository.
+    /// Path inside the repository (`""` for its root).
     pub path: String,
-    /// Requested revision (branch, tag, or `HEAD`).
+    /// Requested revision (`spec.source.git.targetRevision`, else `oci.tag`, else `oci.digest`).
     pub target_revision: String,
+    /// OCI tag to resolve (`spec.source.oci.tag`); absent for a Git source and for a digest-only
+    /// reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// Pinned OCI manifest digest (`spec.source.oci.digest`, `sha256:<64-hex>`); never set by a
+    /// resolution — this is what the `Application` *pinned*, not what the registry answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     /// Selected renderer (`auto`, `plainYaml`, `kustomize`, `helm`).
     pub renderer: String,
 }
@@ -268,6 +313,17 @@ pub struct ApplicationDetailView {
     /// The running operation, when one is recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<OperationView>,
+    /// The `AppProject` sync-window verdict for this `Application` right now (`T17.4`).
+    ///
+    /// Absent when the project configures no window: a project without governance windows adds
+    /// nothing to the payload. (`ApplicationDetailView` has no `rename_all`, so the wire name is
+    /// spelled out here to stay camelCase like the rest of the API.)
+    #[serde(
+        rename = "syncWindow",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sync_window: Option<SyncWindowGateView>,
 }
 
 /// One node of the resource graph.
@@ -502,6 +558,81 @@ pub struct ProjectView {
     /// `spec.allowedServiceAccounts`.
     #[serde(default)]
     pub allowed_service_accounts: Vec<String>,
+    /// `spec.syncWindows`, each with its state at the moment of the response (`T17.4`).
+    ///
+    /// Empty (and omitted) for a project that configures no window, so the pre-`T17.4` payload is
+    /// byte-identical for every such project.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sync_windows: Vec<ProjectSyncWindowView>,
+    /// When the next window starts or stops (RFC 3339), across every configured window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_sync_window_transition: Option<String>,
+}
+
+/// One `spec.syncWindows[]` entry with its state at the moment of the response (`T17.4`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSyncWindowView {
+    /// `allow` or `deny` (deny wins over allow).
+    pub kind: String,
+    /// The 5-field cron expression, verbatim.
+    pub schedule: String,
+    /// The duration, verbatim (`30m`, `2h`, `7d`).
+    pub duration: String,
+    /// The effective IANA time zone (`UTC` when `spec.syncWindows[].timeZone` is absent).
+    pub time_zone: String,
+    /// Glob patterns for `Application.metadata.name` (empty = every application).
+    #[serde(default)]
+    pub applications: Vec<String>,
+    /// Glob patterns for `Application.metadata.namespace` (empty = every namespace).
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    /// Glob patterns for `spec.destination.cluster` (empty = every cluster).
+    #[serde(default)]
+    pub clusters: Vec<String>,
+    /// Whether a manual sync may override this window.
+    pub manual_sync: bool,
+    /// Whether the window is open right now.
+    pub active: bool,
+    /// When the currently open occurrence started (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<String>,
+    /// When the currently open occurrence ends (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<String>,
+    /// The next occurrence that starts after now (RFC 3339), within a year.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_start: Option<String>,
+    /// Why this entry cannot be evaluated. The project is deny-all while it is set (fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The sync-window verdict for one `Application` right now (`T17.4`).
+///
+/// The UI needs this to explain a blocked `POST .../sync` *before* the operator clicks: a window is
+/// a time-based refusal, and "nothing happened" is indistinguishable from a controller stall
+/// otherwise. `manualOverride` says whether a manual sync would be honoured anyway
+/// (`manualSync: true` on every blocking window).
+///
+/// A blocked manual sync is **deferred, not rejected**: the controller pauses the requested
+/// operation and runs it when the window lifts, without asking again (finding N-c), so the modal
+/// tells the operator *when* it will happen rather than to come back and click twice.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncWindowGateView {
+    /// Whether a manual sync would be skipped right now.
+    pub blocked: bool,
+    /// `denyWindowActive`, `outsideAllowWindow`, or `invalidWindow`; absent when not blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Human-readable explanation, including the next window transition.
+    pub message: String,
+    /// Whether `manualSync: true` makes a manual sync still executable.
+    pub manual_override: bool,
+    /// When the verdict could change (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_transition: Option<String>,
 }
 
 /// `GET /api/v1/clusters` body.
@@ -519,6 +650,45 @@ pub struct ClusterView {
     pub name: String,
     /// Whether this is the cluster the control plane runs in.
     pub in_cluster: bool,
+}
+
+/// `GET /api/v1/applicationsets` body (`T19.3`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApplicationSetListView {
+    /// Every `ApplicationSet` of the control-plane namespace.
+    pub items: Vec<ApplicationSetView>,
+}
+
+/// One `ApplicationSet`, reduced to its generation facts.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplicationSetView {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// `spec.generators[0]`'s kind (`list`, `git`, `clusters`, `matrix`).
+    pub generator: String,
+    /// For a `matrix`, the two child generator kinds (empty otherwise).
+    #[serde(default)]
+    pub matrix: Vec<String>,
+    /// `spec.template.spec.project`.
+    pub project: String,
+    /// `spec.syncPolicy.preserveResourcesOnDeletion` (always present, defaults to `true`).
+    pub preserve_resources_on_deletion: bool,
+    /// `spec.syncPolicy.prune` (defaults to `false`).
+    pub prune: bool,
+    /// `status.generatedCount`.
+    pub generated_count: u32,
+    /// `status.conditions`, newest last.
+    #[serde(default)]
+    pub conditions: Vec<ConditionView>,
+    /// `status.observedGeneration`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    /// `status` `Ready` condition, `True`/`False`/`Unknown` (absent before the first pass).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
 }
 
 /// `GET /api/v1/applications/{namespace}/{name}/events` body (`T17.3`).
@@ -557,6 +727,42 @@ pub struct ApplicationEventView {
     /// When it was first observed (RFC 3339 UTC), when the cluster recorded it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_observed_at: Option<String>,
+}
+
+/// `GET /api/v1/auth/config` body (`T19.1`).
+///
+/// Served from the **public** group: the SPA and `ferriscd login --oidc` must learn how to
+/// authenticate before they have a token, so this carries only what a stranger may know — the auth
+/// mode, the issuer, the public client id and the scopes (`T19.2` consumes it).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthConfigView {
+    /// `token-review`, `oidc`, `token-review-or-oidc`, `pass-through` or `deny-all`.
+    pub auth_mode: String,
+    /// The configured OIDC issuer. **Absent** when OIDC is disabled; never `null`.
+    //
+    // Finding `N4`: the field is absent — never `null` — when OIDC is off, so the published schema
+    // says "an optional string" instead of `string | null`, a third state the server cannot produce.
+    // `value_type` keeps the Rust field an `Option` (serde still omits it) while the schema is a
+    // plain optional string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String)]
+    pub issuer: Option<String>,
+    /// The configured OAuth client id. **Absent** when OIDC is disabled; never `null`.
+    //
+    // Absent, never `null`, exactly like `issuer` (finding `N4`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = String)]
+    pub client_id: Option<String>,
+    /// The scopes the client should request from the IdP. Always present (`[]` when OIDC is off).
+    //
+    // Finding `N4`: the handler always emits this field, so the contract marks it **required**
+    // (`scopes: string[]`, not `scopes?: string[]`). That is why there is no `#[serde(default)]`
+    // here: the attribute would mark the field optional in the published schema while every
+    // response carries it.
+    pub scopes: Vec<String>,
+    /// Whether the optional server-side (BFF cookie) session mode is enabled (`T19.2`).
+    pub bff_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -599,6 +805,9 @@ pub fn router(state: AppState) -> Router {
             post(rollback_application),
         )
         .route("/api/v1/projects", get(list_projects))
+        // `T19.3`: the read-only `ApplicationSet` view. Generation itself is opt-in in the
+        // controller; the API only reports what exists.
+        .route("/api/v1/applicationsets", get(list_applicationsets))
         .route("/api/v1/clusters", get(list_clusters))
         .route("/api/v1/openapi.json", get(openapi_document))
         // The `T14.3` seam: one layer installed on the group before it is merged. `axum`'s
@@ -608,11 +817,36 @@ pub fn router(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
+        ))
+        // `T19.2`: when the optional BFF session cookie flow is on, every mutating request that
+        // carries that cookie must echo the double-submit CSRF header. Installed on the same route
+        // group (and after the routes, like the auth layer) so a new protected POST cannot silently
+        // lose it.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_bff::csrf,
         ));
 
     let public = Router::new()
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz));
+        .route("/readyz", get(readyz))
+        // `T19.1`: the sign-in discovery endpoint. It must be reachable **before** a caller has a
+        // credential (that is its whole purpose), so it is registered here, in the public group, and
+        // never behind the middleware above.
+        .route("/api/v1/auth/config", get(auth_config));
+
+    // `T19.2`: the optional BFF routes. Always registered so the OpenAPI document is honest about
+    // them; each answers `404` when the server was not started with `--oidc-bff-enabled`. `logout`
+    // sits in this group deliberately: it must be reachable with an expired/absent session cookie so
+    // a stuck browser can always clear it, and the CSRF layer is installed on the group.
+    let auth_sessions = Router::new()
+        .route(auth_bff::LOGIN_PATH, get(auth_bff::login))
+        .route(auth_bff::CALLBACK_PATH, get(auth_bff::callback))
+        .route(auth_bff::LOGOUT_PATH, post(auth_bff::logout))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_bff::csrf,
+        ));
 
     let webhooks = Router::new()
         .route("/api/v1/webhooks/github", post(webhooks::github))
@@ -621,6 +855,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(protected)
         .merge(public)
+        .merge(auth_sessions)
         .merge(webhooks)
         .layer(DefaultBodyLimit::max(state.webhooks.max_body_bytes()))
         // `T17.2`: outermost correlation layer so every protected handler, 401 auth rejection,
@@ -684,6 +919,45 @@ pub async fn readyz(State(state): State<AppState>) -> axum::response::Response {
         )
             .into_response()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: authentication discovery
+// ---------------------------------------------------------------------------
+
+/// Publishes how a caller can authenticate, so the Web UI and the CLI can pick a sign-in flow
+/// (`T19.1`; `T19.2` consumes it with PKCE).
+///
+/// Unauthenticated by design: a client cannot present a credential for a flow it does not know yet.
+/// The payload is therefore the *public* half of the configuration only — no CA bundle, no client
+/// secret, no token — and [`crate::oidc::OidcConfig`] is not rendered here at all.
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/config",
+    description = "How to authenticate against this server: the auth mode (token-review, oidc, token-review-or-oidc, ...), plus the OIDC issuer, public client id and scopes when OIDC is enabled. Public by design — a client needs it before it has a credential.",
+    tag = "auth",
+    responses((status = 200, description = "The authentication configuration", body = AuthConfigView)),
+)]
+pub async fn auth_config(State(state): State<AppState>) -> Json<AuthConfigView> {
+    // Finding `N4a`: `authMode` is a promise. Publishing `oidc` with no issuer and no client id
+    // tells every Web UI and CLI to start a sign-in flow that cannot complete, so an `AppState`
+    // built as `with_auth(AuthPolicy::Oidc)` without the matching `with_auth_config` is a builder
+    // bug. The binary cannot produce it (`--oidc-issuer`/`--oidc-client-id` are required and the
+    // server refuses to start), so this is asserted in debug builds only — where a test or an
+    // embedder's own suite runs — and is a no-op in a release binary that never reaches it.
+    debug_assert!(
+        state.auth_config_matches_policy(),
+        "with_auth(AuthPolicy::{}) must be paired with with_auth_config(PublicAuthConfig::oidc(..)): \
+         GET /api/v1/auth/config would publish an OIDC sign-in mode with no issuer and no client id",
+        state.auth.as_str()
+    );
+    Json(AuthConfigView {
+        auth_mode: state.auth.as_str().to_owned(),
+        issuer: state.auth_config.issuer.clone(),
+        client_id: state.auth_config.client_id.clone(),
+        scopes: state.auth_config.scopes.clone(),
+        bff_enabled: state.auth_config.bff_enabled,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -776,7 +1050,32 @@ pub async fn get_application(
         Action::Get,
         "read",
     )?;
-    Ok(Json(application_detail(&app)))
+    // `T17.4`: the sync-window verdict the modal explains.
+    //
+    // Finding M4: the project is a *different* object from the `Application`, so the caller's grant
+    // on the `Application` is not a grant on the project's `spec.syncWindows` — the verdict is only
+    // derived from a project this actor may see, and is omitted (not guessed) otherwise. A project
+    // that cannot be read is logged rather than silently answering "no windows", which would
+    // tell every caller that their change freeze does not exist.
+    //
+    // Finding M-4: the project is resolved by name (`ProjectCatalog::get`), the one object this
+    // page needs, instead of listing the whole catalogue per request. Every "not resolvable" answer
+    // — absent, or invisible to this actor — still yields no verdict at all.
+    let now = Timestamp::now();
+    let project = match state.projects.get(&app.spec.project).await {
+        Ok(project) => project,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                application = %format!("{namespace}/{name}"),
+                project = %app.spec.project,
+                "could not read the AppProject to compute the sync-window verdict; omitting it"
+            );
+            None
+        }
+    };
+    let project = project.filter(|project| actor.can_see(&project.name_any()));
+    Ok(Json(application_detail(&app, project.as_ref(), now)))
 }
 
 /// Reads the live resource graph of an `Application` (`T14.1`).
@@ -1737,11 +2036,51 @@ pub async fn list_projects(
     let rbac = state.rbac.snapshot();
     let actor = Actor::new(&rbac, &identity);
     let projects = state.projects.list().await?;
+    // One clock for the whole response: every window in the list is evaluated at the same instant,
+    // so `active`/`nextStart` cannot contradict each other between entries.
+    let now = Timestamp::now();
     Ok(Json(ProjectListView {
         items: projects
             .iter()
             .filter(|project| actor.can_see(&project.name_any()))
-            .map(project_view)
+            .map(|project| project_view(project, now))
+            .collect(),
+    }))
+}
+
+/// Lists `ApplicationSet` objects (`T19.3`).
+///
+/// Read-only: generation happens in the opt-in controller loop, never in an API request. A caller
+/// sees an `ApplicationSet` only when at least one `AppProject` visible to them
+/// (`actor.can_see(project)`) is the project its template targets.
+///
+/// # Errors
+///
+/// [`ApiError::Backend`] when the `ApplicationSet` catalog cannot be listed.
+#[utoipa::path(
+    get,
+    path = "/api/v1/applicationsets",
+    description = "Every `ApplicationSet` of the control-plane namespace whose template targets an `AppProject` the caller may see, with its generator kinds, deletion/prune policy, and generation count.",
+    tag = "platform",
+    responses(
+        (status = 200, description = "Every visible ApplicationSet", body = ApplicationSetListView),
+        (status = 401, description = "Authentication required", body = ApiErrorBody),
+        (status = 502, description = "The cluster could not be read", body = ApiErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn list_applicationsets(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthenticatedIdentity>,
+) -> Result<Json<ApplicationSetListView>, ApiError> {
+    let rbac = state.rbac.snapshot();
+    let actor = Actor::new(&rbac, &identity);
+    let applicationsets = state.applicationsets.list().await?;
+    Ok(Json(ApplicationSetListView {
+        items: applicationsets
+            .iter()
+            .filter(|appset| actor.can_see(&appset.spec.template.spec.project))
+            .map(applicationset_view)
             .collect(),
     }))
 }
@@ -1915,6 +2254,74 @@ fn authorize(
     })
 }
 
+/// Maps an `ApplicationSet` to its read-view representation.
+fn applicationset_view(appset: &ferriscd_crd::ApplicationSet) -> ApplicationSetView {
+    let status = appset.status.as_ref();
+    let (generator, matrix) = appset
+        .spec
+        .generators
+        .first()
+        .map(generator_labels)
+        .unwrap_or_else(|| ("unknown".to_owned(), Vec::new()));
+    ApplicationSetView {
+        namespace: appset.namespace().unwrap_or_default(),
+        name: appset.name_any(),
+        generator,
+        matrix,
+        project: appset.spec.template.spec.project.clone(),
+        preserve_resources_on_deletion: appset.spec.sync_policy.preserve_resources_on_deletion,
+        prune: appset.spec.sync_policy.prune,
+        generated_count: status.map_or(0, |status| status.generated_count),
+        conditions: status
+            .map(|status| status.conditions.iter().map(condition_view).collect())
+            .unwrap_or_default(),
+        observed_generation: status.and_then(|status| status.observed_generation),
+        ready: status
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.type_ == ferriscd_crd::status::CONDITION_READY)
+            })
+            .map(|condition| {
+                match condition.status {
+                    ConditionStatus::True => "True",
+                    ConditionStatus::False => "False",
+                    ConditionStatus::Unknown => "Unknown",
+                }
+                .to_owned()
+            }),
+    }
+}
+
+/// The generator kind labels of one `ApplicationSet` generator (and, for a matrix, its children).
+fn generator_labels(generator: &ferriscd_crd::ApplicationSetGenerator) -> (String, Vec<String>) {
+    use ferriscd_crd::ApplicationSetGenerator as Generator;
+    match generator {
+        Generator::List(_) => ("list".to_owned(), Vec::new()),
+        Generator::Git(_) => ("git".to_owned(), Vec::new()),
+        Generator::Clusters(_) => ("clusters".to_owned(), Vec::new()),
+        Generator::Matrix(matrix) => (
+            "matrix".to_owned(),
+            matrix
+                .generators
+                .iter()
+                .map(|child| child_generator_label(child).to_owned())
+                .collect(),
+        ),
+    }
+}
+
+/// The kind label of one matrix child (the child type has no `matrix` variant by construction).
+fn child_generator_label(generator: &ferriscd_crd::MatrixChildGenerator) -> &'static str {
+    use ferriscd_crd::MatrixChildGenerator as Child;
+    match generator {
+        Child::List(_) => "list",
+        Child::Git(_) => "git",
+        Child::Clusters(_) => "clusters",
+    }
+}
+
 /// Maps an `Application` to its list representation.
 fn application_summary(app: &Application) -> ApplicationSummary {
     let status = app.status.as_ref();
@@ -1923,10 +2330,25 @@ fn application_summary(app: &Application) -> ApplicationSummary {
         name: app.name_any(),
         project: app.spec.project.clone(),
         source: SourceView {
-            // A Git remote routinely carries a personal access token (`https://oauth2:ghp_...@...`).
-            repo_url: ferriscd_engine::manifest::redact_repo_url(&app.spec.source.git.repo_url),
-            path: app.spec.source.git.path.clone(),
-            target_revision: app.spec.source.git.target_revision.clone(),
+            // `T18.4`: an OCI source reports `oci`, and its tag/digest, through the same view — the
+            // URL goes through the same redaction rule either way.
+            source_type: if app.spec.source.oci.is_some() {
+                "oci".to_owned()
+            } else {
+                "git".to_owned()
+            },
+            // A Git remote routinely carries a personal access token (`https://oauth2:ghp_...@...`);
+            // the same rule covers an `oci://` reference.
+            repo_url: ferriscd_engine::manifest::redact_repo_url(app.spec.source.repo_url()),
+            path: app.spec.source.source_path().to_owned(),
+            target_revision: app.spec.source.requested_revision().to_owned(),
+            tag: app.spec.source.oci.as_ref().and_then(|oci| oci.tag.clone()),
+            digest: app
+                .spec
+                .source
+                .oci
+                .as_ref()
+                .and_then(|oci| oci.digest.clone()),
             renderer: renderer_label(&app.spec.source.renderer).to_owned(),
         },
         destination: DestinationView {
@@ -1949,11 +2371,19 @@ fn application_summary(app: &Application) -> ApplicationSummary {
             .unwrap_or_default(),
         resource_count: status.map_or(0, |status| status.inventory.len()),
         observed_generation: status.and_then(|status| status.observed_generation),
+        applicationset: app
+            .labels()
+            .get(ferriscd_crd::APPLICATIONSET_LABEL)
+            .cloned(),
     }
 }
 
 /// Maps an `Application` to its detail representation.
-fn application_detail(app: &Application) -> ApplicationDetailView {
+fn application_detail(
+    app: &Application,
+    project: Option<&AppProject>,
+    now: Timestamp,
+) -> ApplicationDetailView {
     let status = app.status.as_ref();
     ApplicationDetailView {
         application: application_summary(app),
@@ -1963,6 +2393,7 @@ fn application_detail(app: &Application) -> ApplicationDetailView {
         operation: status
             .and_then(|status| status.operation_state.as_ref())
             .map(operation_view),
+        sync_window: sync_window_gate_view(project, app, now),
     }
 }
 
@@ -2014,7 +2445,8 @@ fn operation_view(state: &ferriscd_crd::status::OperationState) -> OperationView
     }
 }
 
-fn project_view(project: &AppProject) -> ProjectView {
+fn project_view(project: &AppProject, now: Timestamp) -> ProjectView {
+    let windows = windows_view(project, now);
     ProjectView {
         name: project.name_any(),
         description: project.spec.description.clone(),
@@ -2027,7 +2459,111 @@ fn project_view(project: &AppProject) -> ProjectView {
             .map(|destination| format!("{}/{}", destination.cluster, destination.namespace))
             .collect(),
         allowed_service_accounts: project.spec.allowed_service_accounts.clone(),
+        sync_windows: windows.items,
+        next_sync_window_transition: windows.next_transition,
     }
+}
+
+/// Rendering of `spec.syncWindows` for the API, with the state each window is in at `now`.
+struct WindowsView {
+    items: Vec<ProjectSyncWindowView>,
+    next_transition: Option<String>,
+}
+
+/// Builds the window list in `spec` order, with unparseable entries marked instead of dropped.
+///
+/// The evaluation is the engine's ([`ferriscd_engine::policy::SyncWindowSet`]), never a second
+/// implementation: `GET /api/v1/projects` and the controller's gate must agree about whether a
+/// window is open.
+fn windows_view(project: &AppProject, now: Timestamp) -> WindowsView {
+    let spec = &project.spec;
+    if spec.sync_windows.is_empty() {
+        return WindowsView {
+            items: Vec::new(),
+            next_transition: None,
+        };
+    }
+    let set = SyncWindowSet::from_spec(spec);
+    let statuses = set.statuses(now);
+    let items = spec
+        .sync_windows
+        .iter()
+        .enumerate()
+        .map(|(index, window)| {
+            let status = statuses.iter().find(|status| status.index == index);
+            ProjectSyncWindowView {
+                kind: window.kind.as_str().to_owned(),
+                schedule: status.map_or_else(
+                    || window.schedule.trim().to_owned(),
+                    |status| status.schedule.clone(),
+                ),
+                duration: window.duration.trim().to_owned(),
+                time_zone: window.time_zone_name().to_owned(),
+                applications: window.applications.clone(),
+                namespaces: window.namespaces.clone(),
+                clusters: window.clusters.clone(),
+                manual_sync: window.manual_sync,
+                active: status.is_some_and(|status| status.active),
+                starts_at: status
+                    .and_then(|status| status.starts_at)
+                    .map(|instant| instant.to_string()),
+                ends_at: status
+                    .and_then(|status| status.ends_at)
+                    .map(|instant| instant.to_string()),
+                next_start: status
+                    .and_then(|status| status.next_start)
+                    .map(|instant| instant.to_string()),
+                error: set
+                    .invalid()
+                    .iter()
+                    .find(|invalid| invalid.index == index)
+                    .map(|invalid| invalid.message.clone()),
+            }
+        })
+        .collect();
+    let next_transition = statuses
+        .iter()
+        .flat_map(|status| [status.ends_at, status.next_start])
+        .flatten()
+        .filter(|instant| *instant > now)
+        .min()
+        .map(|instant| instant.to_string());
+    WindowsView {
+        items,
+        next_transition,
+    }
+}
+
+/// The `T17.4` verdict for one `Application`, from its project's windows.
+///
+/// `None` when the project has no windows (nothing to explain) or is not in the catalogue (the
+/// reconcile path already reports a missing project as a terminal policy denial — inventing a
+/// window verdict for it here would be a second, quieter answer).
+fn sync_window_gate_view(
+    project: Option<&AppProject>,
+    app: &Application,
+    now: Timestamp,
+) -> Option<SyncWindowGateView> {
+    let project = project?;
+    if !project.spec.has_sync_windows() {
+        return None;
+    }
+    let set = SyncWindowSet::from_spec(&project.spec);
+    let namespace = app.namespace().unwrap_or_default();
+    let name = app.name_any();
+    let target = SyncWindowTarget::new(&name, &namespace, &app.spec.destination.cluster);
+    // A `Manual` trigger is what the modal asks about: `POST .../sync` is always manual, so the
+    // view answers "would *my* click be honoured?".
+    let verdict = set.evaluate(now, &target);
+    Some(SyncWindowGateView {
+        blocked: verdict.is_denied(),
+        reason: verdict
+            .denial()
+            .map(|denial| denial.reason.as_str().to_owned()),
+        message: verdict.message(now),
+        manual_override: verdict.manual_override(),
+        next_transition: verdict.next_transition().map(|instant| instant.to_string()),
+    })
 }
 
 /// Per-resource health recorded by the last reconcile, keyed by GKNN.
@@ -2174,6 +2710,49 @@ mod tests {
         assert_eq!(
             renderer_label(&ferriscd_crd::RendererSpec::Helm(HelmRenderer::default())),
             "helm"
+        );
+    }
+
+    /// **Finding M6.** A `v1.1` server's `SourceView` payload — no `sourceType` key at all —
+    /// deserializes into a Git source instead of failing the whole response, while the **schema**
+    /// keeps `sourceType` required (a `v1.2` server always sends it, and the generated TypeScript
+    /// client depends on it being present).
+    #[test]
+    fn a_v1_1_source_view_deserializes_as_a_git_source_and_the_schema_stays_strict() {
+        // Exactly what a `v1.1` server emitted: no `sourceType`, no `tag`, no `digest`.
+        let payload = serde_json::json!({
+            "repoUrl": "https://github.com/example/manifests",
+            "path": "apps/payments",
+            "targetRevision": "main",
+            "renderer": "kustomize",
+        });
+        let view: SourceView =
+            serde_json::from_value(payload.clone()).expect("a v1.1 payload must still deserialize");
+        assert_eq!(
+            view.source_type, "git",
+            "the only kind a v1.1 server can serve"
+        );
+        assert_eq!(view.tag, None);
+        assert_eq!(view.digest, None);
+        assert_eq!(view.repo_url, "https://github.com/example/manifests");
+
+        // A `v1.2` payload still overrides the default, so the fallback cannot mask a real OCI
+        // source.
+        let mut oci = payload.clone();
+        oci["sourceType"] = serde_json::json!("oci");
+        oci["tag"] = serde_json::json!("1.4.2");
+        let view: SourceView = serde_json::from_value(oci).expect("an OCI payload must parse");
+        assert_eq!(view.source_type, "oci");
+        assert_eq!(view.tag.as_deref(), Some("1.4.2"));
+
+        // The response schema is strict: `sourceType` is required even though deserialization
+        // defaults it.
+        let schema = serde_json::to_value(<SourceView as utoipa::PartialSchema>::schema())
+            .expect("the schema must serialize");
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            required.contains(&serde_json::json!("sourceType")),
+            "the OpenAPI schema must keep `sourceType` required: {schema}"
         );
     }
 

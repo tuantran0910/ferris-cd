@@ -28,6 +28,22 @@
 //! handle is asynchronous because loading a CA bundle into a `rustls` store and constructing a
 //! `kube::Client` are blocking, and they must never run on a Tokio worker (finding H1).
 //!
+//! ## Lifecycle broadcast (`T18.1`)
+//!
+//! Three events are the whole public surface of a registration change: a cluster became addressable
+//! ([`ClusterLifecycleEvent::Added`]), its handle was replaced because its `Secret` changed
+//! ([`ClusterLifecycleEvent::Rebuilt`]), or it stopped being addressable
+//! ([`ClusterLifecycleEvent::Removed`]) — the last one **also** for a registration that vanished
+//! from a completed re-list, i.e. exactly where no `Delete` is ever delivered (finding `P13-H2`).
+//!
+//! [`ClusterManager::subscribe`] hands out receivers on a bounded
+//! [`tokio::sync::broadcast`] channel of [`CLUSTER_EVENT_CAPACITY`] events. The stream is a
+//! **notification, not a snapshot**: a subscriber that starts late (or falls behind and gets
+//! [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError::Lagged)) must resynchronise
+//! against [`ClusterManager::names`], which is always authoritative. Nothing may block the registry
+//! on a subscriber: a channel with no receivers is the normal state before a consumer is wired, and
+//! `broadcast::Sender::send` never awaits.
+//!
 //! ## Security rules (all enforced by [`ClusterSecret::parse`])
 //!
 //! | Rule | Why |
@@ -50,7 +66,7 @@
 //! plane** — the remote credential is never asked to write a FerrisCD CR the remote cluster may not
 //! even serve.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -66,6 +82,7 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::config::Kubeconfig;
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client, ResourceExt};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::credentials::SECRET_TYPE_LABEL;
@@ -1053,6 +1070,21 @@ impl ClusterHandleBuilder for KubeClusterBuilder {
     }
 }
 
+/// One registered cluster as the `T19.3` `clusters` generator sees it.
+///
+/// Deliberately credential-free: the cluster name, the registration `Secret`'s **labels** (which is
+/// what a label selector matches), and the optional default namespace. No API server URL, token, CA
+/// bundle, or kubeconfig ever leaves the registry through this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterRegistrationInfo {
+    /// Cluster name (`spec.destination.cluster` value).
+    pub name: String,
+    /// Labels of the registration `Secret`, recorded when it was seeded.
+    pub labels: BTreeMap<String, String>,
+    /// The registration's default namespace, when it sets one.
+    pub default_namespace: Option<String>,
+}
+
 /// What seeding one `Secret` did to the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterChange {
@@ -1064,6 +1096,59 @@ pub enum ClusterChange {
     Unchanged,
 }
 
+/// Bound on the cluster lifecycle broadcast channel (`T18.1`).
+///
+/// Events are one per registration change, so the bound is generous for the common case but **not**
+/// a guarantee: a re-list (or a burst of `Secret` edits) that changes more than
+/// [`CLUSTER_EVENT_CAPACITY`] registrations while a consumer is behind can exceed it, and a large
+/// fleet makes that reachable rather than theoretical. Overflow is a supported outcome, not a lost
+/// update: the recipient is told so with
+/// [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError::Lagged) and recovers by dropping
+/// its state and resynchronising against [`ClusterManager::names`], which is authoritative. The
+/// channel is deliberately **bounded**: the registry must never grow unboundedly because a
+/// consumer is slow, and a subscriber that fell behind needs a fresh `names()` snapshot anyway.
+pub const CLUSTER_EVENT_CAPACITY: usize = 64;
+
+/// A change to the set of addressable clusters (`T18.1`).
+///
+/// Emitted by [`ClusterManager::subscribe`]'s channel, from **every** path that registers, rebuilds
+/// or forgets a cluster — including a revocation discovered by a completed re-list (`InitDone`),
+/// which is the only signal for a `Secret` that disappeared while the watch was reconnecting
+/// (finding `P13-H2`). The payload is the cluster name only: no `Secret`, no credential, and no
+/// `kube::Client` ever travels through it (trap T4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClusterLifecycleEvent {
+    /// The cluster became addressable (a registration `Secret` was observed).
+    Added(String),
+    /// An existing registration changed and its handle was rebuilt (credential rotation or an
+    /// edit that altered the connection material).
+    Rebuilt(String),
+    /// The cluster stopped being addressable: its `Secret` was deleted, it became unusable, it
+    /// renamed itself, or a completed re-list no longer reported it. Every consumer must treat it
+    /// as gone — a lookup fails closed with [`ClusterError::NotFound`].
+    Removed(String),
+}
+
+impl ClusterLifecycleEvent {
+    /// The cluster name this event is about.
+    #[must_use]
+    pub fn cluster(&self) -> &str {
+        match self {
+            Self::Added(name) | Self::Rebuilt(name) | Self::Removed(name) => name,
+        }
+    }
+
+    /// A stable, low-cardinality kind for logs and metrics (`added` / `rebuilt` / `removed`).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Added(_) => "added",
+            Self::Rebuilt(_) => "rebuilt",
+            Self::Removed(_) => "removed",
+        }
+    }
+}
+
 /// The registry of remote clusters plus the control plane's own handle.
 ///
 /// `handles` is exactly the `DashMap<ClusterName, Arc<ClusterHandle>>` the milestone specifies;
@@ -1073,12 +1158,19 @@ pub enum ClusterChange {
 pub struct ClusterManager {
     handles: DashMap<ClusterName, Arc<ClusterHandle>>,
     materials: DashMap<ClusterName, ClusterSecret>,
+    /// `T19.3`: the registration `Secret`'s labels, keyed by cluster name. Kept beside (not inside)
+    /// [`ClusterSecret`] on purpose: a label edit must not change the parsed material, otherwise
+    /// every label change would rebuild the connector.
+    labels: DashMap<ClusterName, BTreeMap<String, String>>,
     in_cluster: Arc<ClusterHandle>,
     namespace: String,
     options: ClusterOptions,
     builder: Arc<dyn ClusterHandleBuilder>,
     rebuilds: AtomicUsize,
     audit: Option<crate::audit::AuditLogger>,
+    /// `T18.1`: bounded lifecycle fan-out. Kept even with no subscribers, so a consumer that
+    /// subscribes later sees every change from that point on (never a partially built channel).
+    events: broadcast::Sender<ClusterLifecycleEvent>,
 }
 
 impl fmt::Debug for ClusterManager {
@@ -1088,6 +1180,7 @@ impl fmt::Debug for ClusterManager {
             .field("in_cluster", &self.in_cluster.name())
             .field("clusters", &self.names())
             .field("rebuilds", &self.rebuilds())
+            .field("subscribers", &self.events.receiver_count())
             .finish()
     }
 }
@@ -1105,15 +1198,99 @@ impl ClusterManager {
         options: ClusterOptions,
         builder: Arc<dyn ClusterHandleBuilder>,
     ) -> Self {
+        // The channel exists from construction on: `subscribe` may be called before the watch ever
+        // starts (that is how a consumer is wired at startup), and a later `subscribe` must not
+        // observe a different channel.
+        let (events, _receiver) = broadcast::channel(CLUSTER_EVENT_CAPACITY);
         Self {
             handles: DashMap::new(),
             materials: DashMap::new(),
+            labels: DashMap::new(),
             in_cluster,
             namespace: namespace.into(),
             options,
             builder,
             rebuilds: AtomicUsize::new(0),
             audit: None,
+            events,
+        }
+    }
+
+    /// Subscribes to [`ClusterLifecycleEvent`]s (`T18.1`).
+    ///
+    /// The receiver is a **notification stream, not a snapshot**: it only reports changes that
+    /// happen after the call, so a consumer must take its initial set from [`Self::names`] (plus
+    /// the always-available [`Self::in_cluster`]). A subscriber that falls more than
+    /// [`CLUSTER_EVENT_CAPACITY`] events behind gets
+    /// [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError::Lagged) and must resynchronise
+    /// the same way — `names()` is authoritative at every instant, and the registry never waits for
+    /// a consumer.
+    ///
+    /// # Ordering: `subscribe()` first, `names()` second
+    ///
+    /// Call `subscribe()` **before** `names()`, never the other way round. A `broadcast` receiver
+    /// only sees what is sent after it exists, so subscribing first means a change that lands
+    /// between the two calls is buffered; taking the snapshot first loses exactly the registration
+    /// change the consumer most needs to hear about. That ordering is the **only** safe one —
+    /// `subscribe()`-then-`names()` (plus [`Self::in_cluster`]) is the complete initial state.
+    ///
+    /// # What a handler must assume
+    ///
+    /// The stream is edge-triggered while the registry holds the state, so a handler must be
+    /// **idempotent per cluster name** and must never assume the events alternate or arrive once
+    /// per cluster:
+    ///
+    /// * [`ClusterLifecycleEvent::Added`] and [`ClusterLifecycleEvent::Rebuilt`] mean
+    ///   **start-or-replace**. A handler that does not track the name must start tracking it; a
+    ///   handler that already tracks it must treat the per-cluster state it holds as stale and
+    ///   replace it (rebuild the client/watcher, re-read the handle). `Added` is **not** a promise
+    ///   that the name was previously unknown, and `Rebuilt` is **not** a promise that it was known.
+    /// * [`ClusterLifecycleEvent::Removed`] means "gone" only for a name the handler tracks. It must
+    ///   be **ignored for an unknown name**: a duplicate removal, one for a cluster that was never
+    ///   observed, or one produced by a revocation discovered in a completed re-list (no `Delete`
+    ///   is ever delivered in that case) is normal, not an error and not a reason to fail a pass.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::collections::BTreeSet;
+    ///
+    /// use ferriscd_controller::{ClusterLifecycleEvent, ClusterManager};
+    ///
+    /// /// Follows the registry: subscribe first, take the snapshot second.
+    /// pub async fn follow(manager: &ClusterManager) {
+    ///     let mut events = manager.subscribe();
+    ///     let mut known: BTreeSet<String> = manager.names().into_iter().collect();
+    ///     while let Ok(event) = events.recv().await {
+    ///         match event {
+    ///             // Start-or-replace: both arms converge on "track the name as it is now".
+    ///             ClusterLifecycleEvent::Added(name) | ClusterLifecycleEvent::Rebuilt(name) => {
+    ///                 known.insert(name);
+    ///             }
+    ///             // Ignored when unknown: an unsolicited removal is normal.
+    ///             ClusterLifecycleEvent::Removed(name) => {
+    ///                 known.remove(&name);
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<ClusterLifecycleEvent> {
+        self.events.subscribe()
+    }
+
+    /// Publishes one lifecycle event, never blocking and never failing the registry.
+    ///
+    /// A `broadcast::Sender::send` only fails when nobody is subscribed — the normal state until a
+    /// consumer is wired — so the "error" is a trace line, not a registry error.
+    fn publish(&self, event: ClusterLifecycleEvent) {
+        match self.events.send(event) {
+            Ok(subscribers) => tracing::trace!(subscribers, "published a cluster lifecycle event"),
+            Err(err) => tracing::trace!(
+                event = ?err.0,
+                "cluster lifecycle event dropped: no subscriber"
+            ),
         }
     }
 
@@ -1176,6 +1353,35 @@ impl ClusterManager {
         names
     }
 
+    /// The `T19.3` cluster-generator view: every registered cluster with its `Secret` labels.
+    ///
+    /// Sorted by cluster name and credential-free. `in-cluster` is deliberately absent: an
+    /// `ApplicationSet` selects *registered* clusters (`ferriscd.io/secret-type=cluster`), and the
+    /// control plane's own cluster is not a registration an operator can label.
+    #[must_use]
+    pub fn registrations(&self) -> Vec<ClusterRegistrationInfo> {
+        let mut registrations: Vec<ClusterRegistrationInfo> = self
+            .handles
+            .iter()
+            .map(|entry| {
+                let name = entry.key().clone();
+                ClusterRegistrationInfo {
+                    labels: self
+                        .labels
+                        .get(&name)
+                        .map(|labels| labels.value().clone())
+                        .unwrap_or_default(),
+                    default_namespace: self.materials.get(&name).and_then(|material| {
+                        material.value().default_namespace().map(str::to_owned)
+                    }),
+                    name: name.as_str().to_owned(),
+                }
+            })
+            .collect();
+        registrations.sort_by(|left, right| left.name.cmp(&right.name));
+        registrations
+    }
+
     /// How many remote clusters are registered.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1226,12 +1432,29 @@ impl ClusterManager {
     pub async fn seed(&self, secret: &Secret) -> Result<ClusterChange, ClusterError> {
         let material = ClusterSecret::parse(secret, self.options)?;
         let name = material.name.clone();
+        // `T19.3`: the labels are what the `clusters` generator's selector matches. They are tracked
+        // separately from the connection material so a label-only edit never rebuilds a connector —
+        // but it *is* a registration change, so it must be published and re-selected.
+        let labels: BTreeMap<String, String> = secret
+            .labels()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         if self
             .materials
             .get(&name)
             .is_some_and(|existing| existing.value() == &material)
         {
-            return Ok(ClusterChange::Unchanged);
+            let labels_changed = self
+                .labels
+                .get(&name)
+                .is_none_or(|existing| existing.value() != &labels);
+            if !labels_changed {
+                return Ok(ClusterChange::Unchanged);
+            }
+            self.labels.insert(name.clone(), labels);
+            self.publish(ClusterLifecycleEvent::Rebuilt(name.as_str().to_owned()));
+            return Ok(ClusterChange::Rebuilt);
         }
         let replaced = self.materials.contains_key(&name);
         let handle = self.builder.build(&material).await?;
@@ -1250,6 +1473,7 @@ impl ClusterManager {
             .map(|entry| entry.key().clone())
             .collect();
         let secret_name = material.secret.clone();
+        self.labels.insert(name.clone(), labels);
         self.store(material, Arc::new(handle));
         for old in stale {
             if self.remove(&old) {
@@ -1267,6 +1491,19 @@ impl ClusterManager {
         } else {
             ClusterChange::Added
         };
+        // `T18.1`: the broadcast mirrors `ClusterChange` exactly — an unchanged `Secret` publishes
+        // nothing, so a re-list of a stable fleet never wakes a single subscriber.
+        match change {
+            ClusterChange::Added => {
+                self.publish(ClusterLifecycleEvent::Added(name.as_str().to_owned()));
+            }
+            ClusterChange::Rebuilt => {
+                self.publish(ClusterLifecycleEvent::Rebuilt(name.as_str().to_owned()));
+            }
+            // `seed` returned `Unchanged` above; the arm stays explicit so a future edit there
+            // cannot silently publish an event for a handle that was not rebuilt.
+            ClusterChange::Unchanged => {}
+        }
         let action = match change {
             ClusterChange::Added => "cluster.added",
             ClusterChange::Rebuilt => "cluster.rebuilt",
@@ -1339,9 +1576,20 @@ impl ClusterManager {
     }
 
     /// Drops both maps together.
+    ///
+    /// The one place a registration stops existing, which is why the `T18.1` [`Removed`] event is
+    /// published here: every revocation path (`forget`, `forget_secret`, a renamed `Secret`, an
+    /// unusable `Secret`, and the `InitDone` re-list sweep) goes through it, so no consumer can be
+    /// left believing a revoked cluster is still addressable.
+    ///
+    /// [`Removed`]: ClusterLifecycleEvent::Removed
     fn remove(&self, name: &ClusterName) -> bool {
+        self.labels.remove(name);
         let material = self.materials.remove(name).is_some();
         let handle = self.handles.remove(name).is_some();
+        if material || handle {
+            self.publish(ClusterLifecycleEvent::Removed(name.as_str().to_owned()));
+        }
         material || handle
     }
 
@@ -1866,6 +2114,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use kube::config::Config;
+    use tokio::sync::broadcast::error::TryRecvError;
 
     use super::*;
 
@@ -2681,6 +2930,120 @@ VvvhRCE9YVNC/nP/0IrzmyUJjadxsSjY9K50kjOxukR8diF5fBhlpWz5n11sh+Sw
     // The watch seam (no cluster needed)
     // -----------------------------------------------------------------
 
+    /// **`T19.3`:** the `clusters` generator's view is sorted, credential-free, and tracks the
+    /// registration `Secret`'s **labels** — including a label-only edit, which must publish a
+    /// `Rebuilt` event (a selector result changed) without rebuilding the connector.
+    #[tokio::test]
+    async fn registrations_expose_sorted_labels_and_react_to_a_label_only_change() {
+        let builder = Arc::new(FakeBuilder::default());
+        let manager = manager(builder.clone());
+        let mut subscribed = manager.subscribe();
+
+        let mut registration = token_secret("workload");
+        registration
+            .metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert("env".to_owned(), "prod".to_owned());
+        registration
+            .metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert("region".to_owned(), "eu".to_owned());
+        registration
+            .data
+            .as_mut()
+            .expect("data")
+            .insert(KEY_NAMESPACE.to_owned(), ByteString(b"payments".to_vec()));
+        let mut second = token_secret("another");
+        second
+            .metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert("env".to_owned(), "dev".to_owned());
+
+        manager.seed(&registration).await.expect("seeds");
+        manager.seed(&second).await.expect("seeds");
+        assert_eq!(builder.builds.load(Ordering::SeqCst), 2);
+        // Drain the two `Added` events so the relabel assertions below only see what follows.
+        while subscribed.try_recv().is_ok() {}
+
+        let registrations = manager.registrations();
+        assert_eq!(
+            registrations
+                .iter()
+                .map(|registration| registration.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["another", "workload"],
+            "the generator view is sorted by name"
+        );
+        let workload = &registrations[1];
+        assert_eq!(workload.labels.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(
+            workload.labels.get(SECRET_TYPE_LABEL).map(String::as_str),
+            Some(SECRET_TYPE_CLUSTER)
+        );
+        assert_eq!(workload.default_namespace.as_deref(), Some("payments"));
+        assert_eq!(registrations[0].default_namespace, None);
+        // The view carries no credential material at all.
+        let rendered = format!("{registrations:?}");
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+        assert!(!rendered.contains("workload.example.com"), "{rendered}");
+        // `in-cluster` is never a registration.
+        assert!(
+            !registrations
+                .iter()
+                .any(|registration| registration.name == IN_CLUSTER)
+        );
+
+        // A label-only edit changes the material not at all, but it does change what a selector
+        // matches: it must publish `Rebuilt` and must not rebuild the connector.
+        let mut relabeled = registration.clone();
+        relabeled
+            .metadata
+            .labels
+            .get_or_insert_with(BTreeMap::new)
+            .insert("region".to_owned(), "us".to_owned());
+        assert_eq!(
+            manager.seed(&relabeled).await.expect("relabel"),
+            ClusterChange::Rebuilt
+        );
+        assert_eq!(
+            builder.builds.load(Ordering::SeqCst),
+            2,
+            "a label edit must not rebuild the connector"
+        );
+        assert_eq!(
+            manager
+                .registrations()
+                .into_iter()
+                .find(|registration| registration.name == "workload")
+                .and_then(|registration| registration.labels.get("region").cloned()),
+            Some("us".to_owned())
+        );
+        let event = subscribed
+            .try_recv()
+            .expect("a lifecycle event was published");
+        assert_eq!(event, ClusterLifecycleEvent::Rebuilt("workload".to_owned()));
+
+        // Re-registering the identical `Secret` still publishes nothing and rebuilds nothing.
+        assert_eq!(
+            manager.seed(&relabeled).await.expect("unchanged"),
+            ClusterChange::Unchanged
+        );
+        assert_eq!(builder.builds.load(Ordering::SeqCst), 2);
+        assert!(subscribed.try_recv().is_err());
+
+        // A forgotten registration disappears from the generator view.
+        assert!(manager.forget("workload"));
+        assert!(
+            !manager
+                .registrations()
+                .iter()
+                .any(|registration| registration.name == "workload")
+        );
+    }
+
     /// A scripted registration source: the whole add/change/delete behaviour without a cluster.
     struct ScriptedSource {
         events: Mutex<Option<Vec<Result<ClusterSecretEvent, ClusterWatchError>>>>,
@@ -3078,5 +3441,191 @@ VvvhRCE9YVNC/nP/0IrzmyUJjadxsSjY9K50kjOxukR8diF5fBhlpWz5n11sh+Sw
             !serialized.contains("rotated-bearer-secret"),
             "{serialized}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `T18.1`: the lifecycle broadcast
+    // -----------------------------------------------------------------
+
+    /// Every registration change is broadcast exactly once, and an unchanged `Secret` publishes
+    /// nothing — a re-list of a stable fleet must never wake a subscriber.
+    #[tokio::test]
+    async fn the_lifecycle_broadcast_reports_added_rebuilt_and_removed() {
+        let manager = manager(Arc::new(FakeBuilder::default()));
+        let mut events = manager.subscribe();
+        assert!(
+            events.is_empty(),
+            "subscribing is not a snapshot: nothing has happened yet"
+        );
+        assert_eq!(
+            manager.seed(&token_secret("workload")).await.expect("seed"),
+            ClusterChange::Added
+        );
+        assert_eq!(
+            events.try_recv(),
+            Ok(ClusterLifecycleEvent::Added("workload".to_owned()))
+        );
+
+        // The same material again: no rebuild, so no event.
+        assert_eq!(
+            manager
+                .seed(&token_secret("workload"))
+                .await
+                .expect("re-seed"),
+            ClusterChange::Unchanged
+        );
+        assert!(
+            matches!(events.try_recv(), Err(TryRecvError::Empty)),
+            "an unchanged Secret must not publish a lifecycle event"
+        );
+
+        // A rotated credential rebuilds the handle, so it is reported as such (not as `Added`).
+        let rotated = with_data(token_secret("workload"), KEY_BEARER_TOKEN, b"rotated-token");
+        assert_eq!(
+            manager.seed(&rotated).await.expect("rotate"),
+            ClusterChange::Rebuilt
+        );
+        assert_eq!(
+            events.try_recv(),
+            Ok(ClusterLifecycleEvent::Rebuilt("workload".to_owned()))
+        );
+
+        assert!(manager.forget("workload"));
+        assert_eq!(
+            events.try_recv(),
+            Ok(ClusterLifecycleEvent::Removed("workload".to_owned()))
+        );
+        // Forgetting something already gone is a no-op, so it publishes nothing either.
+        assert!(!manager.forget("workload"));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // The payload is the cluster name and nothing else: no material, no credential, no client.
+        let added = ClusterLifecycleEvent::Added("workload".to_owned());
+        assert_eq!(added.cluster(), "workload");
+        assert_eq!(added.kind(), "added");
+        assert_eq!(
+            ClusterLifecycleEvent::Removed("workload".to_owned()).kind(),
+            "removed"
+        );
+        assert!(
+            !format!("{added:?}").contains(TOKEN),
+            "a lifecycle event must never carry credential material"
+        );
+    }
+
+    /// **Finding `P13-H2`:** a `Secret` deleted while the watch was reconnecting produces no
+    /// `Delete`, so only the completed re-list revokes it — and that revocation has to reach
+    /// subscribers, or a consumer keeps watching a cluster whose credentials were deleted.
+    #[tokio::test]
+    async fn the_watch_broadcasts_re_list_revocations() {
+        let manager = Arc::new(manager(Arc::new(FakeBuilder::default())));
+        let mut events = manager.subscribe();
+
+        // The initial list registers both clusters, in list order.
+        manager
+            .clone()
+            .run(
+                scripted(vec![
+                    Ok(ClusterSecretEvent::Init),
+                    Ok(ClusterSecretEvent::Upsert(Box::new(token_secret("a")))),
+                    Ok(ClusterSecretEvent::Upsert(Box::new(token_secret("b")))),
+                    Ok(ClusterSecretEvent::InitDone),
+                ]),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            events.try_recv(),
+            Ok(ClusterLifecycleEvent::Added("a".to_owned()))
+        );
+        assert_eq!(
+            events.try_recv(),
+            Ok(ClusterLifecycleEvent::Added("b".to_owned()))
+        );
+        assert!(
+            matches!(events.try_recv(), Err(TryRecvError::Empty)),
+            "a completed list publishes nothing of its own"
+        );
+
+        // `b` was deleted while the watch was down: the re-list only reports `a`, and no `Delete`
+        // is ever delivered for `b`.
+        manager
+            .clone()
+            .run(
+                scripted(vec![
+                    Ok(ClusterSecretEvent::Init),
+                    Ok(ClusterSecretEvent::Upsert(Box::new(token_secret("a")))),
+                    Ok(ClusterSecretEvent::InitDone),
+                ]),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            events.try_recv(),
+            Ok(ClusterLifecycleEvent::Removed("b".to_owned())),
+            "the registration the re-list omitted must be broadcast as removed"
+        );
+        assert!(
+            matches!(events.try_recv(), Err(TryRecvError::Empty)),
+            "the re-listed, unchanged `a` publishes nothing"
+        );
+
+        // A delivered `Delete` reaches subscribers through the same path.
+        manager
+            .clone()
+            .run(
+                scripted(vec![Ok(ClusterSecretEvent::Deleted("a".to_owned()))]),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            events.try_recv(),
+            Ok(ClusterLifecycleEvent::Removed("a".to_owned()))
+        );
+        assert!(manager.is_empty());
+    }
+
+    /// The channel is **bounded**: a subscriber that stops reading learns it fell behind
+    /// (`Lagged`) instead of growing the registry's memory, and `names()` is what it resynchronises
+    /// against.
+    #[tokio::test]
+    async fn a_lagging_subscriber_is_told_and_resynchronises_against_names() {
+        let manager = manager(Arc::new(FakeBuilder::default()));
+        // A receiver that is never polled: `seed`/`forget` publish two events per iteration, so
+        // the bounded channel overflows well before the loop ends.
+        let mut slow = manager.subscribe();
+        for _ in 0..(CLUSTER_EVENT_CAPACITY / 2 + 4) {
+            manager.seed(&token_secret("workload")).await.expect("seed");
+            assert!(manager.forget("workload"));
+        }
+
+        assert!(
+            matches!(slow.try_recv(), Err(TryRecvError::Lagged(_))),
+            "a subscriber that fell more than {CLUSTER_EVENT_CAPACITY} events behind must be told"
+        );
+
+        // The receiver is not wedged: it keeps delivering the buffered tail.
+        let mut drained = 0;
+        while slow.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert!(
+            drained > 0,
+            "a lagged receiver must keep delivering the events still buffered"
+        );
+        assert!(matches!(slow.try_recv(), Err(TryRecvError::Empty)));
+
+        // The authority a lagged subscriber resynchronises against: the live registry, not the
+        // stream. Publishing resumes normally afterwards.
+        assert!(manager.names().is_empty());
+        manager
+            .seed(&token_secret("after-gap"))
+            .await
+            .expect("seed");
+        assert_eq!(
+            slow.try_recv(),
+            Ok(ClusterLifecycleEvent::Added("after-gap".to_owned()))
+        );
+        assert_eq!(manager.names(), vec!["after-gap".to_owned()]);
     }
 }

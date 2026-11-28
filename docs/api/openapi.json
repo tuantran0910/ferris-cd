@@ -712,6 +712,230 @@
         ]
       }
     },
+    "/api/v1/applicationsets": {
+      "get": {
+        "tags": [
+          "platform"
+        ],
+        "summary": "Lists `ApplicationSet` objects (`T19.3`).",
+        "description": "Every `ApplicationSet` of the control-plane namespace whose template targets an `AppProject` the caller may see, with its generator kinds, deletion/prune policy, and generation count.",
+        "operationId": "list_applicationsets",
+        "responses": {
+          "200": {
+            "description": "Every visible ApplicationSet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplicationSetListView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The cluster could not be read",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`GET /api/v1/auth/callback` — completes the BFF flow (`T19.2`).",
+        "description": "Validates that `state` is **this browser's** (the [`STATE_COOKIE_NAME`] cookie must equal the query\nparameter, compared in constant time), consumes the one-shot transaction, exchanges the code with\nthe stored verifier, seals a session cookie plus the CSRF cookie, and answers `303` to the\nconfigured post-login path. The state cookie is expired on the response whatever the outcome.",
+        "operationId": "callback",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "description": "The authorization code",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The state this server issued",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "Session established; redirect to the post-login path"
+          },
+          "400": {
+            "description": "The state is missing, unknown, expired or not this browser's",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The session cookie could not be sealed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The BFF flow is not enabled on this server"
+          },
+          "502": {
+            "description": "The identity provider could not be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/config": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Publishes how a caller can authenticate, so the Web UI and the CLI can pick a sign-in flow\n(`T19.1`; `T19.2` consumes it with PKCE).",
+        "description": "How to authenticate against this server: the auth mode (token-review, oidc, token-review-or-oidc, ...), plus the OIDC issuer, public client id and scopes when OIDC is enabled. Public by design — a client needs it before it has a credential.",
+        "operationId": "auth_config",
+        "responses": {
+          "200": {
+            "description": "The authentication configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthConfigView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/login": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`GET /api/v1/auth/login` — starts the BFF flow (`T19.2`).",
+        "description": "Answers `302` to the IdP's authorization endpoint with a fresh `state`, `nonce` and `S256`\nchallenge — plus the short-lived [`STATE_COOKIE_NAME`] cookie that binds that `state` to this\nbrowser — or `404` when the server was started without `--oidc-bff-enabled`.\n\n`429` is the per-client sign-in budget ([`MAX_LOGINS_PER_CLIENT`] per [`LOGIN_WINDOW`]).",
+        "operationId": "login",
+        "parameters": [
+          {
+            "name": "redirect_uri",
+            "in": "query",
+            "description": "The registered redirect URI; must match exactly",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to the identity provider's authorization endpoint"
+          },
+          "400": {
+            "description": "redirect_uri is not the registered one",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The BFF flow is not enabled on this server"
+          },
+          "429": {
+            "description": "Too many sign-ins were started from this address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The identity provider's discovery document is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /api/v1/auth/logout` — clears the BFF session (`T19.2`).",
+        "description": "Requires the double-submit CSRF header (see [`csrf`]) for a *usable* session: a cross-site page\nmust not be able to sign an operator out. A request the browser labels cross-site is refused\noutright, even with no session cookie at all — otherwise any page could force the `Max-Age=0`\ncookies to be stored. A cookie that no longer opens (expired, tampered, sealed under a rotated\nkey) is treated as absent here, because the caller's only remaining goal is to get rid of it —\nrefusing that would leave the browser stuck behind a `401` it cannot clear.\n\nThe session is stateless, so this cannot revoke a cookie that was copied before the sign-out: that\ncopy keeps working until the token (or the cookie) expires; only the IdP can revoke it earlier.",
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "Session cookies cleared"
+          },
+          "403": {
+            "description": "The CSRF header is missing or does not match, or the sign-out was initiated from another site",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The BFF flow is not enabled on this server"
+          }
+        }
+      }
+    },
     "/api/v1/clusters": {
       "get": {
         "tags": [
@@ -1075,7 +1299,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "Stable code (`NotFound`, `BadRequest`, `Conflict`, `Unprocessable`, `Unauthorized`,\n`Forbidden`, `BackendUnavailable`, `PayloadTooLarge`)."
+            "description": "Stable code (`NotFound`, `BadRequest`, `Conflict`, `Unprocessable`, `Unauthorized`,\n`Forbidden`, `BackendUnavailable`, `PayloadTooLarge`, `TooManyRequests`)."
           },
           "message": {
             "type": "string",
@@ -1109,6 +1333,17 @@
               {
                 "$ref": "#/components/schemas/OperationView",
                 "description": "The running operation, when one is recorded."
+              }
+            ]
+          },
+          "syncWindow": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SyncWindowGateView",
+                "description": "The `AppProject` sync-window verdict for this `Application` right now (`T17.4`).\n\nAbsent when the project configures no window: a project without governance windows adds\nnothing to the payload. (`ApplicationDetailView` has no `rename_all`, so the wire name is\nspelled out here to stay camelCase like the rest of the API.)"
               }
             ]
           }
@@ -1213,6 +1448,96 @@
           }
         }
       },
+      "ApplicationSetListView": {
+        "type": "object",
+        "description": "`GET /api/v1/applicationsets` body (`T19.3`).",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApplicationSetView"
+            },
+            "description": "Every `ApplicationSet` of the control-plane namespace."
+          }
+        }
+      },
+      "ApplicationSetView": {
+        "type": "object",
+        "description": "One `ApplicationSet`, reduced to its generation facts.",
+        "required": [
+          "namespace",
+          "name",
+          "generator",
+          "project",
+          "preserveResourcesOnDeletion",
+          "prune",
+          "generatedCount"
+        ],
+        "properties": {
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConditionView"
+            },
+            "description": "`status.conditions`, newest last."
+          },
+          "generatedCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`status.generatedCount`.",
+            "minimum": 0
+          },
+          "generator": {
+            "type": "string",
+            "description": "`spec.generators[0]`'s kind (`list`, `git`, `clusters`, `matrix`)."
+          },
+          "matrix": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "For a `matrix`, the two child generator kinds (empty otherwise)."
+          },
+          "name": {
+            "type": "string",
+            "description": "`metadata.name`."
+          },
+          "namespace": {
+            "type": "string",
+            "description": "`metadata.namespace`."
+          },
+          "observedGeneration": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`status.observedGeneration`."
+          },
+          "preserveResourcesOnDeletion": {
+            "type": "boolean",
+            "description": "`spec.syncPolicy.preserveResourcesOnDeletion` (always present, defaults to `true`)."
+          },
+          "project": {
+            "type": "string",
+            "description": "`spec.template.spec.project`."
+          },
+          "prune": {
+            "type": "boolean",
+            "description": "`spec.syncPolicy.prune` (defaults to `false`)."
+          },
+          "ready": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`status` `Ready` condition, `True`/`False`/`Unknown` (absent before the first pass)."
+          }
+        }
+      },
       "ApplicationSummary": {
         "type": "object",
         "description": "One `Application`, reduced to what a UI/CLI lists.",
@@ -1225,6 +1550,13 @@
           "resourceCount"
         ],
         "properties": {
+          "applicationset": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`metadata.labels[\"ferriscd.io/applicationset\"]`: the `ApplicationSet` that generated this\n`Application` (`T19.3`). Absent for a hand-authored one, which is what the web UI badges on."
+          },
           "conditions": {
             "type": "array",
             "items": {
@@ -1286,6 +1618,40 @@
                 "description": "`status.sync` (absent before the first reconcile)."
               }
             ]
+          }
+        }
+      },
+      "AuthConfigView": {
+        "type": "object",
+        "description": "`GET /api/v1/auth/config` body (`T19.1`).\n\nServed from the **public** group: the SPA and `ferriscd login --oidc` must learn how to\nauthenticate before they have a token, so this carries only what a stranger may know — the auth\nmode, the issuer, the public client id and the scopes (`T19.2` consumes it).",
+        "required": [
+          "authMode",
+          "scopes",
+          "bffEnabled"
+        ],
+        "properties": {
+          "authMode": {
+            "type": "string",
+            "description": "`token-review`, `oidc`, `token-review-or-oidc`, `pass-through` or `deny-all`."
+          },
+          "bffEnabled": {
+            "type": "boolean",
+            "description": "Whether the optional server-side (BFF cookie) session mode is enabled (`T19.2`)."
+          },
+          "clientId": {
+            "type": "string",
+            "description": "The configured OAuth client id. **Absent** when OIDC is disabled; never `null`."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The configured OIDC issuer. **Absent** when OIDC is disabled; never `null`."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The scopes the client should request from the IdP. Always present (`[]` when OIDC is off)."
           }
         }
       },
@@ -1759,6 +2125,93 @@
           }
         }
       },
+      "ProjectSyncWindowView": {
+        "type": "object",
+        "description": "One `spec.syncWindows[]` entry with its state at the moment of the response (`T17.4`).",
+        "required": [
+          "kind",
+          "schedule",
+          "duration",
+          "timeZone",
+          "manualSync",
+          "active"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Whether the window is open right now."
+          },
+          "applications": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Glob patterns for `Application.metadata.name` (empty = every application)."
+          },
+          "clusters": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Glob patterns for `spec.destination.cluster` (empty = every cluster)."
+          },
+          "duration": {
+            "type": "string",
+            "description": "The duration, verbatim (`30m`, `2h`, `7d`)."
+          },
+          "endsAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the currently open occurrence ends (RFC 3339)."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why this entry cannot be evaluated. The project is deny-all while it is set (fail closed)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`allow` or `deny` (deny wins over allow)."
+          },
+          "manualSync": {
+            "type": "boolean",
+            "description": "Whether a manual sync may override this window."
+          },
+          "namespaces": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Glob patterns for `Application.metadata.namespace` (empty = every namespace)."
+          },
+          "nextStart": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The next occurrence that starts after now (RFC 3339), within a year."
+          },
+          "schedule": {
+            "type": "string",
+            "description": "The 5-field cron expression, verbatim."
+          },
+          "startsAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the currently open occurrence started (RFC 3339)."
+          },
+          "timeZone": {
+            "type": "string",
+            "description": "The effective IANA time zone (`UTC` when `spec.syncWindows[].timeZone` is absent)."
+          }
+        }
+      },
       "ProjectView": {
         "type": "object",
         "description": "One `AppProject`, reduced to its boundary facts.",
@@ -1791,6 +2244,13 @@
             "type": "string",
             "description": "`metadata.name`."
           },
+          "nextSyncWindowTransition": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the next window starts or stops (RFC 3339), across every configured window."
+          },
           "sourceNamespaces": {
             "type": "array",
             "items": {
@@ -1804,6 +2264,13 @@
               "type": "string"
             },
             "description": "`spec.sourceRepos`."
+          },
+          "syncWindows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProjectSyncWindowView"
+            },
+            "description": "`spec.syncWindows`, each with its state at the moment of the response (`T17.4`).\n\nEmpty (and omitted) for a project that configures no window, so the pre-`T17.4` payload is\nbyte-identical for every such project."
           }
         }
       },
@@ -1952,17 +2419,25 @@
       },
       "SourceView": {
         "type": "object",
-        "description": "`spec.source` summary.",
+        "description": "`spec.source` summary.\n\n`T18.4` added the source **kind** and, for an OCI artifact, its `tag` and pinned `digest`. The\nfields are additive: a Git `Application` keeps `sourceType: \"git\"` with no `tag`/`digest` key at\nall, so an existing client sees exactly the payload it saw before.\n\n**Client/server skew (finding M6).** `sourceType` is *new*, so a `v1.1` server does not send it.\nDeserializing therefore defaults to `\"git\"` (the only source kind that version could serve)\ninstead of failing the whole response, while the **response** schema keeps the field required\n(`#[schema(required = true)]`) — a `v1.2` server always fills it in, and the generated\nTypeScript client must keep treating it as present.",
         "required": [
+          "sourceType",
           "repoUrl",
           "path",
           "targetRevision",
           "renderer"
         ],
         "properties": {
+          "digest": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pinned OCI manifest digest (`spec.source.oci.digest`, `sha256:<64-hex>`); never set by a\nresolution — this is what the `Application` *pinned*, not what the registry answered."
+          },
           "path": {
             "type": "string",
-            "description": "Path inside the repository."
+            "description": "Path inside the repository (`\"\"` for its root)."
           },
           "renderer": {
             "type": "string",
@@ -1970,11 +2445,22 @@
           },
           "repoUrl": {
             "type": "string",
-            "description": "Repository URL, redacted (a remote URL may carry a token)."
+            "description": "Repository or registry URL, redacted (a remote URL may carry a token)."
+          },
+          "sourceType": {
+            "type": "string",
+            "description": "Source kind (`git` or `oci`).\n\nDefaults to `git` when absent: an older server has no OCI support, so every source it can\nreport *is* a Git source."
+          },
+          "tag": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "OCI tag to resolve (`spec.source.oci.tag`); absent for a Git source and for a digest-only\nreference."
           },
           "targetRevision": {
             "type": "string",
-            "description": "Requested revision (branch, tag, or `HEAD`)."
+            "description": "Requested revision (`spec.source.git.targetRevision`, else `oci.tag`, else `oci.digest`)."
           }
         }
       },
@@ -2039,6 +2525,43 @@
           }
         }
       },
+      "SyncWindowGateView": {
+        "type": "object",
+        "description": "The sync-window verdict for one `Application` right now (`T17.4`).\n\nThe UI needs this to explain a blocked `POST .../sync` *before* the operator clicks: a window is\na time-based refusal, and \"nothing happened\" is indistinguishable from a controller stall\notherwise. `manualOverride` says whether a manual sync would be honoured anyway\n(`manualSync: true` on every blocking window).\n\nA blocked manual sync is **deferred, not rejected**: the controller pauses the requested\noperation and runs it when the window lifts, without asking again (finding N-c), so the modal\ntells the operator *when* it will happen rather than to come back and click twice.",
+        "required": [
+          "blocked",
+          "message",
+          "manualOverride"
+        ],
+        "properties": {
+          "blocked": {
+            "type": "boolean",
+            "description": "Whether a manual sync would be skipped right now."
+          },
+          "manualOverride": {
+            "type": "boolean",
+            "description": "Whether `manualSync: true` makes a manual sync still executable."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable explanation, including the next window transition."
+          },
+          "nextTransition": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the verdict could change (RFC 3339)."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`denyWindowActive`, `outsideAllowWindow`, or `invalidWindow`; absent when not blocked."
+          }
+        }
+      },
       "WebhookResponse": {
         "type": "object",
         "description": "The `ferriscd.io/refresh` request a webhook reports back.",
@@ -2093,6 +2616,10 @@
     {
       "name": "health",
       "description": "Liveness and readiness probes"
+    },
+    {
+      "name": "auth",
+      "description": "Sign-in discovery: how a client authenticates (public)"
     },
     {
       "name": "applications",

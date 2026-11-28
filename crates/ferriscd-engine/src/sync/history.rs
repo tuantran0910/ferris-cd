@@ -98,6 +98,32 @@ impl SyncRecording {
     }
 }
 
+/// Summarizes `source` for `status.history`, with the **credential-free** URL.
+///
+/// Finding M-D: `status.history[].sourceSummary` is shipped in `/status` and printed by
+/// `kubectl describe`, so it must not publish the credential that may be embedded in a source URL.
+/// `SourceSummary::from_source` copies the effective URL verbatim (it lives in `ferriscd-crd`, which
+/// deliberately has no shared Git URL grammar), so the one production site that builds a history
+/// entry redacts here, per source kind:
+///
+/// * a Git remote keeps its SCP-style login (`git@github.com:org/repo.git` is not a credential) and
+///   loses only `user:token@`/`token@` userinfo — [`redact_repo_url`];
+/// * an OCI reference has no SCP-style spelling, so *every* userinfo is a credential —
+///   [`redact_oci_url_credentials`], the registry-shaped rule the engine's `repo` module already uses
+///   when it refuses a reference.
+///
+/// Both helpers are the ones the rest of the controller logs through, so a rejected URL, a log line,
+/// and a history entry can never disagree about what is safe to print.
+fn redacted_source_summary(source: &SourceSpec) -> SourceSummary {
+    let mut summary = SourceSummary::from_source(source);
+    summary.repo_url = if source.oci_source().is_some() {
+        crate::repo::redact_oci_url_credentials(&summary.repo_url)
+    } else {
+        crate::manifest::redact_repo_url(&summary.repo_url)
+    };
+    summary
+}
+
 /// Appends a successful sync to `status.history` and trims it to the effective bound.
 ///
 /// The new entry gets `id = max(existing ids) + 1` — monotonic even when older entries have been
@@ -136,7 +162,7 @@ pub fn record_sync_success(
         .max()
         .map_or(1, |id| id.saturating_add(1));
     let entry = RevisionHistoryEntry::new(next_id, revision, deployed_at)
-        .with_source_summary(source.map(SourceSummary::from_source));
+        .with_source_summary(source.map(redacted_source_summary));
     // `push_history` inserts newest-first and truncates to `clamp(1, MAX_HISTORY_ENTRIES)`.
     status.push_history(entry.clone(), revision_history_limit.max(1));
     SyncRecording::Appended(entry)
@@ -417,7 +443,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::diff::decision::{SkipReason, SyncDecision, SyncTrigger, should_sync};
+    use crate::diff::decision::{
+        SkipReason, SyncDecision, SyncTrigger, SyncWindowGate, should_sync,
+    };
     use crate::diff::types::DiffSummary;
 
     const SHA_V1: &str = "1111111111111111111111111111111111111111";
@@ -430,11 +458,12 @@ mod tests {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
             source: SourceSpec {
-                git: GitSourceSpec {
+                git: Some(GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "main".to_owned(),
                     path: String::new(),
-                },
+                }),
+                oci: None,
                 renderer: RendererSpec::default(),
             },
             destination: DestinationSpec {
@@ -697,7 +726,7 @@ mod tests {
 
         // Baseline: the source is unchanged, so self-heal re-applies HEAD on every pass.
         assert_eq!(
-            should_sync(&app, head, SPEC_HASH, &drift, false),
+            should_sync(&app, head, SPEC_HASH, &drift, false, SyncWindowGate::Allow),
             SyncDecision::Execute(SyncTrigger::DriftDetected)
         );
 
@@ -712,7 +741,14 @@ mod tests {
         let mut rolled_back = app.clone();
         assert!(decision.apply_to_spec(&mut rolled_back.spec));
         assert_eq!(
-            should_sync(&rolled_back, head, SPEC_HASH, &drift, false),
+            should_sync(
+                &rolled_back,
+                head,
+                SPEC_HASH,
+                &drift,
+                false,
+                SyncWindowGate::Allow
+            ),
             SyncDecision::Skip(SkipReason::AutomatedDisabled),
             "the pinned revision must survive subsequent requeues"
         );
@@ -724,7 +760,8 @@ mod tests {
                 decision.pinned_revision(),
                 SPEC_HASH,
                 &drift,
-                true
+                true,
+                SyncWindowGate::Allow
             )
             .is_execute()
         );
@@ -882,6 +919,103 @@ mod tests {
             at("2026-11-24T12:00:00Z"),
         );
         assert!(recorded.entry().expect("appended").source_summary.is_none());
+    }
+
+    /// **Finding M-D (`T18.4`).** `status.history[].sourceSummary.repoURL` is shipped in `/status`
+    /// and printed by `kubectl describe`, so an embedded credential must be redacted — the T18.3
+    /// build pinned the leaky shape on purpose, and this is the flip.
+    ///
+    /// The rule is per source kind: a Git remote keeps its SCP-style login and loses only real
+    /// userinfo, while an OCI reference (which has no SCP-style spelling) loses every `@` userinfo.
+    #[test]
+    fn a_history_source_summary_redacts_an_embedded_credential() {
+        const SECRET: &str = "ghp-t0ken-in-the-remote";
+        let remote = format!("https://user:{SECRET}@example.com/repo.git");
+
+        let mut source = source();
+        let git = source.git.as_mut().expect("the fixture is a Git source");
+        git.repo_url = remote.clone();
+
+        let mut status = ApplicationStatus::default();
+        let recorded = record_sync_success(
+            &mut status,
+            Some(SHA_V1.to_owned()),
+            Some(&source),
+            10,
+            at("2026-11-24T12:00:00Z"),
+        );
+        recorded.entry().expect("appended");
+
+        let json = serde_json::to_value(&status).expect("status serializes");
+        let recorded_url = json["history"][0]["sourceSummary"]["repoURL"]
+            .as_str()
+            .expect("repoURL is a string");
+        assert!(
+            !recorded_url.contains(SECRET),
+            "the token must never reach /status: {recorded_url}"
+        );
+        assert_eq!(
+            recorded_url, "https://user:***@example.com/repo.git",
+            "the shared Git redactor keeps the login and the host so the entry still names the \
+             source, and masks only the secret"
+        );
+        assert!(
+            !json.to_string().contains(SECRET),
+            "no part of /status may carry the token: {json}"
+        );
+
+        // An SCP-style login is not a credential and survives redaction.
+        let mut scp = source.clone();
+        scp.git.as_mut().expect("git").repo_url =
+            "git@github.com:ferris-cd/manifests.git".to_owned();
+        let mut status = ApplicationStatus::default();
+        let _ = record_sync_success(
+            &mut status,
+            Some(SHA_V1.to_owned()),
+            Some(&scp),
+            10,
+            at("2026-11-24T12:00:00Z"),
+        );
+        assert_eq!(
+            status.history[0]
+                .source_summary
+                .as_ref()
+                .expect("summary")
+                .repo_url,
+            "git@github.com:ferris-cd/manifests.git"
+        );
+
+        // An OCI reference is redacted with the registry rule, which treats every `@` before the
+        // path as userinfo (a registry reference has no SCP-style form).
+        let mut oci = source.clone();
+        oci.git = None;
+        oci.oci = Some(ferriscd_crd::OciSourceSpec {
+            url: format!("oci://robot:{SECRET}@ghcr.io/payments/charts"),
+            tag: Some("1.4.2".to_owned()),
+            digest: None,
+            path: "charts/api".to_owned(),
+        });
+        let mut status = ApplicationStatus::default();
+        let recorded = record_sync_success(
+            &mut status,
+            Some("sha256:".to_owned() + &"a".repeat(64)),
+            Some(&oci),
+            10,
+            at("2026-11-24T12:00:00Z"),
+        );
+        let summary = recorded
+            .entry()
+            .expect("appended")
+            .source_summary
+            .clone()
+            .expect("summary");
+        assert_eq!(summary.repo_url, "oci://[REDACTED]@ghcr.io/payments/charts");
+        assert_eq!(summary.path, "charts/api");
+        assert_eq!(
+            summary.target_revision, "1.4.2",
+            "the tag is the requested revision the history entry records"
+        );
+        assert!(!summary.repo_url.contains(SECRET));
     }
 
     fn succeeded_operation(

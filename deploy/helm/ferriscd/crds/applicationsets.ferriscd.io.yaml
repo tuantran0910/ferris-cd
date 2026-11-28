@@ -1,0 +1,693 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: applicationsets.ferriscd.io
+spec:
+  group: ferriscd.io
+  names:
+    kind: ApplicationSet
+    plural: applicationsets
+    shortNames:
+    - appset
+    singular: applicationset
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Number of Applications the last successful generation produced
+      jsonPath: .status.generatedCount
+      name: GENERATED
+      type: integer
+    - description: Age of the ApplicationSet
+      jsonPath: .metadata.creationTimestamp
+      name: AGE
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: "Fleet template: one generator produces parameter sets that render many Applications in this namespace"
+        properties:
+          spec:
+            description: "`ApplicationSet` custom resource (`ferriscd.io/v1alpha1`)."
+            properties:
+              generators:
+                description: |-
+                  Exactly one top-level generator (a `matrix` carries its two children).
+
+                  A list is used instead of a single field so the wire shape matches the documented
+                  `spec.generators[]` API; [`ApplicationSetSpec::validate`] enforces `len() == 1`.
+                items:
+                  description: One parameter source of an `ApplicationSet`.
+                  oneOf:
+                  - required:
+                    - list
+                  - required:
+                    - git
+                  - required:
+                    - clusters
+                  - required:
+                    - matrix
+                  properties:
+                    clusters:
+                      description: Label selector over registered cluster `Secret`s.
+                      properties:
+                        selector:
+                          description: Optional label selector; omitted selects every registered cluster.
+                          nullable: true
+                          properties:
+                            matchLabels:
+                              additionalProperties:
+                                type: string
+                              default: {}
+                              description: Label keys and values a cluster registration `Secret` must carry, all of them.
+                              type: object
+                          type: object
+                      type: object
+                    git:
+                      description: Directory glob or parameter-file glob inside one Git repository.
+                      properties:
+                        directories:
+                          default: []
+                          description: Directory globs (mutually exclusive with `files`).
+                          items:
+                            description: One directory glob of a `git` generator.
+                            properties:
+                              exclude:
+                                default: false
+                                description: >-
+                                  Exclude matching directories instead of including them (a deny wins over every
+                                  include).
+                                type: boolean
+                              path:
+                                description: >-
+                                  Repository-relative glob (`apps/*`, `envs/**`). `*` matches one path segment,
+                                  `**` any number.
+                                type: string
+                            required:
+                            - path
+                            type: object
+                          type: array
+                        files:
+                          default: []
+                          description: Parameter-file globs (mutually exclusive with `directories`).
+                          items:
+                            description: One parameter-file glob of a `git` generator.
+                            properties:
+                              exclude:
+                                default: false
+                                description: Exclude matching files instead of including them.
+                                type: boolean
+                              path:
+                                description: Repository-relative glob of YAML/JSON parameter files (`envs/*/config.yaml`).
+                                type: string
+                            required:
+                            - path
+                            type: object
+                          type: array
+                        repoURL:
+                          description: >-
+                            Repository clone URL (`https://`, `ssh://`, SCP-style SSH, or a local test
+                            path).
+                          type: string
+                        revision:
+                          default: HEAD
+                          description: Branch, tag, `HEAD`, or a full 40-character commit SHA.
+                          type: string
+                      required:
+                      - repoURL
+                      type: object
+                    list:
+                      description: Static array of flat key/value maps.
+                      properties:
+                        elements:
+                          default: []
+                          description: One parameter map per generated `Application`.
+                          items:
+                            additionalProperties:
+                              type: string
+                            type: object
+                          type: array
+                      type: object
+                    matrix:
+                      description: Cartesian product of exactly two child generators.
+                      properties:
+                        generators:
+                          default: []
+                          description: |-
+                            Exactly two children; the child *type* has no `matrix` variant, so nesting is
+                            unrepresentable and the output stays a product of two.
+                          items:
+                            description: |-
+                              A leaf generator, as a `matrix` child.
+
+                              Deliberately **not** [`ApplicationSetGenerator`]: that enum contains `Matrix`, which would make
+                              the schema recursive. Two things follow, and both matter:
+
+                              * **A nested matrix cannot be expressed at all.** `spec.generators[].matrix.generators[]` accepts
+                                only `list`, `git`, and `clusters`, so the product of a product (an unbounded fan-out shape)
+                                is rejected by the API server's own schema instead of by a controller check.
+                              * **The generated CRD stays structural.** A Kubernetes `CustomResourceDefinition` schema may not
+                                contain JSON schema reference pointers (the API server rejects them outright), and a recursive
+                                Rust type is exactly what makes the schema generator emit one. A CRD that cannot be applied is
+                                a CRD that cannot ship, so the recursion is removed here rather than papered over.
+                            oneOf:
+                            - required:
+                              - list
+                            - required:
+                              - git
+                            - required:
+                              - clusters
+                            properties:
+                              clusters:
+                                description: Label selector over registered cluster `Secret`s.
+                                properties:
+                                  selector:
+                                    description: Optional label selector; omitted selects every registered cluster.
+                                    nullable: true
+                                    properties:
+                                      matchLabels:
+                                        additionalProperties:
+                                          type: string
+                                        default: {}
+                                        description: Label keys and values a cluster registration `Secret` must carry, all of them.
+                                        type: object
+                                    type: object
+                                type: object
+                              git:
+                                description: Directory glob or parameter-file glob inside one Git repository.
+                                properties:
+                                  directories:
+                                    default: []
+                                    description: Directory globs (mutually exclusive with `files`).
+                                    items:
+                                      description: One directory glob of a `git` generator.
+                                      properties:
+                                        exclude:
+                                          default: false
+                                          description: >-
+                                            Exclude matching directories instead of including them (a deny wins over every
+                                            include).
+                                          type: boolean
+                                        path:
+                                          description: >-
+                                            Repository-relative glob (`apps/*`, `envs/**`). `*` matches one path segment,
+                                            `**` any number.
+                                          type: string
+                                      required:
+                                      - path
+                                      type: object
+                                    type: array
+                                  files:
+                                    default: []
+                                    description: Parameter-file globs (mutually exclusive with `directories`).
+                                    items:
+                                      description: One parameter-file glob of a `git` generator.
+                                      properties:
+                                        exclude:
+                                          default: false
+                                          description: Exclude matching files instead of including them.
+                                          type: boolean
+                                        path:
+                                          description: Repository-relative glob of YAML/JSON parameter files (`envs/*/config.yaml`).
+                                          type: string
+                                      required:
+                                      - path
+                                      type: object
+                                    type: array
+                                  repoURL:
+                                    description: >-
+                                      Repository clone URL (`https://`, `ssh://`, SCP-style SSH, or a local test
+                                      path).
+                                    type: string
+                                  revision:
+                                    default: HEAD
+                                    description: Branch, tag, `HEAD`, or a full 40-character commit SHA.
+                                    type: string
+                                required:
+                                - repoURL
+                                type: object
+                              list:
+                                description: Static array of flat key/value maps.
+                                properties:
+                                  elements:
+                                    default: []
+                                    description: One parameter map per generated `Application`.
+                                    items:
+                                      additionalProperties:
+                                        type: string
+                                      type: object
+                                    type: array
+                                type: object
+                            type: object
+                          type: array
+                      type: object
+                  type: object
+                type: array
+              maxGeneratedApplications:
+                description: |-
+                  Optional lower ceiling on this object's fan-out (`1..=200`).
+
+                  Omitted means [`MAX_GENERATED_APPLICATIONS`]; a value above it is rejected, never clamped
+                  silently.
+                format: int64
+                maximum: 200.0
+                minimum: 1.0
+                nullable: true
+                type: integer
+              requeueAfterSeconds:
+                default: 180
+                description: Periodic re-evaluation interval in seconds (default 180).
+                format: uint32
+                maximum: 86400.0
+                minimum: 1.0
+                type: integer
+              syncPolicy:
+                default:
+                  preserveResourcesOnDeletion: true
+                  prune: false
+                description: Generation and deletion policy (non-destructive by default).
+                properties:
+                  preserveResourcesOnDeletion:
+                    default: true
+                    description: >-
+                      Orphan (never delete) the generated `Application`s when this `ApplicationSet`
+                      is deleted.
+                    type: boolean
+                  prune:
+                    default: false
+                    description: >-
+                      Delete generated `Application`s the generators no longer produce (default
+                      `false`).
+                    type: boolean
+                type: object
+              template:
+                description: The `Application` template every generated parameter set is rendered into.
+                properties:
+                  metadata:
+                    description: >-
+                      Generated `Application` metadata (placeholders allowed; the name is DNS-1123
+                      sanitized).
+                    properties:
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        default: {}
+                        description: Annotations.
+                        type: object
+                      labels:
+                        additionalProperties:
+                          type: string
+                        default: {}
+                        description: >-
+                          Additional labels (the `ferriscd.io/applicationset` label is always applied by
+                          the engine).
+                        type: object
+                      name:
+                        description: Template for `metadata.name`; the rendered value is DNS-1123 sanitized.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  spec:
+                    description: Generated `Application` spec (placeholders allowed in its string fields).
+                    properties:
+                      destination:
+                        description: Target cluster and namespace.
+                        properties:
+                          cluster:
+                            default: in-cluster
+                            description: "Target cluster: `in-cluster` or a FerrisCD cluster Secret name."
+                            type: string
+                          namespace:
+                            description: Namespace injected onto namespaced resources that do not set one explicitly.
+                            type: string
+                        required:
+                        - namespace
+                        type: object
+                      ignoreDifferences:
+                        default: []
+                        description: Field-level drift suppressions applied before diffing.
+                        items:
+                          description: >-
+                            Field-level drift suppression for one Group/Kind (optionally narrowed by
+                            name/namespace).
+                          properties:
+                            group:
+                              description: API group (`""` for the core group); omitted means "any group".
+                              nullable: true
+                              type: string
+                            jsonPointers:
+                              default: []
+                              description: RFC 6901 JSON Pointers whose live/desired values are ignored during diffing.
+                              items:
+                                type: string
+                              type: array
+                            kind:
+                              description: Kind the suppression applies to.
+                              type: string
+                            managedFieldsManagers:
+                              default: []
+                              description: Field managers whose owned fields are ignored during diffing.
+                              items:
+                                type: string
+                              type: array
+                            name:
+                              description: Resource name the suppression applies to; omitted means "any name".
+                              nullable: true
+                              type: string
+                            namespace:
+                              description: Resource namespace the suppression applies to; omitted means "any namespace".
+                              nullable: true
+                              type: string
+                          required:
+                          - kind
+                          type: object
+                        type: array
+                      project:
+                        default: default
+                        description: |-
+                          `AppProject` this application belongs to; checked on every rendered resource.
+
+                          Defaults to [`DEFAULT_PROJECT_NAME`].
+                        type: string
+                      requeueAfterSeconds:
+                        default: 180
+                        description: >-
+                          Periodic reconcile interval in seconds (default
+                          [`DEFAULT_REQUEUE_AFTER_SECONDS`]).
+                        format: uint32
+                        maximum: 86400.0
+                        minimum: 1.0
+                        type: integer
+                      revisionHistoryLimit:
+                        default: 10
+                        description: |-
+                          Hard cap on `status.history` entries, validated to `1..=20`
+                          (default [`DEFAULT_REVISION_HISTORY_LIMIT`]).
+                        format: int32
+                        maximum: 20.0
+                        minimum: 1.0
+                        type: integer
+                      serviceAccountName:
+                        description: |-
+                          ServiceAccount (in the destination namespace) used for impersonation.
+
+                          Only honored when the referenced `AppProject` lists it in `allowedServiceAccounts`.
+                        nullable: true
+                        type: string
+                      source:
+                        description: Where the desired manifests come from and how they are rendered.
+                        properties:
+                          git:
+                            description: Git repository, revision, and manifest sub-path. Mutually exclusive with `oci`.
+                            nullable: true
+                            properties:
+                              path:
+                                default: ""
+                                description: Relative sub-directory inside the repository (`""` means repository root).
+                                type: string
+                              repoURL:
+                                description: >-
+                                  Repository clone URL (`https://`, `ssh://`, SCP-style SSH, or a local test
+                                  path).
+                                type: string
+                              targetRevision:
+                                default: HEAD
+                                description: Branch, tag, `HEAD`, or full 40-character commit SHA.
+                                type: string
+                            required:
+                            - repoURL
+                            type: object
+                          oci:
+                            description: >-
+                              OCI artifact (Helm chart or Kustomize/manifest bundle). Mutually exclusive with
+                              `git`.
+                            nullable: true
+                            properties:
+                              digest:
+                                description: |-
+                                  Immutable manifest digest (`sha256:<64 lowercase hex>`).
+
+                                  When both `tag` and `digest` are set the resolved manifest must match `digest`.
+                                nullable: true
+                                type: string
+                              path:
+                                default: ""
+                                description: >-
+                                  Relative sub-directory inside the extracted artifact (`""` means the artifact
+                                  root).
+                                type: string
+                              tag:
+                                description: "Tag to resolve (a plain tag, never a SemVer range: resolution stays a digest lookup)."
+                                nullable: true
+                                type: string
+                              url:
+                                description: "Artifact reference: `oci://<registry>/<repository>` (HTTPS-only registry transport)."
+                                type: string
+                            required:
+                            - url
+                            type: object
+                          renderer:
+                            default:
+                              auto: {}
+                            description: Renderer used to turn the checked-out path into Kubernetes manifests.
+                            oneOf:
+                            - required:
+                              - auto
+                            - required:
+                              - plainYaml
+                            - required:
+                              - kustomize
+                            - required:
+                              - helm
+                            properties:
+                              auto:
+                                description: Automatic renderer detection based on the files present in the source path.
+                                type: object
+                              helm:
+                                description: Helm chart rendering (CRDs are not installed unless `includeCRDs` is set).
+                                properties:
+                                  includeCRDs:
+                                    default: false
+                                    description: Install CRDs shipped in the chart's `crds/` directory (default `false`).
+                                    type: boolean
+                                  releaseName:
+                                    description: Release name used for rendering; defaults to the `Application` name.
+                                    nullable: true
+                                    type: string
+                                  valueFiles:
+                                    default: []
+                                    description: |-
+                                      Additional values files, relative to the source path (`spec.source.git.path` /
+                                      `spec.source.oci.path`).
+                                    items:
+                                      type: string
+                                    type: array
+                                type: object
+                              kustomize:
+                                description: Kustomize overlay (remote resources are rejected).
+                                properties:
+                                  images:
+                                    default: []
+                                    description: Image overrides applied to the rendered output (`name=newImage:tag`).
+                                    items:
+                                      type: string
+                                    type: array
+                                  kustomizationPath:
+                                    description: |-
+                                      Overlay directory (relative to the source path (`spec.source.git.path` /
+                                      `spec.source.oci.path`)); defaults to the source path.
+                                    nullable: true
+                                    type: string
+                                type: object
+                              plainYaml:
+                                description: Literal multi-document YAML/JSON manifests.
+                                properties:
+                                  recursive:
+                                    default: true
+                                    description: |-
+                                      Recurse into sub-directories of the source path (`spec.source.git.path` /
+                                      `spec.source.oci.path`) (default `true`).
+                                    type: boolean
+                                type: object
+                            type: object
+                        type: object
+                      syncPolicy:
+                        description: |-
+                          Automated sync policy, sync options, and retry behaviour.
+
+                          Omitted entirely for manual-only sync.
+                        nullable: true
+                        properties:
+                          automated:
+                            description: |-
+                              Automated sync policy.
+
+                              `None` means manual-only sync. Because this is an `Option` of a struct, the
+                              invalid combination `automated: false` + `selfHeal: true` cannot be expressed.
+                            nullable: true
+                            properties:
+                              prune:
+                                default: false
+                                description: >-
+                                  Prune resources removed from Git (never CRDs/Namespaces unless explicitly opted
+                                  in).
+                                type: boolean
+                              selfHeal:
+                                default: false
+                                description: Re-apply live drift automatically.
+                                type: boolean
+                            type: object
+                          retry:
+                            description: Bounded retry policy for failed sync operations.
+                            nullable: true
+                            properties:
+                              backoff:
+                                description: Exponential backoff parameters.
+                                nullable: true
+                                properties:
+                                  durationSeconds:
+                                    default: 5
+                                    description: Initial backoff duration in seconds.
+                                    format: uint32
+                                    minimum: 0.0
+                                    type: integer
+                                  factor:
+                                    default: 2
+                                    description: Multiplier applied after every failed attempt.
+                                    format: uint32
+                                    minimum: 0.0
+                                    type: integer
+                                  maxDurationSeconds:
+                                    default: 180
+                                    description: Upper bound for a single backoff duration in seconds.
+                                    format: uint32
+                                    minimum: 0.0
+                                    type: integer
+                                type: object
+                              limit:
+                                default: 5
+                                description: Maximum number of retry attempts (default [`DEFAULT_RETRY_LIMIT`]).
+                                format: uint32
+                                minimum: 0.0
+                                type: integer
+                            type: object
+                          syncOptions:
+                            description: "Sync options applied to every sync (safe defaults: no forced apply, no CRD/namespace pruning)."
+                            nullable: true
+                            properties:
+                              applyOutOfSyncOnly:
+                                default: true
+                                description: Only apply resources that are actually out of sync (default `true`).
+                                type: boolean
+                              createNamespace:
+                                default: false
+                                description: Create `spec.destination.namespace` when it does not exist.
+                                type: boolean
+                              pruneCRDs:
+                                default: false
+                                description: "Allow pruning `CustomResourceDefinition` objects (safety rail: default `false`)."
+                                type: boolean
+                              pruneLast:
+                                default: true
+                                description: Apply pruning last, after every other resource converged.
+                                type: boolean
+                              pruneNamespaces:
+                                default: false
+                                description: "Allow pruning `Namespace` objects (safety rail: default `false`)."
+                                type: boolean
+                              serverSideForce:
+                                default: false
+                                description: "Send `force: true` in Server-Side Apply patches (default `false`)."
+                                type: boolean
+                              takeoverFieldManagers:
+                                default: []
+                                description: Field managers whose ownership FerrisCD may take over (brownfield adoption).
+                                items:
+                                  type: string
+                                type: array
+                            type: object
+                        type: object
+                    required:
+                    - destination
+                    - source
+                    type: object
+                required:
+                - metadata
+                - spec
+                type: object
+            required:
+            - generators
+            - template
+            type: object
+          status:
+            description: |-
+              `ApplicationSet` `/status` subresource.
+
+              Kept as small as `Application.status`: the generation count plus standard conditions, never the
+              generated objects themselves (trap T9).
+            nullable: true
+            properties:
+              conditions:
+                description: Standard conditions (`Ready` is set on every pass, success or failure).
+                items:
+                  description: |-
+                    Wire-compatible mirror of `metav1.Condition`.
+
+                    Field names and values match the Kubernetes API so `kubectl wait --for=condition=Ready`
+                    and `kubectl describe` behave exactly as for built-in resources.
+                  properties:
+                    lastTransitionTime:
+                      description: When `status` last changed. Preserved while `status` is unchanged.
+                      format: date-time
+                      type: string
+                    message:
+                      default: ""
+                      description: >-
+                        Human-readable message; always present on the wire for `metav1.Condition`
+                        parity.
+                      type: string
+                    observedGeneration:
+                      description: "`metadata.generation` observed when the condition was computed."
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      description: CamelCase machine-readable reason for the current status.
+                      type: string
+                    status:
+                      description: Whether the condition currently holds.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: Condition type (e.g. [`CONDITION_READY`]).
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              generatedCount:
+                default: 0
+                description: How many `Application`s the last successful generation produced.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              observedGeneration:
+                description: "`metadata.generation` observed by the last evaluation."
+                format: int64
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: ApplicationSet
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

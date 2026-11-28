@@ -31,6 +31,10 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
     paths(
         crate::api::healthz,
         crate::api::readyz,
+        crate::api::auth_config,
+        crate::auth_bff::login,
+        crate::auth_bff::callback,
+        crate::auth_bff::logout,
         crate::api::list_applications,
         crate::api::stream_applications,
         crate::api::get_application,
@@ -40,6 +44,7 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
         crate::api::sync_application,
         crate::api::rollback_application,
         crate::api::list_projects,
+        crate::api::list_applicationsets,
         crate::api::list_clusters,
         crate::api::openapi_document,
         crate::webhooks::github,
@@ -48,6 +53,7 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
     components(schemas(
         crate::api::HealthResponse,
         crate::api::ReadyResponse,
+        crate::api::AuthConfigView,
         crate::api::ApplicationListView,
         crate::api::ApplicationSummary,
         crate::api::ApplicationDetailView,
@@ -71,6 +77,10 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
         crate::api::OperationResponse,
         crate::api::ProjectListView,
         crate::api::ProjectView,
+        crate::api::ApplicationSetListView,
+        crate::api::ApplicationSetView,
+        crate::api::ProjectSyncWindowView,
+        crate::api::SyncWindowGateView,
         crate::api::ClusterListView,
         crate::api::ClusterView,
         crate::api::ApplicationEventListView,
@@ -81,6 +91,7 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
     )),
     tags(
         (name = "health", description = "Liveness and readiness probes"),
+        (name = "auth", description = "Sign-in discovery: how a client authenticates (public)"),
         (name = "applications", description = "Applications, live resources, diffs, and manual operations"),
         (name = "platform", description = "Projects, clusters, and the OpenAPI contract"),
         (name = "webhooks", description = "GitHub/GitLab push webhooks (secret-authenticated)"),
@@ -157,6 +168,7 @@ mod tests {
         for path in [
             "/healthz",
             "/readyz",
+            "/api/v1/auth/config",
             "/api/v1/applications",
             "/api/v1/applications/stream",
             "/api/v1/applications/{namespace}/{name}",
@@ -166,6 +178,7 @@ mod tests {
             "/api/v1/applications/{namespace}/{name}/sync",
             "/api/v1/applications/{namespace}/{name}/rollback",
             "/api/v1/projects",
+            "/api/v1/applicationsets",
             "/api/v1/clusters",
             "/api/v1/openapi.json",
             "/api/v1/webhooks/github",
@@ -178,6 +191,7 @@ mod tests {
             .as_object()
             .expect("component schemas");
         for schema in [
+            "AuthConfigView",
             "ApplicationSummary",
             "ApplicationDetailView",
             "ResourceGraphView",
@@ -217,6 +231,7 @@ mod tests {
             "/api/v1/applications/{namespace}/{name}/sync",
             "/api/v1/applications/{namespace}/{name}/rollback",
             "/api/v1/projects",
+            "/api/v1/applicationsets",
             "/api/v1/clusters",
             "/api/v1/openapi.json",
         ] {
@@ -230,7 +245,9 @@ mod tests {
                 "{protected} must document the bearer requirement"
             );
         }
-        for public in ["/healthz", "/readyz"] {
+        // `T19.1`: the sign-in discovery endpoint is part of the *public* contract — a client needs it
+        // before it has a credential — so it must never grow a security requirement.
+        for public in ["/healthz", "/readyz", "/api/v1/auth/config"] {
             let operation = paths[public]
                 .as_object()
                 .and_then(|methods| methods.values().next())

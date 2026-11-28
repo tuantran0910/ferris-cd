@@ -253,7 +253,10 @@ impl<'a> OwnershipVerifiedPruner<'a> {
                     })
                     .await?
                 {
-                    // `AlreadyGone` is a `404`/`410` from the delete itself: still confirmed.
+                    // `AlreadyGone` is a `404`/`410` from the delete itself: still confirmed, and
+                    // still a delete FerrisCD issued — so the caller records a prune marker for it
+                    // exactly like a `Deleted` (finding N-5: `ReplaceRecovery` follows the same
+                    // rule, so "a marker exists for every delete we issued" holds on both paths).
                     DeleteOutcome::Deleted | DeleteOutcome::AlreadyGone => Ok(PruneResult::Pruned),
                 }
             }
@@ -317,6 +320,8 @@ mod tests {
         deletes: StdMutex<Vec<String>>,
         /// Deletes that fail with an API error.
         failing_deletes: StdMutex<BTreeMap<String, u16>>,
+        /// Deletes the API server answers with `404`/`410` (`DeleteOutcome::AlreadyGone`).
+        already_gone: StdMutex<bool>,
     }
 
     impl FakeCluster {
@@ -330,6 +335,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(gknn.to_owned(), code);
+            self
+        }
+
+        /// Every delete answers `AlreadyGone`: the object vanished before the delete landed.
+        fn answering_already_gone(self) -> Self {
+            *self.already_gone.lock().unwrap() = true;
             self
         }
 
@@ -409,6 +420,9 @@ mod tests {
                     });
                 }
                 self.objects.lock().unwrap().remove(&key);
+                if *self.already_gone.lock().unwrap() {
+                    return Ok(DeleteOutcome::AlreadyGone);
+                }
                 Ok(DeleteOutcome::Deleted)
             })
         }
@@ -642,6 +656,49 @@ mod tests {
             fixture.discovery.fetches(),
             1,
             "resolution must consult discovery exactly once"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Finding N-5: the confirmed-absence result the `Replace` path must match
+    // ------------------------------------------------------------------
+
+    /// **Finding N-5 (the rule `ReplaceRecovery` mirrors):** a delete the API server answers with
+    /// `404`/`410` is still a delete FerrisCD issued, so it is a confirmed prune.
+    ///
+    /// Both delete paths must agree: the executor records a prune marker for exactly
+    /// `PruneResult::Pruned`, so an `AlreadyGone` here must not turn into a `Retained`/error — that
+    /// would leave the `Delete` event of our own prune looking like an out-of-band delete (the event
+    /// repeats the last written `resourceVersion`). `ReplaceRecovery::replace` follows the same rule
+    /// for the delete a `Replace=true` issues.
+    #[tokio::test]
+    async fn an_already_gone_delete_is_a_confirmed_prune() {
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_object(config_map(
+                    "removed",
+                    Some(&tracking_id("ConfigMap", "removed")),
+                    None,
+                ))
+                .answering_already_gone(),
+        );
+        let options = SyncOptions::default();
+
+        let result = fixture
+            .pruner(&options)
+            .prune(&removed_key("removed"), Some("v1"))
+            .await
+            .expect("a 404/410 from the delete itself is not an error");
+
+        assert_eq!(
+            result,
+            PruneResult::Pruned,
+            "an AlreadyGone delete is a delete FerrisCD issued, exactly like a 200"
+        );
+        assert_eq!(
+            fixture.cluster.deletes(),
+            vec!["/ConfigMap/payments/removed".to_owned()],
+            "the delete must have been issued exactly once"
         );
     }
 

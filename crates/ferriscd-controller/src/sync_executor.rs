@@ -61,6 +61,7 @@
 //! Nothing in this module touches Git or the filesystem.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferriscd_engine::graph::order::is_crd_key;
@@ -486,6 +487,14 @@ pub struct SyncExecutor<'a> {
     crd_status: &'a dyn CrdStatusReader,
     owner: &'a TrackingOwner,
     policy: &'a ExecutionPolicy,
+    /// `T18.2`: where every confirmed write is recorded so the opt-in drift watcher can tell
+    /// FerrisCD's own echo apart from an out-of-band edit. `None` (the default, and the state of a
+    /// deployment that did not pass `--enable-drift-watcher`) records nothing.
+    echo: Option<Arc<crate::drift_watcher::SelfEchoCache>>,
+    /// `T18.2` (finding M-1): the destination cluster (`spec.destination.cluster`) every record is
+    /// keyed by, so a write in one cluster can never suppress an event from another. Empty when
+    /// `echo` is `None`.
+    echo_cluster: String,
 }
 
 impl std::fmt::Debug for SyncExecutor<'_> {
@@ -517,6 +526,69 @@ impl<'a> SyncExecutor<'a> {
             crd_status,
             owner,
             policy,
+            echo: None,
+            echo_cluster: String::new(),
+        }
+    }
+
+    /// Records every confirmed write into `echo` so the opt-in drift watcher (`T18.2`) can suppress
+    /// the watch event FerrisCD's own apply/prune produces.
+    ///
+    /// Without this, a generation-less kind (`ConfigMap`, `Secret`) would enter the classic
+    /// apply → watch event → apply feedback loop the moment `selfHeal: true` converged.
+    ///
+    /// `cluster` is the destination cluster the write goes to (`spec.destination.cluster`): it is
+    /// part of the echo identity, so a record made against cluster A never suppresses an event from
+    /// cluster B (finding M-1).
+    #[must_use]
+    pub fn with_self_echo(
+        mut self,
+        echo: Arc<crate::drift_watcher::SelfEchoCache>,
+        cluster: impl Into<String>,
+    ) -> Self {
+        self.echo = Some(echo);
+        self.echo_cluster = cluster.into();
+        self
+    }
+
+    /// Same as [`Self::with_self_echo`], for a cache that may be absent (the pipeline holds an
+    /// `Option`, because `--enable-drift-watcher=false` must cost nothing).
+    #[must_use]
+    pub fn with_self_echo_option(
+        mut self,
+        echo: Option<Arc<crate::drift_watcher::SelfEchoCache>>,
+        cluster: impl Into<String>,
+    ) -> Self {
+        self.echo = echo;
+        self.echo_cluster = cluster.into();
+        self
+    }
+
+    /// Records one successful apply's returned metadata (`uid`, `generation`, `resourceVersion`).
+    fn record_apply_echo(&self, key: &ResourceKey, object: &DynamicObject) {
+        if let Some(echo) = self.echo.as_ref() {
+            echo.record_apply(
+                &self.echo_cluster,
+                key,
+                &object.metadata,
+                std::time::Instant::now(),
+            );
+        }
+    }
+
+    /// Records one confirmed prune, so the watcher ignores the `Delete` it caused itself.
+    ///
+    /// This and `ReplaceRecovery` are the **complete** set of desired-state deletes FerrisCD issues
+    /// (`Applier::delete` has no other caller). A lifecycle-hook delete is the one exception and
+    /// needs no marker: hooks are never stamped with `ferriscd.io/managed-by` /
+    /// `ferriscd.io/app-hash` (`T18.1`), so the label-scoped watch never sees them.
+    ///
+    /// `PruneResult::Pruned` covers a delete the API server answered with `404`/`410`
+    /// (`AlreadyGone`) as well as `200`/`202`: FerrisCD did issue that delete, so a marker is
+    /// recorded for it too — the same rule `ReplaceRecovery` follows (finding N-5).
+    fn record_prune_echo(&self, key: &ResourceKey) {
+        if let Some(echo) = self.echo.as_ref() {
+            echo.record_prune(&self.echo_cluster, key, std::time::Instant::now());
         }
     }
 
@@ -599,7 +671,12 @@ impl<'a> SyncExecutor<'a> {
                                 .map(|resource| resource.gvk.version.as_str())
                         });
                     match self.pruner.prune(key, hint).await {
-                        Ok(PruneResult::Pruned) => report.pruned_ok.push(key.clone()),
+                        Ok(PruneResult::Pruned) => {
+                            // `T18.2`: the delete is ours, so the watcher must not treat its
+                            // `Delete` event as drift.
+                            self.record_prune_echo(key);
+                            report.pruned_ok.push(key.clone());
+                        }
                         Ok(PruneResult::Retained(reason)) => {
                             report.retained += 1;
                             info!(
@@ -723,15 +800,25 @@ impl<'a> SyncExecutor<'a> {
         match mode {
             ApplyMode::Replace => {
                 report.apply_calls += 1;
-                ReplaceRecovery::new(
+                // `T18.2` (finding C1): `Replace=true` deletes before it re-applies, and that delete
+                // is FerrisCD's own. The recovery records the prune marker the moment the API server
+                // accepts the delete (so the watcher does not mistake its `Delete` event for drift),
+                // and the returned object is the write the watcher will see echoed back.
+                //
+                // The apply echo replaces the marker for the same key: if the `Delete` event happened
+                // to arrive after this point it would cost one no-op reconcile, which is the bias the
+                // cache documents (a stale record may cost a reconcile, never hide a drift).
+                let applied = ReplaceRecovery::new(
                     self.applier,
                     self.reader,
                     self.discovery,
                     self.owner,
                     self.policy.replace,
                 )
+                .with_self_echo(self.echo.clone(), self.echo_cluster.clone())
                 .replace(key, resource, &target.api_resource, namespace.as_deref())
                 .await?;
+                self.record_apply_echo(key, &applied);
             }
             ApplyMode::Apply => {
                 report.apply_calls += 1;
@@ -745,7 +832,11 @@ impl<'a> SyncExecutor<'a> {
                     })
                     .await
                 {
-                    Ok(_) => {}
+                    Ok(applied) => {
+                        // `T18.2`: the applied object's `metadata.resourceVersion` (and
+                        // `uid`/`generation`) is exactly what the watcher will see echoed back.
+                        self.record_apply_echo(key, &applied);
+                    }
                     Err(ReconcileError::Apply {
                         resource: offending,
                         source,
@@ -766,7 +857,8 @@ impl<'a> SyncExecutor<'a> {
                             Recovery::Takeover { managers } => {
                                 log_takeover(key, &managers);
                                 report.apply_calls += 1;
-                                self.applier
+                                let applied = self
+                                    .applier
                                     .apply(ApplyRequest {
                                         resource,
                                         api_resource: &target.api_resource,
@@ -774,6 +866,7 @@ impl<'a> SyncExecutor<'a> {
                                         force: true,
                                     })
                                     .await?;
+                                self.record_apply_echo(key, &applied);
                             }
                         }
                     }
@@ -945,6 +1038,10 @@ mod tests {
     use crate::sync::{DeleteOutcome, DeleteRequest};
 
     const NAMESPACE: &str = "payments";
+
+    /// The destination cluster the executor fixtures record into (`T18.2` finding M-1: the echo
+    /// key is `(cluster, ResourceKey)`; the cross-cluster cases live in `sync.rs`/`drift_watcher.rs`).
+    const CLUSTER: &str = "in-cluster";
 
     fn status(value: Value) -> kube::core::Status {
         serde_json::from_value(value).expect("valid kube Status")
@@ -1456,6 +1553,352 @@ mod tests {
         assert_eq!(report.applied_ok.len(), 2);
         assert!(!report.is_pending());
         assert!(fixture.pruner.pruned.lock().unwrap().is_empty());
+    }
+
+    /// `T18.2` **echo recording:** every confirmed apply records the metadata the API server
+    /// returned (`uid`, `generation`, `resourceVersion`), and every confirmed prune records its
+    /// marker — that is what lets the opt-in drift watcher drop its own echo instead of entering the
+    /// apply → watch → apply loop on a generation-less `ConfigMap`/`Secret`.
+    #[tokio::test]
+    async fn confirmed_writes_are_recorded_in_the_self_echo_cache() {
+        use crate::drift_watcher::{MetadataObservation, SelfEcho, SelfEchoCache};
+
+        /// Applies successfully and answers like a real Server-Side Apply of a **generation-less**
+        /// kind: the object comes back with `uid` and `resourceVersion`, and no `generation` (a
+        /// `ConfigMap` never gets one — which is exactly why the echo cache cannot rely on it).
+        struct EchoingApplier;
+
+        impl Applier for EchoingApplier {
+            fn apply<'a>(
+                &'a self,
+                request: ApplyRequest<'a>,
+            ) -> BoxFuture<'a, Result<DynamicObject, ReconcileError>> {
+                let mut body = request.resource.object.clone();
+                body.metadata.uid = Some("uid-settings".to_owned());
+                body.metadata.generation = None;
+                body.metadata.resource_version = Some("42".to_owned());
+                Box::pin(async move { Ok(body) })
+            }
+
+            fn delete<'a>(
+                &'a self,
+                _request: DeleteRequest<'a>,
+            ) -> BoxFuture<'a, Result<DeleteOutcome, ReconcileError>> {
+                Box::pin(async { Ok(DeleteOutcome::Deleted) })
+            }
+        }
+
+        let fixture = fixture(FakeCluster::default(), FakeCrdStatus::always(true));
+        let applier = EchoingApplier;
+        let echo = Arc::new(SelfEchoCache::with_defaults());
+        let desired = vec![resource("", "ConfigMap", "settings")];
+        let options = SyncOptions::default();
+        let plan = plan_for(&desired, &options);
+        let policy = ExecutionPolicy::without_waits();
+        let report = SyncExecutor::new(
+            &applier,
+            &fixture.pruner,
+            &fixture.reader,
+            &fixture.cache,
+            &fixture.crd_status,
+            &fixture.owner,
+            &policy,
+        )
+        .with_self_echo(echo.clone(), CLUSTER)
+        .execute(&plan, &desired, &Inventory::new())
+        .await;
+        assert!(report.is_ok(), "{}", reason(&report));
+
+        let key = &desired[0].key;
+        let now = std::time::Instant::now();
+        // The event mirroring our own apply is recognised as an echo: this is the single fact that
+        // breaks the `selfHeal: true` apply → watch → apply loop.
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER,
+                    key,
+                    uid: Some("uid-settings"),
+                    generation: None,
+                    resource_version: Some("42"),
+                    deleted: false,
+                },
+                now,
+            ),
+            Some(SelfEcho::Write),
+            "the applied object's returned resourceVersion must be recorded verbatim"
+        );
+        // A newer resource version is an external write, never suppressed.
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER,
+                    key,
+                    uid: Some("uid-settings"),
+                    generation: None,
+                    resource_version: Some("43"),
+                    deleted: false,
+                },
+                now,
+            ),
+            None,
+            "an out-of-band write must still trigger"
+        );
+        // **Finding C1 (inverted):** an apply is not a prune. A `Delete` event repeats the object's
+        // last written resource version, so a delete of the object we just wrote is *not*
+        // recognisably ours — suppressing it would hide an out-of-band `kubectl delete` forever.
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER,
+                    key,
+                    uid: None,
+                    generation: None,
+                    resource_version: Some("42"),
+                    deleted: true,
+                },
+                now,
+            ),
+            None,
+            "without a prune marker a delete is drift, even when its resourceVersion matches our              own write"
+        );
+        // The same holds for a delete after an external change; there is no version that makes a
+        // delete "ours" other than a recorded prune.
+        let (external_uid, external_rv) = (Some("someone-else"), Some("44"));
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER,
+                    key,
+                    uid: external_uid,
+                    generation: None,
+                    resource_version: external_rv,
+                    deleted: true,
+                },
+                now,
+            ),
+            None,
+            "a delete after an external change is drift"
+        );
+    }
+
+    /// The prune half of the same contract: a confirmed prune is recorded, an unconfirmed one is not.
+    #[tokio::test]
+    async fn a_confirmed_prune_is_recorded_and_a_retained_orphan_is_not() {
+        use crate::drift_watcher::{MetadataObservation, SelfEcho, SelfEchoCache};
+
+        let fixture = fixture(FakeCluster::default(), FakeCrdStatus::always(true));
+        let desired = vec![resource("", "ConfigMap", "settings")];
+        let options = SyncOptions::default();
+        let orphan = OrphanCandidate::owned(ResourceKey::new(
+            "",
+            "Service",
+            Some(NAMESPACE.to_owned()),
+            "removed",
+        ));
+        let plan = plan_with_orphan(&desired, &options, &orphan);
+        let policy = ExecutionPolicy::without_waits();
+        let echo = Arc::new(SelfEchoCache::with_defaults());
+        let applier: &dyn Applier = &*fixture.cluster;
+
+        let report = SyncExecutor::new(
+            applier,
+            &fixture.pruner,
+            &fixture.reader,
+            &fixture.cache,
+            &fixture.crd_status,
+            &fixture.owner,
+            &policy,
+        )
+        .with_self_echo(echo.clone(), CLUSTER)
+        .execute(&plan, &desired, &Inventory::new())
+        .await;
+        assert!(report.is_ok(), "{}", reason(&report));
+        assert_eq!(report.pruned_ok, vec![orphan.key.clone()]);
+
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER,
+                    key: &orphan.key,
+                    uid: None,
+                    generation: None,
+                    resource_version: None,
+                    deleted: true,
+                },
+                std::time::Instant::now(),
+            ),
+            Some(SelfEcho::Prune),
+            "the delete FerrisCD issued itself must not look like drift"
+        );
+
+        // A pruner that retains does not record anything: there was no write.
+        let retaining = RetainingPruner;
+        let echo = Arc::new(SelfEchoCache::with_defaults());
+        let report = SyncExecutor::new(
+            applier,
+            &retaining,
+            &fixture.reader,
+            &fixture.cache,
+            &fixture.crd_status,
+            &fixture.owner,
+            &policy,
+        )
+        .with_self_echo(echo.clone(), CLUSTER)
+        .execute(&plan, &desired, &Inventory::new())
+        .await;
+        assert!(report.is_ok(), "{}", reason(&report));
+        assert!(
+            report.pruned_ok.is_empty(),
+            "a retained orphan is not a prune"
+        );
+        assert!(
+            !echo
+                .suppresses(
+                    &MetadataObservation {
+                        cluster: CLUSTER,
+                        key: &orphan.key,
+                        uid: None,
+                        generation: None,
+                        resource_version: None,
+                        deleted: true,
+                    },
+                    std::time::Instant::now(),
+                )
+                .is_some_and(|suppression| suppression == SelfEcho::Prune),
+            "nothing was pruned, so no prune marker may be recorded"
+        );
+    }
+
+    /// **Finding M-1 (wiring):** the executor keys every record by the destination cluster it was
+    /// wired with, so a write it made in cluster A never suppresses an event from cluster B.
+    ///
+    /// The wiring seam is `with_self_echo(echo, cluster)` → `SyncExecutor::echo_cluster` →
+    /// `SelfEchoCache::{record_apply, record_prune}`. If that cluster were dropped (or hard-coded),
+    /// every cluster would share one echo namespace and a prune in the in-cluster destination would
+    /// hide a real out-of-band `kubectl delete` in a registered remote.
+    #[tokio::test]
+    async fn the_executor_records_its_echoes_against_the_wired_destination_cluster_only() {
+        use crate::drift_watcher::{MetadataObservation, SelfEcho, SelfEchoCache};
+
+        const CLUSTER_A: &str = "cluster-a";
+        const CLUSTER_B: &str = "cluster-b";
+
+        /// Answers like the API server's SSA: the object comes back with a `resourceVersion`.
+        struct VersionedApplier;
+
+        impl Applier for VersionedApplier {
+            fn apply<'a>(
+                &'a self,
+                request: ApplyRequest<'a>,
+            ) -> BoxFuture<'a, Result<DynamicObject, ReconcileError>> {
+                let mut body = request.resource.object.clone();
+                body.metadata.uid = Some("uid-settings".to_owned());
+                body.metadata.resource_version = Some("42".to_owned());
+                Box::pin(async move { Ok(body) })
+            }
+
+            fn delete<'a>(
+                &'a self,
+                _request: DeleteRequest<'a>,
+            ) -> BoxFuture<'a, Result<DeleteOutcome, ReconcileError>> {
+                Box::pin(async { Ok(DeleteOutcome::Deleted) })
+            }
+        }
+
+        let fixture = fixture(FakeCluster::default(), FakeCrdStatus::always(true));
+        let applier = VersionedApplier;
+        let desired = vec![resource("", "ConfigMap", "settings")];
+        let options = SyncOptions::default();
+        let orphan = OrphanCandidate::owned(ResourceKey::new(
+            "",
+            "Service",
+            Some(NAMESPACE.to_owned()),
+            "removed",
+        ));
+        let plan = plan_with_orphan(&desired, &options, &orphan);
+        let policy = ExecutionPolicy::without_waits();
+        let echo = Arc::new(SelfEchoCache::with_defaults());
+
+        let report = SyncExecutor::new(
+            &applier,
+            &fixture.pruner,
+            &fixture.reader,
+            &fixture.cache,
+            &fixture.crd_status,
+            &fixture.owner,
+            &policy,
+        )
+        .with_self_echo(echo.clone(), CLUSTER_A)
+        .execute(&plan, &desired, &Inventory::new())
+        .await;
+        assert!(report.is_ok(), "{}", reason(&report));
+        assert_eq!(report.pruned_ok, vec![orphan.key.clone()]);
+
+        let now = std::time::Instant::now();
+        // The apply echo and the prune marker are visible under cluster A, the wired destination…
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER_A,
+                    key: &desired[0].key,
+                    uid: Some("uid-settings"),
+                    generation: None,
+                    resource_version: Some("42"),
+                    deleted: false,
+                },
+                now,
+            ),
+            Some(SelfEcho::Write),
+            "the destination cluster is recorded verbatim"
+        );
+        // …and invisible to cluster B, for both an apply echo and a prune marker.
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER_B,
+                    key: &desired[0].key,
+                    uid: Some("uid-settings"),
+                    generation: None,
+                    resource_version: Some("42"),
+                    deleted: false,
+                },
+                now,
+            ),
+            None,
+            "ANOTHER cluster's identical write must not be suppressed"
+        );
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER_B,
+                    key: &orphan.key,
+                    uid: None,
+                    generation: None,
+                    resource_version: None,
+                    deleted: true,
+                },
+                now,
+            ),
+            None,
+            "ANOTHER cluster's delete must not be suppressed by an in-cluster prune"
+        );
+        // The marker is still there for cluster A (checked after B, so B did not consume it).
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER_A,
+                    key: &orphan.key,
+                    uid: None,
+                    generation: None,
+                    resource_version: None,
+                    deleted: true,
+                },
+                now,
+            ),
+            Some(SelfEcho::Prune),
+            "the delete FerrisCD issued in the wired destination is its own"
+        );
     }
 
     #[tokio::test]
@@ -2219,6 +2662,85 @@ mod tests {
             "delete, wait for 404, then a non-forced apply"
         );
         assert!(report.applied_ok.contains_key(&desired[0].key));
+    }
+
+    /// **`T18.2` finding C1 (the `Replace=` path):** the executor wires the self-echo cache into the
+    /// replacement, so the delete a `Replace=true` issues is recorded as FerrisCD's own.
+    ///
+    /// The apply is made to fail on purpose: the recovery records the marker right after the delete,
+    /// and a *successful* re-apply is followed by the new object's echo entry for the same key (which
+    /// is the more useful record). With the apply failing, the marker is observable unchanged —
+    /// which is exactly the `Replace` that deleted an object and then could not recreate it.
+    #[tokio::test]
+    async fn a_replace_step_records_the_prune_marker_of_its_own_delete() {
+        use crate::drift_watcher::{MetadataObservation, SelfEcho, SelfEchoCache};
+
+        let desired = vec![resource("", "ConfigMap", "settings")];
+        let target = desired[0].key.canonical();
+        let target_key = desired[0].key.clone();
+        let fixture = fixture(
+            FakeCluster::default()
+                .with_object(owned_config_map("settings"))
+                .failing(
+                    &target,
+                    kube::Error::Api(
+                        kube::core::Status::failure("still immutable", "Invalid")
+                            .with_code(422)
+                            .boxed(),
+                    ),
+                ),
+            FakeCrdStatus::always(true),
+        );
+        let plan = SyncPlan {
+            pre_create_namespace: None,
+            steps: vec![SyncAction::Replace {
+                key: desired[0].key.clone(),
+            }],
+        };
+        let policy = ExecutionPolicy::without_waits();
+        let echo = Arc::new(SelfEchoCache::with_defaults());
+        let applier: &dyn Applier = &*fixture.cluster;
+
+        let report = SyncExecutor::new(
+            applier,
+            &fixture.pruner,
+            &fixture.reader,
+            &fixture.cache,
+            &fixture.crd_status,
+            &fixture.owner,
+            &policy,
+        )
+        .with_self_echo(echo.clone(), CLUSTER)
+        .execute(&plan, &desired, &Inventory::new())
+        .await;
+
+        assert!(
+            !report.is_ok(),
+            "the injected apply failure must be reported"
+        );
+        assert!(
+            fixture
+                .cluster
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::Delete { key } if key == &target)),
+            "the replacement must have issued the delete"
+        );
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER,
+                    key: &target_key,
+                    uid: None,
+                    generation: None,
+                    resource_version: None,
+                    deleted: true,
+                },
+                std::time::Instant::now(),
+            ),
+            Some(SelfEcho::Prune),
+            "the delete a Replace=true issued must be recorded as FerrisCD's own"
+        );
     }
 
     // ------------------------------------------------------------------

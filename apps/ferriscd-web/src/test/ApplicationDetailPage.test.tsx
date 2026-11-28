@@ -7,7 +7,14 @@ import { ApiClientError, type FerrisApiClient } from "../api/client";
 import { AuthProvider } from "../auth/AuthContext";
 import { resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
 import { ApplicationDetailPage } from "../features/applications/ApplicationDetailPage";
-import { createMockApiClient, sampleAppDetail, sampleApps } from "./fixtures";
+import {
+  blockedSyncWindow,
+  createMockApiClient,
+  overridableSyncWindow,
+  sampleAppDetail,
+  sampleApps,
+  sampleOciAppDetail,
+} from "./fixtures";
 
 function renderDetailPage(overrides: Partial<FerrisApiClient> = {}) {
   const queryClient = new QueryClient({
@@ -77,6 +84,9 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
     const summarySection = screen.getByLabelText(
       "Source and destination summary",
     );
+    expect(within(summarySection).getByTestId("source-kind")).toHaveTextContent(
+      "Git",
+    );
     expect(
       within(summarySection).getByText(
         "https://github.com/acme/gitops-payments.git",
@@ -101,6 +111,74 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
     expect(
       await screen.findByText("***REDACTED(sha256:9f86d081)***"),
     ).toBeInTheDocument();
+  });
+
+  it("surfaces an OCI source kind, tag and pinned digest from the API (T18.4)", async () => {
+    renderDetailPage({ getApplication: async () => sampleOciAppDetail });
+
+    expect(
+      await screen.findByRole("heading", { name: "ledger-artifact" }),
+    ).toBeInTheDocument();
+
+    const summarySection = screen.getByLabelText(
+      "Source and destination summary",
+    );
+    expect(within(summarySection).getByTestId("source-kind")).toHaveTextContent(
+      "OCI",
+    );
+    expect(within(summarySection).getByTestId("source-tag")).toHaveTextContent(
+      "1.4.2",
+    );
+    expect(within(summarySection).getByTestId("source-digest")).toHaveTextContent(
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    );
+    // The registry reference is not a Git web link, and the collapsed revision
+    // row is replaced by the two OCI facts above.
+    expect(within(summarySection).queryByRole("link")).not.toBeInTheDocument();
+    expect(
+      within(summarySection).queryByText("Target Revision"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("explains a blocking sync window before the dialog submits (T17.4)", async () => {
+    const user = userEvent.setup();
+    renderDetailPage({
+      getApplication: async () => ({ ...sampleAppDetail, syncWindow: blockedSyncWindow }),
+    });
+
+    // The header badge says "blocked" without opening anything…
+    expect(await screen.findByTestId("sync-window-badge")).toHaveTextContent(
+      "Sync window blocked",
+    );
+    // …the page repeats the reason next to the operation banner…
+    expect(screen.getByTestId("detail-sync-window-notice")).toHaveTextContent(
+      "deny sync window is active",
+    );
+    // …and the dialog explains it and refuses to submit a pass the controller would skip.
+    await user.click(screen.getByRole("button", { name: /^Sync$/i }));
+    expect(
+      await screen.findByTestId("sync-window-blocked"),
+    ).toHaveTextContent("Drift is still detected and reported");
+    expect(screen.getByRole("button", { name: /Confirm Sync/i })).toBeDisabled();
+  });
+
+  it("lets the operator break the glass when the window sets manualSync (T17.4)", async () => {
+    const user = userEvent.setup();
+    renderDetailPage({
+      getApplication: async () => ({
+        ...sampleAppDetail,
+        syncWindow: overridableSyncWindow,
+      }),
+    });
+
+    expect(await screen.findByTestId("sync-window-badge")).toHaveTextContent(
+      "Sync window (override)",
+    );
+    await user.click(screen.getByRole("button", { name: /^Sync$/i }));
+    expect(await screen.findByTestId("sync-window-override")).toHaveTextContent(
+      "Manual override applies",
+    );
+    expect(screen.getByRole("button", { name: /Confirm Sync/i })).toBeEnabled();
   });
 
   it("disables Sync action and displays read-only notice when server responds 403 Forbidden", async () => {

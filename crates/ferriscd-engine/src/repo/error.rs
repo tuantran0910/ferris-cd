@@ -73,6 +73,43 @@ pub enum RepoError {
     #[error("checkout limit exceeded: {reason}")]
     CheckoutLimitExceeded { reason: String },
 
+    /// An OCI artifact's content did not match the immutable digest that was pinned for it.
+    ///
+    /// Terminal: the registry served bytes that are not the artifact the `Application` asked for
+    /// (a moved tag, a corrupted mirror, or a proxy rewriting the body), and re-reading it cannot
+    /// make it the right artifact.
+    #[error("OCI artifact digest mismatch: expected {expected}, got {actual}")]
+    OciDigestMismatch { expected: String, actual: String },
+
+    /// An OCI artifact manifest (or a layer's declared size) is not usable.
+    #[error("invalid OCI artifact: {reason}")]
+    OciInvalidArtifact { reason: String },
+
+    /// An OCI artifact layer carries a media type FerrisCD cannot render.
+    #[error("unsupported OCI artifact media type '{media_type}'")]
+    OciUnsupportedMediaType { media_type: String },
+
+    /// A registry answered with a redirect, which FerrisCD deliberately does not follow.
+    ///
+    /// Terminal on purpose: the redirect is normally a CDN `Location`, and following it would mean
+    /// carrying the `Authorization` header to a host the operator never configured. Naming the
+    /// status (rather than reporting a generic `4xx`) is what lets an operator tell "this registry
+    /// always redirects (ECR/GAR), put a proxy in front of it" apart from "this repository is
+    /// missing".
+    ///
+    /// Note: `url` MUST have any embedded credentials redacted before constructing this variant, and
+    /// the redirect `Location` is intentionally not part of the error.
+    #[error(
+        "the registry refused to serve {url} directly: HTTP {status} redirect (FerrisCD does not \
+         follow registry redirects, because the Authorization header must not be carried to a host \
+         the operator never configured)"
+    )]
+    RegistryRedirectRefused { status: u16, url: String },
+
+    /// An archive entry is unsafe to materialize (tar-slip, link, device node, duplicate path).
+    #[error("unsafe archive entry at '{}': {reason}", path.display())]
+    UnsafeArchive { path: PathBuf, reason: String },
+
     /// Corrupt repository state or unsupported Git object/protocol error.
     #[error("repository error: {message}")]
     RepositoryError { message: String },
@@ -106,6 +143,11 @@ impl RepoError {
             | Self::HostKeyVerificationFailed { .. }
             | Self::UnsafeSymlink { .. }
             | Self::CheckoutLimitExceeded { .. }
+            | Self::OciDigestMismatch { .. }
+            | Self::OciInvalidArtifact { .. }
+            | Self::OciUnsupportedMediaType { .. }
+            | Self::RegistryRedirectRefused { .. }
+            | Self::UnsafeArchive { .. }
             | Self::RepositoryError { .. } => false,
         }
     }
@@ -253,6 +295,44 @@ mod tests {
                 "CheckoutLimitExceeded",
                 RepoError::CheckoutLimitExceeded {
                     reason: "too many files".into(),
+                },
+                false,
+            ),
+            (
+                "OciDigestMismatch",
+                RepoError::OciDigestMismatch {
+                    expected: format!("sha256:{}", "a".repeat(64)),
+                    actual: format!("sha256:{}", "b".repeat(64)),
+                },
+                false,
+            ),
+            (
+                "OciInvalidArtifact",
+                RepoError::OciInvalidArtifact {
+                    reason: "schemaVersion must be 2".into(),
+                },
+                false,
+            ),
+            (
+                "OciUnsupportedMediaType",
+                RepoError::OciUnsupportedMediaType {
+                    media_type: "application/vnd.example".into(),
+                },
+                false,
+            ),
+            (
+                "RegistryRedirectRefused",
+                RepoError::RegistryRedirectRefused {
+                    status: 307,
+                    url: "https://ghcr.io/v2/org/chart/blobs/sha256:abc".into(),
+                },
+                false,
+            ),
+            (
+                "UnsafeArchive",
+                RepoError::UnsafeArchive {
+                    path: PathBuf::from("../../etc/passwd"),
+                    reason: "traversal".into(),
                 },
                 false,
             ),

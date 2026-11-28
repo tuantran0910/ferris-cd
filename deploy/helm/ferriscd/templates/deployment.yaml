@@ -90,6 +90,16 @@ spec:
             - --application-namespaces
             - {{ join "," .Values.multiTenant.applicationNamespaces | quote }}
             {{- end }}
+            {{- /* Opt-in label-scoped `PartialObjectMetadata` drift watcher (`T18.2`). The
+                   allow-list is optional: without it the watcher derives its watches from
+                   `status.inventory`, capped at 64 per cluster. */}}
+            {{- if .Values.driftWatcher.enabled }}
+            - --enable-drift-watcher
+            {{- if .Values.driftWatcher.kinds }}
+            - --drift-watcher-kinds
+            - {{ .Values.driftWatcher.kinds | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.audit }}
             {{- if .logPath }}
             - --audit-log-path
@@ -100,6 +110,9 @@ spec:
             - {{ .webhookUrl | quote }}
             {{- end }}
             {{- end }}
+            {{- /* Switches the chart has no dedicated value for (e.g. `--enable-drift-watcher`,
+                   `T18.1`) are wired here and through `server.extraEnv` below, so both the flag
+                   and its `FERRISCD_ENABLE_DRIFT_WATCHER` fallback are reachable from values. */}}
             {{- range .Values.server.extraArgs }}
             - {{ . | quote }}
             {{- end }}
@@ -133,6 +146,8 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: {{ .Values.telemetry.serviceName | quote }}
             {{- end }}
+            {{- /* The env half of the same escape hatch, e.g.
+                   `FERRISCD_ENABLE_DRIFT_WATCHER: "true"` (must be exactly `true`/`false`). */}}
             {{- with .Values.server.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

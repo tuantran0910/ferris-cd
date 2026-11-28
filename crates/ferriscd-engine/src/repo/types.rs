@@ -341,7 +341,7 @@ fn validate_scheme_url(
     }
 }
 
-fn validate_authority_host(raw_url: &str, authority: &str) -> Result<(), RepoError> {
+pub(super) fn validate_authority_host(raw_url: &str, authority: &str) -> Result<(), RepoError> {
     if authority.is_empty() {
         return Err(RepoError::InvalidUrl {
             url: redact_url_credentials(raw_url),
@@ -459,7 +459,41 @@ fn validate_scp_ssh_url(raw_url: &str, user: &str, after_at: &str) -> Result<(),
     Ok(())
 }
 
-fn redact_url_credentials(url: &str) -> String {
+/// Returns `url` with any embedded `user:password@`/`token@` userinfo replaced by `[REDACTED]`.
+///
+/// Every [`RepoError::InvalidUrl`] this module (and [`super::oci`]) builds must call this: the
+/// message reaches `Application.status`, Events, and logs, so a rejected URL must never carry the
+/// credential that made it rejected. Only the authority's userinfo is a secret; the host, port,
+/// path, and scheme are kept so the error still names the offending reference.
+///
+/// A **scheme-less** `user@host` is kept as written: `git@github.com:org/repo.git` is the
+/// SCP-style SSH spelling, where `git` is a login name and not a credential. The scheme-less rule
+/// therefore only redacts userinfo that carries a `:` (finding M-A pins the registry counterpart,
+/// [`redact_oci_url_credentials`], which cannot rely on that).
+pub(super) fn redact_url_credentials(url: &str) -> String {
+    redact_userinfo(url, SCP_STYLE_USER_IS_KEPT)
+}
+
+/// Redacts userinfo in a **registry** reference, including a scheme-less one.
+///
+/// Identical to [`redact_url_credentials`] except that a scheme-less `user@host` is userinfo too.
+/// The difference is not cosmetic: a reference that forgot its `oci://` reaches the "must be
+/// absolute" rejection as `token@ghcr.io/org/chart`, and the Git rule would keep it intact because
+/// there is no `:`. A registry reference has no SCP-style spelling — every `@` before the end of
+/// the authority is a credential (finding M-A).
+pub(crate) fn redact_oci_url_credentials(url: &str) -> String {
+    redact_userinfo(url, false)
+}
+
+/// `true` for the Git rule: a scheme-less `user@host` may be SCP-style SSH and is kept.
+const SCP_STYLE_USER_IS_KEPT: bool = true;
+
+/// Shared body of [`redact_url_credentials`] and [`redact_oci_url_credentials`].
+///
+/// An optional `scheme://` is split off, the authority runs to the first `/`, `?`, or `#`, and the
+/// **last** `@` in it is the userinfo/host boundary (userinfo may contain an unescaped `@`; the
+/// host cannot).
+fn redact_userinfo(url: &str, keep_scp_style: bool) -> String {
     if let Some((scheme, rest)) = url.split_once("://") {
         let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let (authority, suffix) = rest.split_at(auth_end);
@@ -472,7 +506,7 @@ fn redact_url_credentials(url: &str) -> String {
     let head_end = url.find(['/', '?', '#']).unwrap_or(url.len());
     let (head, suffix) = url.split_at(head_end);
     if let Some((userinfo, host_part)) = head.rsplit_once('@')
-        && userinfo.contains(':')
+        && (!keep_scp_style || userinfo.contains(':'))
     {
         return format!("[REDACTED]@{host_part}{suffix}");
     }
@@ -525,7 +559,7 @@ fn validate_target_revision(rev: &str) -> Result<(), RepoError> {
     Ok(())
 }
 
-fn validate_source_path(path: &str) -> Result<(), RepoError> {
+pub(super) fn validate_source_path(path: &str) -> Result<(), RepoError> {
     if path.chars().any(char::is_control) {
         return Err(RepoError::InvalidSource {
             reason: "source path must not contain control characters".to_owned(),

@@ -455,6 +455,11 @@ pub struct OperationState {
     pub message: Option<String>,
 
     /// When the operation started.
+    ///
+    /// `T17.4`: this clock is paused by a blocked sync window. A pass that `spec.syncWindows`
+    /// denies leaves the operation `Running` but moves `startedAt` (and `phaseStartedAt`) to that
+    /// pass's own `now`, so a change freeze never counts against the operation/wave timeouts: the
+    /// resumed operation gets its full budget measured from the moment the window lifted.
     pub started_at: Time,
 
     /// When the operation finished (`None` while `phase` is `Running`).
@@ -558,12 +563,15 @@ impl RevisionHistoryEntry {
 ///
 /// Field-for-field mirror of the parts of `spec.source` that change what a revision renders
 /// (`repoURL`, `path`, `renderer`, `targetRevision`), so a history entry can explain *why* two
-/// deployments of the same repository differ. It never contains rendered manifests or credentials
-/// (the source spec carries none; credentials live in a `Repository` secret).
+/// deployments of the same repository differ. It never contains rendered manifests or bulky data.
+///
+/// An OCI source (`T18.3`) reports `oci.url` as `repoURL`, `oci.path` as `path`, and its tag (else
+/// the pinned digest) as `targetRevision`, so the schema is unchanged across the two source kinds
+/// and an operator can still tell the two deployments apart.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceSummary {
-    /// Repository clone URL (Kubernetes spelling: `repoURL`, as in `spec.source.git.repoURL`).
+    /// Repository/registry URL, as recorded by the controller (credential-free).
     #[serde(rename = "repoURL", default, skip_serializing_if = "String::is_empty")]
     pub repo_url: String,
 
@@ -586,13 +594,25 @@ fn default_target_revision() -> String {
 
 impl SourceSummary {
     /// Summarizes an [`ApplicationSpec`](crate::application::ApplicationSpec) source.
+    ///
+    /// The summary reports the *effective* source (`T18.3`): a Git application keeps reporting
+    /// `git.repoURL`/`git.path`/`git.targetRevision` exactly as before, and an OCI application
+    /// reports `oci.url`/`oci.path`/`oci.tag` (else the pinned digest) through the same three
+    /// fields, so `status.history` stays metadata-only and its schema stays unchanged.
+    ///
+    /// **This constructor does not redact.** It lives in the CRD crate, which has no Git URL
+    /// grammar (the SCP-style `git@host:org/repo.git` login must survive, while a registry
+    /// reference's every `@` is userinfo), and it is a pure mapping that tests and callers use to
+    /// compare summaries. The one production site that builds a history entry —
+    /// `ferriscd_engine::sync::history::record_sync_success` — redacts the effective URL per source
+    /// kind before persisting it (finding M-D, `T18.4`).
     #[must_use]
     pub fn from_source(source: &SourceSpec) -> Self {
         Self {
-            repo_url: source.git.repo_url.clone(),
-            path: source.git.path.clone(),
+            repo_url: source.repo_url().to_owned(),
+            path: source.source_path().to_owned(),
             renderer: source.renderer.clone(),
-            target_revision: source.git.target_revision.clone(),
+            target_revision: source.requested_revision().to_owned(),
         }
     }
 }
@@ -787,7 +807,9 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::application::{GitSourceSpec, KustomizeRenderer, RendererSpec};
+    use crate::application::{
+        AutoRenderer, GitSourceSpec, KustomizeRenderer, OciSourceSpec, RendererSpec,
+    };
 
     use super::*;
 
@@ -1330,11 +1352,12 @@ mod tests {
     #[test]
     fn source_summaries_mirror_the_spec_source_shape() {
         let source = SourceSpec {
-            git: GitSourceSpec {
+            git: Some(GitSourceSpec {
                 repo_url: "https://example.com/repo.git".to_owned(),
                 target_revision: "release-1.4".to_owned(),
                 path: "deploy/production".to_owned(),
-            },
+            }),
+            oci: None,
             renderer: RendererSpec::Kustomize(KustomizeRenderer {
                 kustomization_path: Some("overlays/prod".to_owned()),
                 images: vec!["api=ghcr.io/example/api:v2".to_owned()],
@@ -1343,14 +1366,15 @@ mod tests {
 
         let summary = SourceSummary::from_source(&source);
         assert_eq!(summary, SourceSummary::from(&source));
-        assert_eq!(summary.repo_url, source.git.repo_url);
-        assert_eq!(summary.path, source.git.path);
-        assert_eq!(summary.target_revision, source.git.target_revision);
+        let git = source.git.as_ref().expect("git source");
+        assert_eq!(summary.repo_url, git.repo_url);
+        assert_eq!(summary.path, git.path);
+        assert_eq!(summary.target_revision, git.target_revision);
         assert_eq!(summary.renderer, source.renderer);
 
         // The wire form reuses the spec's spellings, so a summary can be copy-pasted into a spec.
         let value = serde_json::to_value(&summary).expect("summary must serialize");
-        assert_eq!(value["repoURL"], json!(source.git.repo_url));
+        assert_eq!(value["repoURL"], json!(git.repo_url));
         assert_eq!(value["targetRevision"], json!("release-1.4"));
         assert_eq!(
             value["renderer"]["kustomize"]["kustomizationPath"],
@@ -1359,5 +1383,23 @@ mod tests {
 
         // Nothing secret or bulky is copied: a summary of a full spec stays tiny.
         assert!(value.to_string().len() < 512, "{value}");
+
+        // `T18.3`: an OCI source is summarized through the same metadata-only fields, so the
+        // history schema stays unchanged and no artifact bytes reach `status`.
+        let oci_source = SourceSpec {
+            git: None,
+            oci: Some(OciSourceSpec {
+                url: "oci://ghcr.io/example/payments".to_owned(),
+                tag: Some("1.4.2".to_owned()),
+                digest: None,
+                path: "charts".to_owned(),
+            }),
+            renderer: RendererSpec::Auto(AutoRenderer {}),
+        };
+        let oci_summary = SourceSummary::from_source(&oci_source);
+        assert_eq!(oci_summary.repo_url, "oci://ghcr.io/example/payments");
+        assert_eq!(oci_summary.path, "charts");
+        assert_eq!(oci_summary.target_revision, "1.4.2");
+        assert!(serde_json::to_value(&oci_summary).is_ok());
     }
 }

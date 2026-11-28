@@ -10,7 +10,28 @@ import type {
   ProjectListView,
   ResourceGraphView,
   ResourceNodeView,
+  SyncWindowGateView,
 } from "../api/types";
+
+/** A project whose window blocks a manual sync with no override (`T17.4`). */
+export const blockedSyncWindow: SyncWindowGateView = {
+  blocked: true,
+  reason: "denyWindowActive",
+  message:
+    "a deny sync window is active (deny \"0 9-17 * * MON-FRI\" in America/New_York); the next window transition is 2026-11-25T22:00:00Z (5h); manual sync does not override this window (set manualSync: true to allow it)",
+  manualOverride: false,
+  nextTransition: "2026-11-25T22:00:00Z",
+};
+
+/** The same block, on a window that opted into `manualSync: true` (`T17.4`). */
+export const overridableSyncWindow: SyncWindowGateView = {
+  blocked: true,
+  reason: "denyWindowActive",
+  message:
+    "a deny sync window is active (deny \"0 9-17 * * MON-FRI\" in America/New_York); a manual sync may override this window (manualSync: true)",
+  manualOverride: true,
+  nextTransition: "2026-11-25T22:00:00Z",
+};
 
 export const sampleApps: ApplicationSummary[] = [
   {
@@ -20,6 +41,7 @@ export const sampleApps: ApplicationSummary[] = [
     resourceCount: 15,
     observedGeneration: 4,
     source: {
+      sourceType: "git",
       repoUrl: "https://github.com/acme/gitops-payments.git",
       path: "deploy/prod",
       targetRevision: "main",
@@ -65,6 +87,7 @@ export const sampleApps: ApplicationSummary[] = [
     resourceCount: 8,
     observedGeneration: 2,
     source: {
+      sourceType: "git",
       repoUrl: "https://github.com/acme/gitops-storefront.git",
       path: "charts/checkout",
       targetRevision: "v2.4.0",
@@ -93,6 +116,7 @@ export const sampleApps: ApplicationSummary[] = [
     resourceCount: 22,
     observedGeneration: 7,
     source: {
+      sourceType: "git",
       repoUrl: "https://github.com/acme/gitops-platform.git",
       path: "monitoring",
       targetRevision: "HEAD",
@@ -115,6 +139,73 @@ export const sampleApps: ApplicationSummary[] = [
     conditions: [],
   },
 ];
+
+/**
+ * An OCI-sourced `Application` (`T18.4`): `sourceType: "oci"` with a tag to
+ * resolve *and* the digest the operator pinned, which are the two facts the
+ * source panel has to render separately.
+ */
+export const sampleOciApp: ApplicationSummary = {
+  namespace: "ferriscd-system",
+  name: "ledger-artifact",
+  project: "payments",
+  resourceCount: 4,
+  observedGeneration: 1,
+  source: {
+    sourceType: "oci",
+    repoUrl: "oci://registry.ferriscd-system.svc:5000/payments/ledger",
+    path: "charts/ledger",
+    targetRevision: "1.4.2",
+    tag: "1.4.2",
+    digest:
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    renderer: "helm",
+  },
+  destination: {
+    cluster: "in-cluster",
+    namespace: "payments",
+  },
+  sync: {
+    status: "Synced",
+    revision:
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    lastSyncedRevision:
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    lastSyncedAt: "2026-11-25T20:10:00Z",
+  },
+  health: {
+    status: "Healthy",
+    message: null,
+  },
+  conditions: [],
+};
+
+export const sampleOciAppDetail: ApplicationDetailView = {
+  application: sampleOciApp,
+  history: [
+    {
+      id: 1,
+      revision:
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      deployedAt: "2026-11-24T09:00:00Z",
+    },
+    {
+      id: 2,
+      revision:
+        "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+      deployedAt: "2026-11-25T20:10:00Z",
+    },
+  ],
+  operation: {
+    phase: "Succeeded",
+    currentWave: 0,
+    startedAt: "2026-11-25T20:09:50Z",
+    finishedAt: "2026-11-25T20:10:00Z",
+    revision:
+      "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
+    message: "Applied wave 0 cleanly",
+  },
+};
 
 export const sampleAppDetail: ApplicationDetailView = {
   application: sampleApps[0]!,
@@ -470,6 +561,36 @@ export const sampleProjects: ProjectListView = {
       sourceNamespaces: ["ferriscd-system"],
       destinations: ["prod-us-east/payments", "in-cluster/payments"],
       allowedServiceAccounts: ["payments-deployer"],
+      // `T17.4`: a change freeze that is open right now, and a Saturday release window.
+      syncWindows: [
+        {
+          kind: "deny",
+          schedule: "0 9-17 * * MON-FRI",
+          duration: "8h",
+          timeZone: "America/New_York",
+          applications: ["payments-*"],
+          namespaces: [],
+          clusters: ["prod-*"],
+          manualSync: false,
+          active: true,
+          startsAt: "2026-11-25T14:00:00Z",
+          endsAt: "2026-11-25T22:00:00Z",
+          nextStart: "2026-11-26T14:00:00Z",
+        },
+        {
+          kind: "allow",
+          schedule: "0 2 * * SAT",
+          duration: "2h",
+          timeZone: "UTC",
+          applications: [],
+          namespaces: [],
+          clusters: [],
+          manualSync: true,
+          active: false,
+          nextStart: "2026-11-28T02:00:00Z",
+        },
+      ],
+      nextSyncWindowTransition: "2026-11-25T22:00:00Z",
     },
     {
       name: "storefront",
@@ -544,6 +665,12 @@ export function createMockApiClient(
     }),
     listProjects: async () => sampleProjects,
     listClusters: async () => sampleClusters,
+    getAuthConfig: async () => ({
+      authMode: "token-review",
+      scopes: [],
+      bffEnabled: false,
+    }),
+    logoutSession: async () => {},
     ...overrides,
   };
 }

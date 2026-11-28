@@ -25,15 +25,34 @@ opa-policy = ["dep:regorus"]
 base64.workspace = true
 dashmap.workspace = true
 ferriscd-crd.workspace = true
+# `T18.3`: gzip decompression of OCI artifact layers. Only this crate (and only `repo::oci`)
+# decompresses an untrusted archive, and it does so behind a bounded streaming counter.
+flate2.workspace = true
+# `T18.4`: the OCI registry transport consumes the blob body as a byte stream, so the layer can be
+# spooled through a byte counter instead of being buffered whole. Already in the lock file (it is
+# `gix`'s and `kube`'s dependency); no new package.
+futures.workspace = true
 gix.workspace = true
+# `T17.4`: the injected-clock sync-window evaluator takes a `jiff::Timestamp` (`k8s-openapi`
+# re-exports the same crate, but without a tzdb; the workspace dependency enables it).
+jiff.workspace = true
 jsonptr.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 # Only linkable behind `opa-policy`; a default build carries no Rego interpreter at all.
 regorus = { workspace = true, optional = true }
+# `T18.4`: the bounded HTTPS registry transport behind `repo::registry`. Encapsulated here exactly
+# like `gix`: no `reqwest` type appears outside `repo/`, and the workspace lock already carries it
+# (`gix`'s blocking HTTP transport), so this adds no package.
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde-saphyr.workspace = true
+# `T18.3`: verifies the `sha256:<64-hex>` digest of an OCI manifest/layer before extraction.
+sha2.workspace = true
+# `T18.4`: pins the process-level TLS crypto provider (`ring`) before the registry client is built.
+# Two providers are linked in this workspace, and `rustls` refuses to guess between them.
+rustls.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

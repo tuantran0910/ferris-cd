@@ -46,6 +46,7 @@
 //! apply is not forced at all: an HPA's `spec.replicas` must never be clobbered (trap T5), and the
 //! failure names the manager so the operator can decide.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ferriscd_engine::inventory::Ownership;
@@ -55,10 +56,11 @@ use kube::core::Status;
 use tracing::info;
 
 use crate::discovery::DiscoveryCache;
+use crate::drift_watcher::SelfEchoCache;
 use crate::dry_run::parse_conflict_status;
 use crate::live_state::{ClusterStateReader, LiveState, TrackingOwner};
 use crate::reconcile::ReconcileError;
-use crate::sync::{Applier, ApplyRequest, DeleteRequest};
+use crate::sync::{Applier, ApplyRequest, DeleteOutcome, DeleteRequest};
 
 /// The per-resource annotation that opts into delete-and-recreate.
 pub const REPLACE_ANNOTATION: &str = "ferriscd.io/sync-options";
@@ -216,6 +218,13 @@ pub struct ReplaceRecovery<'a> {
     discovery: &'a DiscoveryCache,
     owner: &'a TrackingOwner,
     policy: ReplacePolicy,
+    /// `T18.2` (finding C1): where the delete this replacement issues is recorded, so the opt-in
+    /// drift watcher does not mistake FerrisCD's own `Delete` event for an out-of-band one. `None`
+    /// (the default) records nothing, which is exactly the disabled behaviour.
+    echo: Option<Arc<SelfEchoCache>>,
+    /// `T18.2` (finding M-1): the destination cluster the replace goes to
+    /// (`spec.destination.cluster`), part of the recorded echo's identity.
+    echo_cluster: String,
 }
 
 impl std::fmt::Debug for ReplaceRecovery<'_> {
@@ -242,7 +251,27 @@ impl<'a> ReplaceRecovery<'a> {
             discovery,
             owner,
             policy,
+            echo: None,
+            echo_cluster: String::new(),
         }
+    }
+
+    /// Records the delete of a replacement in `echo` (builder style, `T18.2`).
+    ///
+    /// `Replace=true` is a FerrisCD-issued delete just like a prune, so its `Delete` watch event must
+    /// be suppressed by a prune marker rather than mistaken for an out-of-band `kubectl delete`
+    /// (which repeats the object's last written resource version and therefore cannot be told apart
+    /// from our own write). `cluster` is the destination cluster, part of the marker's identity
+    /// (finding M-1).
+    #[must_use]
+    pub fn with_self_echo(
+        mut self,
+        echo: Option<Arc<SelfEchoCache>>,
+        cluster: impl Into<String>,
+    ) -> Self {
+        self.echo = echo;
+        self.echo_cluster = cluster.into();
+        self
     }
 
     /// Replaces `resource` in `namespace`, returning the freshly applied object.
@@ -299,13 +328,31 @@ impl<'a> ReplaceRecovery<'a> {
         match self.recheck(key, resource).await? {
             LiveState::Missing | LiveState::OrphanGvkGone => Ok(false),
             LiveState::Present(_, Ownership::OwnedBySelf) => {
-                self.applier
+                let outcome = self
+                    .applier
                     .delete(DeleteRequest {
                         key,
                         api_resource,
                         namespace,
                     })
                     .await?;
+                // `T18.2` (finding C1): this delete is ours, so its `Delete` event must be
+                // suppressed by a marker.
+                //
+                // Finding N-5: a delete the API server answers with `404`/`410` (`AlreadyGone`)
+                // records the same marker as a `200`. FerrisCD *did* issue that delete; the answer
+                // only says the object was already absent, which is also what a retried delete of
+                // our own reports. The invariant is therefore "a marker exists for every delete
+                // FerrisCD issued, and for no other delete" — the same rule `Pruner::prune` applies
+                // to its own `AlreadyGone` — so the marker is not skipped here (and the object is
+                // re-applied immediately below, so a drift this could suppress is corrected in this
+                // very pass). The marker is one-shot (finding M-2), so it can absorb at most the one
+                // event it was written for.
+                if matches!(outcome, DeleteOutcome::Deleted | DeleteOutcome::AlreadyGone)
+                    && let Some(echo) = self.echo.as_ref()
+                {
+                    echo.record_prune(&self.echo_cluster, key, std::time::Instant::now());
+                }
                 Ok(true)
             }
             LiveState::Present(_, Ownership::OwnedByForeign(owner)) => {
@@ -417,6 +464,9 @@ mod tests {
     use crate::sync::DeleteOutcome;
 
     const NAMESPACE: &str = "payments";
+
+    /// The destination cluster the recovery fixtures record into (`T18.2` finding M-1).
+    const CLUSTER: &str = "in-cluster";
 
     fn status(value: serde_json::Value) -> Status {
         serde_json::from_value(value).expect("valid kube Status")
@@ -645,6 +695,9 @@ mod tests {
         /// Deletes that are accepted but do not remove the object (a finalizer holds it).
         held: StdMutex<Vec<String>>,
         fail_apply: StdMutex<bool>,
+        /// Deletes the API server answers with `404`/`410` (`DeleteOutcome::AlreadyGone`): the
+        /// object vanished between our re-read and the delete itself.
+        already_gone: StdMutex<bool>,
     }
 
     impl FakeCluster {
@@ -656,6 +709,12 @@ mod tests {
         /// The next delete of this key is accepted but leaves the object present.
         fn held(self, gknn: &str) -> Self {
             self.held.lock().unwrap().push(gknn.to_owned());
+            self
+        }
+
+        /// Every delete answers `AlreadyGone` (the object disappeared after the ownership re-read).
+        fn answering_already_gone(self) -> Self {
+            *self.already_gone.lock().unwrap() = true;
             self
         }
 
@@ -750,8 +809,15 @@ mod tests {
             let key = request.key.canonical();
             Box::pin(async move {
                 self.calls.lock().unwrap().push(Call::Delete(key.clone()));
-                if !self.held.lock().unwrap().iter().any(|held| held == &key) {
-                    self.objects.lock().unwrap().remove(&key);
+                if self.held.lock().unwrap().iter().any(|held| held == &key) {
+                    // A finalizer holds the object: the delete is accepted but the name stays taken.
+                    return Ok(DeleteOutcome::Deleted);
+                }
+                // A `404`/`410` from the delete itself means the object is gone, so it disappears
+                // from the served state either way.
+                self.objects.lock().unwrap().remove(&key);
+                if *self.already_gone.lock().unwrap() {
+                    return Ok(DeleteOutcome::AlreadyGone);
                 }
                 Ok(DeleteOutcome::Deleted)
             })
@@ -874,6 +940,170 @@ mod tests {
                 },
             ],
             "delete first, then a non-forced apply"
+        );
+    }
+
+    /// **`T18.2` finding C1:** the delete a `Replace=true` issues is FerrisCD's own, so it records a
+    /// prune marker — otherwise the opt-in drift watcher sees the `Delete` event (which repeats the
+    /// object's last written resource version, indistinguishable from our own write) and cannot tell
+    /// it apart from an out-of-band `kubectl delete`.
+    #[tokio::test]
+    async fn a_replace_records_the_prune_marker_of_its_own_delete() {
+        use crate::drift_watcher::{MetadataObservation, SelfEcho, SelfEchoCache};
+
+        let cluster = FakeCluster::default().with_object(live_job(
+            "ferriscd-system/payments:batch/Job:payments/migrate",
+        ));
+        let discovery = Arc::new(FakeDiscovery::new());
+        let cache = DiscoveryCache::with_source(discovery, Duration::from_secs(3600));
+        let bucket = Arc::new(cluster);
+        let reader = ClusterStateReader::new(bucket.clone());
+        let owner = TrackingOwner::new("ferriscd-system", "payments");
+        let job = resource("Job", "batch", "migrate");
+        let echo = Arc::new(SelfEchoCache::with_defaults());
+
+        recovery(
+            Arc::as_ref(&bucket),
+            &reader,
+            &cache,
+            &owner,
+            ReplacePolicy {
+                timeout: Duration::ZERO,
+                interval: Duration::ZERO,
+            },
+        )
+        .with_self_echo(Some(echo.clone()), CLUSTER)
+        .replace(
+            &job.key,
+            &job,
+            &api_resource("Job", "batch"),
+            Some(NAMESPACE),
+        )
+        .await
+        .expect("replace must succeed");
+
+        assert_eq!(
+            echo.suppresses(
+                &MetadataObservation {
+                    cluster: CLUSTER,
+                    key: &job.key,
+                    uid: None,
+                    generation: None,
+                    resource_version: None,
+                    deleted: true,
+                },
+                std::time::Instant::now(),
+            ),
+            Some(SelfEcho::Prune),
+            "the delete a Replace issued must be recognisable as ours"
+        );
+
+        // Without the seam nothing is recorded: a `Replace` in a disabled deployment costs nothing.
+        let bucket = Arc::new(FakeCluster::default().with_object(live_job(
+            "ferriscd-system/payments:batch/Job:payments/migrate",
+        )));
+        let reader = ClusterStateReader::new(bucket.clone());
+        let unwired = Arc::new(SelfEchoCache::with_defaults());
+        recovery(
+            Arc::as_ref(&bucket),
+            &reader,
+            &cache,
+            &owner,
+            ReplacePolicy {
+                timeout: Duration::ZERO,
+                interval: Duration::ZERO,
+            },
+        )
+        .with_self_echo(None, CLUSTER)
+        .replace(
+            &job.key,
+            &job,
+            &api_resource("Job", "batch"),
+            Some(NAMESPACE),
+        )
+        .await
+        .expect("replace must succeed");
+        assert!(unwired.is_empty(), "an unwired recovery records nothing");
+    }
+
+    /// **Finding N-5:** a `Replace` whose delete answers `404`/`410` (`AlreadyGone`) records the
+    /// same prune marker as a `200`, exactly like `Pruner::prune` treats the same answer.
+    ///
+    /// FerrisCD *did* issue that delete; the answer only says the object vanished between the
+    /// ownership re-read and the delete. The invariant is therefore "a marker exists for every
+    /// delete FerrisCD issued, and for no other delete" — the rule `OwnershipVerifiedPruner::prune`
+    /// already follows by counting `AlreadyGone` as `Pruned` (which is what makes the executor
+    /// record the marker on that path). If this path skipped the marker, the `Delete` event of a
+    /// `Replace` would be indistinguishable from an out-of-band `kubectl delete` (the event repeats
+    /// the object's last written resource version), which is the very feedback C1 exists to stop.
+    #[tokio::test]
+    async fn a_replace_records_the_prune_marker_when_the_delete_answers_already_gone() {
+        use crate::drift_watcher::{MetadataObservation, SelfEcho, SelfEchoCache};
+
+        let cluster = FakeCluster::default()
+            .with_object(live_job(
+                "ferriscd-system/payments:batch/Job:payments/migrate",
+            ))
+            .answering_already_gone();
+        let discovery = Arc::new(FakeDiscovery::new());
+        let cache = DiscoveryCache::with_source(discovery, Duration::from_secs(3600));
+        let bucket = Arc::new(cluster);
+        let reader = ClusterStateReader::new(bucket.clone());
+        let owner = TrackingOwner::new("ferriscd-system", "payments");
+        let job = resource("Job", "batch", "migrate");
+        let echo = Arc::new(SelfEchoCache::with_defaults());
+
+        recovery(
+            Arc::as_ref(&bucket),
+            &reader,
+            &cache,
+            &owner,
+            ReplacePolicy {
+                timeout: Duration::ZERO,
+                interval: Duration::ZERO,
+            },
+        )
+        .with_self_echo(Some(echo.clone()), CLUSTER)
+        .replace(
+            &job.key,
+            &job,
+            &api_resource("Job", "batch"),
+            Some(NAMESPACE),
+        )
+        .await
+        .expect("an AlreadyGone delete is not a failure: the name is free for the re-apply");
+
+        // The delete really was issued and answered `AlreadyGone`, and the re-apply followed.
+        let calls = bucket.calls();
+        assert_eq!(
+            calls.first(),
+            Some(&Call::Delete("batch/Job/payments/migrate".to_owned())),
+            "the replacement must have issued the delete, got {calls:?}"
+        );
+        assert!(
+            matches!(calls.last(), Some(Call::Apply { key, .. }) if key == "batch/Job/payments/migrate"),
+            "an AlreadyGone delete must still re-apply, got {calls:?}"
+        );
+
+        let marker = MetadataObservation {
+            cluster: CLUSTER,
+            key: &job.key,
+            uid: None,
+            generation: None,
+            resource_version: None,
+            deleted: true,
+        };
+        assert_eq!(
+            echo.suppresses(&marker, std::time::Instant::now()),
+            Some(SelfEcho::Prune),
+            "a delete FerrisCD issued and the API server answered with 404/410 is still ours"
+        );
+        // …and it is one-shot, exactly like `Pruner::prune`'s marker (finding M-2): a later,
+        // external delete of the re-applied object must trigger.
+        assert_eq!(
+            echo.suppresses(&marker, std::time::Instant::now()),
+            None,
+            "the marker may suppress one event, never the next external delete"
         );
     }
 

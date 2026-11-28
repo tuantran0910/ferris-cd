@@ -1,8 +1,12 @@
 # Least-privilege RBAC for FerrisCD.
 #
 # Control-plane namespace Role:
-# Strictly scopes `secrets` (`ferriscd.io/secret-type=repository` and `cluster`),
-# `configmaps` (`ferriscd-rbac-cm`), leader-election `leases`, `events`, and
+# A **namespace-scoped read** of `secrets` (`get`/`list`/`watch` on every `Secret` in
+# `ferriscd-system` — Kubernetes RBAC cannot select by label). The
+# `ferriscd.io/secret-type=repository|cluster|oidc` labels are a **client-side opt-in**: the control
+# plane ignores a `Secret` without them, but the Role itself grants the whole namespace, so keep
+# unrelated `Secret`s out of `ferriscd-system` (or grant a narrower rule of your own).
+# The rest: `configmaps` (`ferriscd-rbac-cm`), leader-election `leases`, `events`, and
 # control-plane `Application`/`AppProject` access to `ferriscd-system` only.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -38,6 +42,42 @@ rules:
   - apiGroups: ["ferriscd.io"]
     resources: ["appprojects"]
     verbs: ["get", "list", "watch"]
+  # `T17.4`: report an unusable `spec.syncWindows` entry as a `Ready=False`
+  # (`reason=SyncWindowInvalid`) condition on the AppProject. `status` is a subresource, so this
+  # cannot edit the project's spec.
+  - apiGroups: ["ferriscd.io"]
+    resources: ["appprojects/status"]
+    verbs: ["get", "patch"]
+  # --- OPT-IN: ApplicationSet controller (`T19.3`, `--enable-applicationsets`) ----------------
+  # Disabled by default, like the controller flag: nothing below is granted until an operator asks
+  # for it. Apply the patch in `deploy/README.md` (§ "ApplicationSet controller") or copy these
+  # rules into the Role above before turning the flag on.
+  #
+  # The verbs are exactly what the loop uses, in this namespace only:
+  #   * `applicationsets` needs `patch`: the finalizer is added and removed with a merge patch on
+  #     `metadata.finalizers` of the object, never through the `finalizers` subresource.
+  #   * `applicationsets/status` is patched on every pass (`Ready`, `generatedCount`).
+  #   * `applications` needs `create` *and* `patch`: the generated Applications are written with
+  #     Server-Side Apply, which Kubernetes authorizes as `patch` on an existing object and
+  #     `create` on a new one. It never needs `update`.
+  #   * `applications` `delete` is a *separate* opt-in, and it is deliberately not part of the
+  #     minimum: only `spec.syncPolicy.prune: true` and `spec.syncPolicy.preserveResourcesOnDeletion:
+  #     false` delete anything, and granting it here is a namespace-wide permission that applies to
+  #     every ApplicationSet, not just the one that opted in. Add it only if you use either feature
+  #     (Helm: `rbac.applicationsets: true` + `rbac.applicationsetPrune: true`).
+  #
+  # - apiGroups: ["ferriscd.io"]
+  #   resources: ["applications"]
+  #   verbs: ["get", "list", "watch", "patch", "create"]
+  # - apiGroups: ["ferriscd.io"]
+  #   resources: ["applications"]
+  #   verbs: ["get", "list", "watch", "patch", "create", "delete"]
+  # - apiGroups: ["ferriscd.io"]
+  #   resources: ["applicationsets"]
+  #   verbs: ["get", "list", "watch", "patch"]
+  # - apiGroups: ["ferriscd.io"]
+  #   resources: ["applicationsets/status"]
+  #   verbs: ["get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -26,7 +26,7 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use k8s_openapi::api::apps::v1::ReplicaSet;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
-use k8s_openapi::api::core::v1::{ConfigMap, Pod};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret};
 use k8s_openapi::api::events::v1::Event;
 use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
 use kube::runtime::WatchStreamExt as _;
@@ -35,7 +35,7 @@ use kube::{Client, ResourceExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{
-    AuthPolicy, AuthenticatedIdentity, IdentityCache, MAX_BEARER_TOKEN_CHARS, TokenAuthenticator,
+    AuthenticatedIdentity, IdentityCache, MAX_BEARER_TOKEN_CHARS, TokenAuthenticator,
 };
 use crate::error::ApiError;
 use crate::rbac::{
@@ -43,10 +43,11 @@ use crate::rbac::{
     RbacPolicyStore,
 };
 use crate::state::{
-    AppState, ApplicationEvent, ApplicationSnapshotSource, ApplicationSource, ChildNode,
-    ClusterCatalog, ClusterEntry, DiffSource, EventSource, GRAPH_LIST_LIMIT, GraphRequest,
-    GraphTraversal, InventoryReader, ListKey, ListedNode, LiveResourceState, OperationRequest,
-    OperationWriter, ProjectCatalog, Readiness, SeamFuture, WorkloadGraphSource,
+    AppState, ApplicationEvent, ApplicationSetCatalog, ApplicationSnapshotSource,
+    ApplicationSource, ChildNode, ClusterCatalog, ClusterEntry, DiffSource, EventSource,
+    GRAPH_LIST_LIMIT, GraphRequest, GraphTraversal, InventoryReader, ListKey, ListedNode,
+    LiveResourceState, OperationRequest, OperationWriter, ProjectCatalog, Readiness, SeamFuture,
+    WorkloadGraphSource,
 };
 use crate::webhooks::{RefreshSink, RefreshTarget, WebhookConfig};
 
@@ -113,6 +114,11 @@ pub fn app_state(plane: &ControlPlane, webhooks: WebhookConfig) -> AppState {
     // `T17.3`: the read-only `events.k8s.io/v1` timeline and the RBAC-filtered SSE snapshot feed,
     // both over the controller's own client (no second connector pool, no informer).
     .with_event_source(Arc::new(KubeEventSource::new(client.clone())))
+    // `T19.3`: the read-only `ApplicationSet` view (generation is the opt-in controller loop's job).
+    .with_applicationset_catalog(Arc::new(KubeApplicationSetCatalog::new(
+        client.clone(),
+        plane.namespace(),
+    )))
     .with_snapshot_source(Arc::new(PollingApplicationSnapshot::new(
         Arc::new(KubeApplicationSource::new(
             client.clone(),
@@ -229,6 +235,58 @@ impl ProjectCatalog for KubeProjectCatalog {
                 .map_err(|err| ApiError::backend(&err))?
                 .items;
             items.sort_by_key(|project| project.name_any());
+            Ok(items)
+        })
+    }
+
+    /// Finding M-4: one scoped `get`, not a catalogue listing.
+    ///
+    /// The application-detail handler resolves a single project by name; listing the control-plane
+    /// namespace to find it turned one object read into a list of every project (and every window on
+    /// each of them) on a page the UI opens constantly.
+    fn get(&self, name: &str) -> SeamFuture<'_, Option<AppProject>> {
+        let name = name.to_owned();
+        Box::pin(async move {
+            self.api
+                .get_opt(&name)
+                .await
+                .map_err(|err| ApiError::backend(&err))
+        })
+    }
+}
+
+/// Reads `ApplicationSet`s from the control-plane namespace (never cluster-wide, `T19.3`).
+pub struct KubeApplicationSetCatalog {
+    api: Api<ferriscd_crd::ApplicationSet>,
+}
+
+impl std::fmt::Debug for KubeApplicationSetCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KubeApplicationSetCatalog")
+            .finish_non_exhaustive()
+    }
+}
+
+impl KubeApplicationSetCatalog {
+    /// Builds a catalog reading `namespace` (the control-plane namespace).
+    #[must_use]
+    pub fn new(client: Client, namespace: &str) -> Self {
+        Self {
+            api: Api::namespaced(client, namespace),
+        }
+    }
+}
+
+impl ApplicationSetCatalog for KubeApplicationSetCatalog {
+    fn list(&self) -> SeamFuture<'_, Vec<ferriscd_crd::ApplicationSet>> {
+        Box::pin(async move {
+            let mut items = self
+                .api
+                .list(&ListParams::default())
+                .await
+                .map_err(|err| ApiError::backend(&err))?
+                .items;
+            items.sort_by_key(|appset| appset.name_any());
             Ok(items)
         })
     }
@@ -1301,9 +1359,86 @@ pub fn fallback_to_deny_all(result: Result<RbacPolicy, RbacLoadError>) -> RbacPo
 }
 
 /// Whether `state` would refuse every authenticated caller (used by the startup warnings).
+///
+/// `T19.1`: every bearer policy is affected, not just `TokenReview` — an OIDC deployment with an empty
+/// RBAC policy authenticates a human and then refuses everything they ask for, which reads as a
+/// broken login rather than as a missing `policy.yaml`.
 #[must_use]
 pub fn denies_every_authenticated_caller(state: &AppState) -> bool {
-    state.auth == AuthPolicy::TokenReview && state.rbac.is_empty()
+    state.auth.authenticates_bearer() && state.rbac.is_empty()
+}
+
+/// The `Secret` that carries the optional OIDC material (`T19.1`, `T19.2`).
+///
+/// Lives beside `ferriscd-rbac-cm` in the control-plane namespace and is labelled
+/// `ferriscd.io/secret-type: oidc`, the same convention `ClusterManager` uses for cluster
+/// credentials.
+pub const OIDC_SECRET_NAME: &str = "ferriscd-oidc";
+
+/// The label that marks a `Secret` as OIDC material.
+pub const OIDC_SECRET_TYPE_KEY: &str = "ferriscd.io/secret-type";
+
+/// The label value that marks a `Secret` as OIDC material.
+pub const OIDC_SECRET_TYPE_VALUE: &str = "oidc";
+
+/// The `Secret` key holding the optional PEM CA bundle used to trust the IdP (an internal IdP with a
+/// private CA needs it; a public one does not).
+pub const OIDC_CA_KEY: &str = "ca.crt";
+
+/// Reads the optional OIDC CA bundle from `ferriscd-oidc` in the control-plane namespace (`T19.1`).
+///
+/// Returns `None` when the `Secret` (or its `ca.crt` entry) is absent, which is the ordinary case for
+/// a public IdP: the system roots are then used. The `Secret` must carry
+/// `ferriscd.io/secret-type: oidc`; anything else in that name is ignored with a warning rather than
+/// trusted as a CA. The bundle's **contents** are never logged.
+pub async fn load_oidc_ca(plane: &ControlPlane) -> Option<Vec<u8>> {
+    load_oidc_ca_from(plane.client().clone(), plane.namespace()).await
+}
+
+/// [`load_oidc_ca`] over an explicit client and namespace (the testable half).
+pub async fn load_oidc_ca_from(client: Client, namespace: &str) -> Option<Vec<u8>> {
+    let api: Api<Secret> = Api::namespaced(client, namespace);
+    let secret = match api.get_opt(OIDC_SECRET_NAME).await {
+        Ok(secret) => secret?,
+        Err(error) => {
+            tracing::warn!(
+                namespace = %namespace,
+                secret = OIDC_SECRET_NAME,
+                error = %error,
+                "the OIDC Secret could not be read; the IdP must be trusted by the system roots"
+            );
+            return None;
+        }
+    };
+    let is_oidc = secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(OIDC_SECRET_TYPE_KEY))
+        .is_some_and(|value| value == OIDC_SECRET_TYPE_VALUE);
+    if !is_oidc {
+        tracing::warn!(
+            namespace = %namespace,
+            secret = OIDC_SECRET_NAME,
+            label = OIDC_SECRET_TYPE_KEY,
+            "the OIDC Secret is not labelled as OIDC material; ignoring it and trusting the system \
+             roots"
+        );
+        return None;
+    }
+    let ca = secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get(OIDC_CA_KEY))
+        .map(|bytes| bytes.0.clone())
+        .filter(|bytes| !bytes.is_empty());
+    tracing::info!(
+        namespace = %namespace,
+        secret = OIDC_SECRET_NAME,
+        ca_configured = ca.is_some(),
+        "read the OIDC Secret (contents are never logged)"
+    );
+    ca
 }
 
 /// Watches `ferriscd-rbac-cm` in `namespace` (**strictly namespaced**, never cluster-wide —
@@ -1497,6 +1632,56 @@ mod tests {
                 ..ObjectMeta::default()
             },
             ..Pod::default()
+        }
+    }
+
+    /// **`T19.1`:** the "the RBAC policy is empty, everybody will be refused" startup warning covers
+    /// every policy that authenticates a bearer credential — not just `TokenReview` — because an OIDC
+    /// deployment with no rules authenticates a human and then refuses everything they ask for.
+    #[test]
+    fn every_bearer_policy_is_named_by_the_empty_rbac_warning() {
+        use crate::auth::AuthPolicy;
+        use crate::state::ServingReadiness;
+
+        let empty = crate::tests_support::state(Arc::new(ServingReadiness));
+        for policy in [
+            AuthPolicy::TokenReview,
+            AuthPolicy::Oidc,
+            AuthPolicy::TokenReviewOrOidc,
+        ] {
+            let state = empty.clone().with_auth(policy);
+            assert!(
+                denies_every_authenticated_caller(&state),
+                "{policy:?} with an empty policy authorizes nobody"
+            );
+        }
+        for policy in [AuthPolicy::PassThrough, AuthPolicy::DenyAll] {
+            let state = empty.clone().with_auth(policy);
+            assert!(
+                !denies_every_authenticated_caller(&state),
+                "{policy:?} does not authenticate anybody, so the warning would be noise"
+            );
+        }
+
+        // A loaded rule silences it for every policy.
+        let rules = Arc::new(
+            RbacPolicy::parse(
+                r#"
+rules:
+  - subject: {kind: group, name: "oidc:payments-team"}
+    project: payments
+    actions: [get]
+"#,
+            )
+            .expect("the documented policy parses"),
+        );
+        for auth in [
+            AuthPolicy::TokenReview,
+            AuthPolicy::Oidc,
+            AuthPolicy::TokenReviewOrOidc,
+        ] {
+            let state = empty.clone().with_auth(auth).with_rbac(rules.clone());
+            assert!(!denies_every_authenticated_caller(&state), "{auth:?}");
         }
     }
 
