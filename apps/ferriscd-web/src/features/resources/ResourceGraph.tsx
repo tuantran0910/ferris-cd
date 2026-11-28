@@ -289,12 +289,15 @@ export function ResourceGraph({
             <Background color="var(--color-elevated)" gap={20} />
             <Controls />
             <MiniMap
+              style={{ background: "var(--color-surface)" }}
+              maskColor="var(--color-canvas)"
+              nodeStrokeColor="var(--color-line-strong)"
               nodeColor={(n) => {
                 const flowNode = n as ResourceFlowNode;
                 if (flowNode.data?.healthStatus === "Degraded") return "var(--color-danger)";
                 if (flowNode.data?.healthStatus === "Healthy") return "var(--color-success)";
                 if (flowNode.data?.healthStatus === "Progressing") return "var(--color-info)";
-                return "var(--color-text-ink-subtle)";
+                return "var(--color-ink-subtle)";
               }}
             />
           </ReactFlow>

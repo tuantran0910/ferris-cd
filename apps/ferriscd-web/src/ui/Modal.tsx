@@ -74,7 +74,7 @@ export function Modal({
           ref={dialogRef}
           tabIndex={-1}
           className={cx(
-            "motion-scale-in w-full rounded-2xl border border-line bg-surface shadow-2xl focus:outline-none",
+            "motion-scale-in w-full rounded-2xl border border-line bg-surface shadow-2xl ",
             panelClassName ?? "max-w-lg",
           )}
         >

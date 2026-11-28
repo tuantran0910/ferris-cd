@@ -12,6 +12,10 @@ function systemTheme(): Theme {
 
 /** The explicit choice (or `system` when the operator never chose). */
 export function readMode(): ThemeMode {
+  const painted = document.documentElement.dataset.themeMode;
+  if (painted === "light" || painted === "dark" || painted === "system") {
+    return painted;
+  }
   try {
     const stored = window.localStorage.getItem(STORAGE_KEY);
     if (stored === "light" || stored === "dark" || stored === "system") {
@@ -41,6 +45,9 @@ export function applyMode(mode: ThemeMode): Theme {
   const resolved = resolveMode(mode);
   document.documentElement.dataset.theme = resolved;
   document.documentElement.dataset.themeMode = mode;
+  document
+    .querySelector('meta[name="theme-color"]')
+    ?.setAttribute("content", resolved === "light" ? "#f1f5f9" : "#020617");
   try {
     window.localStorage.setItem(STORAGE_KEY, mode);
   } catch {

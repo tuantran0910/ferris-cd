@@ -64,7 +64,7 @@ export function ResourceTable({ nodes, graph, onSelect }: ResourceTableProps) {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search resources by name, kind, namespace, or GKNN..."
-            className="w-full rounded-lg border border-control bg-surface py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint focus:border-indigo-500 focus:outline-none"
+            className="w-full rounded-lg border border-control bg-surface py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint focus-visible:border-accent "
           />
         </div>
         <Select

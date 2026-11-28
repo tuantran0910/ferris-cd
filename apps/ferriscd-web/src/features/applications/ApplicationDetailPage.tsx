@@ -213,12 +213,15 @@ function ApplicationDetailContent({
             <SyncStatusBadge status={app.sync?.status} />
             <HealthStatusBadge status={app.health?.status} />
             <SyncWindowBadge syncWindow={syncWindow} />
-            {app.health?.message && (
-              <span className="text-xs text-ink-muted">
-                — {app.health.message}
-              </span>
-            )}
           </div>
+          {app.health?.message && (
+            <p
+              title={app.health.message}
+              className="line-clamp-2 max-w-3xl break-words pt-1 text-xs leading-relaxed text-ink-muted"
+            >
+              {app.health.message}
+            </p>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">

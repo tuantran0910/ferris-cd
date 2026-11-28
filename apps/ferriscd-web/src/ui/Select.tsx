@@ -159,7 +159,7 @@ export function Select({
         onClick={() => (open ? closeMenu(true) : openMenu())}
         onKeyDown={onTriggerKeyDown}
         className={cx(
-          "flex w-full items-center justify-between gap-2 rounded-lg border border-control bg-canvas py-2 pl-3 pr-3 text-left text-xs text-ink transition-colors focus:border-indigo-500 focus:outline-none",
+          "flex w-full items-center justify-between gap-2 rounded-lg border border-control bg-canvas py-2 pl-3 pr-3 text-left text-xs text-ink transition-colors focus-visible:border-accent ",
           disabled ? "cursor-not-allowed opacity-60" : "hover:border-line-emphasis",
         )}
       >

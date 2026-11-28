@@ -1,4 +1,4 @@
-import { FolderGit2, Layers, LogOut, Moon, Search, Server, Sun } from "lucide-react";
+import { FolderGit2, Layers, LogOut, Monitor, Moon, Search, Server, Sun } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { flushSync } from "react-dom";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
@@ -12,6 +12,7 @@ import {
 import {
   applyMode,
   applyThemeTransition,
+  nextMode,
   readMode,
   resolveMode,
   type Theme,
@@ -51,9 +52,7 @@ export function Layout() {
 
   const togglePalette = useCallback(() => setPaletteOpen((open) => !open), []);
   const toggleTheme = useCallback(() => {
-    // Binary on purpose: a `system` step would be a no-op whenever the OS
-    // preference already matches, which reads as a broken button.
-    const next = theme === "light" ? "dark" : "light";
+    const next = nextMode(mode);
     applyThemeTransition(() => {
       const resolved = applyMode(next);
       flushSync(() => {
@@ -61,7 +60,14 @@ export function Layout() {
         setTheme(resolved);
       });
     });
-  }, [theme]);
+  }, [mode]);
+
+  // Keep the document's state attributes truthful even before the first toggle
+  // (the inline script normally sets them, but tests and embeds may not).
+  useEffect(() => {
+    document.documentElement.dataset.themeMode = mode;
+    document.documentElement.dataset.theme = theme;
+  }, [mode, theme]);
 
   // `system` must follow the OS live, not just at first paint.
   useEffect(() => {
@@ -112,7 +118,7 @@ export function Layout() {
                 height={28}
                 className="h-7 w-7"
               />
-              <span>FerrisCD</span>
+              <span className="hidden sm:inline">FerrisCD</span>
             </Link>
             <nav aria-label="Primary" className="flex items-center gap-1">
               {NAV_ITEMS.map((item) => (
@@ -120,8 +126,9 @@ export function Layout() {
                   key={item.to}
                   to={item.to}
                   end={item.end}
+                  aria-label={item.label}
                   className={({ isActive }) =>
-                    `inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
+                    `inline-flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-sm font-medium transition-colors sm:px-3 ${
                       isActive
                         ? "bg-elevated text-ink-strong"
                         : "text-ink hover:bg-elevated hover:text-ink-strong"
@@ -129,22 +136,24 @@ export function Layout() {
                   }
                 >
                   <item.icon className="h-4 w-4 text-accent" aria-hidden="true" />
-                  {item.label}
+                  <span className="hidden md:inline">{item.label}</span>
                 </NavLink>
               ))}
             </nav>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3">
             <button
               type="button"
               onClick={toggleTheme}
-              aria-label={`Switch to ${theme === "light" ? "dark" : "light"} theme`}
-              title={`Switch to ${theme === "light" ? "dark" : "light"} theme`}
+              aria-label={`Theme ${mode}${mode === "system" ? ` (${theme})` : ""}. Switch to ${nextMode(mode)}.`}
+              title={`Theme ${mode}${mode === "system" ? ` (${theme})` : ""}. Switch to ${nextMode(mode)}.`}
               data-testid="theme-toggle"
               className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-control bg-surface text-ink-body transition-colors hover:border-line-emphasis hover:bg-elevated hover:text-ink-strong"
             >
-              {theme === "light" ? (
+              {mode === "system" ? (
+                <Monitor aria-hidden="true" className="h-4 w-4" />
+              ) : theme === "light" ? (
                 <Moon aria-hidden="true" className="h-4 w-4" />
               ) : (
                 <Sun aria-hidden="true" className="h-4 w-4" />
@@ -163,21 +172,24 @@ export function Layout() {
                 ⌘K
               </kbd>
             </button>
-            <span
-              className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-line bg-surface px-2.5 py-1 font-mono text-xs text-ink-body sm:inline-flex"
-              title={`Connected FerrisCD API endpoint: ${baseUrl || "same-origin"}`}
-            >
-              <Server className="h-3.5 w-3.5 shrink-0 text-success" aria-hidden="true" />
-              <span className="truncate">{baseUrl || "same-origin"}</span>
-            </span>
+            {baseUrl && baseUrl !== "same-origin" && (
+              <span
+                className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-line bg-surface px-2.5 py-1 font-mono text-xs text-ink-body sm:inline-flex"
+                title={`Connected FerrisCD API endpoint: ${baseUrl}`}
+              >
+                <Server className="h-3.5 w-3.5 shrink-0 text-success" aria-hidden="true" />
+                <span className="truncate">{baseUrl}</span>
+              </span>
+            )}
             <Button
               variant="secondary"
               size="sm"
               onClick={() => logout()}
               icon={<LogOut className="h-3.5 w-3.5" />}
-              className="px-3 py-1.5"
+              aria-label="Sign out"
+              className="px-2 py-1.5 sm:px-3"
             >
-              Sign Out
+              <span className="hidden sm:inline">Sign Out</span>
             </Button>
           </div>
         </div>
@@ -211,7 +223,7 @@ export function Layout() {
       <main
         id="main-content"
         tabIndex={-1}
-        className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 focus:outline-none sm:px-6"
+        className="mx-auto w-full max-w-7xl flex-1 px-4 py-6  sm:px-6"
       >
         <div key={pathname} className="motion-slide-up">
           <Outlet />

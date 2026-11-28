@@ -102,6 +102,14 @@ export function ApiErrorAlert({
   error: unknown;
   onRetry?: () => void;
 }) {
+  // A query cancelled by React Query (navigation, a fresher fetch) is not an
+  // API failure and must not paint an error banner.
+  if (
+    error instanceof Error &&
+    (error.name === "CancelledError" || error.name === "AbortError")
+  ) {
+    return null;
+  }
   const apiError = error instanceof ApiClientError ? error : null;
   const message =
     error instanceof Error ? error.message : "Failed to load data from API.";

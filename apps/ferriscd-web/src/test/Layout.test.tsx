@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Layout } from "../app/Layout";
 import { AuthProvider } from "../auth/AuthContext";
 import { resetTokenMemoryCache, setStoredToken } from "../auth/tokenStorage";
@@ -36,6 +36,9 @@ describe("Layout accessibility (T17.3)", () => {
   beforeEach(() => {
     resetTokenMemoryCache();
     window.sessionStorage.clear();
+    window.localStorage.removeItem("ferriscd-theme");
+    delete document.documentElement.dataset.theme;
+    delete document.documentElement.dataset.themeMode;
     setStoredToken("test-token");
   });
 
@@ -79,8 +82,39 @@ describe("Layout accessibility (T17.3)", () => {
     expect(window.localStorage.getItem("ferriscd-theme")).toBe("dark");
 
     await user.click(screen.getByTestId("theme-toggle"));
+    expect(document.documentElement.dataset.themeMode).toBe("system");
+    expect(window.localStorage.getItem("ferriscd-theme")).toBe("system");
+
+    await user.click(screen.getByTestId("theme-toggle"));
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(window.localStorage.getItem("ferriscd-theme")).toBe("light");
+  });
+
+  it("follows the OS theme while in system mode and cleans the listener up", async () => {
+    window.localStorage.clear();
+    delete document.documentElement.dataset.theme;
+    delete document.documentElement.dataset.themeMode;
+    let listener: (() => void) | undefined;
+    const query = {
+      matches: false,
+      addEventListener: (_: string, cb: () => void) => {
+        listener = cb;
+      },
+      removeEventListener: vi.fn(),
+    };
+    const matchMedia = vi
+      .spyOn(window, "matchMedia")
+      .mockReturnValue(query as unknown as MediaQueryList);
+
+    const view = renderShell();
+    expect(document.documentElement.dataset.themeMode).toBe("system");
+    query.matches = true;
+    listener?.();
+    expect(document.documentElement.dataset.theme).toBe("light");
+
+    view.unmount();
+    expect(query.removeEventListener).toHaveBeenCalled();
+    matchMedia.mockRestore();
   });
 
   it("offers Insights-free primary navigation to Applications, Projects and Clusters", () => {

@@ -116,7 +116,7 @@ export function ProjectsPage() {
           value={search}
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search by project, repo, namespace, cluster, ServiceAccount, or schedule..."
-          className="w-full rounded-lg border border-control bg-canvas py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint focus:border-indigo-400 focus:outline-none"
+          className="w-full rounded-lg border border-control bg-canvas py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint focus-visible:border-accent "
         />
       </div>
 

@@ -34,7 +34,7 @@ export function OperationBanner({ operation, repoUrl }: OperationBannerProps) {
         <div className="flex flex-wrap items-center gap-2">
           <Activity className="h-4 w-4 shrink-0" aria-hidden="true" />
           <span className="font-semibold">Operation: {operation.phase}</span>
-          <span className="rounded bg-black/20 px-1.5 py-0.5 font-mono text-[11px]">
+          <span className="rounded bg-canvas px-1.5 py-0.5 font-mono text-[11px]">
             wave {operation.currentWave}
           </span>
           {operation.revision &&

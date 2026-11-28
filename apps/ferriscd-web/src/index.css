@@ -22,7 +22,7 @@
   --color-ink: #e2e8f0;
   --color-ink-body: #cbd5e1;
   --color-ink-muted: #94a3b8;
-  --color-ink-subtle: #64748b;
+  --color-ink-subtle: #94a3b8;
   --color-accent: #a5b4fc;
   --color-accent-alt: #f0abfc;
   --color-success: #6ee7b7;
@@ -38,36 +38,40 @@
   --color-control: #64748b;
 }
 
+:root {
+  color-scheme: dark;
+}
+
 :root[data-theme="dark"] {
   color-scheme: dark;
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --color-canvas: #f8fafc;
+  --color-canvas: #f1f5f9;
   --color-surface: #ffffff;
   --color-elevated: #e2e8f0;
   --color-handle: #64748b;
   --color-line-subtle: #e2e8f0;
-  --color-line: #e2e8f0;
-  --color-line-strong: #cbd5e1;
+  --color-line: #cbd5e1;
+  --color-line-strong: #94a3b8;
   --color-line-emphasis: #94a3b8;
   --color-ink-strong: #0f172a;
   --color-ink: #1e293b;
   --color-ink-body: #334155;
   --color-ink-muted: #475569;
-  --color-ink-subtle: #64748b;
+  --color-ink-subtle: #475569;
   --color-accent: #4338ca;
   --color-accent-alt: #a21caf;
   --color-success: #047857;
   --color-warning: #b45309;
   --color-danger: #be123c;
   --color-info: #0369a1;
-  --color-accent-tint: #c7d2fe;
-  --color-success-tint: #a7f3d0;
-  --color-warning-tint: #fde68a;
-  --color-danger-tint: #fecdd3;
-  --color-info-tint: #bae6fd;
+  --color-accent-tint: #e0e7ff;
+  --color-success-tint: #d1fae5;
+  --color-warning-tint: #fffbeb;
+  --color-danger-tint: #ffe4e6;
+  --color-info-tint: #e0f2fe;
   --color-hint: #64748b;
   --color-control: #64748b;
 }

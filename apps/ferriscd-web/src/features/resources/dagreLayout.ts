@@ -1,5 +1,5 @@
 import dagre from "dagre";
-import { Position, type Edge, type Node } from "@xyflow/react";
+import { MarkerType, Position, type Edge, type Node } from "@xyflow/react";
 import type { ResourceGraphView, ResourceNodeView } from "../../api/types";
 
 export const GRAPH_NODE_WIDTH = 264;
@@ -140,16 +140,18 @@ export function buildResourceGraphElements(
     const parentKey = parentOf.get(resource.key);
     const sourceId =
       parentKey !== undefined && terminatesAtRoot(parentKey) ? parentKey : rootId;
+    const stroke =
+      derivedHealth === "Degraded" || derivedHealth === "Missing"
+        ? "var(--color-danger)"
+        : "var(--color-line-emphasis)";
     edges.push({
       id: `${sourceId}->${resource.key}`,
       source: sourceId,
       target: resource.key,
       animated: derivedHealth === "Progressing",
+      markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 16, height: 16 },
       style: {
-        stroke:
-          derivedHealth === "Degraded" || derivedHealth === "Missing"
-            ? "var(--color-danger)"
-            : "var(--color-border-line-emphasis)",
+        stroke,
         strokeWidth: 1.5,
       },
     });

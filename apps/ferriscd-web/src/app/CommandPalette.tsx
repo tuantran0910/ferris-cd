@@ -251,7 +251,7 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
             setActiveIndex(0);
           }}
           onKeyDown={onKeyDown}
-          className="w-full rounded-lg border border-control bg-canvas px-3 py-2 text-sm text-ink-strong transition-colors placeholder-hint focus:border-indigo-400 focus:outline-none"
+          className="w-full rounded-lg border border-control bg-canvas px-3 py-2 text-sm text-ink-strong transition-colors placeholder-hint focus-visible:border-accent "
         />
         <kbd className="hidden shrink-0 rounded border border-control bg-surface px-1.5 py-0.5 font-mono text-[10px] text-ink-body sm:block">
           Esc
@@ -277,17 +277,17 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
                       onMouseEnter={() => setActiveIndex(index)}
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => activate(item)}
-                      className={`flex cursor-pointer items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-xs ${
+                      className={`flex cursor-pointer items-center justify-between gap-4 rounded-lg px-3 py-2 text-xs ${
                         active ? "bg-elevated text-ink-strong" : "text-ink"
                       }`}
                     >
-                      <span className="flex min-w-0 items-center gap-2">
+                      <span className="flex min-w-0 flex-1 items-center gap-2">
                         <span aria-hidden="true" className="shrink-0 text-ink-body">
                           {item.icon}
                         </span>
                         <span className="truncate font-medium">{item.label}</span>
                       </span>
-                      <span className="shrink-0 text-[11px] text-ink-body">{item.hint}</span>
+                      <span title={item.hint} className="max-w-[45%] shrink-0 truncate text-right text-[11px] text-ink-body">{item.hint}</span>
                     </li>
                   );
                 })}
@@ -354,7 +354,7 @@ function buildGroups({
   const projectItems: PaletteItem[] = projects.map((project) => ({
     id: `project-${project.name}`,
     label: project.name,
-    hint: `project${project.description ? ` · ${project.description}` : ""}`,
+    hint: "project",
     group: "Projects",
     icon: <Layers className="h-3.5 w-3.5" />,
     to: { pathname: "/", search: searchFor({ project: project.name }) },

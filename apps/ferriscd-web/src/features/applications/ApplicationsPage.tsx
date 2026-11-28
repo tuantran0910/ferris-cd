@@ -277,7 +277,7 @@ export function ApplicationsPage() {
             value={search}
             onChange={(e) => setParam(FILTER_PARAMS.search, e.target.value)}
             placeholder="Search by name, namespace, repo, or cluster..."
-            className="w-full rounded-lg border border-control bg-canvas py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint focus:border-indigo-500 focus:outline-none"
+            className="w-full rounded-lg border border-control bg-canvas py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint focus-visible:border-accent "
           />
         </div>
 
