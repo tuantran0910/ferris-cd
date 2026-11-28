@@ -21,13 +21,13 @@ export function ConditionsList({ conditions }: { conditions: ConditionView[] }) 
       {conditions.length === 0 ? (
         <EmptyState bordered={false}>No status conditions recorded yet.</EmptyState>
       ) : (
-        <ol className="relative space-y-3 border-l border-default pl-6">
+        <ol className="relative space-y-3 border-l border-line pl-6">
           {conditions.map((cond, idx) => {
             const isTrue = cond.status === "True";
             return (
               <li
                 key={`${cond.type}-${cond.lastTransitionTime}-${idx}`}
-                className="relative rounded-xl border border-default bg-surface/70 p-4 text-xs"
+                className="relative rounded-xl border border-line bg-surface p-4 text-xs"
               >
                 <span
                   className={`absolute -left-[33px] top-4 flex h-5 w-5 items-center justify-center rounded-full border ${
@@ -44,10 +44,10 @@ export function ConditionsList({ conditions }: { conditions: ConditionView[] }) 
                 </span>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-semibold text-strong">
+                    <span className="font-semibold text-ink-strong">
                       {cond.type}
                     </span>
-                    <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[11px] text-body">
+                    <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[11px] text-ink-body">
                       status={cond.status}
                     </span>
                     <span className="max-w-full truncate rounded bg-indigo-500/15 px-1.5 py-0.5 font-mono text-[11px] text-accent">
@@ -57,12 +57,12 @@ export function ConditionsList({ conditions }: { conditions: ConditionView[] }) 
                   <time
                     dateTime={cond.lastTransitionTime}
                     title={cond.lastTransitionTime}
-                    className="font-mono text-[11px] text-muted"
+                    className="font-mono text-[11px] text-ink-muted"
                   >
                     {formatTimestamp(cond.lastTransitionTime)}
                   </time>
                 </div>
-                <p className="mt-2 break-words leading-relaxed text-body">
+                <p className="mt-2 break-words leading-relaxed text-ink-body">
                   {cond.message}
                 </p>
               </li>

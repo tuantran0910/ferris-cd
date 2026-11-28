@@ -113,7 +113,7 @@ export function RollbackModal({
       <ModalBody>
         <p
           id="rollback-modal-description"
-          className="break-words text-body"
+          className="break-words text-ink-body"
         >
           Select a previous deployment from{" "}
           <code className="break-all rounded bg-canvas px-1.5 py-0.5 font-mono text-xs text-accent">
@@ -132,7 +132,7 @@ export function RollbackModal({
             <p className="font-semibold text-warning">
               Automated sync will be paused
             </p>
-            <p className="mt-0.5 leading-relaxed text-warning/90">
+            <p className="mt-0.5 leading-relaxed text-warning">
               Rolling back pins this application to the chosen commit and
               disables{" "}
               <code className="font-mono text-warning">
@@ -145,7 +145,7 @@ export function RollbackModal({
 
         {sortedHistory.length === 0 ? (
           <EmptyState>
-            <History className="mx-auto mb-2 h-5 w-5 text-subtle" />
+            <History className="mx-auto mb-2 h-5 w-5 text-ink-subtle" />
             No deployment history entries are available to roll back to.
           </EmptyState>
         ) : (
@@ -161,8 +161,8 @@ export function RollbackModal({
                   key={entry.id}
                   className={`flex cursor-pointer items-center justify-between gap-3 rounded-xl border px-3.5 py-2.5 text-xs transition-colors ${
                     checked
-                      ? "border-indigo-500 bg-indigo-500/10 text-strong"
-                      : "border-default bg-canvas/60 text-body hover:border-strong"
+                      ? "border-indigo-500 bg-indigo-500/10 text-ink-strong"
+                      : "border-line bg-canvas text-ink-body hover:border-line-strong"
                   }`}
                 >
                   <div className="flex min-w-0 items-center gap-3">
@@ -172,10 +172,10 @@ export function RollbackModal({
                       value={entry.id}
                       checked={checked}
                       onChange={() => setSelectedId(entry.id)}
-                      className="border-emphasis bg-surface text-accent"
+                      className="border-line-emphasis bg-surface text-accent"
                     />
                     <div className="min-w-0">
-                      <p className="font-semibold text-strong">
+                      <p className="font-semibold text-ink-strong">
                         Deployment #{entry.id}
                       </p>
                       <p
@@ -189,7 +189,7 @@ export function RollbackModal({
                   <time
                     dateTime={entry.deployedAt}
                     title={entry.deployedAt}
-                    className="shrink-0 font-mono text-[11px] text-muted"
+                    className="shrink-0 font-mono text-[11px] text-ink-muted"
                   >
                     {entry.deployedAt}
                   </time>
@@ -203,7 +203,7 @@ export function RollbackModal({
           <div
             role="alert"
             data-testid="rollback-rbac-forbidden"
-            className="flex items-start gap-2.5 rounded-lg border border-rose-500/40 bg-danger-tint/40 p-3 text-xs text-danger motion-fade-in"
+            className="flex items-start gap-2.5 rounded-lg border border-rose-500/40 bg-danger-tint p-3 text-xs text-danger motion-fade-in"
           >
             <ShieldOff className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
             <div>
@@ -222,12 +222,12 @@ export function RollbackModal({
           <div
             role="alert"
             data-testid="rollback-error"
-            className="flex items-start gap-2 rounded-lg border border-rose-500/40 bg-danger-tint/40 p-3 text-xs text-danger motion-fade-in"
+            className="flex items-start gap-2 rounded-lg border border-rose-500/40 bg-danger-tint p-3 text-xs text-danger motion-fade-in"
           >
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
             <div>
               <p className="font-semibold text-danger">{error.title}</p>
-              <p className="mt-0.5 break-words text-danger/90">
+              <p className="mt-0.5 break-words text-danger">
                 {error.detail}
               </p>
             </div>
@@ -238,14 +238,14 @@ export function RollbackModal({
           <div
             role="status"
             data-testid="rollback-success-banner"
-            className="rounded-lg border border-emerald-500/40 bg-success-tint/40 p-3 text-xs text-success motion-fade-in"
+            className="rounded-lg border border-emerald-500/40 bg-success-tint p-3 text-xs text-success motion-fade-in"
           >
             <p>
               Rollback request <strong>{successResponse.status}</strong> — the
               controller will redeploy deployment <strong>#{selectedId}</strong>{" "}
               and pause automated sync.
             </p>
-            <p className="mt-1 text-success/80">
+            <p className="mt-1 text-success">
               Polling for the Sync badge and history to update; this dialog can
               be closed.
             </p>

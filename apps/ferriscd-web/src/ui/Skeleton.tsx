@@ -33,7 +33,7 @@ export function Skeleton({ className, radius = "xl" }: SkeletonProps) {
       aria-hidden="true"
       data-skeleton="true"
       className={cx(
-        "motion-shimmer border border-default bg-surface/60",
+        "motion-shimmer border border-line bg-surface",
         RADIUS_CLASSES[radius],
         className,
       )}

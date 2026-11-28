@@ -57,14 +57,14 @@ export function ResourceTable({ nodes, graph, onSelect }: ResourceTableProps) {
     <div data-testid="resource-table-view" className="space-y-3">
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative min-w-[240px] flex-1">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-subtle" />
           <input
             type="search"
             aria-label="Search resources"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search resources by name, kind, namespace, or GKNN..."
-            className="w-full rounded-lg border border-strong bg-surface py-2 pl-9 pr-3 text-xs text-strong transition-colors placeholder-hint focus:border-indigo-500 focus:outline-none"
+            className="w-full rounded-lg border border-control bg-surface py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint focus:border-indigo-500 focus:outline-none"
           />
         </div>
         <Select
@@ -76,14 +76,14 @@ export function ResourceTable({ nodes, graph, onSelect }: ResourceTableProps) {
             ...uniqueKinds.map((kind) => ({ value: kind, label: kind })),
           ]}
         />
-        <span className="text-xs text-muted">
+        <span className="text-xs text-ink-muted">
           Showing {filteredNodes.length} of {nodes.length}
         </span>
       </div>
 
-      <div className="overflow-x-auto rounded-xl border border-default bg-surface/60">
+      <div className="overflow-x-auto rounded-xl border border-line bg-surface">
         <table className="w-full text-left text-xs">
-          <thead className="border-b border-default bg-surface text-[11px] uppercase tracking-wider text-muted">
+          <thead className="border-b border-line bg-surface text-[11px] uppercase tracking-wider text-ink-muted">
             <tr>
               <th className="px-4 py-2.5">Kind</th>
               <th className="px-4 py-2.5">Name</th>
@@ -93,7 +93,7 @@ export function ResourceTable({ nodes, graph, onSelect }: ResourceTableProps) {
               <th className="px-4 py-2.5">Message</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-default/70">
+          <tbody className="divide-y divide-line">
             {filteredNodes.map((node) => {
               const syncStatus = node.present ? graph.syncStatus : "OutOfSync";
               const healthStatus = !node.present
@@ -111,19 +111,19 @@ export function ResourceTable({ nodes, graph, onSelect }: ResourceTableProps) {
                       onSelect(node.key);
                     }
                   }}
-                  className="cursor-pointer transition-colors hover:bg-elevated/60 focus-visible:bg-elevated/60"
+                  className="cursor-pointer transition-colors hover:bg-elevated focus-visible:bg-elevated"
                 >
                   <td className="whitespace-nowrap px-4 py-2.5 font-medium text-accent">
                     {node.kind}
                   </td>
                   <td
-                    className="max-w-[220px] truncate px-4 py-2.5 font-mono text-strong"
+                    className="max-w-[220px] truncate px-4 py-2.5 font-mono text-ink-strong"
                     title={node.name}
                   >
                     {node.name}
                   </td>
                   <td
-                    className="max-w-[160px] truncate px-4 py-2.5 font-mono text-muted"
+                    className="max-w-[160px] truncate px-4 py-2.5 font-mono text-ink-muted"
                     title={node.namespace ?? undefined}
                   >
                     {node.namespace ?? "—"}
@@ -135,7 +135,7 @@ export function ResourceTable({ nodes, graph, onSelect }: ResourceTableProps) {
                     <HealthStatusBadge status={healthStatus} compact />
                   </td>
                   <td
-                    className="max-w-xs truncate px-4 py-2.5 text-muted"
+                    className="max-w-xs truncate px-4 py-2.5 text-ink-muted"
                     title={node.healthMessage ?? undefined}
                   >
                     {node.healthMessage ?? "—"}
@@ -145,7 +145,7 @@ export function ResourceTable({ nodes, graph, onSelect }: ResourceTableProps) {
             })}
             {filteredNodes.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-4 py-8 text-center text-muted">
+                <td colSpan={6} className="px-4 py-8 text-center text-ink-muted">
                   No resources match your search filter.
                 </td>
               </tr>

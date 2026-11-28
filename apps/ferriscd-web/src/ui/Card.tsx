@@ -4,7 +4,7 @@ import { cx } from "../utils/cx";
 /** Surface shared by every card in the UI. Exported for card-shaped callers
  *  that must render a different element (e.g. a router `Link`). */
 export const CARD_SURFACE_CLASS =
-  "rounded-xl border border-default bg-surface/70";
+  "rounded-xl border border-line bg-surface";
 
 /** Hover treatment for cards that are themselves clickable. The 2px lift is
  *  CSS-only and is neutralised under `prefers-reduced-motion`. */

@@ -47,7 +47,7 @@ export function EventsTimeline({ events, truncated = false }: EventsTimelineProp
           sync succeeds, fails, or prunes resources.
         </EmptyState>
       ) : (
-        <ol className="relative space-y-3 border-l border-default pl-6">
+        <ol className="relative space-y-3 border-l border-line pl-6">
           {events.map((event, index) => {
             const isWarning = event.type === "Warning";
             return (
@@ -55,7 +55,7 @@ export function EventsTimeline({ events, truncated = false }: EventsTimelineProp
                 key={`${event.name}-${event.lastObservedAt ?? index}`}
                 data-testid="event-row"
                 data-event-type={event.type}
-                className="relative rounded-xl border border-default bg-surface/70 p-4 text-xs"
+                className="relative rounded-xl border border-line bg-surface p-4 text-xs"
               >
                 <span
                   aria-hidden="true"
@@ -82,9 +82,9 @@ export function EventsTimeline({ events, truncated = false }: EventsTimelineProp
                       )}
                       {isWarning ? "Warning" : "Normal"}
                     </Badge>
-                    <span className="font-semibold text-strong">{event.reason}</span>
+                    <span className="font-semibold text-ink-strong">{event.reason}</span>
                     {event.action && (
-                      <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[11px] text-primary">
+                      <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[11px] text-ink">
                         {event.action}
                       </span>
                     )}
@@ -101,19 +101,19 @@ export function EventsTimeline({ events, truncated = false }: EventsTimelineProp
                     <time
                       dateTime={event.lastObservedAt}
                       title={event.lastObservedAt}
-                      className="font-mono text-[11px] text-body"
+                      className="font-mono text-[11px] text-ink-body"
                     >
                       {formatTimestamp(event.lastObservedAt)}
                     </time>
                   )}
                 </div>
 
-                <p className="mt-2 break-words leading-relaxed text-primary">
+                <p className="mt-2 break-words leading-relaxed text-ink">
                   {event.message || "—"}
                 </p>
 
                 {event.reportingComponent && (
-                  <p className="mt-1.5 flex items-center gap-1 text-[11px] text-body">
+                  <p className="mt-1.5 flex items-center gap-1 text-[11px] text-ink-body">
                     <Info aria-hidden="true" className="h-3 w-3 text-info" />
                     reported by <span className="font-mono">{event.reportingComponent}</span>
                   </p>
@@ -125,7 +125,7 @@ export function EventsTimeline({ events, truncated = false }: EventsTimelineProp
       )}
 
       {truncated && (
-        <p role="status" className="text-xs text-body">
+        <p role="status" className="text-xs text-ink-body">
           Showing the most recent events. Older events are still in the cluster
           (<code className="font-mono">kubectl get events</code>).
         </p>

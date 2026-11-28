@@ -18,10 +18,10 @@ export interface OperationBannerProps {
 export function OperationBanner({ operation, repoUrl }: OperationBannerProps) {
   const tone =
     operation.phase === "Failed" || operation.phase === "Error"
-      ? "border-rose-500/40 bg-danger-tint/30 text-danger"
+      ? "border-rose-500/40 bg-danger-tint text-danger"
       : operation.phase === "Succeeded"
-        ? "border-emerald-500/40 bg-success-tint/25 text-success"
-        : "border-indigo-500/40 bg-accent-tint/30 text-accent";
+        ? "border-emerald-500/40 bg-success-tint text-success"
+        : "border-indigo-500/40 bg-accent-tint text-accent";
   const revisionUrl = commitWebUrl(repoUrl, operation.revision);
 
   return (

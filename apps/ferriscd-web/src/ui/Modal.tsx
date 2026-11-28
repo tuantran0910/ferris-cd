@@ -74,7 +74,7 @@ export function Modal({
           ref={dialogRef}
           tabIndex={-1}
           className={cx(
-            "motion-scale-in w-full rounded-2xl border border-default bg-surface shadow-2xl focus:outline-none",
+            "motion-scale-in w-full rounded-2xl border border-line bg-surface shadow-2xl focus:outline-none",
             panelClassName ?? "max-w-lg",
           )}
         >
@@ -103,10 +103,10 @@ export function ModalHeader({
   closeLabel,
 }: ModalHeaderProps) {
   return (
-    <div className="flex items-center justify-between border-b border-default px-5 py-4">
+    <div className="flex items-center justify-between border-b border-line px-5 py-4">
       <div className="flex items-center gap-2">
         {icon}
-        <h2 id={titleId} className="text-base font-semibold text-strong">
+        <h2 id={titleId} className="text-base font-semibold text-ink-strong">
           {title}
         </h2>
       </div>
@@ -114,7 +114,7 @@ export function ModalHeader({
         type="button"
         onClick={onClose}
         aria-label={closeLabel}
-        className="rounded-lg p-1 text-muted transition-colors hover:bg-elevated hover:text-strong"
+        className="rounded-lg p-1 text-ink-muted transition-colors hover:bg-elevated hover:text-ink-strong"
       >
         <X className="h-4 w-4" />
       </button>
@@ -136,7 +136,7 @@ export function ModalBody({
 
 export function ModalFooter({ children }: { children: ReactNode }) {
   return (
-    <div className="flex items-center justify-end gap-2.5 border-t border-default px-5 py-3.5">
+    <div className="flex items-center justify-end gap-2.5 border-t border-line px-5 py-3.5">
       {children}
     </div>
   );

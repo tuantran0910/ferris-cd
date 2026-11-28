@@ -93,10 +93,10 @@ export function ClustersPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight text-strong">
+        <h1 className="text-2xl font-bold tracking-tight text-ink-strong">
           Clusters
         </h1>
-        <p className="mt-1 text-xs text-body">
+        <p className="mt-1 text-xs text-ink-body">
           {clusters.length === 1
             ? "1 destination cluster visible to your identity"
             : `${clusters.length} destination clusters visible to your identity`}
@@ -179,7 +179,7 @@ function ClusterCard({
   return (
     <Card className="flex h-full flex-col gap-4" data-testid={`cluster-card-${cluster.name}`}>
       <div className="flex flex-wrap items-start justify-between gap-2">
-        <h2 className="flex min-w-0 items-center gap-2 text-base font-semibold text-strong">
+        <h2 className="flex min-w-0 items-center gap-2 text-base font-semibold text-ink-strong">
           <Server aria-hidden="true" className="h-4 w-4 text-success" />
           <Link
             to={filterLink}
@@ -212,9 +212,9 @@ function ClusterCard({
       </dl>
 
       <div className="mt-auto flex flex-wrap items-center gap-2 text-xs">
-        <span className="text-body">Rollup:</span>
+        <span className="text-ink-body">Rollup:</span>
         {rollup.total === 0 ? (
-          <span className="text-body">no visible applications</span>
+          <span className="text-ink-body">no visible applications</span>
         ) : (
           <>
             <SyncStatusBadge status={worstSync} compact />
@@ -224,11 +224,11 @@ function ClusterCard({
       </div>
 
       {/* The per-application breakdown stays textual: a colour alone is never the only signal. */}
-      <ul className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-body">
+      <ul className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-ink-body">
         {healthBreakdown(rollup).map(({ status, count }) => (
           <li key={status} data-testid={`cluster-health-${status.toLowerCase()}`}>
             {status}:{" "}
-            <span className="font-mono text-primary" data-testid="count">
+            <span className="font-mono text-ink" data-testid="count">
               {count}
             </span>
           </li>
@@ -267,14 +267,14 @@ function Metric({
 }) {
   return (
     <div>
-      <dt className="text-body">{label}</dt>
+      <dt className="text-ink-body">{label}</dt>
       <dd
         data-testid={`cluster-metric-${testId}`}
         className={`mt-0.5 flex items-center gap-1 font-mono text-sm ${
-          emphasize ? "text-warning" : "text-strong"
+          emphasize ? "text-warning" : "text-ink-strong"
         }`}
       >
-        <Layers aria-hidden="true" className="h-3.5 w-3.5 text-muted" />
+        <Layers aria-hidden="true" className="h-3.5 w-3.5 text-ink-muted" />
         {value}
       </dd>
     </div>

@@ -1,4 +1,4 @@
-import { FolderGit2, Layers, LogOut, Monitor, Moon, Search, Server, Sun } from "lucide-react";
+import { FolderGit2, Layers, LogOut, Moon, Search, Server, Sun } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { flushSync } from "react-dom";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
@@ -12,7 +12,6 @@ import {
 import {
   applyMode,
   applyThemeTransition,
-  nextMode,
   readMode,
   resolveMode,
   type Theme,
@@ -52,7 +51,9 @@ export function Layout() {
 
   const togglePalette = useCallback(() => setPaletteOpen((open) => !open), []);
   const toggleTheme = useCallback(() => {
-    const next = nextMode(mode);
+    // Binary on purpose: a `system` step would be a no-op whenever the OS
+    // preference already matches, which reads as a broken button.
+    const next = theme === "light" ? "dark" : "light";
     applyThemeTransition(() => {
       const resolved = applyMode(next);
       flushSync(() => {
@@ -60,7 +61,7 @@ export function Layout() {
         setTheme(resolved);
       });
     });
-  }, [mode]);
+  }, [theme]);
 
   // `system` must follow the OS live, not just at first paint.
   useEffect(() => {
@@ -88,7 +89,7 @@ export function Layout() {
   }, [pathname]);
 
   return (
-    <div className="flex min-h-screen flex-col bg-canvas text-strong">
+    <div className="flex min-h-screen flex-col bg-canvas text-ink-strong">
       <a
         href="#main-content"
         data-testid="skip-to-content"
@@ -97,12 +98,12 @@ export function Layout() {
         Skip to main content
       </a>
 
-      <header className="sticky top-0 z-30 border-b border-default bg-canvas/90 backdrop-blur">
+      <header className="sticky top-0 z-30 border-b border-line bg-canvas backdrop-blur">
         <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4 sm:px-6">
           <div className="flex items-center gap-6">
             <Link
               to="/"
-              className="flex items-center gap-2.5 font-semibold tracking-tight text-strong transition-colors hover:text-strong"
+              className="flex items-center gap-2.5 font-semibold tracking-tight text-ink-strong transition-colors hover:text-ink-strong"
             >
               <img
                 src="/ferriscd-mark.svg"
@@ -122,8 +123,8 @@ export function Layout() {
                   className={({ isActive }) =>
                     `inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
                       isActive
-                        ? "bg-elevated text-strong"
-                        : "text-primary hover:bg-elevated/80 hover:text-strong"
+                        ? "bg-elevated text-ink-strong"
+                        : "text-ink hover:bg-elevated hover:text-ink-strong"
                     }`
                   }
                 >
@@ -138,14 +139,12 @@ export function Layout() {
             <button
               type="button"
               onClick={toggleTheme}
-              aria-label={`Theme: ${mode}. Switch to ${nextMode(mode)}.`}
-              title={`Theme: ${mode}. Switch to ${nextMode(mode)}.`}
+              aria-label={`Switch to ${theme === "light" ? "dark" : "light"} theme`}
+              title={`Switch to ${theme === "light" ? "dark" : "light"} theme`}
               data-testid="theme-toggle"
-              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-strong bg-surface text-body transition-colors hover:border-emphasis hover:bg-elevated hover:text-strong"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-control bg-surface text-ink-body transition-colors hover:border-line-emphasis hover:bg-elevated hover:text-ink-strong"
             >
-              {mode === "system" ? (
-                <Monitor aria-hidden="true" className="h-4 w-4" />
-              ) : theme === "light" ? (
+              {theme === "light" ? (
                 <Moon aria-hidden="true" className="h-4 w-4" />
               ) : (
                 <Sun aria-hidden="true" className="h-4 w-4" />
@@ -156,16 +155,16 @@ export function Layout() {
               onClick={() => setPaletteOpen(true)}
               aria-keyshortcuts="Meta+K Control+K"
               title={`Search everything (${COMMAND_PALETTE_HINT})`}
-              className="hidden items-center gap-2 rounded-lg border border-strong bg-surface px-2.5 py-1.5 text-xs text-primary transition-colors hover:border-emphasis hover:bg-elevated sm:inline-flex"
+              className="hidden items-center gap-2 rounded-lg border border-control bg-surface px-2.5 py-1.5 text-xs text-ink transition-colors hover:border-line-emphasis hover:bg-elevated sm:inline-flex"
             >
-              <Search aria-hidden="true" className="h-3.5 w-3.5 text-body" />
+              <Search aria-hidden="true" className="h-3.5 w-3.5 text-ink-body" />
               <span>Search</span>
-              <kbd className="rounded border border-emphasis bg-canvas px-1 py-0.5 font-mono text-[10px] text-primary">
+              <kbd className="rounded border border-line-emphasis bg-canvas px-1 py-0.5 font-mono text-[10px] text-ink">
                 ⌘K
               </kbd>
             </button>
             <span
-              className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-default bg-surface px-2.5 py-1 font-mono text-xs text-body sm:inline-flex"
+              className="hidden max-w-[22rem] items-center gap-1.5 truncate rounded-md border border-line bg-surface px-2.5 py-1 font-mono text-xs text-ink-body sm:inline-flex"
               title={`Connected FerrisCD API endpoint: ${baseUrl || "same-origin"}`}
             >
               <Server className="h-3.5 w-3.5 shrink-0 text-success" aria-hidden="true" />

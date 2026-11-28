@@ -118,13 +118,13 @@ export function SyncModal({
       />
 
       <ModalBody>
-        <p id="sync-modal-description" className="break-words text-body">
+        <p id="sync-modal-description" className="break-words text-ink-body">
           Request a manual reconcile for{" "}
           <code className="break-all rounded bg-canvas px-1.5 py-0.5 font-mono text-xs text-accent">
             {namespace}/{name}
           </code>{" "}
           at revision{" "}
-          <code className="break-all rounded bg-canvas px-1.5 py-0.5 font-mono text-xs text-primary">
+          <code className="break-all rounded bg-canvas px-1.5 py-0.5 font-mono text-xs text-ink">
             {targetRevision}
           </code>
           .
@@ -132,19 +132,19 @@ export function SyncModal({
 
         <SyncWindowNotice syncWindow={syncWindow} />
 
-        <div className="space-y-2.5 rounded-xl border border-default bg-canvas/60 p-3.5 text-xs">
-          <label className="flex items-start gap-2.5 text-muted">
+        <div className="space-y-2.5 rounded-xl border border-line bg-canvas p-3.5 text-xs">
+          <label className="flex items-start gap-2.5 text-ink-muted">
             <input
               type="checkbox"
               checked={false}
               disabled
-              className="mt-0.5 cursor-not-allowed rounded border-strong bg-surface text-accent opacity-60"
+              className="mt-0.5 cursor-not-allowed rounded border-line-strong bg-surface text-accent opacity-60"
             />
             <span>
-              <strong className="block font-medium text-body">
+              <strong className="block font-medium text-ink-body">
                 Prune orphaned resources
               </strong>
-              <span className="text-muted">
+              <span className="text-ink-muted">
                 Configured via{" "}
                 <code className="font-mono">spec.syncPolicy.automated.prune</code>{" "}
                 (v1.0).
@@ -152,17 +152,17 @@ export function SyncModal({
             </span>
           </label>
 
-          <label className="flex items-start gap-2.5 text-primary">
+          <label className="flex items-start gap-2.5 text-ink">
             <input
               type="checkbox"
               checked={dryRun}
               disabled={submitting}
               onChange={(e) => setDryRun(e.target.checked)}
-              className="mt-0.5 rounded border-emphasis bg-surface text-accent"
+              className="mt-0.5 rounded border-line-emphasis bg-surface text-accent"
             />
             <span>
               <strong className="block font-medium">Dry-run preview</strong>
-              <span className="text-muted">
+              <span className="text-ink-muted">
                 Opens the live SSA dry-run Diff tab powered by{" "}
                 <code className="font-mono">GET .../diff</code> without
                 triggering a sync.
@@ -171,7 +171,7 @@ export function SyncModal({
           </label>
 
           {onPreviewDiff && (
-            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-default pt-2.5 text-muted">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-line pt-2.5 text-ink-muted">
               <span className="flex items-center gap-1.5">
                 <Info className="h-3.5 w-3.5 text-info" />
                 Want to preview SSA dry-run changes first?
@@ -194,7 +194,7 @@ export function SyncModal({
           <div
             role="alert"
             data-testid="sync-rbac-forbidden"
-            className="flex items-start gap-2.5 rounded-lg border border-rose-500/40 bg-danger-tint/40 p-3 text-xs text-danger motion-fade-in"
+            className="flex items-start gap-2.5 rounded-lg border border-rose-500/40 bg-danger-tint p-3 text-xs text-danger motion-fade-in"
           >
             <ShieldOff className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
             <div>
@@ -213,12 +213,12 @@ export function SyncModal({
           <div
             role="alert"
             data-testid="sync-error"
-            className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-warning-tint/40 p-3 text-xs text-warning motion-fade-in"
+            className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-warning-tint p-3 text-xs text-warning motion-fade-in"
           >
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
             <div>
               <p className="font-semibold text-warning">{error.title}</p>
-              <p className="mt-0.5 break-words text-warning/90">
+              <p className="mt-0.5 break-words text-warning">
                 {error.detail}
               </p>
             </div>
@@ -229,7 +229,7 @@ export function SyncModal({
           <div
             role="status"
             data-testid="sync-success-banner"
-            className="rounded-lg border border-emerald-500/40 bg-success-tint/40 p-3 text-xs text-success motion-fade-in"
+            className="rounded-lg border border-emerald-500/40 bg-success-tint p-3 text-xs text-success motion-fade-in"
           >
             <p>
               Sync request <strong>{successResponse.status}</strong> — the
@@ -239,7 +239,7 @@ export function SyncModal({
               </code>
               .
             </p>
-            <p className="mt-1 text-success/80">
+            <p className="mt-1 text-success">
               Polling for the Sync badge and diff to update; this dialog can be
               closed.
             </p>

@@ -49,7 +49,7 @@ function getDiffStatusBadge(status: string): string {
     case "OwnershipConflict":
       return "border-fuchsia-500/40 bg-fuchsia-500/15 text-accent-alt";
     default:
-      return "border-emphasis bg-elevated text-body";
+      return "border-line-emphasis bg-elevated text-ink-body";
   }
 }
 
@@ -79,7 +79,7 @@ function RenderedDiffValue({
       ? "text-danger"
       : tone === "predicted"
         ? "text-success"
-        : "text-primary";
+        : "text-ink";
 
   return (
     <div className="space-y-1">
@@ -105,43 +105,43 @@ function SideBySideChanges({ changes }: { changes: DiffChange[] }) {
   return (
     <div
       data-testid="diff-side-by-side"
-      className="overflow-x-auto rounded-lg border border-default"
+      className="overflow-x-auto rounded-lg border border-line"
     >
       <table className="w-full table-fixed text-left text-xs">
-        <thead className="border-b border-default bg-canvas/90 text-[11px] uppercase tracking-wider text-muted">
+        <thead className="border-b border-line bg-canvas text-[11px] uppercase tracking-wider text-ink-muted">
           <tr>
             <th className="w-1/4 px-3 py-2">Field Path</th>
-            <th className="w-[37.5%] border-l border-default px-3 py-2 text-danger">
+            <th className="w-[37.5%] border-l border-line px-3 py-2 text-danger">
               Live (Cluster)
             </th>
-            <th className="w-[37.5%] border-l border-default px-3 py-2 text-success">
+            <th className="w-[37.5%] border-l border-line px-3 py-2 text-success">
               Predicted (Git / SSA Dry-Run)
             </th>
           </tr>
         </thead>
-        <tbody className="divide-y divide-default/80">
+        <tbody className="divide-y divide-line">
           {changes.map((change, idx) => (
             <tr key={`${change.path}-${idx}`} className="align-top">
               <td className="px-3 py-2.5">
-                <div className="break-all font-mono text-xs text-primary">
+                <div className="break-all font-mono text-xs text-ink">
                   {change.path}
                 </div>
-                <span className="mt-1 inline-block rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] uppercase text-muted">
+                <span className="mt-1 inline-block rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] uppercase text-ink-muted">
                   {change.kind}
                 </span>
               </td>
-              <td className="border-l border-default bg-danger-tint/15 px-3 py-2.5">
+              <td className="border-l border-line bg-danger-tint px-3 py-2.5">
                 {change.kind === "added" ? (
-                  <span className="font-mono text-xs italic text-subtle">
+                  <span className="font-mono text-xs italic text-ink-subtle">
                     (absent)
                   </span>
                 ) : (
                   <RenderedDiffValue value={change.live} tone="live" />
                 )}
               </td>
-              <td className="border-l border-default bg-success-tint/15 px-3 py-2.5">
+              <td className="border-l border-line bg-success-tint px-3 py-2.5">
                 {change.kind === "removed" ? (
-                  <span className="font-mono text-xs italic text-subtle">
+                  <span className="font-mono text-xs italic text-ink-subtle">
                     (removed)
                   </span>
                 ) : (
@@ -160,11 +160,11 @@ function UnifiedChanges({ changes }: { changes: DiffChange[] }) {
   return (
     <div
       data-testid="diff-unified"
-      className="divide-y divide-default rounded-lg border border-default bg-canvas font-mono text-xs"
+      className="divide-y divide-line rounded-lg border border-line bg-canvas font-mono text-xs"
     >
       {changes.map((change, idx) => (
         <div key={`${change.path}-${idx}`} className="p-3">
-          <div className="mb-1.5 flex items-center gap-2 text-muted">
+          <div className="mb-1.5 flex items-center gap-2 text-ink-muted">
             <span className="font-semibold text-accent">
               @@ {change.path} @@
             </span>
@@ -173,7 +173,7 @@ function UnifiedChanges({ changes }: { changes: DiffChange[] }) {
             </span>
           </div>
           {change.kind !== "added" && (
-            <div className="flex items-start gap-2 rounded bg-danger-tint/35 px-2.5 py-1.5 text-danger">
+            <div className="flex items-start gap-2 rounded bg-danger-tint px-2.5 py-1.5 text-danger">
               <span className="select-none font-bold text-danger">-</span>
               <div className="min-w-0 flex-1">
                 <RenderedDiffValue value={change.live} tone="live" />
@@ -181,7 +181,7 @@ function UnifiedChanges({ changes }: { changes: DiffChange[] }) {
             </div>
           )}
           {change.kind !== "removed" && (
-            <div className="mt-1 flex items-start gap-2 rounded bg-success-tint/35 px-2.5 py-1.5 text-success">
+            <div className="mt-1 flex items-start gap-2 rounded bg-success-tint px-2.5 py-1.5 text-success">
               <span className="select-none font-bold text-success">+</span>
               <div className="min-w-0 flex-1">
                 <RenderedDiffValue value={change.predicted} tone="predicted" />
@@ -214,11 +214,11 @@ function ResourceDiffCard({
   return (
     <article
       data-testid={`diff-resource-${resource.key}`}
-      className="rounded-xl border border-default bg-surface/70 p-4 motion-fade-in"
+      className="rounded-xl border border-line bg-surface p-4 motion-fade-in"
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <code className="break-all font-mono text-xs font-semibold text-strong">
+          <code className="break-all font-mono text-xs font-semibold text-ink-strong">
             {resource.key}
           </code>
           <span
@@ -244,7 +244,7 @@ function ResourceDiffCard({
             </span>
           )}
           {resource.truncated && (
-            <span className="inline-flex items-center gap-1 rounded-full border border-emphasis bg-elevated px-2 py-0.5 text-[11px] text-body">
+            <span className="inline-flex items-center gap-1 rounded-full border border-line-emphasis bg-elevated px-2 py-0.5 text-[11px] text-ink-body">
               <FileWarning className="h-3 w-3" />
               Diff Truncated
             </span>
@@ -265,7 +265,7 @@ function ResourceDiffCard({
       {conflicts.length > 0 && (
         <div
           data-testid="field-conflict-list"
-          className="mt-3 rounded-lg border border-rose-500/40 bg-danger-tint/30 p-3 text-xs"
+          className="mt-3 rounded-lg border border-rose-500/40 bg-danger-tint p-3 text-xs"
         >
           <p className="flex items-center gap-1.5 font-semibold text-danger">
             <AlertTriangle className="h-4 w-4 text-danger" />
@@ -280,7 +280,7 @@ function ResourceDiffCard({
                 <span className="rounded bg-rose-500/25 px-1.5 py-0.5 text-[11px] font-semibold text-danger">
                   manager: {conflict.manager ?? "unknown"}
                 </span>
-                <span className="break-all text-primary">
+                <span className="break-all text-ink">
                   {conflict.field ?? "(unspecified field)"}
                 </span>
               </li>
@@ -298,17 +298,17 @@ function ResourceDiffCard({
           )}
         </div>
       ) : resource.status === "Synced" ? (
-        <p className="mt-2 flex items-center gap-1.5 text-xs text-success/90">
+        <p className="mt-2 flex items-center gap-1.5 text-xs text-success">
           <CheckCircle2 className="h-3.5 w-3.5" />
           Live cluster state matches SSA dry-run prediction.
         </p>
       ) : resource.status === "Missing" ? (
-        <p className="mt-2 text-xs text-info/90">
+        <p className="mt-2 text-xs text-info">
           Resource does not exist in the destination cluster yet and will be
           created on sync.
         </p>
       ) : resource.status === "Orphaned" ? (
-        <p className="mt-2 text-xs text-danger/90">
+        <p className="mt-2 text-xs text-danger">
           Tracked in inventory but no longer rendered from Git. Will be pruned
           if <code className="font-mono">syncPolicy.automated.prune</code> is
           enabled.
@@ -344,8 +344,8 @@ function PolicyViolationsBanner({
       aria-labelledby="policy-violations-heading"
       className={`rounded-xl border px-4 py-3 ${
         isBlocking
-          ? "border-rose-500/50 bg-danger-tint/30"
-          : "border-amber-500/40 bg-warning-tint/20"
+          ? "border-rose-500/50 bg-danger-tint"
+          : "border-amber-500/40 bg-warning-tint"
       }`}
     >
       <h2
@@ -366,13 +366,13 @@ function PolicyViolationsBanner({
         <span className={isBlocking ? "text-danger" : "text-warning"}>
           Policy Violations
         </span>
-        <span className="rounded-full border border-strong bg-canvas px-2 py-0.5 text-[11px] font-medium text-body">
+        <span className="rounded-full border border-control bg-canvas px-2 py-0.5 text-[11px] font-medium text-ink-body">
           {isBlocking
             ? `${blocking.length} blocking`
             : `${advisories.length} advisory`}
         </span>
       </h2>
-      <p className="mt-1 text-xs text-body">
+      <p className="mt-1 text-xs text-ink-body">
         {isBlocking
           ? "The sync is refused until these manifests comply: nothing is applied and nothing is pruned."
           : "The sync proceeds; these rules only advise."}
@@ -382,7 +382,7 @@ function PolicyViolationsBanner({
           <li
             key={`${violation.rule}-${violation.resourceKey}-${violation.message}`}
             data-testid="policy-violation"
-            className="flex flex-wrap items-baseline gap-2 rounded-lg border border-default bg-canvas/70 px-2.5 py-1.5 text-xs"
+            className="flex flex-wrap items-baseline gap-2 rounded-lg border border-line bg-canvas px-2.5 py-1.5 text-xs"
           >
             <span
               className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
@@ -394,10 +394,10 @@ function PolicyViolationsBanner({
               {violation.enforcement}
             </span>
             <code className="font-mono text-accent">{violation.rule}</code>
-            <code className="break-all font-mono text-muted">
+            <code className="break-all font-mono text-ink-muted">
               {violation.resourceKey}
             </code>
-            <span className="text-primary">{violation.message}</span>
+            <span className="text-ink">{violation.message}</span>
           </li>
         ))}
       </ul>
@@ -463,8 +463,8 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
         />
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-default bg-surface/60 px-4 py-3 text-xs">
-        <div className="flex flex-wrap items-center gap-3 text-body">
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line bg-surface px-4 py-3 text-xs">
+        <div className="flex flex-wrap items-center gap-3 text-ink-body">
           <span className="min-w-0">
             Revision:{" "}
             <code
@@ -476,7 +476,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
           </span>
           <span>
             Desired resources:{" "}
-            <strong className="text-strong">{diff.desired}</strong>
+            <strong className="text-ink-strong">{diff.desired}</strong>
           </span>
           <span>
             Would sync:{" "}
@@ -491,7 +491,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
         <div
           role="group"
           aria-label="Diff display mode"
-          className="inline-flex rounded-lg border border-strong bg-canvas p-0.5"
+          className="inline-flex rounded-lg border border-control bg-canvas p-0.5"
         >
           <button
             type="button"
@@ -500,7 +500,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
               viewMode === "side-by-side"
                 ? "bg-indigo-600 text-white"
-                : "text-body hover:text-strong"
+                : "text-ink-body hover:text-ink-strong"
             }`}
           >
             <Columns2 className="h-3.5 w-3.5" />
@@ -513,7 +513,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
               viewMode === "unified"
                 ? "bg-indigo-600 text-white"
-                : "text-body hover:text-strong"
+                : "text-ink-body hover:text-ink-strong"
             }`}
           >
             <Rows3 className="h-3.5 w-3.5" />
@@ -524,14 +524,14 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
 
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative min-w-[220px] flex-1">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-subtle" />
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-subtle" />
           <input
             type="search"
             aria-label="Filter diff resources"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Filter resources by GKNN key..."
-            className="w-full rounded-lg border border-strong bg-surface py-2 pl-9 pr-3 text-xs text-strong transition-colors placeholder-hint focus:border-indigo-500 focus:outline-none"
+            className="w-full rounded-lg border border-control bg-surface py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint focus:border-indigo-500 focus:outline-none"
           />
         </div>
         <Select
@@ -578,7 +578,7 @@ function SummaryStat({
   tone: "slate" | "emerald" | "amber" | "sky" | "rose" | "fuchsia";
 }) {
   const colorMap: Record<typeof tone, string> = {
-    slate: "text-strong",
+    slate: "text-ink-strong",
     emerald: "text-success",
     amber: "text-warning",
     sky: "text-info",
@@ -586,8 +586,8 @@ function SummaryStat({
     fuchsia: "text-accent-alt",
   };
   return (
-    <div className="rounded-lg border border-default bg-surface/80 px-3 py-2">
-      <p className="text-[11px] text-muted">{label}</p>
+    <div className="rounded-lg border border-line bg-surface px-3 py-2">
+      <p className="text-[11px] text-ink-muted">{label}</p>
       <p className={`mt-0.5 text-lg font-semibold ${colorMap[tone]}`}>
         {value}
       </p>

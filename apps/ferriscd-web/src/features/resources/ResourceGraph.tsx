@@ -37,7 +37,7 @@ function getNodeBorderClass(health: string, sync: string, isRoot: boolean): stri
   if (health === "Healthy") {
     return "border-emerald-500/60 bg-surface";
   }
-  return "border-strong bg-surface";
+  return "border-line-strong bg-surface";
 }
 
 const ResourceNodeCard = memo(function ResourceNodeCard({
@@ -63,7 +63,7 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
         <Handle
           type="target"
           position={Position.Left}
-          className="!h-2.5 !w-2.5 !border-subtle !bg-muted"
+          className="!h-2.5 !w-2.5 !border-line-subtle !bg-handle"
         />
       )}
       <div className="flex items-center justify-between gap-2">
@@ -71,13 +71,13 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
           {data.kind}
         </span>
         {data.namespace && (
-          <span className="truncate font-mono text-[10px] text-muted">
+          <span className="truncate font-mono text-[10px] text-ink-muted">
             {data.namespace}
           </span>
         )}
       </div>
       <p
-        className="mt-0.5 truncate text-sm font-semibold text-strong"
+        className="mt-0.5 truncate text-sm font-semibold text-ink-strong"
         title={data.label}
       >
         {data.label}
@@ -90,7 +90,7 @@ const ResourceNodeCard = memo(function ResourceNodeCard({
         <Handle
           type="source"
           position={Position.Right}
-          className="!h-2.5 !w-2.5 !border-subtle !bg-indigo-400"
+          className="!h-2.5 !w-2.5 !border-line-subtle !bg-indigo-400"
         />
       )}
     </div>
@@ -165,26 +165,26 @@ export function ResourceGraph({
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
-          <span className="font-medium text-primary">
+        <div className="flex flex-wrap items-center gap-2 text-xs text-ink-muted">
+          <span className="font-medium text-ink">
             {graph.nodes.length} resources
           </span>
           <span>•</span>
           <span>
             Cluster:{" "}
-            <code className="break-all text-body">{graph.cluster}</code>
+            <code className="break-all text-ink-body">{graph.cluster}</code>
           </span>
           <span>•</span>
           <span>
             Namespace:{" "}
-            <code className="break-all text-body">{graph.namespace}</code>
+            <code className="break-all text-ink-body">{graph.namespace}</code>
           </span>
         </div>
 
         <div
           role="group"
           aria-label="Resource view mode"
-          className="inline-flex rounded-lg border border-strong bg-surface p-0.5"
+          className="inline-flex rounded-lg border border-control bg-surface p-0.5"
         >
           <button
             type="button"
@@ -193,7 +193,7 @@ export function ResourceGraph({
             className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
               viewMode === "graph"
                 ? "bg-indigo-600 text-white"
-                : "text-body hover:text-strong"
+                : "text-ink-body hover:text-ink-strong"
             }`}
           >
             <GitFork className="h-3.5 w-3.5" />
@@ -206,7 +206,7 @@ export function ResourceGraph({
             className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
               viewMode === "table"
                 ? "bg-indigo-600 text-white"
-                : "text-body hover:text-strong"
+                : "text-ink-body hover:text-ink-strong"
             }`}
           >
             <Table2 className="h-3.5 w-3.5" />
@@ -262,7 +262,7 @@ export function ResourceGraph({
       ) : viewMode === "graph" ? (
         <div
           data-testid="resource-graph-canvas"
-          className="h-[560px] w-full overflow-hidden rounded-xl border border-default bg-canvas"
+          className="h-[560px] w-full overflow-hidden rounded-xl border border-line bg-canvas"
         >
           <ReactFlow
             nodes={layout.nodes}
@@ -294,7 +294,7 @@ export function ResourceGraph({
                 if (flowNode.data?.healthStatus === "Degraded") return "var(--color-danger)";
                 if (flowNode.data?.healthStatus === "Healthy") return "var(--color-success)";
                 if (flowNode.data?.healthStatus === "Progressing") return "var(--color-info)";
-                return "var(--color-text-subtle)";
+                return "var(--color-text-ink-subtle)";
               }}
             />
           </ReactFlow>

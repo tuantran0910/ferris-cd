@@ -38,9 +38,9 @@ export function EmptyState({
     <div
       {...rest}
       className={cx(
-        "text-center text-sm text-muted",
+        "text-center text-sm text-ink-muted",
         PADDING_CLASSES[size],
-        bordered && "rounded-xl border border-default bg-surface/50",
+        bordered && "rounded-xl border border-line bg-surface",
         className,
       )}
     >

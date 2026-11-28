@@ -79,10 +79,6 @@ describe("Layout accessibility (T17.3)", () => {
     expect(window.localStorage.getItem("ferriscd-theme")).toBe("dark");
 
     await user.click(screen.getByTestId("theme-toggle"));
-    expect(document.documentElement.dataset.themeMode).toBe("system");
-    expect(window.localStorage.getItem("ferriscd-theme")).toBe("system");
-
-    await user.click(screen.getByTestId("theme-toggle"));
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(window.localStorage.getItem("ferriscd-theme")).toBe("light");
   });

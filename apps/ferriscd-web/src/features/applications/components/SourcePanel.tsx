@@ -58,7 +58,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
       className="grid grid-cols-1 gap-4 md:grid-cols-3"
     >
       <Card className="text-xs" data-testid="source-card">
-        <p className="flex flex-wrap items-center gap-1.5 font-semibold uppercase tracking-wider text-muted">
+        <p className="flex flex-wrap items-center gap-1.5 font-semibold uppercase tracking-wider text-ink-muted">
           {oci ? (
             <Boxes className="h-3.5 w-3.5 text-accent-alt" />
           ) : (
@@ -93,11 +93,11 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
         </p>
         <dl className="mt-3 space-y-1.5">
           <div>
-            <dt className="text-subtle">
+            <dt className="text-ink-subtle">
               {oci ? "Registry" : "Repository"}
             </dt>
             <dd
-              className="break-all font-mono text-primary"
+              className="break-all font-mono text-ink"
               title={app.source.repoUrl}
             >
               {repoWebUrl(app.source.repoUrl) ? (
@@ -115,9 +115,9 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
             </dd>
           </div>
           <div className="flex justify-between gap-3">
-            <dt className="shrink-0 text-subtle">Path</dt>
+            <dt className="shrink-0 text-ink-subtle">Path</dt>
             <dd
-              className="min-w-0 break-all text-right font-mono text-primary"
+              className="min-w-0 break-all text-right font-mono text-ink"
               title={app.source.path}
             >
               {app.source.path}
@@ -133,10 +133,10 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
             <>
               {app.source.tag ? (
                 <div className="flex justify-between gap-3">
-                  <dt className="shrink-0 text-subtle">Tag</dt>
+                  <dt className="shrink-0 text-ink-subtle">Tag</dt>
                   <dd
                     data-testid="source-tag"
-                    className="min-w-0 break-all text-right font-mono text-primary"
+                    className="min-w-0 break-all text-right font-mono text-ink"
                     title={app.source.tag}
                   >
                     {app.source.tag}
@@ -145,10 +145,10 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
               ) : null}
               {app.source.digest ? (
                 <div className="flex justify-between gap-3">
-                  <dt className="shrink-0 text-subtle">Digest</dt>
+                  <dt className="shrink-0 text-ink-subtle">Digest</dt>
                   <dd
                     data-testid="source-digest"
-                    className="min-w-0 break-all text-right font-mono text-primary"
+                    className="min-w-0 break-all text-right font-mono text-ink"
                     title={app.source.digest}
                   >
                     {app.source.digest}
@@ -157,9 +157,9 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
               ) : null}
               {!app.source.tag && !app.source.digest ? (
                 <div className="flex justify-between gap-3">
-                  <dt className="shrink-0 text-subtle">Target Revision</dt>
+                  <dt className="shrink-0 text-ink-subtle">Target Revision</dt>
                   <dd
-                    className="min-w-0 break-all text-right font-mono text-primary"
+                    className="min-w-0 break-all text-right font-mono text-ink"
                     title={app.source.targetRevision}
                   >
                     {app.source.targetRevision}
@@ -169,9 +169,9 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
             </>
           ) : (
             <div className="flex justify-between gap-3">
-              <dt className="shrink-0 text-subtle">Target Revision</dt>
+              <dt className="shrink-0 text-ink-subtle">Target Revision</dt>
               <dd
-                className="min-w-0 break-all text-right font-mono text-primary"
+                className="min-w-0 break-all text-right font-mono text-ink"
                 title={app.source.targetRevision}
               >
                 {app.source.targetRevision}
@@ -179,8 +179,8 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
             </div>
           )}
           <div className="flex justify-between gap-3">
-            <dt className="shrink-0 text-subtle">Renderer</dt>
-            <dd className="min-w-0 break-all text-right font-mono text-primary">
+            <dt className="shrink-0 text-ink-subtle">Renderer</dt>
+            <dd className="min-w-0 break-all text-right font-mono text-ink">
               {app.source.renderer}
             </dd>
           </div>
@@ -188,9 +188,9 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
         {sources.length > 0 ? (
           <div
             data-testid="declared-sources"
-            className="mt-3 border-t border-strong/60 pt-3"
+            className="mt-3 border-t border-line-strong pt-3"
           >
-            <p className="font-semibold uppercase tracking-wider text-muted">
+            <p className="font-semibold uppercase tracking-wider text-ink-muted">
               Declared sources
             </p>
             <ul aria-label="Declared sources" className="mt-2 space-y-2">
@@ -204,7 +204,7 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
                   className="space-y-1"
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="font-mono text-body">
+                    <span className="font-mono text-ink-body">
                       {sourceAlias(source, index)}
                     </span>
                     <span className="flex items-center gap-1">
@@ -225,12 +225,12 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
                     </span>
                   </div>
                   <p
-                    className="break-all font-mono text-primary"
+                    className="break-all font-mono text-ink"
                     title={source.repoUrl}
                   >
                     {source.repoUrl}
                   </p>
-                  <p className="flex justify-between gap-3 text-muted">
+                  <p className="flex justify-between gap-3 text-ink-muted">
                     <span className="min-w-0 break-all font-mono">
                       {source.path || "/"}
                     </span>
@@ -249,30 +249,30 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
       </Card>
 
       <Card className="text-xs">
-        <p className="flex items-center gap-1.5 font-semibold uppercase tracking-wider text-muted">
+        <p className="flex items-center gap-1.5 font-semibold uppercase tracking-wider text-ink-muted">
           <Server className="h-3.5 w-3.5 text-success" />
           Destination
         </p>
         <dl className="mt-3 space-y-1.5">
           <div className="flex justify-between gap-3">
-            <dt className="shrink-0 text-subtle">Cluster</dt>
-            <dd className="min-w-0 break-all text-right font-mono text-primary">
+            <dt className="shrink-0 text-ink-subtle">Cluster</dt>
+            <dd className="min-w-0 break-all text-right font-mono text-ink">
               {app.destination.cluster}
             </dd>
           </div>
           <div className="flex justify-between gap-3">
-            <dt className="shrink-0 text-subtle">Namespace</dt>
-            <dd className="min-w-0 break-all text-right font-mono text-primary">
+            <dt className="shrink-0 text-ink-subtle">Namespace</dt>
+            <dd className="min-w-0 break-all text-right font-mono text-ink">
               {app.destination.namespace}
             </dd>
           </div>
           <div className="flex justify-between gap-3">
-            <dt className="shrink-0 text-subtle">Tracked Resources</dt>
-            <dd className="font-mono text-primary">{app.resourceCount}</dd>
+            <dt className="shrink-0 text-ink-subtle">Tracked Resources</dt>
+            <dd className="font-mono text-ink">{app.resourceCount}</dd>
           </div>
           <div className="flex justify-between gap-3">
-            <dt className="shrink-0 text-subtle">Observed Generation</dt>
-            <dd className="font-mono text-primary">
+            <dt className="shrink-0 text-ink-subtle">Observed Generation</dt>
+            <dd className="font-mono text-ink">
               {app.observedGeneration ?? "—"}
             </dd>
           </div>

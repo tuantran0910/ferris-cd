@@ -83,10 +83,10 @@ export function ProjectsPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-2xl font-bold tracking-tight text-strong">
+        <h1 className="text-2xl font-bold tracking-tight text-ink-strong">
           Projects
         </h1>
-        <p className="mt-1 text-xs text-body">
+        <p className="mt-1 text-xs text-ink-body">
           {projects.length === 1
             ? "1 AppProject visible to your identity"
             : `${projects.length} AppProjects visible to your identity`}
@@ -108,7 +108,7 @@ export function ProjectsPage() {
       <div className="relative max-w-md">
         <Search
           aria-hidden="true"
-          className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted"
+          className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-muted"
         />
         <input
           type="search"
@@ -116,7 +116,7 @@ export function ProjectsPage() {
           value={search}
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search by project, repo, namespace, cluster, ServiceAccount, or schedule..."
-          className="w-full rounded-lg border border-strong bg-canvas py-2 pl-9 pr-3 text-xs text-strong transition-colors placeholder-hint focus:border-indigo-400 focus:outline-none"
+          className="w-full rounded-lg border border-control bg-canvas py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint focus:border-indigo-400 focus:outline-none"
         />
       </div>
 
@@ -173,7 +173,7 @@ function ProjectCard({
     <Card className="flex h-full flex-col gap-4">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
-          <h2 className="flex items-center gap-2 text-base font-semibold text-strong">
+          <h2 className="flex items-center gap-2 text-base font-semibold text-ink-strong">
             <FolderGit2 aria-hidden="true" className="h-4 w-4 text-accent" />
             <Link
               to={applicationsLink}
@@ -184,7 +184,7 @@ function ProjectCard({
             </Link>
           </h2>
           {project.description && (
-            <p className="mt-1 break-words text-xs text-body">
+            <p className="mt-1 break-words text-xs text-ink-body">
               {project.description}
             </p>
           )}
@@ -226,7 +226,7 @@ function ProjectCard({
         />
       </dl>
 
-      <p className="mt-auto text-xs text-body">
+      <p className="mt-auto text-xs text-ink-body">
         {counts && counts.outOfSync > 0 ? (
           <>
             <span className="font-semibold text-warning">
@@ -271,18 +271,18 @@ function FactList({
 }) {
   return (
     <div data-testid={testId}>
-      <dt className="flex items-center gap-1.5 font-medium text-primary">
+      <dt className="flex items-center gap-1.5 font-medium text-ink">
         {icon}
         {title}
       </dt>
       <dd className="mt-1">
         {values.length === 0 ? (
-          <span className="text-muted">none</span>
+          <span className="text-ink-muted">none</span>
         ) : (
           <ul className="flex flex-wrap gap-1.5">
             {values.map((value) => (
               <li key={value}>
-                <code className="break-all rounded border border-strong bg-canvas px-1.5 py-0.5 font-mono text-[11px] text-primary">
+                <code className="break-all rounded border border-control bg-canvas px-1.5 py-0.5 font-mono text-[11px] text-ink">
                   {value}
                 </code>
               </li>

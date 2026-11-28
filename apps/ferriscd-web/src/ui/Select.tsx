@@ -159,15 +159,15 @@ export function Select({
         onClick={() => (open ? closeMenu(true) : openMenu())}
         onKeyDown={onTriggerKeyDown}
         className={cx(
-          "flex w-full items-center justify-between gap-2 rounded-lg border border-strong bg-canvas py-2 pl-3 pr-3 text-left text-xs text-primary transition-colors focus:border-indigo-500 focus:outline-none",
-          disabled ? "cursor-not-allowed opacity-60" : "hover:border-emphasis",
+          "flex w-full items-center justify-between gap-2 rounded-lg border border-control bg-canvas py-2 pl-3 pr-3 text-left text-xs text-ink transition-colors focus:border-indigo-500 focus:outline-none",
+          disabled ? "cursor-not-allowed opacity-60" : "hover:border-line-emphasis",
         )}
       >
         <span className="truncate">{selected?.label ?? value}</span>
         <ChevronDown
           aria-hidden="true"
           className={cx(
-            "h-3.5 w-3.5 shrink-0 text-muted transition-transform duration-150",
+            "h-3.5 w-3.5 shrink-0 text-ink-muted transition-transform duration-150",
             open && "rotate-180",
           )}
         />
@@ -179,7 +179,7 @@ export function Select({
           id={listId}
           role="listbox"
           aria-label={ariaLabel}
-          className="motion-scale-in absolute z-50 mt-1 max-h-64 w-full origin-top overflow-auto rounded-lg border border-strong bg-surface p-1 shadow-2xl"
+          className="motion-scale-in absolute z-50 mt-1 max-h-64 w-full origin-top overflow-auto rounded-lg border border-control bg-surface p-1 shadow-2xl"
         >
           {options.map((option, index) => {
             const isSelected = option.value === value;
@@ -197,8 +197,8 @@ export function Select({
                 className={cx(
                   "flex cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-xs",
                   index === activeIndex
-                    ? "bg-elevated text-strong"
-                    : "text-body",
+                    ? "bg-elevated text-ink-strong"
+                    : "text-ink-body",
                   isSelected && "text-accent",
                 )}
               >

@@ -54,14 +54,14 @@ export class ApiErrorBoundary extends Component<
           </div>
           <div className="min-w-0 flex-1">
             <div className="flex items-center justify-between gap-2">
-              <h2 className="text-base font-semibold text-strong">
+              <h2 className="text-base font-semibold text-ink-strong">
                 Something went wrong
               </h2>
               <span className="rounded bg-rose-500/20 px-2 py-0.5 font-mono text-xs text-danger">
                 {statusLabel}
               </span>
             </div>
-            <p className="mt-2 break-words text-sm text-body">
+            <p className="mt-2 break-words text-sm text-ink-body">
               {error.message || "An unexpected error occurred while rendering."}
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
@@ -117,14 +117,14 @@ export function ApiErrorAlert({
   return (
     <div
       role="alert"
-      className="rounded-xl border border-rose-500/40 bg-danger-tint/30 p-4 text-sm text-danger motion-fade-in"
+      className="rounded-xl border border-rose-500/40 bg-danger-tint p-4 text-sm text-danger motion-fade-in"
     >
       <div className="flex items-start justify-between gap-4">
         <div className="flex items-start gap-2.5">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-danger" />
           <div className="min-w-0">
             <p className="font-medium text-danger">{heading}</p>
-            <p className="mt-0.5 break-words text-danger/90">
+            <p className="mt-0.5 break-words text-danger">
               {networkError
                 ? "The FerrisCD API server could not be reached. Check the API Server URL and your connection, then retry."
                 : message}

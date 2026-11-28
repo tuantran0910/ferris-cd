@@ -187,7 +187,7 @@ function ApplicationDetailContent({
         <div className="space-y-2">
           <Link
             to={{ pathname: "/", search: listSearch }}
-            className="inline-flex items-center gap-1.5 text-xs font-medium text-muted transition-colors hover:text-accent"
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-muted transition-colors hover:text-accent"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
             Applications
@@ -195,12 +195,12 @@ function ApplicationDetailContent({
 
           <div className="flex flex-wrap items-center gap-3">
             <h1
-              className="max-w-full break-all text-2xl font-bold tracking-tight text-strong"
+              className="max-w-full break-all text-2xl font-bold tracking-tight text-ink-strong"
               title={app.name}
             >
               {app.name}
             </h1>
-            <span className="max-w-full truncate rounded-md border border-strong bg-surface px-2 py-0.5 font-mono text-xs text-body">
+            <span className="max-w-full truncate rounded-md border border-control bg-surface px-2 py-0.5 font-mono text-xs text-ink-body">
               {app.namespace}
             </span>
             <span className="max-w-full truncate rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 font-mono text-xs text-accent">
@@ -214,7 +214,7 @@ function ApplicationDetailContent({
             <HealthStatusBadge status={app.health?.status} />
             <SyncWindowBadge syncWindow={syncWindow} />
             {app.health?.message && (
-              <span className="text-xs text-muted">
+              <span className="text-xs text-ink-muted">
                 — {app.health.message}
               </span>
             )}
@@ -263,7 +263,7 @@ function ApplicationDetailContent({
         <div
           role="status"
           data-testid="detail-rbac-readonly-notice"
-          className="flex items-center gap-2 rounded-xl border border-rose-500/40 bg-danger-tint/30 px-4 py-2.5 text-xs text-danger motion-fade-in"
+          className="flex items-center gap-2 rounded-xl border border-rose-500/40 bg-danger-tint px-4 py-2.5 text-xs text-danger motion-fade-in"
         >
           <ShieldOff className="h-4 w-4 shrink-0 text-danger" />
           <span>
@@ -286,7 +286,7 @@ function ApplicationDetailContent({
       <div
         role="tablist"
         aria-label="Application detail sections"
-        className="flex flex-wrap gap-1 border-b border-default"
+        className="flex flex-wrap gap-1 border-b border-line"
       >
         <TabButton
           active={activeTab === "resources"}
@@ -509,7 +509,7 @@ function TabButton({
       className={`inline-flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-xs font-semibold transition-colors ${
         active
           ? "border-indigo-500 text-accent"
-          : "border-transparent text-muted hover:border-strong hover:text-primary"
+          : "border-transparent text-ink-muted hover:border-line-strong hover:text-ink"
       }`}
     >
       {icon}

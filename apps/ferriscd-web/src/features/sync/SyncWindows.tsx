@@ -39,7 +39,7 @@ export function SyncWindowRow({
 
   return (
     <li
-      className="rounded-lg border border-default bg-canvas/60 p-2.5"
+      className="rounded-lg border border-line bg-canvas p-2.5"
       data-testid={testId}
       data-window-kind={window.kind}
       data-window-state={state}
@@ -65,15 +65,15 @@ export function SyncWindowRow({
             manual override
           </Badge>
         )}
-        <code className="break-all rounded border border-strong bg-surface px-1.5 py-0.5 font-mono text-[11px] text-primary">
+        <code className="break-all rounded border border-control bg-surface px-1.5 py-0.5 font-mono text-[11px] text-ink">
           {window.schedule}
         </code>
-        <span className="text-[11px] text-muted">
+        <span className="text-[11px] text-ink-muted">
           for {window.duration} in {window.timeZone}
         </span>
       </div>
 
-      <p className="mt-1 text-[11px] text-body">
+      <p className="mt-1 text-[11px] text-ink-body">
         {window.error ? (
           <span className="text-danger">
             Cannot be evaluated ({window.error}) — every sync of this project is denied until the
@@ -99,7 +99,7 @@ export function SyncWindowRow({
           <>This schedule does not fire within the next year.</>
         )}
         {scopeLabel(window) && (
-          <span className="text-muted"> Scope: {scopeLabel(window)}.</span>
+          <span className="text-ink-muted"> Scope: {scopeLabel(window)}.</span>
         )}
       </p>
     </li>
@@ -141,7 +141,7 @@ export function SyncWindowsPanel({
   }
   return (
     <div data-testid={testId}>
-      <dt className="flex items-center gap-1.5 font-medium text-primary">
+      <dt className="flex items-center gap-1.5 font-medium text-ink">
         <CalendarClock aria-hidden="true" className="h-3.5 w-3.5 text-warning" />
         Sync windows ({windows.length})
       </dt>
@@ -156,7 +156,7 @@ export function SyncWindowsPanel({
           ))}
         </ul>
         {nextTransition && (
-          <p className="text-[11px] text-muted">
+          <p className="text-[11px] text-ink-muted">
             Next transition{" "}
             <time dateTime={nextTransition}>{formatTimestamp(nextTransition)}</time>.
           </p>
@@ -197,8 +197,8 @@ export function SyncWindowNotice({
       data-sync-window-reason={syncWindow.reason ?? "unknown"}
       className={`flex items-start gap-2.5 rounded-lg border p-3 text-xs motion-fade-in ${
         override
-          ? "border-amber-500/40 bg-warning-tint/40 text-warning"
-          : "border-rose-500/40 bg-danger-tint/40 text-danger"
+          ? "border-amber-500/40 bg-warning-tint text-warning"
+          : "border-rose-500/40 bg-danger-tint text-danger"
       }`}
     >
       {override ? (

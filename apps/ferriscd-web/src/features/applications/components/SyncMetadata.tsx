@@ -38,15 +38,15 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
 
   return (
     <Card className="text-xs">
-      <p className="flex items-center gap-1.5 font-semibold uppercase tracking-wider text-muted">
+      <p className="flex items-center gap-1.5 font-semibold uppercase tracking-wider text-ink-muted">
         <GitBranch className="h-3.5 w-3.5 text-warning" />
         Sync Metadata
       </p>
       <dl className="mt-3 space-y-1.5">
         <div className="flex justify-between gap-3">
-          <dt className="shrink-0 text-subtle">Rendered Revision</dt>
+          <dt className="shrink-0 text-ink-subtle">Rendered Revision</dt>
           <dd
-            className="min-w-0 break-all text-right font-mono text-primary"
+            className="min-w-0 break-all text-right font-mono text-ink"
             title={app.sync?.revision ?? undefined}
           >
             {renderedRevision ? (
@@ -64,9 +64,9 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
           </dd>
         </div>
         <div className="flex justify-between gap-3">
-          <dt className="shrink-0 text-subtle">Last Synced Revision</dt>
+          <dt className="shrink-0 text-ink-subtle">Last Synced Revision</dt>
           <dd
-            className="min-w-0 break-all text-right font-mono text-primary"
+            className="min-w-0 break-all text-right font-mono text-ink"
             title={app.sync?.lastSyncedRevision ?? undefined}
           >
             {lastSyncedRevision ? (
@@ -84,9 +84,9 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
           </dd>
         </div>
         <div className="flex justify-between gap-3">
-          <dt className="shrink-0 text-subtle">Last Synced At</dt>
+          <dt className="shrink-0 text-ink-subtle">Last Synced At</dt>
           <dd
-            className="text-right font-mono text-primary"
+            className="text-right font-mono text-ink"
             title={app.sync?.lastSyncedAt ?? undefined}
           >
             {formatTimestamp(app.sync?.lastSyncedAt)}
@@ -95,9 +95,9 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
         {showPerSource ? (
           <div
             data-testid="per-source-revisions"
-            className="border-t border-strong/60 pt-1.5"
+            className="border-t border-line-strong pt-1.5"
           >
-            <p className="text-subtle">Source Revisions</p>
+            <p className="text-ink-subtle">Source Revisions</p>
             <ul aria-label="Source revisions" className="mt-1 space-y-1">
               {perSource.map((revision, index) => {
                 // The API reports the revisions in `spec.sources` declaration
@@ -113,11 +113,11 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
                     data-testid={`source-revision-${index}`}
                     className="flex justify-between gap-3"
                   >
-                    <span className="shrink-0 font-mono text-muted">
+                    <span className="shrink-0 font-mono text-ink-muted">
                       {alias ?? `source ${index + 1}`}
                     </span>
                     <span
-                      className="min-w-0 break-all text-right font-mono text-primary"
+                      className="min-w-0 break-all text-right font-mono text-ink"
                       title={revision}
                     >
                       {href ? (

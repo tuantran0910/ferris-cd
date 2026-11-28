@@ -14,7 +14,7 @@ export type BadgeTone =
 export type BadgeSize = "sm" | "md";
 
 const TONE_CLASSES: Record<BadgeTone, string> = {
-  neutral: "border-emphasis/60 bg-elevated text-body",
+  neutral: "border-line-emphasis bg-elevated text-ink-body",
   info: "border-sky-500/40 bg-sky-500/15 text-info",
   success: "border-emerald-500/40 bg-emerald-500/15 text-success",
   warning: "border-amber-500/40 bg-amber-500/15 text-warning",
