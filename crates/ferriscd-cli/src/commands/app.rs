@@ -5,7 +5,8 @@
 //!
 //! * **Exit codes are scriptable.** `0` is success (a diff that found nothing, a sync that was
 //!   accepted), `1` is an error (a refusal, a transport failure, a missing application), `2` is "the
-//!   application is out of sync" — the `git diff --exit-code` convention a CI job branches on.
+//!   application is out of sync" — the `git diff --exit-code` convention a CI job branches on — and
+//!   `3` is "an `Enforce` policy rule refused this bundle" (`T20.2`).
 //! * **Nothing re-derives a secret.** `app diff` renders the `DiffView` the server sent, whose values
 //!   the engine already replaced with `***REDACTED(...)***`. The CLI has no code path that reads a
 //!   `Secret`, decodes base64, or fetches an object: the payload *is* the redaction.
@@ -30,6 +31,11 @@ pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
 /// Exit code for "there is drift" (`app diff`), so CI can gate on it.
 pub const EXIT_OUT_OF_SYNC: u8 = 2;
+/// Exit code for "an `Enforce` policy rule refused the bundle" (`T20.2`), so CI can gate on policy.
+///
+/// Distinct from [`EXIT_OUT_OF_SYNC`] on purpose: a policy refusal is not drift — the manifests are
+/// exactly what Git says, they are just not allowed — and a CI job may need to tell the two apart.
+pub const EXIT_POLICY_VIOLATION: u8 = 3;
 
 /// Where the connection comes from for read/mutation commands.
 #[derive(Debug, Args, Clone)]
@@ -576,6 +582,7 @@ pub fn render_diff(namespace: &str, name: &str, diff: &DiffView, color: bool) ->
         diff.summary.ownership_conflicts,
         diff.summary.field_conflicts,
     ));
+    rendered.push_str(&policy_banner(diff, color));
     if diff.resources.is_empty() {
         rendered.push_str("\nNothing is tracked yet: this application has never been applied.\n");
         rendered.push('\n');
@@ -644,6 +651,46 @@ pub fn render_diff(namespace: &str, name: &str, diff: &DiffView, color: bool) ->
     rendered
 }
 
+/// The `T20.2` policy-violation banner.
+///
+/// Printed *above* the resource table because it explains the verdict, not a resource: an `Enforce`
+/// violation means the next sync is refused, and a `Warn` one is an advisory the operator should
+/// read without it blocking anything.
+fn policy_banner(diff: &DiffView, color: bool) -> String {
+    if diff.policy_violations.is_empty() {
+        return String::new();
+    }
+    let blocking = diff
+        .policy_violations
+        .iter()
+        .filter(|violation| violation.enforcement.is_blocking())
+        .count();
+    let heading = if blocking > 0 {
+        paint(
+            color,
+            style::RED,
+            &format!("POLICY VIOLATIONS ({blocking} blocking)"),
+        )
+    } else {
+        paint(color, style::YELLOW, "POLICY ADVISORIES (non-blocking)")
+    };
+    let mut rendered = String::new();
+    rendered.push_str(&heading);
+    rendered.push('\n');
+    for violation in &diff.policy_violations {
+        let marker = if violation.enforcement.is_blocking() {
+            paint(color, style::RED, "x")
+        } else {
+            paint(color, style::YELLOW, "!")
+        };
+        rendered.push_str(&format!(
+            "  {marker} [{}] {} on {}: {}\n",
+            violation.enforcement, violation.rule, violation.resource_key, violation.message
+        ));
+    }
+    rendered
+}
+
 /// The one-line verdict, coloured by drift.
 fn verdict(summary: &DiffSummaryView, color: bool) -> String {
     let drift = summary.out_of_sync
@@ -665,9 +712,20 @@ fn verdict(summary: &DiffSummaryView, color: bool) -> String {
     }
 }
 
-/// The `app diff` exit code: `2` when there is drift, `0` when there is none.
+/// The `app diff` exit code.
+///
+/// `3` when a policy rule blocks the bundle (`T20.2`: `git diff --exit-code`-style CI gating on
+/// policy), then `2` when there is drift or the set would sync right now, else `0`. A policy
+/// refusal wins: the bundle is refused no matter how much drift it has.
 #[must_use]
 pub fn diff_exit_code(diff: &DiffView) -> u8 {
+    if diff
+        .policy_violations
+        .iter()
+        .any(|violation| violation.enforcement.is_blocking())
+    {
+        return EXIT_POLICY_VIOLATION;
+    }
     let summary = &diff.summary;
     let drift = summary.out_of_sync
         + summary.missing
@@ -719,9 +777,11 @@ fn json_scalar(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferriscd_crd::project::PolicyEnforcement;
     use ferriscd_server::api::{
         ApplicationDetailView, ApplicationSummary, DestinationView, DiffChangeView,
-        DiffConflictView, DiffSummaryView, HealthView, SourceEntryView, SourceView, SyncView,
+        DiffConflictView, DiffSummaryView, HealthView, PolicyViolationView, SourceEntryView,
+        SourceView, SyncView,
     };
 
     fn summary() -> ApplicationSummary {
@@ -786,6 +846,7 @@ mod tests {
                 ..empty_summary()
             },
             resources: Vec::new(),
+            policy_violations: Vec::new(),
         };
         assert_eq!(diff_exit_code(&clean), EXIT_OK);
 
@@ -817,6 +878,7 @@ mod tests {
                 would_sync: true,
                 summary: drifting,
                 resources: Vec::new(),
+                policy_violations: Vec::new(),
             };
             assert_eq!(
                 diff_exit_code(&diff),
@@ -859,6 +921,7 @@ mod tests {
                 }],
                 truncated: false,
             }],
+            policy_violations: Vec::new(),
         };
         let plain = render_diff("ferriscd-system", "payments-api", &diff, false);
         assert!(plain.contains("/Secret/payments/db"), "{plain}");
@@ -891,6 +954,7 @@ mod tests {
             would_sync: false,
             summary: empty_summary(),
             resources: Vec::new(),
+            policy_violations: Vec::new(),
         };
         let rendered = render_diff("ferriscd-system", "payments-api", &diff, false);
         assert!(rendered.contains("never been applied"), "{rendered}");
@@ -1125,5 +1189,142 @@ mod tests {
             };
             assert_eq!(target.resolve().0, "ferriscd-system", "{odd}");
         }
+    }
+
+    fn policy_violation(rule: &str, enforcement: PolicyEnforcement) -> PolicyViolationView {
+        PolicyViolationView {
+            rule: rule.to_owned(),
+            enforcement,
+            resource_key: "apps/Deployment/payments/web".to_owned(),
+            message: format!("{rule} rejected this Deployment (policy \"{rule}\")"),
+        }
+    }
+
+    /// `T20.2`: an `Enforce` violation must be a distinct exit code (`3`) so CI can gate on policy
+    /// separately from drift (`2`), and a `Warn` violation must not change the verdict at all.
+    #[test]
+    fn an_enforce_policy_violation_exits_three_and_a_warn_one_does_not() {
+        let blocking = DiffView {
+            revision: "8f3a1c2".to_owned(),
+            desired: 1,
+            would_sync: false,
+            summary: DiffSummaryView {
+                total: 1,
+                synced: 1,
+                ..empty_summary()
+            },
+            resources: Vec::new(),
+            policy_violations: vec![policy_violation(
+                "no-privileged",
+                PolicyEnforcement::Enforce,
+            )],
+        };
+        assert_eq!(
+            diff_exit_code(&blocking),
+            EXIT_POLICY_VIOLATION,
+            "an Enforce violation must exit 3 even when nothing drifted"
+        );
+
+        // Even with drift present, the policy refusal is the verdict: the bundle is refused.
+        let drifted_and_blocked = DiffView {
+            summary: DiffSummaryView {
+                total: 2,
+                out_of_sync: 1,
+                synced: 1,
+                ..empty_summary()
+            },
+            ..blocking.clone()
+        };
+        assert_eq!(diff_exit_code(&drifted_and_blocked), EXIT_POLICY_VIOLATION);
+
+        let advisory = DiffView {
+            policy_violations: vec![policy_violation("prefer-registry", PolicyEnforcement::Warn)],
+            ..blocking
+        };
+        assert_eq!(
+            diff_exit_code(&advisory),
+            EXIT_OK,
+            "a Warn violation is an advisory: it must not fail a CI pipeline"
+        );
+    }
+
+    /// **`T20.2` finding C1, seen from CI:** the engine's violation list is bounded, and the wire
+    /// payload of a bundle with 32 advisories *plus* one `Enforce` violation must still exit `3`.
+    /// Truncation is the engine's business — but the CLI must never be the place where a blocking
+    /// verdict gets lost, so this asserts the exit code over a full advisory list.
+    #[test]
+    fn a_full_advisory_list_with_one_enforce_violation_still_exits_three() {
+        let mut violations: Vec<PolicyViolationView> = (0..32)
+            .map(|index| policy_violation(&format!("advisory-{index}"), PolicyEnforcement::Warn))
+            .collect();
+        violations.push(policy_violation(
+            "require-owner-label",
+            PolicyEnforcement::Enforce,
+        ));
+        let diff = DiffView {
+            revision: "8f3a1c2".to_owned(),
+            desired: 40,
+            would_sync: false,
+            summary: DiffSummaryView {
+                total: 40,
+                synced: 40,
+                ..empty_summary()
+            },
+            resources: Vec::new(),
+            policy_violations: violations,
+        };
+        assert_eq!(
+            diff_exit_code(&diff),
+            EXIT_POLICY_VIOLATION,
+            "a blocking violation must survive a full advisory list"
+        );
+        let rendered = render_diff("ferriscd-system", "payments-api", &diff, false);
+        assert!(
+            rendered.contains("POLICY VIOLATIONS (1 blocking)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("require-owner-label"), "{rendered}");
+    }
+
+    /// The banner names every violation and distinguishes a blocking one from an advisory, so an
+    /// operator reads the reason the sync is refused instead of an unexplained exit code.
+    #[test]
+    fn the_policy_banner_names_each_violation_and_marks_enforce_versus_warn() {
+        let diff = DiffView {
+            revision: "8f3a1c2".to_owned(),
+            desired: 1,
+            would_sync: false,
+            summary: DiffSummaryView {
+                total: 1,
+                synced: 1,
+                ..empty_summary()
+            },
+            resources: Vec::new(),
+            policy_violations: vec![
+                policy_violation("no-privileged", PolicyEnforcement::Enforce),
+                policy_violation("prefer-registry", PolicyEnforcement::Warn),
+            ],
+        };
+        let plain = render_diff("ferriscd-system", "payments-api", &diff, false);
+        assert!(plain.contains("POLICY VIOLATIONS (1 blocking)"), "{plain}");
+        assert!(plain.contains("no-privileged"), "{plain}");
+        assert!(plain.contains("prefer-registry"), "{plain}");
+        assert!(
+            plain.contains("on apps/Deployment/payments/web"),
+            "the banner must name the resource: {plain}"
+        );
+        assert!(
+            !plain.contains('\u{1b}'),
+            "no colour when disabled: {plain:?}"
+        );
+
+        // With only advisories the heading says so, and no blocking count is printed.
+        let advisory_only = DiffView {
+            policy_violations: vec![policy_violation("prefer-registry", PolicyEnforcement::Warn)],
+            ..diff
+        };
+        let advisory = render_diff("ferriscd-system", "payments-api", &advisory_only, false);
+        assert!(advisory.contains("POLICY ADVISORIES"), "{advisory}");
+        assert!(!advisory.contains("(1 blocking)"), "{advisory}");
     }
 }

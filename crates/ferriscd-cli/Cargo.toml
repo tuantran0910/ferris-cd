@@ -14,6 +14,17 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# `T20.2`: build the shipped binary with the embedded OPA/Rego engine wired into the sync pipeline
+# (`ferriscd-controller/opa-policy` -> `ferriscd-engine/opa-policy` -> `regorus`).
+#
+# This is the **only** way to reach it from a released artifact: a Cargo feature is a property of the
+# build, not of the command line, so `ferriscd controller --features opa-policy` cannot exist — a
+# `Rego` policy rule is a compile error unless the binary was built with this flag
+# (`cargo build --features opa-policy`, or the image's `FERRISCD_FEATURES` build arg). Off by
+# default: the CEL engine needs no extra dependency and stays the default policy engine.
+opa-policy = ["ferriscd-controller/opa-policy", "ferriscd-engine/opa-policy"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

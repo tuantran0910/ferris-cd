@@ -15,6 +15,11 @@ workspace = true
 # crates such as `ferriscd-controller` and integration-test targets. Never enabled in
 # production builds; it is always compiled for this crate's own tests.
 test-utils = []
+# `T20.2`: the audited, embedded OPA/Rego engine (`policy::rego::RegorusEvaluator`, built on the
+# pure-Rust `regorus` interpreter). Enabled by `ferriscd-controller/opa-policy` and therefore
+# reachable from `ferriscd controller` and the API server; a build without the feature keeps a
+# `Rego` policy rule a **compile error**, so it fails closed instead of being silently skipped.
+opa-policy = ["dep:regorus"]
 
 [dependencies]
 base64.workspace = true
@@ -34,6 +39,8 @@ jiff.workspace = true
 jsonptr.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
+# Only linkable behind `opa-policy`; a default build carries no Rego interpreter at all.
+regorus = { workspace = true, optional = true }
 # `T18.4`: the bounded HTTPS registry transport behind `repo::registry`. Encapsulated here exactly
 # like `gix`: no `reqwest` type appears outside `repo/`, and the workspace lock already carries it
 # (`gix`'s blocking HTTP transport), so this adds no package.

@@ -14,15 +14,33 @@
 //! [`PolicyError`], never a silent allow.
 
 pub mod app_project;
+pub mod cel;
+pub mod gate;
 pub mod namespace_scope;
+#[cfg(feature = "opa-policy")]
+pub mod rego;
 // `T17.4`: deployment-governance windows — a pure evaluation of `AppProject.spec.syncWindows`
 // against an **injected** `jiff::Timestamp` (never a wall-clock read inside the engine).
 pub mod sync_windows;
 
 pub use app_project::{AppProjectPolicy, PolicyError, wildcard_matches};
+pub use cel::{CelBudget, CelError, CelFailure, Program};
+// The wire-level enums live in `ferriscd-crd` (they are part of the CRD schema); the engine
+// re-exports them so a caller never has to depend on both crates to build a rule.
+pub use ferriscd_crd::project::{PolicyEnforcement, PolicyRuleEngine, PolicyRuleSpec};
+pub use gate::{
+    CONDITION_POLICY_ADVISORY, MAX_CONDITION_ADVISORIES, MAX_POLICY_RESOURCES, MAX_POLICY_RULES,
+    MAX_POLICY_VIOLATIONS, POLICY_CONFIGMAP_NAME, PolicyCompileError, PolicyGate, PolicyGateConfig,
+    PolicyGateInput, PolicyGateOutcome, PolicyRule, PolicyRuleParseError, PolicyViolation,
+    REASON_POLICY_ADVISORY, REASON_POLICY_COMPLIANT, REDACTED_SECRET_VALUE, RegoEvaluator,
+    RegoPassBudget, invalid_match_kinds, normalize_match_kind, normalize_match_kinds,
+    policy_advisory_condition, redact_secret_values, rules_from_configmap_data,
+};
 pub use namespace_scope::{
     ALL_NAMESPACES, ApplicationNamespaces, ApplicationScope, ApplicationScopeError,
 };
+#[cfg(feature = "opa-policy")]
+pub use rego::{RegoLimits, RegorusEvaluator};
 pub use sync_windows::{
     InvalidSyncWindow, SyncWindowDenial, SyncWindowDenialReason, SyncWindowSet, SyncWindowStatus,
     SyncWindowTarget, SyncWindowVerdict,

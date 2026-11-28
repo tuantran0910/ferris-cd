@@ -662,6 +662,14 @@ export interface components {
         DiffView: {
             /** @description How many resources the rendered bundle contains. */
             desired: number;
+            /**
+             * @description Pre-sync policy gate violations (`T20.2`), blockings and advisories alike.
+             *
+             *     Empty when no rule is in force or every rule passed. `wouldSync` is `false` whenever one of
+             *     these is `Enforce`: the payload *shows* a refused bundle rather than hiding it behind an
+             *     error, which is what makes `ferriscd app diff` (exit code `3`) a CI gate.
+             */
+            policyViolations?: components["schemas"]["PolicyViolationView"][];
             /** @description One entry per resource in `desired ∪ status.inventory`. */
             resources?: components["schemas"]["DiffResourceView"][];
             /** @description Commit the desired state was rendered from. */
@@ -729,6 +737,26 @@ export interface components {
             revision?: string | null;
             /** @description When it started (RFC 3339). */
             startedAt: string;
+        };
+        /** @description One pre-sync policy gate violation (`T20.2`). */
+        PolicyViolationView: {
+            /**
+             * @description `Enforce` (blocks the sync) or `Warn` (advisory only).
+             *
+             *     Typed, not a `String`: every consumer (`ferriscd app diff`, the web UI) branches on it, and a
+             *     stringly-typed comparison against a literal is one typo away from treating a blocking
+             *     violation as an advisory. The wire form is unchanged (`"Enforce"`/`"Warn"`).
+             */
+            enforcement: string;
+            /** @description The operator-facing, `Secret`-scrubbed explanation. */
+            message: string;
+            /**
+             * @description Version-agnostic GKNN of the rejected resource, or `*` for a whole-bundle finding (a rule
+             *     that cannot be compiled, a budget overflow).
+             */
+            resourceKey: string;
+            /** @description The policy rule that rejected the resource. */
+            rule: string;
         };
         /** @description `GET /api/v1/projects` body. */
         ProjectListView: {

@@ -10,6 +10,13 @@ description = "Kubernetes controller runtime, watch predicates, discovery cache,
 [lints]
 workspace = true
 
+[features]
+# `T20.2`: wire the embedded OPA/Rego engine (`ferriscd-engine/opa-policy`) into the default sync
+# pipeline, so `Rego` policy rules become reachable from `ferriscd controller` and the API server.
+# Off by default: the CEL engine needs no extra dependency, and a build without this feature keeps
+# a `Rego` rule a compile error (fail closed) instead of silently skipping it.
+opa-policy = ["ferriscd-engine/opa-policy"]
+
 [dependencies]
 anyhow.workspace = true
 # `T15.1`: the dedicated `/metrics` listener. `axum`/`hyper` are already in the lock file (the API
