@@ -42,6 +42,11 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde-saphyr.workspace = true
+# `T20.4`: the `exportedAt` timestamp of a `ferriscd backup export` bundle is RFC 3339 UTC. `jiff`
+# is already a workspace dependency (and already linked through `ferriscd-crd`'s
+# `AppProject.spec.syncWindows`), so this adds no package and no tzdb the binary did not already
+# carry.
+jiff.workspace = true
 # Typed client errors (`ClientError`): the same derive the controller and the server use.
 thiserror.workspace = true
 tempfile.workspace = true
@@ -51,6 +56,15 @@ tracing.workspace = true
 [dev-dependencies]
 # Asserts the exported OpenAPI document is the JSON the server serves.
 serde_json.workspace = true
+# `T20.4`: `commands::backup` proves *which API requests* an export makes — that the credential
+# inventory is a namespaced, label-filtered `list` in the control-plane namespace and never a
+# cluster-wide (or per-tenant) `Secret` read — over a `kube::Client` built from `tower::service_fn`,
+# with no cluster and no socket. Both crates are already workspace dependencies (and already in the
+# lock file through `kube`), so this adds no package; it is the technique `ferriscd-controller`'s
+# `credentials` tests already use (there as regular dependencies, because its production client
+# service needs them).
+tower.workspace = true
+http.workspace = true
 # The CLI tests drive the real client against a local `axum` server on `127.0.0.1:0` (no cluster, no
 # external network, no sleeps), so the HTTP paths, status mapping and exit codes are exercised end to
 # end. `axum` is already a workspace dependency (`ferriscd-server` serves with it).

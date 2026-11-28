@@ -1,0 +1,25 @@
+# A `v1.0` `Application` with **no** `syncPolicy` and a Kustomize renderer: the case that must stay
+# wire-identical (the optional blocks may not reappear as `null` or as filled-in defaults).
+apiVersion: ferriscd.io/v1alpha1
+kind: Application
+metadata:
+  name: legacy-batch
+  namespace: ferriscd-system
+spec:
+  project: default
+  source:
+    git:
+      repoURL: ssh://git@github.com/example/legacy-batch.git
+      targetRevision: v1.0.0
+      path: manifests
+    renderer:
+      kustomize:
+        kustomizationPath: overlays/prod
+        images:
+          - legacy-batch=ghcr.io/example/legacy-batch:v1.0.0
+  destination:
+    cluster: in-cluster
+    namespace: legacy-batch
+  ignoreDifferences: []
+  requeueAfterSeconds: 300
+  revisionHistoryLimit: 3

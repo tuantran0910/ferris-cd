@@ -1,0 +1,32 @@
+# A `v1.0` `AppProject`: allow-lists only. `syncWindows` (`T17.4`) and `policyRules` (`T20.2`) did
+# not exist yet, so this object must keep round-tripping without them being filled in.
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: payments
+  namespace: ferriscd-system
+spec:
+  description: "Payments platform (v1.0 fixture)"
+  sourceRepos:
+    - https://github.com/example/payments.git
+    - "!https://github.com/example/legacy-*"
+  sourceNamespaces:
+    - ferriscd-system
+    - payments
+  destinations:
+    - cluster: in-cluster
+      namespace: payments
+    - cluster: prod-eu
+      namespace: "*"
+  clusterResourceWhitelist:
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: ConfigMap
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: LimitRange
+  allowedServiceAccounts:
+    - payments/payments-deployer
+    - payments:*

@@ -862,6 +862,8 @@ dependencies = [
  "ferriscd-crd",
  "ferriscd-engine",
  "ferriscd-server",
+ "http",
+ "jiff",
  "k8s-openapi",
  "kube",
  "reqwest",
@@ -874,6 +876,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
 ]
 
