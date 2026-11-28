@@ -1,0 +1,106 @@
+# TEMPORARY — `T20.5` acceptance benchmark.
+#
+# This workflow runs the 250-application / 2,500-resource / 3-shard fleet soak
+# (60 minutes) on a throwaway `kind` cluster and publishes the harness' verdict
+# (`summary.txt`) in the job summary.
+#
+# It exists so the 60-minute soak does not have to run on a developer's laptop.
+# It is **not** part of the permanent CI gate: remove this file once the `v2.0`
+# release is signed off (the harness itself stays in `benchmarks/`).
+name: v2 Fleet Benchmark (temporary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apps:
+        description: "Applications in the fleet"
+        required: false
+        default: "250"
+      soak_minutes:
+        description: "Soak duration in minutes"
+        required: false
+        default: "60"
+      total_shards:
+        description: "Control-plane shards"
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v2-fleet-benchmark
+  cancel-in-progress: false
+
+jobs:
+  fleet-benchmark:
+    name: 250 apps / 2,500 resources / 3 shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Install kind and kubectl
+        uses: taiki-e/install-action@18101caa61cb89118e2ee749786f33c6d1f8a8cb # v2.90.9
+        with:
+          tool: kind@v0.33.0,kubectl@v1.35.0
+
+      - name: Create the throwaway kind cluster
+        run: |
+          set -euo pipefail
+          kind create cluster --name ferriscd-bench --wait 120s
+          kubectl config current-context
+
+      - name: Install the CRDs and the control-plane namespace
+        run: |
+          set -euo pipefail
+          kubectl apply -f deploy/crds/
+          kubectl create namespace ferriscd-system
+          kubectl wait --for=condition=Established --timeout=120s \
+            crd/applications.ferriscd.io crd/appprojects.ferriscd.io crd/applicationsets.ferriscd.io
+
+      - name: Run the sharded fleet benchmark
+        run: |
+          set -euo pipefail
+          ./benchmarks/scale_250_sharded.sh \
+            --apps "${{ github.event.inputs.apps }}" \
+            --resources-per-app 10 \
+            --total-shards "${{ github.event.inputs.total_shards }}" \
+            --soak-minutes "${{ github.event.inputs.soak_minutes }}" \
+            --warmup-minutes 5 \
+            --sample-interval 30 \
+            --commit-interval 600 \
+            --drift-interval 300 \
+            --convergence-timeout 1800 \
+            --drift-heal-timeout 300 \
+            --control-plane-namespace ferriscd-system \
+            --results-dir benchmark-results
+
+      - name: Publish the benchmark verdict
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "### FerrisCD v2.0 fleet benchmark"
+            echo
+            if [[ -f benchmark-results/summary.txt ]]; then
+              echo '```'
+              cat benchmark-results/summary.txt
+              echo '```'
+            else
+              echo "The benchmark did not produce a summary (see the job log)."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload the raw artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: v2-fleet-benchmark
+          path: benchmark-results/
+          if-no-files-found: warn
+          retention-days: 14
