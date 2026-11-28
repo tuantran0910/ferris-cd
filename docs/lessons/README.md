@@ -5,7 +5,7 @@
 > paired with Architecture Decision Records (ADRs) and reproducible `kind` Kubernetes experiments.
 
 * **Master Architecture & Specs:** [MASTER_PLAN.md](../MASTER_PLAN.md) · [ROADMAP.md](../ROADMAP.md) · [REVIEW_LOG.md](../REVIEW_LOG.md)
-* **Day-2 Operations & Benchmarks:** [Operations Runbook](../operations/RUNBOOK.md) · [v1.0 Scale & Soak Benchmark](../benchmarks/v1.0.md)
+* **Day-2 Operations & Benchmarks:** [Operations Runbook](../operations/RUNBOOK.md) · [v1.0 Scale & Soak Benchmark](../benchmarks/v1.0.md) · [v2.0 Sharded Fleet Benchmark](../benchmarks/v2.0.md)
 
 ---
 
@@ -76,3 +76,6 @@ Read these three foundational ADRs first — every lesson builds on the boundari
 | Milestone | Lesson | Learning Objectives | Key Codebase Artifacts |
 |---|---|---|---|
 | **`v1.1`** | [Lesson 17: Production Hardening, Live Governance & Software Supply-Chain Security](17-production-hardening-live-governance-and-supply-chain.md) | Watch-backed lock-free `/readyz` barrier, live `ferriscd-rbac-cm` hot-reload (fail-safe retention / fail-closed deletion), tenant-scoped cluster discovery, versioned `ferriscd.io/audit/v1` compliance audit trail with SSRF-guarded non-blocking sinks, `deny.toml` governance, 40-char SHA-pinned CI workflows, CycloneDX SBOMs, keyless Cosign digest signing & SLSA Level 3 provenance | `deny.toml`, `.cargo/audit.toml`, `.github/workflows/{ci,security-audit,release}.yml`, `SECURITY.md` |
+| **`v1.1`** | [Lesson 18: Drift Watchers & OCI GitOps Sources](18-drift-watchers-and-oci-gitops-sources.md) | Label-scoped out-of-band drift watchers with per-cluster watch supervision and self-echo suppression, OCI registry sources (digest pinning, blob extraction, `WWW-Authenticate` challenge, token cache), render-cache probe before any fetch | `crates/ferriscd-controller/src/drift_watcher.rs`, `crates/ferriscd-engine/src/repo/{registry,oci}.rs` |
+| **`v1.1`** | [Lesson 19: Enterprise SSO, ApplicationSets & Event-Driven Notifications](19-enterprise-sso-applicationsets-and-notifications.md) | OIDC login with PKCE, `ApplicationSet` fleet generation (list/git/clusters/matrix generators), event-driven notifications as a status-writer decorator, SSRF-guarded webhook delivery with per-tenant allowlists | `crates/ferriscd-server/src/{auth,oidc}.rs`, `crates/ferriscd-controller/src/{applicationset_controller,notifications}/` |
+| **`v2.0`** | [Lesson 20: Multi-Source, Policy Gates, Progressive Delivery, Disaster Recovery & Fleet Scale](20-multi-source-policy-progressive-delivery-and-fleet-scale.md) | Multi-source `Application`s with `$ref` composition and per-source rollback pins, CEL + OPA policy gates that fail closed, metric-gated progressive delivery with an admin-allowlisted provider list, secret-free DR bundles with SSA restore, 250-app / 3-shard fleet benchmark and an RBAC-scoped fleet overview | `crates/ferriscd-engine/src/{manifest/sources,policy,health/progressive}.rs`, `crates/ferriscd-controller/src/metric_gate.rs`, `crates/ferriscd-cli/src/commands/backup.rs`, `benchmarks/scale_250_sharded.sh`, `apps/ferriscd-web/src/features/overview/` |
