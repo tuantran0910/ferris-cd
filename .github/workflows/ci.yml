@@ -15,6 +15,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_BUILD_JOBS: ${{ vars.CI_CARGO_JOBS || '4' }}
 
 jobs:
   yaml-hygiene:
@@ -246,66 +250,80 @@ jobs:
             puts "OK: Kustomize overlay (#{docs.size} manifests)"
           '
 
-  ci:
-    name: Format, Clippy & Test
+  lint:
+    name: Lint (fmt + clippy)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Detect Rust workspace
-        id: workspace
-        run: |
-          if [ -f Cargo.toml ]; then
-            echo "has_cargo=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_cargo=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
-        if: steps.workspace.outputs.has_cargo == 'true'
         with:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        if: steps.workspace.outputs.has_cargo == 'true'
+        with:
+          shared-key: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
-        if: steps.workspace.outputs.has_cargo == 'true'
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        if: steps.workspace.outputs.has_cargo == 'true'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run Clippy (engine test-utils + opa-policy features)
-        if: steps.workspace.outputs.has_cargo == 'true'
-        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-engine --features test-utils,opa-policy --all-targets -- -D warnings
+        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy --locked -p ferriscd-engine --features test-utils,opa-policy --all-targets -- -D warnings
 
       - name: Run Clippy (controller opa-policy feature)
-        if: steps.workspace.outputs.has_cargo == 'true'
-        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy -p ferriscd-controller --features opa-policy --all-targets -- -D warnings
+        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo clippy --locked -p ferriscd-controller --features opa-policy --all-targets -- -D warnings
+
+  test:
+    name: Test (workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run tests
-        if: steps.workspace.outputs.has_cargo == 'true'
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
-      # The embedded OPA/Rego engine (`T20.2`) is default-off, so it is only compiled — and only
-      # audited — in a feature build. These lines are what keep it from rotting.
+  feature-tests:
+    name: Feature tests (opa-policy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: rust
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Run tests (embedded Rego engine)
-        if: steps.workspace.outputs.has_cargo == 'true'
-        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo test -p ferriscd-engine --features opa-policy
+        run: K8S_OPENAPI_ENABLED_VERSION=1.35 cargo test --locked -p ferriscd-engine --features opa-policy
 
       - name: Run tests (controller with the Rego engine wired)
-        if: steps.workspace.outputs.has_cargo == 'true'
-        run: cargo test -p ferriscd-controller --features opa-policy
+        run: cargo test --locked -p ferriscd-controller --features opa-policy
 
-      # `T20.2` finding H3: the feature has to be reachable from the **shipped binary**, and an
-      # unreachable feature is one that rots. `ferriscd-cli` forwards `opa-policy` to the controller
-      # (and the engine), which is what the image's `FERRISCD_FEATURES` build arg turns on; without
-      # this line nothing in CI would notice if that forwarding broke.
-      - name: Check the shipped binary with the Rego engine (`opa-policy`)
-        if: steps.workspace.outputs.has_cargo == 'true'
-        run: cargo check -p ferriscd-cli --features opa-policy
+      - name: Check the shipped binary with the Rego engine
+        run: cargo check --locked -p ferriscd-cli --features opa-policy
+
+  ci:
+    name: Format, Clippy & Test
+    needs: [lint, test, feature-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All required Rust checks passed."
 
   web-ui:
     name: Web UI Typecheck, Test & Build
