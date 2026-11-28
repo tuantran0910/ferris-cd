@@ -1,8 +1,9 @@
-//! FerrisCD Custom Resource Definitions (`Application`, `AppProject`),
+//! FerrisCD Custom Resource Definitions (`Application`, `AppProject`, `ApplicationSet`),
 //! status subresource models, and version-agnostic GKNN inventory types.
 
 pub mod annotations;
 pub mod application;
+pub mod applicationset;
 pub mod generate;
 pub mod project;
 pub mod status;
@@ -13,6 +14,13 @@ pub use application::{
     GitSourceSpec, HelmRenderer, IgnoreDifference, KustomizeRenderer, MAX_OCI_TAG_LEN,
     OCI_DIGEST_HEX_LEN, OCI_DIGEST_PREFIX, OciSourceSpec, PlainYamlRenderer, RendererSpec,
     RetryBackoff, RetryPolicy, SourceSpec, SpecValidationError, SyncOptions, SyncPolicy,
+};
+pub use applicationset::{
+    APPLICATIONSET_FINALIZER, APPLICATIONSET_LABEL, ApplicationSet, ApplicationSetGenerator,
+    ApplicationSetSpec, ApplicationSetSpecError, ApplicationSetStatus, ApplicationSetSyncPolicy,
+    ApplicationSetTemplate, ApplicationSetTemplateMetadata, ClusterGenerator, ClusterSelector,
+    GitDirectoryPattern, GitFilePattern, GitGenerator, ListGenerator, MAX_GENERATED_APPLICATIONS,
+    MatrixChildGenerator, MatrixGenerator,
 };
 pub use project::{
     AppProject, AppProjectSpec, AppProjectStatus, GroupKind, ProjectDestination,

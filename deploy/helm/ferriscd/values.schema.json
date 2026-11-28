@@ -71,7 +71,9 @@
           }
         },
         "manageCrds": { "type": "boolean" },
-        "manageRbacResources": { "type": "boolean" }
+        "manageRbacResources": { "type": "boolean" },
+        "applicationsets": { "type": "boolean" },
+        "applicationsetPrune": { "type": "boolean" }
       }
     },
     "rbacPolicy": {

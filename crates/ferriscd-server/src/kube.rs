@@ -43,10 +43,11 @@ use crate::rbac::{
     RbacPolicyStore,
 };
 use crate::state::{
-    AppState, ApplicationEvent, ApplicationSnapshotSource, ApplicationSource, ChildNode,
-    ClusterCatalog, ClusterEntry, DiffSource, EventSource, GRAPH_LIST_LIMIT, GraphRequest,
-    GraphTraversal, InventoryReader, ListKey, ListedNode, LiveResourceState, OperationRequest,
-    OperationWriter, ProjectCatalog, Readiness, SeamFuture, WorkloadGraphSource,
+    AppState, ApplicationEvent, ApplicationSetCatalog, ApplicationSnapshotSource,
+    ApplicationSource, ChildNode, ClusterCatalog, ClusterEntry, DiffSource, EventSource,
+    GRAPH_LIST_LIMIT, GraphRequest, GraphTraversal, InventoryReader, ListKey, ListedNode,
+    LiveResourceState, OperationRequest, OperationWriter, ProjectCatalog, Readiness, SeamFuture,
+    WorkloadGraphSource,
 };
 use crate::webhooks::{RefreshSink, RefreshTarget, WebhookConfig};
 
@@ -113,6 +114,11 @@ pub fn app_state(plane: &ControlPlane, webhooks: WebhookConfig) -> AppState {
     // `T17.3`: the read-only `events.k8s.io/v1` timeline and the RBAC-filtered SSE snapshot feed,
     // both over the controller's own client (no second connector pool, no informer).
     .with_event_source(Arc::new(KubeEventSource::new(client.clone())))
+    // `T19.3`: the read-only `ApplicationSet` view (generation is the opt-in controller loop's job).
+    .with_applicationset_catalog(Arc::new(KubeApplicationSetCatalog::new(
+        client.clone(),
+        plane.namespace(),
+    )))
     .with_snapshot_source(Arc::new(PollingApplicationSnapshot::new(
         Arc::new(KubeApplicationSource::new(
             client.clone(),
@@ -245,6 +251,43 @@ impl ProjectCatalog for KubeProjectCatalog {
                 .get_opt(&name)
                 .await
                 .map_err(|err| ApiError::backend(&err))
+        })
+    }
+}
+
+/// Reads `ApplicationSet`s from the control-plane namespace (never cluster-wide, `T19.3`).
+pub struct KubeApplicationSetCatalog {
+    api: Api<ferriscd_crd::ApplicationSet>,
+}
+
+impl std::fmt::Debug for KubeApplicationSetCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KubeApplicationSetCatalog")
+            .finish_non_exhaustive()
+    }
+}
+
+impl KubeApplicationSetCatalog {
+    /// Builds a catalog reading `namespace` (the control-plane namespace).
+    #[must_use]
+    pub fn new(client: Client, namespace: &str) -> Self {
+        Self {
+            api: Api::namespaced(client, namespace),
+        }
+    }
+}
+
+impl ApplicationSetCatalog for KubeApplicationSetCatalog {
+    fn list(&self) -> SeamFuture<'_, Vec<ferriscd_crd::ApplicationSet>> {
+        Box::pin(async move {
+            let mut items = self
+                .api
+                .list(&ListParams::default())
+                .await
+                .map_err(|err| ApiError::backend(&err))?
+                .items;
+            items.sort_by_key(|appset| appset.name_any());
+            Ok(items)
         })
     }
 }
