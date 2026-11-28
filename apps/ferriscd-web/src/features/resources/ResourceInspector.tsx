@@ -63,7 +63,7 @@ export function ResourceInspector({
         data-testid="resource-inspector-backdrop"
         aria-hidden="true"
         onClick={onClose}
-        className="motion-fade-in fixed inset-0 z-30 bg-slate-950/50 backdrop-blur-[1px]"
+        className="motion-fade-in fixed inset-0 z-30 bg-black/40 backdrop-blur-[1px]"
       />
       <aside
         aria-label="Resource Inspector"

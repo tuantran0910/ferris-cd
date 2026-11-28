@@ -59,7 +59,7 @@ export function Modal({
         aria-hidden="true"
         data-testid="modal-backdrop"
         onClick={onBackdropClick}
-        className="motion-fade-in fixed inset-0 bg-slate-950/80 backdrop-blur-sm"
+        className="motion-fade-in fixed inset-0 bg-black/70 backdrop-blur-sm"
       />
       <div
         data-testid="modal-outside"
