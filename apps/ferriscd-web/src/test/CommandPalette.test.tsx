@@ -242,7 +242,7 @@ describe("CommandPalette (T17.3)", () => {
     renderPalette();
     await user.keyboard("{Control>}k{/Control}");
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
-    await user.click(screen.getByTestId("modal-backdrop"));
+    await user.click(screen.getByTestId("modal-outside"));
     await waitFor(() =>
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
     );

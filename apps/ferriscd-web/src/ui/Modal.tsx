@@ -61,7 +61,15 @@ export function Modal({
         onClick={onBackdropClick}
         className="motion-fade-in fixed inset-0 bg-slate-950/80 backdrop-blur-sm"
       />
-      <div className="relative flex min-h-full items-center justify-center p-4">
+      <div
+        data-testid="modal-outside"
+        className="relative flex min-h-full items-center justify-center p-4"
+        onClick={(event) => {
+          if (event.target === event.currentTarget) {
+            onBackdropClick?.();
+          }
+        }}
+      >
         <div
           ref={dialogRef}
           tabIndex={-1}
