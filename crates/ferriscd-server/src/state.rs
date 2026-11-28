@@ -225,10 +225,28 @@ pub trait ApplicationSource: Send + Sync + 'static {
     fn get(&self, namespace: &str, name: &str) -> SeamFuture<'_, Option<Application>>;
 }
 
-/// Reads `AppProject` objects (`GET /api/v1/projects`).
+/// Reads `AppProject` objects (`GET /api/v1/projects`, and the sync-window verdict of
+/// `GET /api/v1/applications/{namespace}/{name}`).
 pub trait ProjectCatalog: Send + Sync + 'static {
     /// Lists every `AppProject` of the control-plane namespace.
     fn list(&self) -> SeamFuture<'_, Vec<AppProject>>;
+
+    /// Reads one `AppProject`, or `Ok(None)` when it does not exist (finding M-4).
+    ///
+    /// The application-detail path needs exactly one project — the one its `spec.project` names — so
+    /// it must not list (and deserialize) the whole catalogue to find it. The default implementation
+    /// is that listing, which keeps every test fake honest without an extra method; the production
+    /// adapter ([`crate::kube::KubeProjectCatalog`]) overrides it with a single `Api::get_opt`.
+    fn get(&self, name: &str) -> SeamFuture<'_, Option<AppProject>> {
+        let name = name.to_owned();
+        Box::pin(async move {
+            Ok(self
+                .list()
+                .await?
+                .into_iter()
+                .find(|project| project.metadata.name.as_deref() == Some(name.as_str())))
+        })
+    }
 }
 
 /// The most Kubernetes `Event`s one `GET .../events` response carries (`T17.3`).

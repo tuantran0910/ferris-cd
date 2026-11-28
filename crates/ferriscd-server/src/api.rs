@@ -60,8 +60,10 @@ use ferriscd_crd::status::{
 use ferriscd_crd::{AppProject, Application};
 use ferriscd_engine::diff::ResourceDiff;
 use ferriscd_engine::manifest::ResourceKey;
+use ferriscd_engine::policy::{SyncWindowSet, SyncWindowTarget};
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
+use k8s_openapi::jiff::Timestamp;
 use kube::ResourceExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -273,6 +275,17 @@ pub struct ApplicationDetailView {
     /// The running operation, when one is recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<OperationView>,
+    /// The `AppProject` sync-window verdict for this `Application` right now (`T17.4`).
+    ///
+    /// Absent when the project configures no window: a project without governance windows adds
+    /// nothing to the payload. (`ApplicationDetailView` has no `rename_all`, so the wire name is
+    /// spelled out here to stay camelCase like the rest of the API.)
+    #[serde(
+        rename = "syncWindow",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sync_window: Option<SyncWindowGateView>,
 }
 
 /// One node of the resource graph.
@@ -480,6 +493,81 @@ pub struct ProjectView {
     /// `spec.allowedServiceAccounts`.
     #[serde(default)]
     pub allowed_service_accounts: Vec<String>,
+    /// `spec.syncWindows`, each with its state at the moment of the response (`T17.4`).
+    ///
+    /// Empty (and omitted) for a project that configures no window, so the pre-`T17.4` payload is
+    /// byte-identical for every such project.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sync_windows: Vec<ProjectSyncWindowView>,
+    /// When the next window starts or stops (RFC 3339), across every configured window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_sync_window_transition: Option<String>,
+}
+
+/// One `spec.syncWindows[]` entry with its state at the moment of the response (`T17.4`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSyncWindowView {
+    /// `allow` or `deny` (deny wins over allow).
+    pub kind: String,
+    /// The 5-field cron expression, verbatim.
+    pub schedule: String,
+    /// The duration, verbatim (`30m`, `2h`, `7d`).
+    pub duration: String,
+    /// The effective IANA time zone (`UTC` when `spec.syncWindows[].timeZone` is absent).
+    pub time_zone: String,
+    /// Glob patterns for `Application.metadata.name` (empty = every application).
+    #[serde(default)]
+    pub applications: Vec<String>,
+    /// Glob patterns for `Application.metadata.namespace` (empty = every namespace).
+    #[serde(default)]
+    pub namespaces: Vec<String>,
+    /// Glob patterns for `spec.destination.cluster` (empty = every cluster).
+    #[serde(default)]
+    pub clusters: Vec<String>,
+    /// Whether a manual sync may override this window.
+    pub manual_sync: bool,
+    /// Whether the window is open right now.
+    pub active: bool,
+    /// When the currently open occurrence started (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<String>,
+    /// When the currently open occurrence ends (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ends_at: Option<String>,
+    /// The next occurrence that starts after now (RFC 3339), within a year.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_start: Option<String>,
+    /// Why this entry cannot be evaluated. The project is deny-all while it is set (fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The sync-window verdict for one `Application` right now (`T17.4`).
+///
+/// The UI needs this to explain a blocked `POST .../sync` *before* the operator clicks: a window is
+/// a time-based refusal, and "nothing happened" is indistinguishable from a controller stall
+/// otherwise. `manualOverride` says whether a manual sync would be honoured anyway
+/// (`manualSync: true` on every blocking window).
+///
+/// A blocked manual sync is **deferred, not rejected**: the controller pauses the requested
+/// operation and runs it when the window lifts, without asking again (finding N-c), so the modal
+/// tells the operator *when* it will happen rather than to come back and click twice.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncWindowGateView {
+    /// Whether a manual sync would be skipped right now.
+    pub blocked: bool,
+    /// `denyWindowActive`, `outsideAllowWindow`, or `invalidWindow`; absent when not blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Human-readable explanation, including the next window transition.
+    pub message: String,
+    /// Whether `manualSync: true` makes a manual sync still executable.
+    pub manual_override: bool,
+    /// When the verdict could change (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_transition: Option<String>,
 }
 
 /// `GET /api/v1/clusters` body.
@@ -855,7 +943,32 @@ pub async fn get_application(
         Action::Get,
         "read",
     )?;
-    Ok(Json(application_detail(&app)))
+    // `T17.4`: the sync-window verdict the modal explains.
+    //
+    // Finding M4: the project is a *different* object from the `Application`, so the caller's grant
+    // on the `Application` is not a grant on the project's `spec.syncWindows` — the verdict is only
+    // derived from a project this actor may see, and is omitted (not guessed) otherwise. A project
+    // that cannot be read is logged rather than silently answering "no windows", which would
+    // tell every caller that their change freeze does not exist.
+    //
+    // Finding M-4: the project is resolved by name (`ProjectCatalog::get`), the one object this
+    // page needs, instead of listing the whole catalogue per request. Every "not resolvable" answer
+    // — absent, or invisible to this actor — still yields no verdict at all.
+    let now = Timestamp::now();
+    let project = match state.projects.get(&app.spec.project).await {
+        Ok(project) => project,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                application = %format!("{namespace}/{name}"),
+                project = %app.spec.project,
+                "could not read the AppProject to compute the sync-window verdict; omitting it"
+            );
+            None
+        }
+    };
+    let project = project.filter(|project| actor.can_see(&project.name_any()));
+    Ok(Json(application_detail(&app, project.as_ref(), now)))
 }
 
 /// Reads the live resource graph of an `Application` (`T14.1`).
@@ -1811,11 +1924,14 @@ pub async fn list_projects(
     let rbac = state.rbac.snapshot();
     let actor = Actor::new(&rbac, &identity);
     let projects = state.projects.list().await?;
+    // One clock for the whole response: every window in the list is evaluated at the same instant,
+    // so `active`/`nextStart` cannot contradict each other between entries.
+    let now = Timestamp::now();
     Ok(Json(ProjectListView {
         items: projects
             .iter()
             .filter(|project| actor.can_see(&project.name_any()))
-            .map(project_view)
+            .map(|project| project_view(project, now))
             .collect(),
     }))
 }
@@ -1997,10 +2113,11 @@ fn application_summary(app: &Application) -> ApplicationSummary {
         name: app.name_any(),
         project: app.spec.project.clone(),
         source: SourceView {
-            // A Git remote routinely carries a personal access token (`https://oauth2:ghp_...@...`).
-            repo_url: ferriscd_engine::manifest::redact_repo_url(&app.spec.source.git.repo_url),
-            path: app.spec.source.git.path.clone(),
-            target_revision: app.spec.source.git.target_revision.clone(),
+            // A Git remote routinely carries a personal access token (`https://oauth2:ghp_...@...`);
+            // the same rule covers an `oci://` reference.
+            repo_url: ferriscd_engine::manifest::redact_repo_url(app.spec.source.repo_url()),
+            path: app.spec.source.source_path().to_owned(),
+            target_revision: app.spec.source.requested_revision().to_owned(),
             renderer: renderer_label(&app.spec.source.renderer).to_owned(),
         },
         destination: DestinationView {
@@ -2027,7 +2144,11 @@ fn application_summary(app: &Application) -> ApplicationSummary {
 }
 
 /// Maps an `Application` to its detail representation.
-fn application_detail(app: &Application) -> ApplicationDetailView {
+fn application_detail(
+    app: &Application,
+    project: Option<&AppProject>,
+    now: Timestamp,
+) -> ApplicationDetailView {
     let status = app.status.as_ref();
     ApplicationDetailView {
         application: application_summary(app),
@@ -2037,6 +2158,7 @@ fn application_detail(app: &Application) -> ApplicationDetailView {
         operation: status
             .and_then(|status| status.operation_state.as_ref())
             .map(operation_view),
+        sync_window: sync_window_gate_view(project, app, now),
     }
 }
 
@@ -2088,7 +2210,8 @@ fn operation_view(state: &ferriscd_crd::status::OperationState) -> OperationView
     }
 }
 
-fn project_view(project: &AppProject) -> ProjectView {
+fn project_view(project: &AppProject, now: Timestamp) -> ProjectView {
+    let windows = windows_view(project, now);
     ProjectView {
         name: project.name_any(),
         description: project.spec.description.clone(),
@@ -2101,7 +2224,111 @@ fn project_view(project: &AppProject) -> ProjectView {
             .map(|destination| format!("{}/{}", destination.cluster, destination.namespace))
             .collect(),
         allowed_service_accounts: project.spec.allowed_service_accounts.clone(),
+        sync_windows: windows.items,
+        next_sync_window_transition: windows.next_transition,
     }
+}
+
+/// Rendering of `spec.syncWindows` for the API, with the state each window is in at `now`.
+struct WindowsView {
+    items: Vec<ProjectSyncWindowView>,
+    next_transition: Option<String>,
+}
+
+/// Builds the window list in `spec` order, with unparseable entries marked instead of dropped.
+///
+/// The evaluation is the engine's ([`ferriscd_engine::policy::SyncWindowSet`]), never a second
+/// implementation: `GET /api/v1/projects` and the controller's gate must agree about whether a
+/// window is open.
+fn windows_view(project: &AppProject, now: Timestamp) -> WindowsView {
+    let spec = &project.spec;
+    if spec.sync_windows.is_empty() {
+        return WindowsView {
+            items: Vec::new(),
+            next_transition: None,
+        };
+    }
+    let set = SyncWindowSet::from_spec(spec);
+    let statuses = set.statuses(now);
+    let items = spec
+        .sync_windows
+        .iter()
+        .enumerate()
+        .map(|(index, window)| {
+            let status = statuses.iter().find(|status| status.index == index);
+            ProjectSyncWindowView {
+                kind: window.kind.as_str().to_owned(),
+                schedule: status.map_or_else(
+                    || window.schedule.trim().to_owned(),
+                    |status| status.schedule.clone(),
+                ),
+                duration: window.duration.trim().to_owned(),
+                time_zone: window.time_zone_name().to_owned(),
+                applications: window.applications.clone(),
+                namespaces: window.namespaces.clone(),
+                clusters: window.clusters.clone(),
+                manual_sync: window.manual_sync,
+                active: status.is_some_and(|status| status.active),
+                starts_at: status
+                    .and_then(|status| status.starts_at)
+                    .map(|instant| instant.to_string()),
+                ends_at: status
+                    .and_then(|status| status.ends_at)
+                    .map(|instant| instant.to_string()),
+                next_start: status
+                    .and_then(|status| status.next_start)
+                    .map(|instant| instant.to_string()),
+                error: set
+                    .invalid()
+                    .iter()
+                    .find(|invalid| invalid.index == index)
+                    .map(|invalid| invalid.message.clone()),
+            }
+        })
+        .collect();
+    let next_transition = statuses
+        .iter()
+        .flat_map(|status| [status.ends_at, status.next_start])
+        .flatten()
+        .filter(|instant| *instant > now)
+        .min()
+        .map(|instant| instant.to_string());
+    WindowsView {
+        items,
+        next_transition,
+    }
+}
+
+/// The `T17.4` verdict for one `Application`, from its project's windows.
+///
+/// `None` when the project has no windows (nothing to explain) or is not in the catalogue (the
+/// reconcile path already reports a missing project as a terminal policy denial — inventing a
+/// window verdict for it here would be a second, quieter answer).
+fn sync_window_gate_view(
+    project: Option<&AppProject>,
+    app: &Application,
+    now: Timestamp,
+) -> Option<SyncWindowGateView> {
+    let project = project?;
+    if !project.spec.has_sync_windows() {
+        return None;
+    }
+    let set = SyncWindowSet::from_spec(&project.spec);
+    let namespace = app.namespace().unwrap_or_default();
+    let name = app.name_any();
+    let target = SyncWindowTarget::new(&name, &namespace, &app.spec.destination.cluster);
+    // A `Manual` trigger is what the modal asks about: `POST .../sync` is always manual, so the
+    // view answers "would *my* click be honoured?".
+    let verdict = set.evaluate(now, &target);
+    Some(SyncWindowGateView {
+        blocked: verdict.is_denied(),
+        reason: verdict
+            .denial()
+            .map(|denial| denial.reason.as_str().to_owned()),
+        message: verdict.message(now),
+        manual_override: verdict.manual_override(),
+        next_transition: verdict.next_transition().map(|instant| instant.to_string()),
+    })
 }
 
 /// Per-resource health recorded by the last reconcile, keyed by GKNN.

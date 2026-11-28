@@ -878,6 +878,7 @@ mod tests {
     #[test]
     fn the_detail_and_history_views_carry_the_server_values() {
         let detail = ApplicationDetailView {
+            sync_window: None,
             application: summary(),
             history: vec![HistoryView {
                 id: 7,
@@ -905,6 +906,7 @@ mod tests {
     #[test]
     fn watching_settles_on_the_operations_terminal_phase() {
         let mut detail = ApplicationDetailView {
+            sync_window: None,
             application: summary(),
             history: Vec::new(),
             operation: Some(OperationView {

@@ -104,7 +104,10 @@ pub use metrics::{
     SYNC_STATUS_VALUES,
 };
 pub use predicate::{ApplicationPredicate, PredicateTracker, composite_hash};
-pub use project::{ApiProjectSource, ProjectSource};
+pub use project::{
+    ApiProjectSource, ApiProjectStatusSink, ProjectSource, ProjectStatusSink,
+    REASON_SYNC_WINDOW_INVALID, sync_window_condition,
+};
 pub use prune::{
     OwnershipVerifiedPruner, PruneResult, ResourcePruner, RetainReason, prune_opted_out, prune_rail,
 };
@@ -975,6 +978,12 @@ pub async fn prepare(options: RunOptions) -> anyhow::Result<ControlPlane> {
         // `T12.1`: every `Application` is validated against its `AppProject`, which is read from
         // the control-plane namespace (never from the `Application`'s own namespace).
         .with_project_source(Arc::new(ApiProjectSource::new(
+            client.clone(),
+            &config.namespace,
+        )))
+        // `T17.4`: an unusable `spec.syncWindows` entry is deny-all at runtime; this is the one
+        // `AppProject` `/status` write that explains it (skipped unless the condition changed).
+        .with_project_status(Arc::new(ApiProjectStatusSink::new(
             client.clone(),
             &config.namespace,
         )))

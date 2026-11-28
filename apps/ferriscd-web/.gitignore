@@ -3,4 +3,5 @@ dist/
 coverage/
 .vite/
 *.local
+*.tsbuildinfo
 .DS_Store
