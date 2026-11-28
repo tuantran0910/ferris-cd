@@ -2,6 +2,8 @@ import { Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { ResourceGraphView, ResourceNodeView } from "../../api/types";
 import { HealthStatusBadge, SyncStatusBadge } from "../../ui/StatusBadges";
+import { Badge } from "../../ui/Badge";
+import { kindTone } from "../../ui/kindTone";
 import { Select } from "../../ui/Select";
 
 export interface ResourceTableProps {
@@ -113,8 +115,10 @@ export function ResourceTable({ nodes, graph, onSelect }: ResourceTableProps) {
                   }}
                   className="cursor-pointer transition-colors hover:bg-elevated focus-visible:bg-elevated"
                 >
-                  <td className="whitespace-nowrap px-4 py-2.5 font-medium text-accent">
-                    {node.kind}
+                  <td className="whitespace-nowrap px-4 py-2.5">
+                    <Badge tone={kindTone(node.kind)} size="sm" className="font-mono">
+                      {node.kind}
+                    </Badge>
                   </td>
                   <td
                     className="max-w-[220px] truncate px-4 py-2.5 font-mono text-ink-strong"

@@ -1,8 +1,11 @@
-import { Copy, Check, FileDiff, Layers, Shield, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { FileDiff, Layers, Shield, X } from "lucide-react";
+import { useEffect } from "react";
 import { createPortal } from "react-dom";
 import type { ResourceNodeView } from "../../api/types";
+import { Badge } from "../../ui/Badge";
 import { Button } from "../../ui/Button";
+import { CopyText } from "../../ui/CopyText";
+import { kindTone } from "../../ui/kindTone";
 import { HealthStatusBadge, SyncStatusBadge } from "../../ui/StatusBadges";
 
 export interface ResourceInspectorProps {
@@ -18,8 +21,6 @@ export function ResourceInspector({
   onClose,
   onInspectDiff,
 }: ResourceInspectorProps) {
-  const [copied, setCopied] = useState(false);
-
   useEffect(() => {
     if (!resource) {
       return;
@@ -42,21 +43,6 @@ export function ResourceInspector({
     ? "Missing"
     : resource.health ?? "Unknown";
 
-  const handleCopyKey = async () => {
-    try {
-      if (!navigator.clipboard?.writeText) {
-        // No clipboard API (insecure context): report nothing rather than
-        // claiming a copy that never happened.
-        return;
-      }
-      await navigator.clipboard.writeText(resource.key);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard access can be denied by permissions policy.
-    }
-  };
-
   return createPortal(
     <>
       <div
@@ -72,9 +58,9 @@ export function ResourceInspector({
       >
       <div className="flex items-start justify-between gap-3 border-b border-line px-5 py-4">
         <div className="min-w-0">
-          <p className="text-xs font-medium uppercase tracking-wider text-accent">
+          <Badge tone={kindTone(resource.kind)} size="sm" className="font-mono uppercase tracking-wider">
             {resource.kind}
-          </p>
+          </Badge>
           <h3 className="truncate text-lg font-semibold text-ink-strong">
             {resource.name}
           </h3>
@@ -99,28 +85,14 @@ export function ResourceInspector({
           <h4 className="text-xs font-semibold uppercase tracking-wider text-ink-muted">
             Version-Agnostic GKNN Key
           </h4>
-          <div className="flex items-center justify-between gap-2 rounded-lg border border-line bg-canvas px-3 py-2">
-            <code
-              data-testid="inspector-gknn"
-              className="break-all font-mono text-xs text-ink"
-            >
-              {resource.key}
-            </code>
-            <button
-              type="button"
-              onClick={handleCopyKey}
-              aria-label="Copy GKNN key"
-              className="shrink-0 rounded p-1 text-ink-muted transition-colors hover:bg-elevated hover:text-ink-strong"
-            >
-              {copied ? (
-                <Check className="h-3.5 w-3.5 text-success" />
-              ) : (
-                <Copy className="h-3.5 w-3.5" />
-              )}
-              <span aria-live="polite" className="sr-only">
-                {copied ? "Copied" : ""}
-              </span>
-            </button>
+          <div className="rounded-lg border border-line bg-canvas px-3 py-2">
+            <span data-testid="inspector-gknn">
+              <CopyText
+                value={resource.key}
+                label="GKNN key"
+                className="break-all text-xs text-ink"
+              />
+            </span>
           </div>
         </section>
 

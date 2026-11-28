@@ -2,12 +2,11 @@ import { RotateCcw } from "lucide-react";
 import type { HistoryView } from "../../../api/types";
 import { Button } from "../../../ui/Button";
 import { EmptyState } from "../../../ui/EmptyState";
-import { commitWebUrl, formatTimestamp, shortRevision } from "../../../utils/format";
+import { CopyText } from "../../../ui/CopyText";
+import { formatTimestamp, shortRevision } from "../../../utils/format";
 
 export interface HistoryTableProps {
   history: HistoryView[];
-  /** Repository the revisions belong to (for commit links). */
-  repoUrl: string;
   /** True once a 403 proved this identity cannot roll back. */
   rollbackForbidden: boolean;
   /** Opens the rollback modal pre-selected on this entry. */
@@ -23,7 +22,6 @@ export interface HistoryTableProps {
  */
 export function HistoryTable({
   history,
-  repoUrl,
   rollbackForbidden,
   onRollback,
 }: HistoryTableProps) {
@@ -49,7 +47,6 @@ export function HistoryTable({
             {[...history]
               .sort((a, b) => b.id - a.id)
               .map((entry) => {
-                const revisionUrl = commitWebUrl(repoUrl, entry.revision);
                 return (
                   <tr key={entry.id} className="hover:bg-elevated">
                     <td className="px-4 py-3 font-mono font-semibold text-ink-strong">
@@ -59,15 +56,12 @@ export function HistoryTable({
                       className="max-w-[280px] truncate px-4 py-3 font-mono text-accent"
                       title={entry.revision ?? undefined}
                     >
-                      {revisionUrl ? (
-                        <a
-                          href={revisionUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="underline decoration-indigo-500/40 decoration-dotted underline-offset-2 hover:text-accent hover:decoration-indigo-300"
-                        >
-                          {shortRevision(entry.revision, 12)}
-                        </a>
+                      {entry.revision ? (
+                        <CopyText
+                          value={entry.revision}
+                          display={shortRevision(entry.revision, 12)}
+                          label="revision"
+                        />
                       ) : (
                         shortRevision(entry.revision, 12)
                       )}

@@ -1,4 +1,5 @@
 import { render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 import type { ApplicationSummary } from "../api/types";
 import { SourcePanel } from "../features/applications/components/SourcePanel";
@@ -9,7 +10,11 @@ const DIGEST =
 
 /** Renders the panel and returns its source card. */
 function sourceCard(app: ApplicationSummary): HTMLElement {
-  render(<SourcePanel app={app} />);
+  render(
+    <MemoryRouter>
+      <SourcePanel app={app} />
+    </MemoryRouter>,
+  );
   return screen.getByTestId("source-card");
 }
 

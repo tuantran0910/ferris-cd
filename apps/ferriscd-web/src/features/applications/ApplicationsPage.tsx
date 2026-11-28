@@ -4,6 +4,7 @@ import { Link, useLocation, useSearchParams } from "react-router-dom";
 import type { ApplicationSummary } from "../../api/types";
 import { ApiErrorAlert } from "../../ui/ApiErrorBoundary";
 import { Button } from "../../ui/Button";
+import { CopyText } from "../../ui/CopyText";
 import { EmptyState } from "../../ui/EmptyState";
 import { LiveRegion } from "../../ui/LiveRegion";
 import {
@@ -409,7 +410,15 @@ export function ApplicationsPage() {
                     className="px-4 py-3 font-mono text-ink-body"
                     title={app.sync?.revision ?? undefined}
                   >
-                    {shortRevision(app.sync?.revision, 12)}
+                    {app.sync?.revision ? (
+                      <CopyText
+                        value={app.sync.revision}
+                        display={shortRevision(app.sync.revision, 12)}
+                        label="rendered revision"
+                      />
+                    ) : (
+                      shortRevision(app.sync?.revision, 12)
+                    )}
                   </td>
                   <td className="max-w-[200px] truncate px-4 py-3 font-mono text-ink-muted">
                     {app.destination.cluster}/{app.destination.namespace}

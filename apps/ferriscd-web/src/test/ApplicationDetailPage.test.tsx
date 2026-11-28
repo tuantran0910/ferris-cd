@@ -144,8 +144,11 @@ describe("ApplicationDetailPage (T16.2 & T16.4 integration)", () => {
       "sha256:9f2c6ab1de5a4c8e70f0f9b8d1a2c3e4f5061728394a5b6c7d8e9f0a1b2c3d4e",
     );
     // The registry reference is not a Git web link, and the collapsed revision
-    // row is replaced by the two OCI facts above.
-    expect(within(summarySection).queryByRole("link")).not.toBeInTheDocument();
+    // row is replaced by the two OCI facts above. Namespace/cluster rows are
+    // navigation links, so only the registry reference must stay plain.
+    expect(
+      within(summarySection).queryByRole("link", { name: /sha256:/ }),
+    ).not.toBeInTheDocument();
     expect(
       within(summarySection).queryByText("Target Revision"),
     ).not.toBeInTheDocument();

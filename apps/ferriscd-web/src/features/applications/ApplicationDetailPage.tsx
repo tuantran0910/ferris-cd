@@ -302,7 +302,7 @@ function ApplicationDetailContent({
       )}
 
       {operation && (
-        <OperationBanner operation={operation} repoUrl={app.source.repoUrl} />
+        <OperationBanner operation={operation} />
       )}
 
       {/* A blocked window is why an automated (and possibly a manual) sync is doing nothing:
@@ -432,7 +432,6 @@ function ApplicationDetailContent({
         {activeTab === "history" && (
           <HistoryTable
             history={history}
-            repoUrl={app.source.repoUrl}
             rollbackForbidden={rollbackForbidden}
             onRollback={(historyId) => {
               setRollbackInitialId(historyId);

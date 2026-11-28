@@ -6,6 +6,7 @@ import type {
   RollbackRequestBody,
 } from "../../api/types";
 import { Button } from "../../ui/Button";
+import { CopyText } from "../../ui/CopyText";
 import { EmptyState } from "../../ui/EmptyState";
 import { Modal, ModalBody, ModalFooter, ModalHeader } from "../../ui/Modal";
 import { describeOperationError } from "../../utils/apiErrorText";
@@ -182,7 +183,15 @@ export function RollbackModal({
                         className="break-all font-mono text-[11px] text-accent"
                         title={entry.revision ?? undefined}
                       >
-                        {shortRevision(entry.revision, 12)}
+                        {entry.revision ? (
+                          <CopyText
+                            value={entry.revision}
+                            display={shortRevision(entry.revision, 12)}
+                            label="rollback revision"
+                          />
+                        ) : (
+                          shortRevision(entry.revision, 12)
+                        )}
                       </p>
                     </div>
                   </div>

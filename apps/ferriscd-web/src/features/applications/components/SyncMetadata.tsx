@@ -1,11 +1,8 @@
 import { GitBranch } from "lucide-react";
 import type { ApplicationSummary } from "../../../api/types";
 import { Card } from "../../../ui/Card";
-import {
-  commitWebUrl,
-  formatTimestamp,
-  shortRevision,
-} from "../../../utils/format";
+import { CopyText } from "../../../ui/CopyText";
+import { formatTimestamp, shortRevision } from "../../../utils/format";
 
 /**
  * Third card of the source/destination summary: what the controller actually
@@ -16,14 +13,6 @@ import {
  * missing link never hides data.
  */
 export function SyncMetadata({ app }: { app: ApplicationSummary }) {
-  const renderedRevision = commitWebUrl(
-    app.source.repoUrl,
-    app.sync?.revision,
-  );
-  const lastSyncedRevision = commitWebUrl(
-    app.source.repoUrl,
-    app.sync?.lastSyncedRevision,
-  );
   // `T20.1`: a multi-source pass reports one revision per declared source.
   // They are shown next to the composite revision above, because the whole
   // point of the list is answering "did the values repository move?" — a
@@ -49,15 +38,13 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
             className="min-w-0 break-all text-right font-mono text-ink"
             title={app.sync?.revision ?? undefined}
           >
-            {renderedRevision ? (
-              <a
-                href={renderedRevision}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-accent hover:decoration-indigo-400"
-              >
-                {shortRevision(app.sync?.revision, 12)}
-              </a>
+            {app.sync?.revision ? (
+              <CopyText
+                value={app.sync.revision}
+                display={shortRevision(app.sync.revision, 12)}
+                label="rendered revision"
+                className="justify-end font-mono"
+              />
             ) : (
               shortRevision(app.sync?.revision, 12)
             )}
@@ -69,15 +56,13 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
             className="min-w-0 break-all text-right font-mono text-ink"
             title={app.sync?.lastSyncedRevision ?? undefined}
           >
-            {lastSyncedRevision ? (
-              <a
-                href={lastSyncedRevision}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-accent hover:decoration-indigo-400"
-              >
-                {shortRevision(app.sync?.lastSyncedRevision, 12)}
-              </a>
+            {app.sync?.lastSyncedRevision ? (
+              <CopyText
+                value={app.sync.lastSyncedRevision}
+                display={shortRevision(app.sync.lastSyncedRevision, 12)}
+                label="last synced revision"
+                className="justify-end font-mono"
+              />
             ) : (
               shortRevision(app.sync?.lastSyncedRevision, 12)
             )}
@@ -105,8 +90,6 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
                 // entry (an older payload, or a source added since the last
                 // pass) is labelled by position rather than dropped.
                 const alias = sources[index]?.ref?.trim();
-                const repoUrl = sources[index]?.repoUrl ?? app.source.repoUrl;
-                const href = commitWebUrl(repoUrl, revision);
                 return (
                   <li
                     key={`${alias ?? "source"}-${index}`}
@@ -120,18 +103,12 @@ export function SyncMetadata({ app }: { app: ApplicationSummary }) {
                       className="min-w-0 break-all text-right font-mono text-ink"
                       title={revision}
                     >
-                      {href ? (
-                        <a
-                          href={href}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="underline decoration-slate-500/60 decoration-dotted underline-offset-2 hover:text-accent hover:decoration-indigo-400"
-                        >
-                          {shortRevision(revision, 12)}
-                        </a>
-                      ) : (
-                        shortRevision(revision, 12)
-                      )}
+                      <CopyText
+                        value={revision}
+                        display={shortRevision(revision, 12)}
+                        label={`source ${alias ?? index + 1} revision`}
+                        className="justify-end font-mono"
+                      />
                     </span>
                   </li>
                 );

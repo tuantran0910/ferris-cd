@@ -10,6 +10,7 @@ import {
   ShieldAlert,
 } from "lucide-react";
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import type {
   DiffChange,
   DiffPayload,
@@ -18,8 +19,10 @@ import type {
 } from "../../api/types";
 import { isBlockingEnforcement } from "../../api/types";
 import { parseResourceKey } from "../../utils/format";
-import { CopyButton } from "../../ui/CopyButton";
+import { Badge } from "../../ui/Badge";
+import { CopyText } from "../../ui/CopyText";
 import { EmptyState } from "../../ui/EmptyState";
+import { kindTone } from "../../ui/kindTone";
 import {
   containsRedactedMarker,
   formatDiffValue,
@@ -39,16 +42,16 @@ type DiffStatusFilter =
   | "Synced";
 
 function getDiffStatusBadge(status: string): string {
-  switch (status) {
-    case "Synced":
+  switch (status.toLowerCase()) {
+    case "synced":
       return "border-emerald-500/40 bg-emerald-500/15 text-success";
-    case "OutOfSync":
+    case "outofsync":
       return "border-amber-500/40 bg-amber-500/15 text-warning";
-    case "Missing":
+    case "missing":
       return "border-sky-500/40 bg-sky-500/15 text-info";
-    case "Orphaned":
+    case "orphaned":
       return "border-rose-500/40 bg-rose-500/15 text-danger";
-    case "OwnershipConflict":
+    case "ownershipconflict":
       return "border-fuchsia-500/40 bg-fuchsia-500/15 text-accent-alt";
     default:
       return "border-line-emphasis bg-elevated text-ink-body";
@@ -221,36 +224,52 @@ function ResourceDiffCard({
       title={resource.key}
       className="rounded-xl border border-line bg-surface p-4 motion-fade-in"
     >
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-muted">
-            {identity.kind}
-          </span>
-          <span className="truncate text-sm font-semibold text-ink-strong">
-            {identity.name}
-          </span>
-          <span className="text-[11px] text-ink-muted">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge
+              tone={kindTone(identity.kind)}
+              size="sm"
+              className="font-mono uppercase tracking-wide"
+            >
+              {identity.kind}
+            </Badge>
+            <span className="truncate text-sm font-semibold text-ink-strong">
+              {identity.name}
+            </span>
+          </div>
+          <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ink-muted">
             {identity.namespace ? (
-              <>
-                namespace <span className="font-mono">{identity.namespace}</span>
-              </>
+              <span>
+                <span className="text-ink-subtle">Namespace:</span>{" "}
+                <Link
+                  to={`/?q=${encodeURIComponent(identity.namespace)}`}
+                  title={`Show applications in namespace ${identity.namespace}`}
+                  className="font-mono hover:text-accent hover:underline"
+                >
+                  {identity.namespace}
+                </Link>
+              </span>
             ) : (
-              "cluster-scoped"
+              <span>
+                <span className="text-ink-subtle">Scope:</span> cluster
+              </span>
             )}
             {identity.group ? (
-              <>
-                {" "}
-                · <span className="font-mono">{identity.group}</span>
-              </>
+              <span>
+                <span className="text-ink-subtle">Group:</span>{" "}
+                <span className="font-mono">{identity.group}</span>
+              </span>
             ) : null}
-          </span>
-          <CopyButton value={resource.key} label="resource key" />
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
           <span
             className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${getDiffStatusBadge(
               resource.status,
             )}`}
           >
-            {resource.status}
+            {resource.status.charAt(0).toUpperCase() + resource.status.slice(1)}
           </span>
           {conflicts.length > 0 && (
             <span
@@ -491,12 +510,11 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
         <div className="flex flex-wrap items-center gap-3 text-ink-body">
           <span className="min-w-0">
             Revision:{" "}
-            <code
-              className="break-all rounded bg-canvas px-1.5 py-0.5 font-mono text-accent"
-              title={diff.revision}
-            >
-              {diff.revision}
-            </code>
+            <CopyText
+              value={diff.revision}
+              label="revision"
+              className="break-all rounded bg-canvas px-1.5 py-0.5 text-accent"
+            />
           </span>
           <span>
             Desired resources:{" "}
@@ -554,7 +572,7 @@ export function DiffViewer({ diff, initialSearch = "" }: DiffViewerProps) {
             aria-label="Filter diff resources"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Filter resources by GKNN key..."
+            placeholder="Filter by kind, name or namespace..."
             className="w-full rounded-lg border border-control bg-surface py-2 pl-9 pr-3 text-xs text-ink-strong transition-colors placeholder-hint focus-visible:border-accent "
           />
         </div>

@@ -1,8 +1,9 @@
 import { Boxes, FolderGit2, Layers, Server } from "lucide-react";
 import type { ApplicationSummary, SourceEntryView } from "../../../api/types";
 import { Badge } from "../../../ui/Badge";
+import { CopyText } from "../../../ui/CopyText";
+import { Link } from "react-router-dom";
 import { Card } from "../../../ui/Card";
-import { CopyButton } from "../../../ui/CopyButton";
 import { repoWebUrl } from "../../../utils/format";
 import { SyncMetadata } from "./SyncMetadata";
 
@@ -51,6 +52,7 @@ function sourceCount(count: number): string {
  */
 export function SourcePanel({ app }: { app: ApplicationSummary }) {
   const oci = isOciSource(app);
+  const repoWeb = repoWebUrl(app.source.repoUrl);
   const sources = declaredSources(app);
   const multiSource = app.source.multiSource === true || sources.length > 1;
   return (
@@ -106,21 +108,20 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
               className="flex items-start justify-between gap-1 font-mono text-ink"
               title={app.source.repoUrl}
             >
-              <span className="min-w-0 break-all">
-                {repoWebUrl(app.source.repoUrl) ? (
+              <span className="min-w-0">
+                {repoWeb ? (
                   <a
-                    href={repoWebUrl(app.source.repoUrl)!}
+                    href={repoWeb}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="underline decoration-dotted underline-offset-2 hover:text-accent"
+                    className="break-all underline decoration-dotted underline-offset-2 hover:text-accent"
                   >
                     {app.source.repoUrl}
                   </a>
                 ) : (
-                  app.source.repoUrl
+                  <span className="break-all">{app.source.repoUrl}</span>
                 )}
               </span>
-              <CopyButton value={app.source.repoUrl} label="repository" />
             </dd>
           </div>
           <div className="flex justify-between gap-3">
@@ -130,7 +131,6 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
               title={app.source.path}
             >
               <span className="min-w-0 break-all">{app.source.path}</span>
-              <CopyButton value={app.source.path} label="path" />
             </dd>
           </div>
           {/*
@@ -172,7 +172,10 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
                     className="min-w-0 break-all text-right font-mono text-ink"
                     title={app.source.targetRevision}
                   >
-                    {app.source.targetRevision}
+                    <CopyText
+                      value={app.source.targetRevision}
+                      label="target revision"
+                    />
                   </dd>
                 </div>
               ) : null}
@@ -184,7 +187,10 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
                 className="min-w-0 break-all text-right font-mono text-ink"
                 title={app.source.targetRevision}
               >
-                {app.source.targetRevision}
+                <CopyText
+                  value={app.source.targetRevision}
+                  label="target revision"
+                />
               </dd>
             </div>
           )}
@@ -248,7 +254,11 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
                       className="shrink-0 font-mono"
                       title={source.targetRevision}
                     >
-                      @{source.targetRevision}
+                      @
+                      <CopyText
+                        value={source.targetRevision}
+                        label="source target revision"
+                      />
                     </span>
                   </p>
                 </li>
@@ -266,16 +276,26 @@ export function SourcePanel({ app }: { app: ApplicationSummary }) {
         <dl className="mt-3 space-y-1.5">
           <div className="flex justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Cluster</dt>
-            <dd className="flex min-w-0 items-center justify-end gap-1 text-right font-mono text-ink">
-              <span className="min-w-0 break-all">{app.destination.cluster}</span>
-              <CopyButton value={app.destination.cluster} label="cluster" />
+            <dd className="min-w-0 text-right font-mono text-ink">
+              <Link
+                to={`/clusters?q=${encodeURIComponent(app.destination.cluster)}`}
+                title={`Show cluster ${app.destination.cluster}`}
+                className="break-all hover:text-accent hover:underline"
+              >
+                {app.destination.cluster}
+              </Link>
             </dd>
           </div>
           <div className="flex justify-between gap-3">
             <dt className="shrink-0 text-ink-subtle">Namespace</dt>
-            <dd className="flex min-w-0 items-center justify-end gap-1 text-right font-mono text-ink">
-              <span className="min-w-0 break-all">{app.destination.namespace}</span>
-              <CopyButton value={app.destination.namespace} label="namespace" />
+            <dd className="min-w-0 text-right font-mono text-ink">
+              <Link
+                to={`/?q=${encodeURIComponent(app.destination.namespace)}`}
+                title={`Show applications in namespace ${app.destination.namespace}`}
+                className="break-all hover:text-accent hover:underline"
+              >
+                {app.destination.namespace}
+              </Link>
             </dd>
           </div>
           <div className="flex justify-between gap-3">
