@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::CONTROL_PLANE_NAMESPACE;
 use crate::application::DEFAULT_DESTINATION_CLUSTER;
 use crate::status::Condition;
+use crate::sync_window::{SyncWindow, SyncWindowParseError};
 
 /// Wildcard entry matching every group, kind, namespace, repository, or ServiceAccount.
 pub const WILDCARD: &str = "*";
@@ -71,6 +72,15 @@ pub struct AppProjectSpec {
     /// `spec.serviceAccountName` is rejected unless its project lists it here.
     #[serde(default)]
     pub allowed_service_accounts: Vec<String>,
+
+    /// Deployment-governance windows that decide *when* this project may sync (`T17.4`).
+    ///
+    /// Additive and optional: an `AppProject` that omits `syncWindows` behaves exactly as it did
+    /// in `v1.0` (no window, so nothing is blocked), and the field is omitted again on the way out
+    /// (`skip_serializing_if`), so a `v1.0` manifest round-trips byte-for-byte. Evaluation and its
+    /// deny-over-allow precedence live in `ferriscd_engine::policy::sync_windows`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sync_windows: Vec<SyncWindow>,
 }
 
 fn default_source_namespaces() -> Vec<String> {
@@ -78,6 +88,83 @@ fn default_source_namespaces() -> Vec<String> {
         .iter()
         .map(|namespace| (*namespace).to_owned())
         .collect()
+}
+
+/// A `syncWindows` entry that cannot be evaluated.
+///
+/// Every variant is terminal: the operator fixes the `AppProject`, nothing is retried. The index is
+/// the position in `spec.syncWindows`, so the message points at one list entry.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SyncWindowSpecError {
+    /// `spec.syncWindows[i]` is malformed.
+    #[error("spec.syncWindows[{index}]: {source}")]
+    Window {
+        /// Position in `spec.syncWindows`.
+        index: usize,
+        /// The parse failure.
+        #[source]
+        source: SyncWindowParseError,
+    },
+}
+
+impl SyncWindowSpecError {
+    /// Always `false`: a malformed window is a configuration error, not a transient failure.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        false
+    }
+}
+
+/// Failure while validating an [`AppProjectSpec`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProjectValidationError {
+    /// A `syncWindows` entry is malformed (`T17.4`).
+    #[error("{0}")]
+    SyncWindow(#[from] SyncWindowSpecError),
+}
+
+impl ProjectValidationError {
+    /// Always `false`: validation is deterministic.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        false
+    }
+}
+
+impl AppProjectSpec {
+    /// Validates the parts of the spec the OpenAPI schema cannot express (`T17.4`).
+    ///
+    /// The CRD schema enforces types, but a cron expression, an IANA time zone, and a bounded
+    /// duration are all *strings*: without this check a typo would silently become a deny-all
+    /// window at runtime. Rejecting it here — in the CLI, in the controller, and in any future
+    /// admission path — fails closed at the earliest possible point, and the runtime keeps its own
+    /// fail-closed guard for a project that reached the cluster before the typo was found.
+    ///
+    /// **There is no production caller yet (finding M1).** The `AppProject` CRD has no admission
+    /// webhook and the controller does not write `AppProject` specs, so *today* the enforcement
+    /// point is the runtime guard: the sync pipeline compiles `spec.syncWindows` on every pass and
+    /// denies every sync of a project with an unparseable entry (plus the
+    /// `Ready=False/SyncWindowInvalid` condition on the project, so the operator sees why). Only
+    /// the tests call this method; **any future path that writes an `AppProject` must call it
+    /// before the write**, so a typo is rejected instead of parked in fail-closed state.
+    ///
+    /// # Errors
+    ///
+    /// [`ProjectValidationError::SyncWindow`] naming the malformed `spec.syncWindows[i]` entry.
+    pub fn validate(&self) -> Result<(), ProjectValidationError> {
+        for (index, window) in self.sync_windows.iter().enumerate() {
+            window
+                .validate()
+                .map_err(|source| SyncWindowSpecError::Window { index, source })?;
+        }
+        Ok(())
+    }
+
+    /// Whether any deployment-governance window is configured.
+    #[must_use]
+    pub fn has_sync_windows(&self) -> bool {
+        !self.sync_windows.is_empty()
+    }
 }
 
 /// Cluster/namespace destination allowed by a project.
@@ -135,6 +222,31 @@ pub struct AppProjectStatus {
     /// Standard conditions describing project validity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+}
+
+/// Condition reason recorded on an `AppProject` whose `spec.syncWindows` cannot be evaluated
+/// (`T17.4`).
+///
+/// Lives in the CRD, not in the single writer: the controller *sets* the condition and the engine's
+/// policy snapshot *reads* it back (finding H-A, so a project whose windows were all removed still
+/// gets its stale `Ready=False/SyncWindowInvalid` cleared), and two spellings of the same wire string
+/// would silently disagree.
+pub const REASON_SYNC_WINDOW_INVALID: &str = "SyncWindowInvalid";
+
+impl AppProjectStatus {
+    /// Whether this status currently records the `Ready=False/SyncWindowInvalid` condition.
+    ///
+    /// The status is read back on the next pass precisely to decide whether the sync pipeline still
+    /// owes the project a *clearing* write: once an operator empties `spec.syncWindows`, nothing in
+    /// the spec asks for the report any more, so the recorded condition is the only evidence that
+    /// there is one to remove (finding H-A).
+    #[must_use]
+    pub fn records_sync_window_invalid(&self) -> bool {
+        self.conditions.iter().any(|condition| {
+            condition.type_ == crate::status::CONDITION_READY
+                && condition.reason == REASON_SYNC_WINDOW_INVALID
+        })
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +344,216 @@ spec:
         );
         assert!(spec.get("source_repos").is_none());
         assert!(spec.get("allowed_service_accounts").is_none());
+        assert!(
+            spec.get("syncWindows").is_none(),
+            "an empty syncWindows list must be omitted, so a v1.0 manifest round-trips unchanged"
+        );
+    }
+
+    /// `T17.4`: the additive `syncWindows` field, and the *absence* of it in a `v1.0` fixture.
+    ///
+    /// The `v1.0` manifest below is exactly what operators apply today (the shipped
+    /// `default-project.yaml` plus the full example above). It must deserialize, re-serialize, and
+    /// hash to the same spec it did before the field existed — `syncWindows` is `default`ed in and
+    /// skipped on the way out.
+    #[test]
+    fn v1_0_appproject_yaml_fixtures_deserialize_identically() {
+        for fixture in [FULL_PROJECT, DEFAULT_PROJECT_MANIFEST] {
+            let project = parse(fixture);
+            assert!(
+                project.spec.sync_windows.is_empty(),
+                "a v1.0 AppProject must keep an empty syncWindows list"
+            );
+            assert!(!project.spec.has_sync_windows());
+
+            // Field-for-field round-trip through YAML and JSON: the additive field changes nothing.
+            let yaml = serde_saphyr::to_string(&project).expect("project must serialize");
+            assert_eq!(parse(&yaml), project);
+            let value: Value = serde_json::to_value(&project).expect("project must serialize");
+            assert!(
+                value["spec"].get("syncWindows").is_none(),
+                "syncWindows must never be emitted for a project that does not use it"
+            );
+            // The spec validates (no windows is trivially valid) and the fixture is unchanged by
+            // the `T17.4` addition: `spec.validate()` only ever inspects `syncWindows`.
+            assert_eq!(project.spec.validate(), Ok(()));
+        }
+
+        // The committed `v1.0` default project still produces the same JSON document it did before
+        // `syncWindows` existed: a golden hash would be brittle, an exact key set is not.
+        let project = parse(DEFAULT_PROJECT_MANIFEST);
+        let value: Value = serde_json::to_value(&project.spec).expect("spec to json");
+        let keys: Vec<&String> = value
+            .as_object()
+            .expect("spec is an object")
+            .keys()
+            .filter(|key| key.as_str() != "syncWindows")
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "allowedServiceAccounts",
+                "clusterResourceWhitelist",
+                "description",
+                "destinations",
+                "namespaceResourceBlacklist",
+                "namespaceResourceWhitelist",
+                "sourceNamespaces",
+                "sourceRepos",
+            ],
+            "the v1.0 field set must stay exactly as it was"
+        );
+    }
+
+    /// `T17.4`: a project that *does* use windows round-trips, and its defaults are the safe ones.
+    #[test]
+    fn sync_windows_round_trip_and_default_to_no_manual_override() {
+        let project = parse(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: governed
+  namespace: ferriscd-system
+spec:
+  sourceRepos: ["*"]
+  destinations:
+    - cluster: in-cluster
+      namespace: "*"
+  syncWindows:
+    - kind: deny
+      schedule: "0 9-17 * * MON-FRI"
+      duration: 8h
+      timeZone: America/New_York
+      applications: ["payments-*"]
+      namespaces: [payments]
+      clusters: [prod-*]
+      manualSync: false
+    - kind: allow
+      schedule: "0 2 * * SAT"
+      duration: 2h
+"#,
+        );
+        let spec = &project.spec;
+        assert_eq!(spec.sync_windows.len(), 2);
+        assert_eq!(spec.validate(), Ok(()));
+
+        let deny = &spec.sync_windows[0];
+        assert_eq!(deny.kind, crate::sync_window::SyncWindowKind::Deny);
+        assert_eq!(deny.time_zone_name(), "America/New_York");
+        assert_eq!(deny.applications, vec!["payments-*"]);
+        assert!(!deny.manual_sync);
+
+        // Omitted fields take the safe defaults: no filter means "every application", and no
+        // `manualSync` means "manual sync does not override the window".
+        let allow = &spec.sync_windows[1];
+        assert_eq!(allow.kind, crate::sync_window::SyncWindowKind::Allow);
+        assert!(allow.applications.is_empty());
+        assert!(allow.namespaces.is_empty());
+        assert!(allow.clusters.is_empty());
+        assert!(!allow.manual_sync);
+        assert_eq!(allow.time_zone_name(), "UTC");
+        assert!(allow.time_zone.is_none());
+
+        // YAML and JSON round-trip with the camelCase wire names, and `syncWindows` is emitted.
+        let yaml = serde_saphyr::to_string(&project).expect("project must serialize");
+        assert_eq!(parse(&yaml), project);
+        let value: Value = serde_json::to_value(&project).expect("project must serialize");
+        assert_eq!(value["spec"]["syncWindows"][0]["kind"], json!("deny"));
+        assert_eq!(
+            value["spec"]["syncWindows"][0]["timeZone"],
+            json!("America/New_York")
+        );
+        assert_eq!(value["spec"]["syncWindows"][0]["manualSync"], json!(false));
+        assert_eq!(value["spec"]["syncWindows"][1]["kind"], json!("allow"));
+        assert!(
+            value["spec"]["syncWindows"][1].get("timeZone").is_none(),
+            "an absent timeZone must not be serialized"
+        );
+
+        let schema = serde_json::to_value(schemars::schema_for!(AppProjectSpec))
+            .expect("schema must serialize");
+        let windows = &schema["properties"]["syncWindows"];
+        assert_eq!(windows["type"], json!("array"), "{windows}");
+        let window = &schema["$defs"]["SyncWindow"]["properties"];
+        for expected in [
+            "kind",
+            "schedule",
+            "duration",
+            "timeZone",
+            "applications",
+            "namespaces",
+            "clusters",
+            "manualSync",
+        ] {
+            assert!(
+                window.get(expected).is_some(),
+                "the SyncWindow schema is missing {expected}"
+            );
+        }
+        // The `kind` enum reaches the CRD schema (kube copies it verbatim), so an API server
+        // rejects `kind: maybe` before any controller sees it.
+        let kind_schema = schema["$defs"]["SyncWindowKind"].to_string();
+        assert!(
+            kind_schema.contains("\"allow\"") && kind_schema.contains("\"deny\""),
+            "the kind enum must reach the CRD schema: {kind_schema}"
+        );
+    }
+
+    /// `T17.4` fail-closed validation: a typo in a window is a *spec* error, not a runtime surprise.
+    #[test]
+    fn project_validation_rejects_malformed_sync_windows() {
+        let mut project = parse(
+            r#"
+apiVersion: ferriscd.io/v1alpha1
+kind: AppProject
+metadata:
+  name: governed
+spec:
+  syncWindows:
+    - kind: deny
+      schedule: "0 9 * * MON-FRI"
+      duration: 2h
+"#,
+        );
+        assert_eq!(project.spec.validate(), Ok(()));
+
+        let cases: [(&str, &str); 5] = [
+            ("0 9 * * MONDAY", "schedule"),
+            ("* * * *", "5 fields"),
+            ("0 9 * * MON-FRI", "duration"),
+            ("0 9 * * MON-FRI", "timeZone"),
+            ("0 9 * * MON-FRI", "duration"),
+        ];
+        let mutations: [fn(&mut crate::sync_window::SyncWindow); 5] = [
+            |window| window.schedule = "0 9 * * MONDAY".to_owned(),
+            |window| window.schedule = "* * * *".to_owned(),
+            |window| window.duration = "8 days".to_owned(),
+            |window| window.time_zone = Some("Mars/Olympus".to_owned()),
+            |window| window.duration = "14d".to_owned(),
+        ];
+        for ((expected, needle), mutate) in cases.into_iter().zip(mutations) {
+            let original = project.clone();
+            if let Some(window) = project.spec.sync_windows.first_mut() {
+                mutate(window);
+            }
+            let err = project
+                .spec
+                .validate()
+                .expect_err("a malformed window must be rejected");
+            assert!(!err.is_retryable());
+            let message = err.to_string();
+            assert!(
+                message.contains("spec.syncWindows[0]"),
+                "the message must name the entry: {message}"
+            );
+            assert!(
+                message.contains(expected) || message.contains(needle),
+                "the message must name the offending field ({expected}): {message}"
+            );
+            project = original;
+        }
+        assert_eq!(project.spec.validate(), Ok(()));
     }
 
     #[test]
@@ -252,6 +574,7 @@ spec: {}
         assert!(project.spec.namespace_resource_whitelist.is_empty());
         assert!(project.spec.namespace_resource_blacklist.is_empty());
         assert!(project.spec.allowed_service_accounts.is_empty());
+        assert!(project.spec.sync_windows.is_empty());
         assert_eq!(project.status, None);
     }
 
@@ -271,6 +594,7 @@ spec: {}
             "namespaceResourceWhitelist",
             "namespaceResourceBlacklist",
             "allowedServiceAccounts",
+            "syncWindows",
         ] {
             assert!(
                 properties.contains_key(expected),

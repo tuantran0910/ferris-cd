@@ -41,6 +41,7 @@
 //! | [`KEY_TOKEN`] (`token`) | no | HTTPS bearer / personal access token |
 //! | [`KEY_SSH_PRIVATE_KEY`] (`sshPrivateKey`) | no | unencrypted SSH private key (PEM / OpenSSH) |
 //! | [`KEY_KNOWN_HOSTS`] (`knownHosts`) | no | `known_hosts` entry pinning the SSH host key |
+//! | [`KEY_DOCKERCONFIGJSON`] (`.dockerconfigjson`) | no | Docker `config.json` document, for `oci://` registries (`T18.3`) |
 //!
 //! `data` values are base64 on the wire and plain text once decoded (that is what
 //! `k8s-openapi`'s `ByteString` gives us); `stringData` is accepted too, which is what makes a
@@ -49,9 +50,16 @@
 //! `https://` url, …) is a terminal error naming the `Secret` and the offending keys, never a
 //! silently chosen one.
 //!
-//! Only `https://` and `ssh://` templates are accepted: `http://` (plaintext) and every other
-//! scheme is a terminal error rather than a credential that could never be used — FerrisCD's Git
-//! layer rejects plaintext remotes and refuses to send credentials over them at all.
+//! Only `https://`, `ssh://`, and `oci://` templates are accepted: `http://` (plaintext) and every
+//! other scheme is a terminal error rather than a credential that could never be used — FerrisCD's
+//! Git layer rejects plaintext remotes and refuses to send credentials over them at all.
+//!
+//! An `oci://` template (`T18.3`) is a **registry** credential: it accepts
+//! `username`/`password`/`token` and the Docker `config.json` document under
+//! [`.dockerconfigjson`](KEY_DOCKERCONFIGJSON), and rejects `sshPrivateKey`/`knownHosts` (a registry
+//! has no SSH identity, and its TLS trust comes from the system trust store). The Docker document is
+//! read **by registry host**, so one `Secret` for `oci://ghcr.io` can never present its token to
+//! `oci://registry.example.com` just because both appear in the same file.
 //!
 //! ## Matching rules
 //!
@@ -142,12 +150,21 @@ pub const KEY_TOKEN: &str = "token";
 /// passphrase cannot be supplied and is not read.
 pub const KEY_SSH_PRIVATE_KEY: &str = "sshPrivateKey";
 
-/// Secret data key holding the `known_hosts` entry of the SSH host.
+/// Secret data key holding a `known_hosts` entry pinning the SSH host key.
 ///
 /// Optional, but strict host key verification is the default: without it the clone fails
 /// terminally with `RepoError::HostKeyVerificationFailed` unless the operator explicitly allowed
 /// missing host keys (a test/dev-only switch). The `Secret` cannot weaken that policy.
 pub const KEY_KNOWN_HOSTS: &str = "knownHosts";
+
+/// Secret data key holding a Docker `config.json` document (`.dockerconfigjson`), for OCI
+/// registries (`T18.3`).
+///
+/// The document is the standard `{"auths": {"<registry>": {...}}}` shape, so an operator can copy
+/// the file they already use for `docker login` / `helm registry login`: `auth`
+/// (base64 `user:password`), `username`+`password`, `identitytoken`, or `registrytoken`. The entry
+/// whose registry matches the `url` host is used; an entry for another registry is never used.
+pub const KEY_DOCKERCONFIGJSON: &str = ".dockerconfigjson";
 
 /// `https` scheme name.
 const SCHEME_HTTPS: &str = "https";
@@ -159,6 +176,9 @@ const SCHEME_HTTP: &str = "http";
 
 /// `ssh` scheme name.
 const SCHEME_SSH: &str = "ssh";
+
+/// `oci` scheme name (`T18.3`): an artifact registry, authenticated by HTTPS credentials.
+const SCHEME_OCI: &str = "oci";
 
 /// Problems with a repository credential `Secret`.
 ///
@@ -294,6 +314,7 @@ impl CredentialTemplate {
         let password = value(&data, KEY_PASSWORD);
         let token = value(&data, KEY_TOKEN);
         let known_hosts = value(&data, KEY_KNOWN_HOSTS);
+        let docker_config = value(&data, KEY_DOCKERCONFIGJSON);
 
         let credentials = match scheme {
             SCHEME_SSH => {
@@ -330,7 +351,45 @@ impl CredentialTemplate {
                         "{KEY_KNOWN_HOSTS:?} only applies to ssh:// repositories"
                     )));
                 }
-                http_credentials(&ctx, &data, username, password, token)?
+                if docker_config.is_some() {
+                    return Err(ctx.malformed(format!(
+                        "the {KEY_DOCKERCONFIGJSON:?} key only applies to {SCHEME_OCI}:// registries; \
+                         an HTTPS repository is authenticated by {KEY_USERNAME:?}/\
+                         {KEY_PASSWORD:?}/{KEY_TOKEN:?}"
+                    )));
+                }
+                http_credentials(&ctx, &data, username, password, token, false)?
+            }
+            // `T18.3`: an OCI registry speaks the same credentials as HTTPS, plus the Docker
+            // `config.json` document an operator already has from `helm registry login`. An SSH key
+            // or a `knownHosts` entry is meaningless over the registry API, so a `Secret` that
+            // carries one is an operator mistake rather than something to silently ignore.
+            SCHEME_OCI => {
+                if ssh_key.is_some() {
+                    return Err(ctx.malformed(format!(
+                        "the {KEY_URL:?} key is an {SCHEME_OCI}:// registry but the Secret carries \
+                         {KEY_SSH_PRIVATE_KEY:?}; a registry is authenticated by {KEY_USERNAME:?}/\
+                         {KEY_PASSWORD:?}/{KEY_TOKEN:?}/{KEY_DOCKERCONFIGJSON:?}, never by a key"
+                    )));
+                }
+                if known_hosts.is_some() {
+                    return Err(ctx.malformed(format!(
+                        "{KEY_KNOWN_HOSTS:?} only applies to ssh:// repositories, not to an \
+                         {SCHEME_OCI}:// registry (its TLS trust comes from the system trust store)"
+                    )));
+                }
+                if let Some(document) = docker_config {
+                    if username.is_some() || password.is_some() || token.is_some() {
+                        return Err(ctx.malformed(format!(
+                            "the {KEY_DOCKERCONFIGJSON:?} key cannot be combined with \
+                             {KEY_USERNAME:?}/{KEY_PASSWORD:?}/{KEY_TOKEN:?}; keep one of them so the \
+                             request cannot present two credentials"
+                        )));
+                    }
+                    docker_config_credentials(&ctx, document, &url_prefix)?
+                } else {
+                    http_credentials(&ctx, &data, username, password, token, true)?
+                }
             }
             // A plaintext template is refused rather than accepted-and-unusable: FerrisCD's Git
             // layer never clones `http://` (the URL policy rejects it and the transport refuses to
@@ -345,8 +404,8 @@ impl CredentialTemplate {
             }
             other => {
                 return Err(ctx.malformed(format!(
-                    "the {KEY_URL:?} key scheme {other:?} is not supported: only {SCHEME_HTTPS}:// \
-                     and {SCHEME_SSH}:// repositories can carry credentials"
+                    "the {KEY_URL:?} key scheme {other:?} is not supported: only {SCHEME_HTTPS}://, \
+                     {SCHEME_SSH}://, and {SCHEME_OCI}:// sources can carry credentials"
                 )));
             }
         };
@@ -564,12 +623,16 @@ fn strip_authority_userinfo(authority: &str) -> Option<&str> {
 
 /// Removes the scheme's default port (`:443`, `:80`, `:22`) from an authority.
 ///
+/// `oci://` behaves like `https://`: a registry written `oci://ghcr.io:443/org` and one written
+/// `oci://ghcr.io/org` are the same endpoint, and one credential `Secret` must match both.
+///
 /// `https://git.example.com:443/org` and `https://git.example.com/org` are the same endpoint, so a
 /// `Secret` written either way must match either spelling. A non-default port stays part of the
 /// key: `ssh://git.example.com:2222/org` is a different server.
 fn strip_default_port(value: &str, scheme: &str) -> String {
     let default_port = match scheme {
-        SCHEME_HTTPS => ":443",
+        // `oci://` is the GitOps spelling of "this registry over HTTPS".
+        SCHEME_HTTPS | SCHEME_OCI => ":443",
         SCHEME_HTTP => ":80",
         SCHEME_SSH => ":22",
         _ => return value.to_owned(),
@@ -604,15 +667,20 @@ fn scheme_of(normalized: &str) -> Option<&str> {
     normalized.split_once("://").map(|(scheme, _rest)| scheme)
 }
 
-/// Whether `raw` carries `user:password@` (or `token@`) userinfo in an `https`/`http` URL.
+/// Whether `raw` carries `user:password@` (or `token@`) userinfo in an `https`/`http`/`oci` URL.
 ///
-/// Only HTTP(S) URLs are checked: an `ssh://` URL legitimately carries the SSH user
-/// (`ssh://git@github.com/…`), which is not a secret and is dropped by normalization.
+/// Only those three schemes are checked, because only they treat the prefix before `@` as
+/// credentials: an `ssh://` URL legitimately carries the SSH user (`ssh://git@github.com/…`), which
+/// is not a secret and is dropped by normalization. `oci://` is included exactly like the HTTP
+/// schemes — a registry token in a reference is a credential, not a username.
 fn embeds_userinfo(raw: &str) -> bool {
     let Some((scheme, rest)) = raw.split_once("://") else {
         return false;
     };
-    if !scheme.eq_ignore_ascii_case(SCHEME_HTTPS) && !scheme.eq_ignore_ascii_case(SCHEME_HTTP) {
+    if !scheme.eq_ignore_ascii_case(SCHEME_HTTPS)
+        && !scheme.eq_ignore_ascii_case(SCHEME_HTTP)
+        && !scheme.eq_ignore_ascii_case(SCHEME_OCI)
+    {
         return false;
     }
     let authority = rest
@@ -691,6 +759,7 @@ fn http_credentials(
     username: Option<&str>,
     password: Option<&str>,
     token: Option<&str>,
+    registry: bool,
 ) -> Result<RepoCredentials, CredentialError> {
     // Re-read the raw keys so a *blank* value is reported rather than silently treated as absent.
     let blank = |key: &str| data.get(key).is_some_and(|value| value.trim().is_empty());
@@ -728,9 +797,206 @@ fn http_credentials(
         (Some(_), None, None) => Err(ctx.malformed(format!(
             "{KEY_USERNAME:?} is set without {KEY_PASSWORD:?} or {KEY_TOKEN:?}"
         ))),
-        (None, None, None) => Err(ctx.malformed(format!(
-            "no credential keys are set: provide {KEY_USERNAME:?} + {KEY_PASSWORD:?}, \
-             {KEY_TOKEN:?}, or {KEY_SSH_PRIVATE_KEY:?}"
+        (None, None, None) => Err(ctx.malformed(if registry {
+            format!(
+                "no credential keys are set: provide {KEY_USERNAME:?} + {KEY_PASSWORD:?}, \
+                 {KEY_TOKEN:?}, or {KEY_DOCKERCONFIGJSON:?}"
+            )
+        } else {
+            format!(
+                "no credential keys are set: provide {KEY_USERNAME:?} + {KEY_PASSWORD:?}, \
+                 {KEY_TOKEN:?}, or {KEY_SSH_PRIVATE_KEY:?}"
+            )
+        })),
+    }
+}
+
+/// Wire shape of a Docker `config.json` document (`KEY_DOCKERCONFIGJSON`).
+///
+/// Only the `auths` map is read: `credsStore`/`credHelpers` would make FerrisCD shell out to a
+/// credential helper, which is exactly the kind of external process a `Secret` must not be able to
+/// trigger.
+#[derive(serde::Deserialize)]
+struct DockerConfigJson {
+    #[serde(default)]
+    auths: BTreeMap<String, DockerAuthEntry>,
+}
+
+/// One registry entry of a Docker `config.json` `auths` map.
+#[derive(serde::Deserialize)]
+struct DockerAuthEntry {
+    #[serde(default)]
+    auth: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    identitytoken: Option<String>,
+    #[serde(default)]
+    registrytoken: Option<String>,
+}
+
+/// Returns the registry host (`host[:port]`) of a normalized registry URL.
+fn registry_host(url_prefix: &str) -> Option<&str> {
+    let (_scheme, rest) = url_prefix.split_once("://")?;
+    let host = rest.split_once('/').map_or(rest, |(host, _rest)| host);
+    if host.is_empty() { None } else { Some(host) }
+}
+
+/// Normalizes one `auths` key (`https://index.docker.io/v1/`, `ghcr.io`) to a bare registry host.
+fn normalize_registry_key(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = trimmed
+        .split_once("://")
+        .map_or(trimmed, |(_scheme, rest)| rest);
+    let authority = without_scheme
+        .split_once('/')
+        .map_or(without_scheme, |(authority, _rest)| authority);
+    // `config.json` keys never carry userinfo, but a hand-written one must not confuse the match.
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_userinfo, host)| host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Whether one `auths` key names `host` (a `:443`/no-port spelling difference is not a mismatch).
+fn registry_key_matches(key: &str, host: &str) -> bool {
+    let Some(candidate) = normalize_registry_key(key) else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    candidate == host
+        || candidate.strip_suffix(":443") == Some(host.as_str())
+        || host.strip_suffix(":443") == Some(candidate.as_str())
+}
+
+/// Builds credentials from a `.dockerconfigjson` document, using the entry for the `url` registry.
+///
+/// The entry is selected **by registry host**: a credential recorded for a different registry is
+/// never presented, so one `Secret` cannot leak its token to another registry. Every error names
+/// keys only; no decoded value is ever echoed.
+fn docker_config_credentials(
+    ctx: &SecretContext<'_>,
+    document: &str,
+    url_prefix: &str,
+) -> Result<RepoCredentials, CredentialError> {
+    let config: DockerConfigJson = serde_json::from_str(document).map_err(|_error| {
+        // The parser error can quote the offending input, which may be a token: report the shape
+        // instead of the content.
+        ctx.malformed(format!(
+            "the {KEY_DOCKERCONFIGJSON:?} key is not a valid Docker config.json document (expected \
+             {{\"auths\": {{\"<registry>\": {{...}}}}}})"
+        ))
+    })?;
+    if config.auths.is_empty() {
+        return Err(ctx.malformed(format!(
+            "the {KEY_DOCKERCONFIGJSON:?} key declares no `auths` entries"
+        )));
+    }
+    let host = registry_host(url_prefix).ok_or_else(|| {
+        ctx.malformed(format!(
+            "the {KEY_URL:?} key must be an {SCHEME_OCI}://<registry>/<repository> reference so the \
+             registry to read out of {KEY_DOCKERCONFIGJSON:?} is unambiguous"
+        ))
+    })?;
+    let entry = config
+        .auths
+        .iter()
+        .find(|(key, _entry)| registry_key_matches(key, host))
+        .map(|(_key, entry)| entry)
+        .ok_or_else(|| {
+            ctx.malformed(format!(
+                "the {KEY_DOCKERCONFIGJSON:?} key has no `auths` entry for registry {host:?}; a \
+                 credential recorded for another registry is never presented to this one"
+            ))
+        })?;
+    docker_entry_credentials(ctx, entry)
+}
+
+/// Maps one `auths` entry onto [`RepoCredentials`], refusing an ambiguous entry.
+fn docker_entry_credentials(
+    ctx: &SecretContext<'_>,
+    entry: &DockerAuthEntry,
+) -> Result<RepoCredentials, CredentialError> {
+    let non_empty = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let auth = non_empty(&entry.auth);
+    let username = non_empty(&entry.username);
+    let password = non_empty(&entry.password);
+    let identity_token = non_empty(&entry.identitytoken);
+    let registry_token = non_empty(&entry.registrytoken);
+
+    let tokens: Vec<String> = identity_token.into_iter().chain(registry_token).collect();
+    if tokens.len() > 1 {
+        return Err(ctx.malformed(format!(
+            "the {KEY_DOCKERCONFIGJSON:?} entry sets both `identitytoken` and `registrytoken`; keep \
+             one of them so the request cannot present two credentials"
+        )));
+    }
+    if auth.is_some() && !tokens.is_empty() {
+        return Err(ctx.malformed(format!(
+            "the {KEY_DOCKERCONFIGJSON:?} entry sets both `auth` and a token field; keep one of them \
+             so the request cannot present two credentials"
+        )));
+    }
+
+    if let Some(encoded) = auth {
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or_else(|| {
+                ctx.malformed(format!(
+                    "the {KEY_DOCKERCONFIGJSON:?} entry's `auth` value is not base64 of a UTF-8 \
+                     \"user:password\" pair"
+                ))
+            })?;
+        let (user, secret) = decoded.split_once(':').ok_or_else(|| {
+            ctx.malformed(format!(
+                "the {KEY_DOCKERCONFIGJSON:?} entry's `auth` value does not decode to \
+                 \"user:password\""
+            ))
+        })?;
+        if user.is_empty() {
+            return Err(ctx.malformed(format!(
+                "the {KEY_DOCKERCONFIGJSON:?} entry's `auth` value decodes to an empty user name"
+            )));
+        }
+        return Ok(RepoCredentials::HttpBasic {
+            username: user.to_owned(),
+            password: secret.to_owned(),
+        });
+    }
+
+    if let Some(token) = tokens.into_iter().next() {
+        return Ok(RepoCredentials::HttpToken { token });
+    }
+
+    match (username, password) {
+        (Some(username), Some(password)) => Ok(RepoCredentials::HttpBasic { username, password }),
+        (Some(_username), None) => Err(ctx.malformed(format!(
+            "the {KEY_DOCKERCONFIGJSON:?} entry sets `username` without `password`"
+        ))),
+        (None, Some(_password)) => Err(ctx.malformed(format!(
+            "the {KEY_DOCKERCONFIGJSON:?} entry sets `password` without `username`"
+        ))),
+        (None, None) => Err(ctx.malformed(format!(
+            "the {KEY_DOCKERCONFIGJSON:?} entry carries no credential: provide `auth`, \
+             `identitytoken`, or `username` + `password`"
         ))),
     }
 }
@@ -1437,6 +1703,343 @@ mod tests {
         let templates = templates_from_secrets(&secrets).expect("unlabeled Secrets are skipped");
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].secret(), "ferriscd-system/labeled");
+    }
+
+    // ---------------------------------------------------------------------
+    // `T18.3`: `oci://` registry credentials
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn oci_secrets_map_to_registry_credentials_with_the_same_prefix_matching() {
+        // `username` + `password`, `token` alone, and `username` + `token` all map exactly like an
+        // HTTPS repository: a registry speaks HTTP Basic (or a bearer token).
+        let cases: &[(&[(&str, &str)], RepoCredentials)] = &[
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (KEY_USERNAME, "ferriscd-puller"),
+                    (KEY_PASSWORD, PASSWORD),
+                ],
+                RepoCredentials::HttpBasic {
+                    username: "ferriscd-puller".to_owned(),
+                    password: PASSWORD.to_owned(),
+                },
+            ),
+            (
+                &[(KEY_URL, "oci://ghcr.io/payments"), (KEY_TOKEN, TOKEN)],
+                RepoCredentials::HttpToken {
+                    token: TOKEN.to_owned(),
+                },
+            ),
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (KEY_USERNAME, "ferriscd-puller"),
+                    (KEY_TOKEN, TOKEN),
+                ],
+                RepoCredentials::HttpBasic {
+                    username: "ferriscd-puller".to_owned(),
+                    password: TOKEN.to_owned(),
+                },
+            ),
+        ];
+        for (data, expected) in cases {
+            let parsed = template("oci-creds", data);
+            assert_eq!(
+                parsed.credentials(),
+                expected,
+                "unexpected map for {data:?}"
+            );
+            assert_eq!(parsed.url_prefix(), "oci://ghcr.io/payments");
+        }
+
+        // The same longest-prefix, path-boundary matching as Git: a host template covers a
+        // repository, and `payments-evil` is not `payments`.
+        let host = template(
+            "oci-host",
+            &[(KEY_URL, "oci://ghcr.io"), (KEY_TOKEN, "host-token")],
+        );
+        let repo = template(
+            "oci-repo",
+            &[
+                (KEY_URL, "oci://ghcr.io/payments"),
+                (KEY_TOKEN, "repo-token"),
+            ],
+        );
+        let templates = vec![host, repo];
+        let matched = match_credentials(&templates, "oci://ghcr.io/payments")
+            .expect("the repository template must win");
+        assert_eq!(matched.secret(), "ferriscd-system/oci-repo");
+        assert_eq!(
+            match_credentials(&templates, "oci://ghcr.io/other")
+                .expect("the host template must match")
+                .secret(),
+            "ferriscd-system/oci-host"
+        );
+        assert!(
+            match_credentials(&templates, "oci://ghcr.io.evil/payments").is_none(),
+            "a host suffix must never satisfy a registry template"
+        );
+        // The *identity* of the returned template is the real assertion: `payments-evil` must fall
+        // through to the host-wide template (`is_some()` alone would also pass if the repository
+        // template matched a string prefix, which is the bug this test exists to catch), and the
+        // default `:443` port must resolve to the repository template rather than the host one.
+        assert_eq!(
+            match_credentials(&templates, "oci://ghcr.io/payments-evil")
+                .expect("the host template must match")
+                .secret(),
+            "ferriscd-system/oci-host"
+        );
+        assert_eq!(
+            match_credentials(&templates, "oci://ghcr.io:443/payments")
+                .expect("the default port is the same endpoint")
+                .secret(),
+            "ferriscd-system/oci-repo"
+        );
+        // An `https://` credential never leaks into an `oci://` fetch and vice versa.
+        assert!(
+            match_credentials(&templates, "https://ghcr.io/payments").is_none(),
+            "a registry credential is scoped to the oci:// scheme"
+        );
+    }
+
+    #[test]
+    fn docker_config_json_secrets_are_read_by_registry_host() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("ferriscd-puller:s3cr3t-pw");
+        let document = format!(
+            r#"{{"auths":{{
+                "ghcr.io":{{"auth":"{encoded}"}},
+                "https://index.docker.io/v1/":{{"username":"docker-user","password":"docker-pw"}},
+                "registry.example.com:5000":{{"identitytoken":"identity-token-value"}}
+            }}}}"#
+        );
+        let registry_template = |url: &str| {
+            template(
+                "oci-creds",
+                &[(KEY_URL, url), (KEY_DOCKERCONFIGJSON, document.as_str())],
+            )
+        };
+
+        assert_eq!(
+            registry_template("oci://ghcr.io/payments").credentials(),
+            &RepoCredentials::HttpBasic {
+                username: "ferriscd-puller".to_owned(),
+                password: "s3cr3t-pw".to_owned(),
+            },
+            "the `auth` pair must be decoded for the matching registry only"
+        );
+        assert_eq!(
+            registry_template("oci://registry.example.com:5000/charts").credentials(),
+            &RepoCredentials::HttpToken {
+                token: "identity-token-value".to_owned(),
+            }
+        );
+        assert_eq!(
+            registry_template("oci://index.docker.io/library/app").credentials(),
+            &RepoCredentials::HttpBasic {
+                username: "docker-user".to_owned(),
+                password: "docker-pw".to_owned(),
+            },
+            "a config.json key with a scheme and a trailing slash still names its registry"
+        );
+
+        // A registry the document has no entry for is an error: the credential of a *different*
+        // registry is never presented to it.
+        let err = CredentialTemplate::from_secret(&secret(
+            "oci-creds",
+            &[
+                (KEY_URL, "oci://other.example.com/charts"),
+                (KEY_DOCKERCONFIGJSON, document.as_str()),
+            ],
+        ))
+        .expect_err("an unlisted registry must be refused");
+        assert!(err.is_terminal());
+        let message = err.to_string();
+        assert!(message.contains("no `auths` entry"), "{message}");
+        assert!(message.contains("other.example.com"), "{message}");
+        for leaked in [
+            "s3cr3t-pw",
+            encoded.as_str(),
+            "docker-pw",
+            "identity-token-value",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "{leaked:?} leaked into {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn oci_secrets_refuse_ssh_material_and_ambiguous_credentials() {
+        let cases: &[(&[(&str, &str)], &str)] = &[
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (KEY_SSH_PRIVATE_KEY, KEY_BODY),
+                ],
+                "never by a key",
+            ),
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (KEY_KNOWN_HOSTS, KNOWN_HOSTS),
+                    (KEY_TOKEN, TOKEN),
+                ],
+                "only applies to ssh://",
+            ),
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (KEY_USERNAME, "puller"),
+                    (KEY_PASSWORD, PASSWORD),
+                    (KEY_TOKEN, TOKEN),
+                ],
+                "both \"password\" and \"token\"",
+            ),
+            (
+                &[(KEY_URL, "oci://ghcr.io/payments")],
+                "no credential keys are set",
+            ),
+            (
+                &[
+                    (KEY_URL, "oci://user:token@ghcr.io/payments"),
+                    (KEY_TOKEN, TOKEN),
+                ],
+                "embeds credentials",
+            ),
+            (
+                &[
+                    (KEY_URL, "https://ghcr.io/payments"),
+                    (KEY_DOCKERCONFIGJSON, r#"{"auths":{}}"#),
+                ],
+                "only applies to oci://",
+            ),
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (KEY_DOCKERCONFIGJSON, "not json at all"),
+                ],
+                "not a valid Docker config.json",
+            ),
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (KEY_DOCKERCONFIGJSON, r#"{"auths":{}}"#),
+                ],
+                "no `auths` entries",
+            ),
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (
+                        KEY_DOCKERCONFIGJSON,
+                        r#"{"auths":{"ghcr.io":{"username":"only-user"}}}"#,
+                    ),
+                ],
+                "`username` without `password`",
+            ),
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (
+                        KEY_DOCKERCONFIGJSON,
+                        r#"{"auths":{"ghcr.io":{"auth":"!!!not-base64!!!"}}}"#,
+                    ),
+                ],
+                "not base64 of a UTF-8",
+            ),
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (KEY_TOKEN, TOKEN),
+                    (
+                        KEY_DOCKERCONFIGJSON,
+                        r#"{"auths":{"ghcr.io":{"username":"u","password":"p"}}}"#,
+                    ),
+                ],
+                "cannot be combined",
+            ),
+            (
+                &[
+                    (KEY_URL, "oci://ghcr.io/payments"),
+                    (
+                        KEY_DOCKERCONFIGJSON,
+                        r#"{"auths":{"ghcr.io":{"identitytoken":"a","registrytoken":"b"}}}"#,
+                    ),
+                ],
+                "both `identitytoken` and `registrytoken`",
+            ),
+        ];
+
+        for (data, fragment) in cases {
+            let fragment = *fragment;
+            let err = CredentialTemplate::from_secret(&secret("oci-creds", data))
+                .expect_err("the Secret must be refused");
+            let terminal = err.is_terminal();
+            let message = err.to_string();
+            assert!(
+                matches!(&err, CredentialError::Malformed { .. }),
+                "{data:?} produced {err:?}"
+            );
+            assert!(
+                message.contains(fragment),
+                "{data:?}: expected {fragment:?} in {message}"
+            );
+            assert!(terminal);
+        }
+    }
+
+    /// **Trap guard (`T18.3`).** A registry credential is redacted everywhere, exactly like a Git
+    /// one: `Debug`, `Display`, and every error path.
+    #[test]
+    fn oci_credentials_never_appear_in_debug_display_or_errors() {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("bot:{PASSWORD}"));
+        let document = format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{encoded}"}}}}}}"#);
+
+        let token_template = template(
+            "oci-token",
+            &[(KEY_URL, "oci://ghcr.io/payments"), (KEY_TOKEN, TOKEN)],
+        );
+        let docker_template = template(
+            "oci-docker",
+            &[
+                (KEY_URL, "oci://ghcr.io/payments"),
+                (KEY_DOCKERCONFIGJSON, document.as_str()),
+            ],
+        );
+
+        for (template, needles) in [
+            (&token_template, &[TOKEN][..]),
+            (&docker_template, &[PASSWORD, encoded.as_str()][..]),
+        ] {
+            let rendered = format!("{template:?} {template:#?} {template}");
+            for needle in needles {
+                assert!(
+                    !rendered.contains(needle),
+                    "{needle:?} leaked into {rendered}"
+                );
+            }
+            assert!(rendered.contains("ghcr.io/payments"), "{rendered}");
+            assert!(rendered.contains("ferriscd-system/"), "{rendered}");
+        }
+        assert!(token_template.to_string().contains("(http-token)"));
+        assert!(docker_template.to_string().contains("(http-basic)"));
+
+        // The error path is redacted too, even for a malformed Docker document.
+        let err = CredentialTemplate::from_secret(&secret(
+            "oci-leaky",
+            &[
+                (KEY_URL, "oci://ghcr.io/payments"),
+                (KEY_DOCKERCONFIGJSON, PASSWORD),
+            ],
+        ))
+        .expect_err("a non-JSON document must be refused");
+        let rendered = format!("{err} {err:?}");
+        assert!(!rendered.contains(PASSWORD), "{rendered}");
+        assert!(rendered.contains("oci-leaky"), "{rendered}");
     }
 
     // ---------------------------------------------------------------------

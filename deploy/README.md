@@ -296,6 +296,141 @@ the object has not been deleted yet.
 `spec.destination.cluster` is still checked against `AppProject.spec.destinations` **before** the
 registry is consulted, so a tenant cannot use an `Application` to probe which clusters exist.
 
+### OIDC / SSO sign-in (`T19.1`) — optional private CA Secret
+
+`ferriscd server` can authenticate the protected API with corporate IdP tokens instead of (or as well
+as) Kubernetes `ServiceAccount` tokens:
+
+```text
+ferriscd server \
+  --auth-policy oidc \
+  --oidc-issuer https://login.example.com \
+  --oidc-client-id ferriscd
+```
+
+* `--auth-policy oidc` accepts **only** OIDC JWTs; `--auth-policy token-review-or-oidc` accepts an
+  OIDC JWT **or** a `ServiceAccount` token (OIDC first, and a token carrying this server's issuer is
+  never forwarded to the API server). The default, `token-review`, is unchanged.
+* Verification is local against the IdP's published JWKS (RS256/ES256/ES384/EdDSA only), so there is
+  **no client secret** to store and no per-request round trip to the IdP. `--oidc-username-prefix`
+  and `--oidc-groups-prefix` (both default `oidc:`) are what keep an IdP claim from becoming a
+  Kubernetes identity such as `system:masters`.
+* `--oidc-insecure-http` exists for a local Dex on `kind` and nothing else.
+
+An internal IdP signed by a **private** CA is trusted through one optional `Secret` in the
+control-plane namespace (`--namespace`, default `ferriscd-system`):
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ferriscd-oidc
+  namespace: ferriscd-system
+  labels:
+    ferriscd.io/secret-type: oidc
+type: Opaque
+data:
+  # A PEM bundle: the CA that signed the IdP's TLS certificate (and its chain).
+  ca.crt: <base64 PEM>
+```
+
+* The file **must** be named `ca.crt`, and the label `ferriscd.io/secret-type: oidc` is the opt-in
+  (an unlabelled `ferriscd-oidc` is ignored with a warning, so an unrelated `Secret` of that name is
+  never trusted by accident).
+* **Fallback:** with no `ferriscd-oidc` `Secret`, the IdP's certificate must chain to the **system
+  roots** bundled in the image. A missing `Secret` is logged (`the OIDC Secret could not be read;
+  the IdP must be trusted by the system roots`) and is not a startup failure.
+* The bundle is read **once, at startup** — rotate it and restart the server. Its contents are never
+  logged, and `Debug` renders it as a byte count.
+* **No RBAC change is needed:** the control plane already reads `Secret`s in its own namespace for
+  repository credentials (see the namespaced `Role`/`RoleBinding` above), and this `Secret` is read
+  under that same namespaced grant — never cluster-wide.
+
+#### Registering the redirect URI (`T19.2`)
+
+Both sign-in modes are OAuth 2.1 **public clients** (Authorization Code + PKCE `S256`, no client
+secret), so each needs exactly **one** redirect URI registered at the IdP. Register these exact
+strings — a wildcard is not needed and must not be used (it is the open redirect the exact-match
+allowlist exists to prevent):
+
+| Mode | Redirect URI to register |
+|---|---|
+| Web UI, SPA in-memory token (`--auth-policy oidc` / `token-review-or-oidc`) | `https://<ferriscd-web-host>/auth/callback` |
+| Web UI, server-side cookie (`--oidc-bff-enabled`) | the value of `--oidc-bff-redirect-uri`, normally `https://<ferriscd-web-host>/api/v1/auth/callback` |
+| `ferriscd login --oidc` (CLI) | none — it uses an ephemeral `http://127.0.0.1:<random-port>/callback` loopback redirect (RFC 8252). Register `http://127.0.0.1` as an allowed loopback redirect if your IdP requires an entry (Auth0/Okta accept any port on an exact loopback URI). |
+
+* The SPA redirect URI is **fixed** (`origin + /auth/callback`), not `origin + <current route>`, so the
+  page an operator was on is carried through the sign-in transaction and restored afterwards. The
+  static host therefore has to serve `index.html` for `/auth/callback` exactly as it already does for
+  `/applications/...` deep links.
+* The BFF redirect URI is compared **byte for byte** against `--oidc-bff-redirect-uri`; a request that
+  supplies any other `redirect_uri` to `GET /api/v1/auth/login` is refused before anything is sent to
+  the IdP.
+* Optional but recommended for the BFF flow: enable `--oidc-bff-enabled` with
+  `--oidc-bff-redirect-uri` and `--oidc-bff-session-key-file` (the `sessionKey` entry of the
+  `ferriscd.io/secret-type: oidc` `Secret`, at least 32 bytes). The cookies it issues are all
+  `__Host-` prefixed, `Secure`, `SameSite=Lax` and `Path=/`, so they need an **https** origin (a
+  loopback `http://` dev setup works in Chromium/Firefox, which treat `localhost` as trustworthy).
+
+##### One sign-in at a time per browser (`T19.2`)
+
+The BFF flow binds each pending sign-in to the browser that started it with a **single-valued**
+`__Host-ferriscd_oidc_state` cookie, so a browser profile holds at most one pending sign-in:
+
+* Starting a second sign-in in **another tab or window of the same browser** replaces that cookie, and
+  the first tab's callback is then refused (`400`, "this browser did not start the sign-in"). The
+  first tab has to start again — nothing is signed in and no token was ever exchanged, so the only
+  cost is the click.
+* Two operators on two machines, or two different browser profiles, are unrelated: each has its own
+  cookie jar and its own pending transaction.
+* A sign-in left unfinished simply expires after five minutes (`DEFAULT_TRANSACTION_TTL`, 300 s; the
+  pending transaction has no flag of its own) and can be restarted.
+
+This is a deliberate trade: a per-tab `state` store would need either a cookie per transaction or a
+server-side tab identifier, and the single-use cookie is what makes login CSRF / account swap
+impossible (see `docs/REVIEW_LOG.md`, `T19.2` finding `H1`).
+
+##### CSRF and cross-site sign-out (`T19.2`)
+
+Cookie mode adds two browser-side defences, and both leave one residual worth knowing about:
+
+* **Double-submit CSRF on every mutating request.** A request that carries the session cookie must
+  also echo the sealed CSRF token in the `x-ferriscd-csrf` header **and** in the readable
+  `__Host-ferriscd_csrf` cookie (`403` otherwise). A `Bearer` request is exempt: the CLI and CI cannot
+  be forged by a page, so demanding the header would only break scripted syncs.
+* **A cross-site sign-out is refused.** `SameSite=Lax` withholds the session cookie from a cross-site
+  `POST`, so such a `/api/v1/auth/logout` request has nothing to authenticate — but answering it would
+  still store its `Max-Age=0` cookies, i.e. any page on the internet could sign an operator out. A
+  logout the browser itself labelled `Sec-Fetch-Site: cross-site` is therefore refused `403` before
+  the cookie is looked at; `same-origin`, `none`, and a client that sends no Fetch Metadata header at
+  all (curl, the CLI, an older browser) still work.
+* **`same-site` is deliberately allowed, not an oversight.** The web UI and the API are separate
+  origins in a split-origin deployment (`https://ferriscd.example.com` for the SPA,
+  `https://ferriscd-api.example.com` for the server, or two ports on the same host), and a request
+  between them is labelled `same-site`, not `same-origin`. Refusing it would break every such
+  deployment, so only `cross-site` is refused. The residual, stated plainly: a page on a **sibling
+  subdomain** of the same registrable domain (any other team's app on `*.example.com`) is `same-site`,
+  so its `POST /api/v1/auth/logout` reaches the double-submit check instead of the Fetch Metadata one.
+  With a **usable** session cookie it is still refused `403` (it cannot set the `x-ferriscd-csrf`
+  header, and `Set-Cookie` is never sent on a refusal). What it can still reach is the dead-cookie
+  path: a request with no usable session cookie is let through to the handler, so a sibling subdomain
+  can clear cookies that were already dead — a restart click, nothing signed in, no code exchanged.
+  Host the control plane on its own registrable domain if sibling subdomains are not trusted.
+
+##### Cookie mode has no "am I signed in?" probe (`T19.2`)
+
+A BFF deployment holds the credential in an `HttpOnly` cookie the SPA cannot read, and the server
+exposes no session probe on purpose: `GET /api/v1/auth/login` starts a flow, `POST /api/v1/auth/logout`
+ends one, and nothing answers "is this cookie still good?" — such a route would exist only to be a
+`200`/`401` oracle, and the `401` on any real read already says the same thing.
+
+The cost, stated plainly: on a **cold load with an expired (or rotated-key) cookie** the SPA renders
+the authenticated shell first and only discovers the dead session when its first API call answers
+`401`, at which point the existing `401 → logout` path clears the dead cookie and returns to the
+sign-in screen. That flash of the authenticated shell is the trade for keeping the token in exactly
+one place (an `HttpOnly` cookie, never JavaScript memory or `localStorage`). SPA in-memory mode does
+not have it — it can read the token's `exp` and show the re-auth banner before it expires.
+
 ### HA: `Lease` leader election (`T13.2`) — opt-in
 
 By default the controller runs as a single replica: run exactly one. Two replicas without leader
@@ -500,6 +635,47 @@ Operational notes:
   publishing errors are logged as warnings and never fail reconciliation. Grant
   `apiGroups: ["events.k8s.io"], resources: ["events"], verbs: ["create", "patch", "get", "list"]` (included in
   the `ClusterRole` above).
+
+### Ownership labels for the opt-in drift watcher (`T18.1`)
+
+Under Model 1 a `DriftWatcher` (opt-in, `--enable-drift-watcher`) can only be *label*-scoped: the
+Kubernetes API server cannot filter a watch on annotations. `--enable-drift-watcher`
+(`FERRISCD_ENABLE_DRIFT_WATCHER`, default `false`) therefore also stamps two bounded top-level
+labels onto every **non-hook** managed resource, alongside the existing
+`ferriscd.io/tracking-id` annotation:
+
+| Label | Value | Why |
+|---|---|---|
+| `ferriscd.io/managed-by` | `ferriscd` | the server-side selector (`ferriscd.io/managed-by=ferriscd`) so unmanaged objects never cross the wire |
+| `ferriscd.io/app-hash` | 16 lowercase hex characters | first 16 hex chars (64 bits) of `SHA-256("<app-namespace>/<app-name>")` — identifies the owning `Application` without a 253-character name overflowing the **63-character** label-value limit, and without `ns-a/app` colliding with `ns-b/app` (Finding M5) |
+
+Operational notes:
+
+* **The env value is exactly `true` or `false`.** `FERRISCD_ENABLE_DRIFT_WATCHER` is parsed as a
+  bool, not tested for truthiness: unset (or the flag absent) means **off**, and any other value —
+  including the empty string and `1`/`yes`/`True` — is a **usage error** that stops the controller at
+  startup instead of silently leaving the labels off. In the Helm chart there is no dedicated value;
+  wire it through `server.extraArgs: ["--enable-drift-watcher"]` or
+  `server.extraEnv: [{name: FERRISCD_ENABLE_DRIFT_WATCHER, value: "true"}]`, which
+  `templates/deployment.yaml` passes straight to the `ferriscd` container.
+* **Off by default, and additive when on.** With the flag off the apply body is unchanged (the
+  annotation only). Turning it on adds the pair; turning it back off removes nothing from the
+  desired body and the next sync's Server-Side Apply converges the two labels away — one no-op diff
+  per resource, never a drift loop.
+* **Never in an immutable selector.** The labels go on the object's own `metadata.labels` only.
+  `spec.selector.matchLabels` and `spec.template.metadata.labels` are untouched: they are immutable
+  on `Deployment`/`StatefulSet`/`DaemonSet`, so writing there would fail every later apply with
+  `422 Immutable`.
+* **Lifecycle hooks are never stamped.** A stamped hook would look prunable to the pruner even
+  though its lifetime belongs to its `ferriscd.io/hook-delete-policy`.
+* **No extra RBAC is needed for the labels themselves** — they ride on objects the controller
+  already applies. (The metadata watch a future `DriftWatcher` runs needs
+  `get`/`list`/`watch` on the resource kinds it watches; that is its own opt-in grant.)
+* **Cluster lifecycle is broadcast internally.** `ClusterManager` publishes `Added`, `Rebuilt` and
+  `Removed` events on a bounded (64) channel for `ferriscd.io/secret-type=cluster` secrets —
+  including a cluster whose `Secret` vanished while the watch was reconnecting, which Kubernetes
+  never reports as a delete. A subscriber that falls behind is told so (`Lagged`) and resynchronises
+  against the registry's live name set; the registry never waits for a consumer.
 
 ### Multi-tenancy RBAC matrix
 

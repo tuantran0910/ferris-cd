@@ -417,7 +417,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::diff::decision::{SkipReason, SyncDecision, SyncTrigger, should_sync};
+    use crate::diff::decision::{
+        SkipReason, SyncDecision, SyncTrigger, SyncWindowGate, should_sync,
+    };
     use crate::diff::types::DiffSummary;
 
     const SHA_V1: &str = "1111111111111111111111111111111111111111";
@@ -430,11 +432,12 @@ mod tests {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
             source: SourceSpec {
-                git: GitSourceSpec {
+                git: Some(GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "main".to_owned(),
                     path: String::new(),
-                },
+                }),
+                oci: None,
                 renderer: RendererSpec::default(),
             },
             destination: DestinationSpec {
@@ -697,7 +700,7 @@ mod tests {
 
         // Baseline: the source is unchanged, so self-heal re-applies HEAD on every pass.
         assert_eq!(
-            should_sync(&app, head, SPEC_HASH, &drift, false),
+            should_sync(&app, head, SPEC_HASH, &drift, false, SyncWindowGate::Allow),
             SyncDecision::Execute(SyncTrigger::DriftDetected)
         );
 
@@ -712,7 +715,14 @@ mod tests {
         let mut rolled_back = app.clone();
         assert!(decision.apply_to_spec(&mut rolled_back.spec));
         assert_eq!(
-            should_sync(&rolled_back, head, SPEC_HASH, &drift, false),
+            should_sync(
+                &rolled_back,
+                head,
+                SPEC_HASH,
+                &drift,
+                false,
+                SyncWindowGate::Allow
+            ),
             SyncDecision::Skip(SkipReason::AutomatedDisabled),
             "the pinned revision must survive subsequent requeues"
         );
@@ -724,7 +734,8 @@ mod tests {
                 decision.pinned_revision(),
                 SPEC_HASH,
                 &drift,
-                true
+                true,
+                SyncWindowGate::Allow
             )
             .is_execute()
         );
@@ -882,6 +893,47 @@ mod tests {
             at("2026-11-24T12:00:00Z"),
         );
         assert!(recorded.entry().expect("appended").source_summary.is_none());
+    }
+
+    /// **Pinned today (finding M-D; `T18.4` flip target).** A Git remote that embeds userinfo is
+    /// copied into `status.history[].sourceSummary.repoURL` **verbatim**: neither
+    /// [`SourceSummary::from_source`] nor [`record_sync_success`] — the only place a history entry is
+    /// built from a `SourceSpec` — redacts. This test therefore asserts the current (leaky) shape on
+    /// purpose: `T18.4` must route the summary through `redact_repo_url` and turn this **red**, which
+    /// is the point. Until then it documents the leak instead of leaving it unstated.
+    #[test]
+    fn a_history_source_summary_still_carries_git_userinfo_verbatim() {
+        const SECRET: &str = "ghp-t0ken-in-the-remote";
+        let remote = format!("https://user:{SECRET}@example.com/repo.git");
+
+        let mut source = source();
+        let git = source.git.as_mut().expect("the fixture is a Git source");
+        git.repo_url = remote.clone();
+
+        let mut status = ApplicationStatus::default();
+        let recorded = record_sync_success(
+            &mut status,
+            Some(SHA_V1.to_owned()),
+            Some(&source),
+            10,
+            at("2026-11-24T12:00:00Z"),
+        );
+        recorded.entry().expect("appended");
+
+        let json = serde_json::to_value(&status).expect("status serializes");
+        let recorded_url = json["history"][0]["sourceSummary"]["repoURL"]
+            .as_str()
+            .expect("repoURL is a string");
+        assert_eq!(
+            recorded_url, remote,
+            "today the userinfo is copied as written; T18.4 makes this assertion fail on purpose"
+        );
+        assert!(
+            recorded_url.contains(SECRET),
+            "the pinned shape really does carry the token: {recorded_url}"
+        );
+        // And it is what `/status` ships, not just the in-memory value.
+        assert!(json.to_string().contains(SECRET), "{json}");
     }
 
     fn succeeded_operation(

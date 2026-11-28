@@ -154,7 +154,7 @@ impl NotificationContext {
             app_name: bounded_identity(&app.name_any()),
             app_namespace: bounded_identity(&app.namespace().unwrap_or_default()),
             project: bounded_identity(&app.spec.project),
-            repo_url: redact_repo_url(&app.spec.source.git.repo_url),
+            repo_url: redact_repo_url(app.spec.source.repo_url()),
             revision: bounded_identity(&revision),
             sync_status,
             health_status,
@@ -421,11 +421,12 @@ mod tests {
             project: "payments".to_owned(),
             service_account_name: None,
             source: SourceSpec {
-                git: GitSourceSpec {
+                git: Some(GitSourceSpec {
                     repo_url: repo_url.to_owned(),
                     target_revision: "HEAD".to_owned(),
                     path: String::new(),
-                },
+                }),
+                oci: None,
                 renderer: RendererSpec::default(),
             },
             destination: DestinationSpec {

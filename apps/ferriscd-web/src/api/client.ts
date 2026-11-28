@@ -3,6 +3,7 @@ import type { paths } from "./schema";
 import type {
   ApiErrorBody,
   ApplicationDetailView,
+  AuthConfigView,
   ApplicationEventListView,
   ApplicationListView,
   ClusterListView,
@@ -76,6 +77,36 @@ export interface FerrisApiClient {
   ) => Promise<OperationResponse>;
   listProjects: () => Promise<ProjectListView>;
   listClusters: () => Promise<ClusterListView>;
+  /** `GET /api/v1/auth/config`: the public sign-in discovery document (`T19.1`, used by `T19.2`). */
+  getAuthConfig: () => Promise<AuthConfigView>;
+  /** `POST /api/v1/auth/logout`: expires the optional BFF session cookie (`T19.2`). */
+  logoutSession: () => Promise<void>;
+}
+
+/**
+ * Name of the readable, non-`HttpOnly` double-submit CSRF cookie the BFF flow sets (`T19.2`).
+ *
+ * `__Host-` prefixed, matching the server: the browser only stores it when it is `Secure`, `Path=/`
+ * and carries no `Domain`, so a sibling subdomain cannot plant or overwrite the value.
+ */
+export const CSRF_COOKIE_NAME = "__Host-ferriscd_csrf";
+
+/** Header name the server compares against that cookie (and against the sealed session). */
+export const CSRF_HEADER = "x-ferriscd-csrf";
+
+/** Reads one cookie from `document.cookie`, or `null`. */
+function readCookie(name: string): string | null {
+  if (typeof document === "undefined") {
+    return null;
+  }
+  for (const part of document.cookie.split(";")) {
+    const [key, ...rest] = part.split("=");
+    if (key?.trim() === name) {
+      const value = rest.join("=").trim();
+      return value.length > 0 ? value : null;
+    }
+  }
+  return null;
 }
 
 function extractApiError(
@@ -115,6 +146,16 @@ export function createFerrisApiClient(options: FerrisClientOptions): FerrisApiCl
       const token = options.getToken();
       if (token) {
         request.headers.set("Authorization", `Bearer ${token}`);
+      }
+      // `T19.2`: in the optional BFF cookie mode the server requires a double-submit CSRF header on
+      // every mutating request. It is only present when the BFF flow is enabled (the cookie is set by
+      // the callback), so a token-mode deployment sends nothing extra.
+      const method = request.method.toUpperCase();
+      if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+        const csrf = readCookie(CSRF_COOKIE_NAME);
+        if (csrf) {
+          request.headers.set(CSRF_HEADER, csrf);
+        }
       }
       return request;
     },
@@ -233,6 +274,22 @@ export function createFerrisApiClient(options: FerrisClientOptions): FerrisApiCl
         throw extractApiError(error, response);
       }
       return data;
+    },
+
+    async getAuthConfig() {
+      const { data, error, response } = await raw.GET("/api/v1/auth/config");
+      if (error || !data) {
+        throw extractApiError(error, response);
+      }
+      return data;
+    },
+
+    async logoutSession() {
+      // 404 means the server was started without `--oidc-bff-enabled`: there is no cookie to clear.
+      const { error, response } = await raw.POST("/api/v1/auth/logout");
+      if (error && response?.status !== 404) {
+        throw extractApiError(error, response);
+      }
     },
   };
 }

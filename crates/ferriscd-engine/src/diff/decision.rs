@@ -45,6 +45,12 @@ pub enum SkipReason {
     SelfHealDisabled,
     /// Self-healing is enabled and nothing drifted: live state already matches Git.
     AlreadySynced,
+    /// The `AppProject`'s deployment-governance window blocks this sync right now (`T17.4`).
+    ///
+    /// A window is a *governance* refusal, not a policy violation: drift is still computed and
+    /// reported (`OutOfSync`), the controller still keeps `Ready=True` (`reason=SyncWindowActive`),
+    /// and it requeues for the window boundary instead of waiting for an operator.
+    SyncWindowDenied,
 }
 
 impl SkipReason {
@@ -55,6 +61,7 @@ impl SkipReason {
             Self::AutomatedDisabled => "automatedDisabled",
             Self::SelfHealDisabled => "selfHealDisabled",
             Self::AlreadySynced => "alreadySynced",
+            Self::SyncWindowDenied => "syncWindowDenied",
         }
     }
 }
@@ -67,6 +74,9 @@ impl fmt::Display for SkipReason {
                 f.write_str("self-heal is disabled and the source is unchanged")
             }
             Self::AlreadySynced => f.write_str("live state already matches Git"),
+            Self::SyncWindowDenied => {
+                f.write_str("a sync window of the AppProject blocks this sync right now")
+            }
         }
     }
 }
@@ -250,18 +260,80 @@ fn last_synced(app: &Application) -> (Option<&str>, Option<&str>) {
     )
 }
 
+/// The deployed governance verdict on *when* this pass may sync (`T17.4`).
+///
+/// The engine's window evaluation
+/// ([`SyncWindowVerdict`](crate::policy::sync_windows::SyncWindowVerdict)) is reduced to this
+/// two-state gate so the decision gate stays clock-free: the caller injects the verdict it computed
+/// from its own `now`, exactly as it injects `manual_op`.
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncWindowGate {
+    /// No window blocks this pass (also the verdict of a project with no windows).
+    #[default]
+    Allow,
+    /// A window blocks it. `manual_override` is `true` only when **every** blocking window sets
+    /// `manualSync: true`, in which case a `Manual` trigger is still honoured.
+    Deny { manual_override: bool },
+}
+
+impl SyncWindowGate {
+    /// Builds the gate from a window verdict.
+    #[must_use]
+    pub fn from_verdict(verdict: &crate::policy::SyncWindowVerdict) -> Self {
+        match verdict.denial() {
+            None => Self::Allow,
+            Some(denial) => Self::Deny {
+                manual_override: denial.allows_manual(),
+            },
+        }
+    }
+
+    /// Whether a `Manual` trigger may ignore the window.
+    #[must_use]
+    pub const fn allows_manual(self) -> bool {
+        match self {
+            Self::Allow => true,
+            Self::Deny { manual_override } => manual_override,
+        }
+    }
+
+    /// Whether the gate blocks an automated sync.
+    #[must_use]
+    pub const fn is_denied(self) -> bool {
+        matches!(self, Self::Deny { .. })
+    }
+}
+
+impl fmt::Display for SyncWindowGate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Allow => f.write_str("allow"),
+            Self::Deny { manual_override } => {
+                write!(f, "deny (manual override: {manual_override})")
+            }
+        }
+    }
+}
+
 /// Decides whether this reconcile should apply the desired set.
 ///
 /// The order of the checks is the specification, not an implementation detail:
 ///
-/// 1. a manual operation always executes (it bypasses every policy),
-/// 2. `automated: None` never executes automatically,
-/// 3. `selfHeal: false` executes **only** on a source change (revision or spec hash),
-/// 4. `selfHeal: true` executes on a source change, then on drift, then on a prune-eligible
+/// 1. a `Deny` sync window blocks the pass — including a manual one, unless every blocking window
+///    sets `manualSync: true` (`T17.4`),
+/// 2. a manual operation always executes (it bypasses every sync *policy*),
+/// 3. `automated: None` never executes automatically,
+/// 4. `selfHeal: false` executes **only** on a source change (revision or spec hash),
+/// 5. `selfHeal: true` executes on a source change, then on drift, then on a prune-eligible
 ///    orphan.
 ///
 /// `manual_op` is the caller's verdict on `ferriscd.io/operation`/CLI/API requests; this
-/// function never reads annotations itself (that is the controller's job in `T07.5`).
+/// function never reads annotations itself (that is the controller's job in `T07.5`). `window` is
+/// the caller's verdict on `AppProject.spec.syncWindows`, evaluated at the caller's `now`: this
+/// function never reads a clock, so a blocked pass is reproducible in a unit test.
 #[must_use]
 pub fn should_sync(
     app: &Application,
@@ -269,7 +341,15 @@ pub fn should_sync(
     source_spec_hash: &str,
     diff_summary: &DiffSummary,
     manual_op: bool,
+    window: SyncWindowGate,
 ) -> SyncDecision {
+    // `T17.4` trap guard: a blocked window wins over *everything*, including a manual request,
+    // unless the project explicitly opted that window into manual override. Automated triggers are
+    // never overridden (`window.allows_manual()` is only consulted together with `manual_op`).
+    if window.is_denied() && !(manual_op && window.allows_manual()) {
+        return SyncDecision::Skip(SkipReason::SyncWindowDenied);
+    }
+
     if manual_op {
         return SyncDecision::Execute(SyncTrigger::Manual);
     }
@@ -322,16 +402,36 @@ mod tests {
     use crate::diff::types::{DiffStatus, ResourceDiff};
     use crate::manifest::ResourceKey;
 
+    /// Every pre-`T17.4` test exercises the gate with **no** sync window: the shim keeps those
+    /// truth tables unchanged, and the window cases call `super::should_sync` explicitly.
+    fn should_sync(
+        app: &Application,
+        resolved_sha: &str,
+        source_spec_hash: &str,
+        diff_summary: &DiffSummary,
+        manual_op: bool,
+    ) -> SyncDecision {
+        super::should_sync(
+            app,
+            resolved_sha,
+            source_spec_hash,
+            diff_summary,
+            manual_op,
+            SyncWindowGate::Allow,
+        )
+    }
+
     fn spec() -> ApplicationSpec {
         ApplicationSpec {
             project: ferriscd_crd::DEFAULT_PROJECT_NAME.to_owned(),
             service_account_name: None,
             source: SourceSpec {
-                git: GitSourceSpec {
+                git: Some(GitSourceSpec {
                     repo_url: "https://example.com/repo.git".to_owned(),
                     target_revision: "main".to_owned(),
                     path: "deploy/production".to_owned(),
-                },
+                }),
+                oci: None,
                 renderer: RendererSpec::default(),
             },
             destination: DestinationSpec {
@@ -615,7 +715,7 @@ mod tests {
     fn a_git_path_edit_with_an_unchanged_sha_triggers_a_sync() {
         let before = spec();
         let mut after = spec();
-        after.source.git.path = "deploy/staging".to_owned();
+        after.source.git.as_mut().expect("git source").path = "deploy/staging".to_owned();
 
         let before_hash = source_spec_hash(&before).expect("hash");
         let after_hash = source_spec_hash(&after).expect("hash");
@@ -684,19 +784,24 @@ mod tests {
             (
                 "repoURL",
                 Box::new(|spec: &mut ApplicationSpec| {
-                    spec.source.git.repo_url = "https://example.com/other.git".to_owned();
+                    spec.source.git.as_mut().expect("git source").repo_url =
+                        "https://example.com/other.git".to_owned();
                 }),
             ),
             (
                 "targetRevision",
                 Box::new(|spec: &mut ApplicationSpec| {
-                    spec.source.git.target_revision = "release".to_owned();
+                    spec.source
+                        .git
+                        .as_mut()
+                        .expect("git source")
+                        .target_revision = "release".to_owned();
                 }),
             ),
             (
                 "path",
                 Box::new(|spec: &mut ApplicationSpec| {
-                    spec.source.git.path = String::new();
+                    spec.source.git.as_mut().expect("git source").path = String::new();
                 }),
             ),
             (
@@ -762,6 +867,176 @@ mod tests {
         );
         assert_eq!(canonical_json(&json!(null)), "null");
         assert_eq!(canonical_json(&json!([true, "s"])), r#"[true,"s"]"#);
+    }
+
+    // ------------------------------------------------------------------
+    // Sync windows (T17.4)
+    // ------------------------------------------------------------------
+
+    /// A blocked window stops **every** automated trigger, whatever the drift verdict is.
+    #[test]
+    fn a_deny_window_blocks_every_automated_trigger() {
+        let denied = SyncWindowGate::Deny {
+            manual_override: false,
+        };
+        assert!(denied.is_denied());
+        assert!(!denied.allows_manual());
+
+        // `automated: None`, `selfHeal: false`, and `selfHeal: true` all skip identically, and the
+        // reason is the window — never `AutomatedDisabled`/`SelfHealDisabled` — so the operator sees
+        // governance rather than a policy they did not change.
+        for automated in [None, Some(policy(false, false)), Some(policy(true, true))] {
+            for diff in [summary(0, 0, 0), summary(3, 2, 1)] {
+                for (resolved, hash) in [(SHA, HASH), ("new-sha", OTHER_HASH)] {
+                    let app = app_with(automated, Some((SHA, HASH)));
+                    assert_eq!(
+                        super::should_sync(&app, resolved, hash, &diff, false, denied),
+                        SyncDecision::Skip(SkipReason::SyncWindowDenied),
+                        "a deny window must block even a source change"
+                    );
+                }
+            }
+        }
+        // A never-synced application is blocked too (the window is not "wait for the first sync").
+        let fresh = app_with(Some(policy(true, true)), None);
+        assert_eq!(
+            super::should_sync(&fresh, SHA, HASH, &summary(5, 5, 5), false, denied),
+            SyncDecision::Skip(SkipReason::SyncWindowDenied)
+        );
+    }
+
+    /// `manualSync: true` overrides only a **manual** trigger — never an automated one.
+    #[test]
+    fn a_manual_override_applies_only_to_the_manual_trigger() {
+        let overridable = SyncWindowGate::Deny {
+            manual_override: true,
+        };
+        assert!(overridable.allows_manual());
+        assert!(overridable.is_denied(), "the gate is still a denial");
+
+        let app = app_with(Some(policy(true, true)), Some((SHA, HASH)));
+        assert_eq!(
+            super::should_sync(&app, SHA, HASH, &summary(0, 0, 0), true, overridable),
+            SyncDecision::Execute(SyncTrigger::Manual),
+            "manualSync: true lets a human break glass"
+        );
+        // The same app, same window, automated trigger: still skipped. The override is not a
+        // self-heal switch.
+        for diff in [summary(0, 0, 0), summary(4, 0, 0)] {
+            assert_eq!(
+                super::should_sync(&app, SHA, HASH, &diff, false, overridable),
+                SyncDecision::Skip(SkipReason::SyncWindowDenied)
+            );
+        }
+        // ...and a source change does not sneak through either.
+        assert_eq!(
+            super::should_sync(
+                &app,
+                "new-sha",
+                OTHER_HASH,
+                &summary(0, 0, 0),
+                false,
+                overridable
+            ),
+            SyncDecision::Skip(SkipReason::SyncWindowDenied)
+        );
+
+        // Without the override, even a manual request is refused.
+        let strict = SyncWindowGate::Deny {
+            manual_override: false,
+        };
+        assert_eq!(
+            super::should_sync(&app, SHA, HASH, &summary(0, 0, 0), true, strict),
+            SyncDecision::Skip(SkipReason::SyncWindowDenied)
+        );
+
+        // An allowing gate changes nothing about the pre-existing truth table.
+        for manual in [false, true] {
+            let expected = if manual {
+                SyncDecision::Execute(SyncTrigger::Manual)
+            } else {
+                SyncDecision::Skip(SkipReason::SelfHealDisabled)
+            };
+            let source_only = app_with(Some(policy(false, false)), Some((SHA, HASH)));
+            assert_eq!(
+                super::should_sync(
+                    &source_only,
+                    SHA,
+                    HASH,
+                    &summary(0, 0, 0),
+                    manual,
+                    SyncWindowGate::Allow
+                ),
+                expected
+            );
+        }
+    }
+
+    /// The gate is derived from the engine's verdict, so the two can never disagree.
+    #[test]
+    fn the_gate_mirrors_the_window_verdict() {
+        use ferriscd_crd::{SyncWindow, SyncWindowKind};
+
+        use crate::policy::{SyncWindowSet, SyncWindowTarget};
+
+        fn verdict_at(windows: &[SyncWindow], now: &str) -> crate::policy::SyncWindowVerdict {
+            let now = now.parse().expect("test timestamp");
+            SyncWindowSet::compile(windows).evaluate(
+                now,
+                &SyncWindowTarget::new("payments-api", "ferriscd-system", "in-cluster"),
+            )
+        }
+
+        // (No windows) → Allow.
+        assert_eq!(
+            SyncWindowGate::from_verdict(&verdict_at(&[], "2026-01-07T12:00:00Z")),
+            SyncWindowGate::Allow
+        );
+        // (Active deny, no manualSync) → Deny, no override.
+        let blocking = SyncWindow {
+            kind: SyncWindowKind::Deny,
+            schedule: "0 0 * * *".to_owned(),
+            duration: "24h".to_owned(),
+            time_zone: None,
+            applications: Vec::new(),
+            namespaces: Vec::new(),
+            clusters: Vec::new(),
+            manual_sync: false,
+        };
+        assert_eq!(
+            SyncWindowGate::from_verdict(&verdict_at(
+                std::slice::from_ref(&blocking),
+                "2026-01-07T12:00:00Z"
+            )),
+            SyncWindowGate::Deny {
+                manual_override: false
+            }
+        );
+        let mut overridable = blocking;
+        overridable.manual_sync = true;
+        assert_eq!(
+            SyncWindowGate::from_verdict(&verdict_at(&[overridable], "2026-01-07T12:00:00Z")),
+            SyncWindowGate::Deny {
+                manual_override: true
+            }
+        );
+        assert_eq!(SyncWindowGate::default(), SyncWindowGate::Allow);
+        assert_eq!(SyncWindowGate::Allow.to_string(), "allow");
+        assert_eq!(
+            SyncWindowGate::Deny {
+                manual_override: false
+            }
+            .to_string(),
+            "deny (manual override: false)"
+        );
+        assert_eq!(
+            serde_json::to_value(SkipReason::SyncWindowDenied).expect("serialize"),
+            json!("syncWindowDenied")
+        );
+        assert_eq!(
+            SkipReason::SyncWindowDenied.to_string(),
+            "a sync window of the AppProject blocks this sync right now"
+        );
     }
 
     #[test]

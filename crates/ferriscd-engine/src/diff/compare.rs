@@ -668,4 +668,126 @@ mod tests {
         assert_eq!(missing.status(), &DiffStatus::Missing);
         assert!(DiffSummary::from_diffs([&missing]).has_drift());
     }
+
+    /// The object a sync applies once `stamp_tracking_id` ran with the `T18.1` label pair, plus the
+    /// volatile metadata the API server stamps.
+    fn stamped_deployment(labels: Option<Value>, resource_version: &str) -> Value {
+        let mut object = deployment_key_document();
+        if let Some(labels) = labels {
+            object["metadata"]["labels"] = labels;
+        }
+        object["metadata"]["resourceVersion"] = json!(resource_version);
+        object
+    }
+
+    /// The desired payload without any FerrisCD-owned metadata (`stamp_tracking_id` not yet run).
+    fn deployment_key_document() -> Value {
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "api", "namespace": "payments", "labels": { "app": "api" } },
+            "spec": { "replicas": 2 },
+        })
+    }
+
+    fn stamped_labels() -> Value {
+        json!({
+            "app": "api",
+            "ferriscd.io/managed-by": "ferriscd",
+            "ferriscd.io/app-hash": "056646ef98cff795",
+        })
+    }
+
+    /// **`T18.1`:** the stamped ownership labels are ordinary `metadata.labels` as far as the diff is
+    /// concerned, and the comparison is deterministic — so toggling `--enable-drift-watcher` costs
+    /// exactly one sync, in both directions, and never a drift loop.
+    #[test]
+    fn stamped_ownership_labels_diff_deterministically_and_converge() {
+        let rules = IgnoreRuleSet::default();
+
+        // Flag ON, already converged: the live object carries the two labels and the `dryRun=All`
+        // prediction of re-applying the same stamped body predicts them again → zero drift.
+        let converged_live = stamped_deployment(Some(stamped_labels()), "100");
+        let reapply = stamped_deployment(Some(stamped_labels()), "101");
+        let diff = ResourceDiff::compare(&deployment_key(), &converged_live, &reapply, &rules);
+        assert_eq!(
+            diff.status(),
+            &DiffStatus::Synced,
+            "a stamped object must never look drifted against its own re-apply: {:?}",
+            diff.changes()
+        );
+
+        // Flag ON, not yet converged: the live object predates the labels, so the diff reports
+        // exactly the two additions — and reports them in a stable order. The label keys are
+        // escaped as RFC 6901 tokens (`/` -> `~1`), so the report stays a valid JSON Pointer.
+        let untouched_live = stamped_deployment(None, "100");
+        let first = ResourceDiff::compare(&deployment_key(), &untouched_live, &reapply, &rules);
+        assert_eq!(first.status(), &DiffStatus::OutOfSync);
+        assert_eq!(
+            first
+                .changes()
+                .iter()
+                .map(|change| (change.path.as_str(), change.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/metadata/labels/ferriscd.io~1app-hash", ChangeKind::Added),
+                (
+                    "/metadata/labels/ferriscd.io~1managed-by",
+                    ChangeKind::Added
+                ),
+            ],
+            "exactly the two bounded labels are added, sorted by path"
+        );
+        // Key insertion order never changes the report (the label map is rebuilt in reverse).
+        let reversed = json!({
+            "ferriscd.io/app-hash": "056646ef98cff795",
+            "ferriscd.io/managed-by": "ferriscd",
+            "app": "api",
+        });
+        let second = ResourceDiff::compare(
+            &deployment_key(),
+            &untouched_live,
+            &stamped_deployment(Some(reversed), "101"),
+            &rules,
+        );
+        assert_eq!(first.changes(), second.changes());
+
+        // Flag OFF after an opted-in sync: the labels are live but no longer in the desired body, so
+        // one apply removes them. Comparing the post-apply prediction is then `Synced` — one sync,
+        // not a loop.
+        let without_labels = stamped_deployment(None, "102");
+        let removal =
+            ResourceDiff::compare(&deployment_key(), &converged_live, &without_labels, &rules);
+        assert_eq!(removal.status(), &DiffStatus::OutOfSync);
+        assert_eq!(
+            removal
+                .changes()
+                .iter()
+                .map(|change| (change.path.as_str(), change.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "/metadata/labels/ferriscd.io~1app-hash",
+                    ChangeKind::Removed
+                ),
+                (
+                    "/metadata/labels/ferriscd.io~1managed-by",
+                    ChangeKind::Removed
+                ),
+            ],
+            "turning the flag off converges by removing exactly the two labels FerrisCD owns"
+        );
+        let after_apply = ResourceDiff::compare(
+            &deployment_key(),
+            &without_labels,
+            &stamped_deployment(None, "103"),
+            &rules,
+        );
+        assert_eq!(
+            after_apply.status(),
+            &DiffStatus::Synced,
+            "the removal must converge on the next sync: {:?}",
+            after_apply.changes()
+        );
+    }
 }

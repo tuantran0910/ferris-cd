@@ -77,6 +77,12 @@ pub enum ApiError {
         /// The limit that was exceeded, in bytes.
         limit: usize,
     },
+    /// The caller is asking too often (`T19.2`: the per-client sign-in budget on
+    /// `/api/v1/auth/login`). Retrying immediately cannot help; waiting can.
+    TooManyRequests {
+        /// Explanation, secret-free.
+        message: String,
+    },
 }
 
 impl ApiError {
@@ -114,6 +120,14 @@ impl ApiError {
         }
     }
 
+    /// Builds a [`Self::TooManyRequests`].
+    #[must_use]
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self::TooManyRequests {
+            message: bounded(&message.into()),
+        }
+    }
+
     /// Builds an [`Self::Unauthorized`].
     #[must_use]
     pub fn unauthorized(message: impl Into<String>) -> Self {
@@ -146,6 +160,7 @@ impl ApiError {
             Self::Forbidden { .. } => "Forbidden",
             Self::Backend { .. } => "BackendUnavailable",
             Self::PayloadTooLarge { .. } => "PayloadTooLarge",
+            Self::TooManyRequests { .. } => "TooManyRequests",
         }
     }
 
@@ -161,6 +176,7 @@ impl ApiError {
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::Backend { .. } => StatusCode::BAD_GATEWAY,
             Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -178,6 +194,7 @@ impl ApiError {
             | Self::Unprocessable { message }
             | Self::Unauthorized { message }
             | Self::Forbidden { message }
+            | Self::TooManyRequests { message }
             | Self::Backend { message } => message.clone(),
             Self::PayloadTooLarge { limit } => {
                 format!("the request body exceeds the {limit} byte limit")
@@ -200,7 +217,7 @@ pub struct ApiErrorBody {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiErrorDetail {
     /// Stable code (`NotFound`, `BadRequest`, `Conflict`, `Unprocessable`, `Unauthorized`,
-    /// `Forbidden`, `BackendUnavailable`, `PayloadTooLarge`).
+    /// `Forbidden`, `BackendUnavailable`, `PayloadTooLarge`, `TooManyRequests`).
     pub code: String,
     /// Human-readable explanation, secret-free.
     pub message: String,
@@ -266,6 +283,7 @@ mod tests {
             },
             ApiError::backend(&"cluster unreachable"),
             ApiError::PayloadTooLarge { limit: 1024 },
+            ApiError::too_many_requests("too many sign-ins"),
         ];
         let mut codes = std::collections::HashSet::new();
         for variant in &variants {
@@ -282,6 +300,7 @@ mod tests {
         assert_eq!(variants[5].status(), StatusCode::FORBIDDEN);
         assert_eq!(variants[6].status(), StatusCode::BAD_GATEWAY);
         assert_eq!(variants[7].status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(variants[8].status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

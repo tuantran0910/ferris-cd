@@ -1347,8 +1347,13 @@ mod tests {
         .expect("valid bundle");
 
         for resource in partition.permanent_mut() {
-            crate::inventory::stamp_tracking_id(resource, "ferriscd-system", "demo-app")
-                .expect("a plain annotation stamp never fails");
+            crate::inventory::stamp_tracking_id(
+                resource,
+                "ferriscd-system",
+                "demo-app",
+                crate::inventory::StampOptions::default(),
+            )
+            .expect("a plain annotation stamp never fails");
         }
 
         let stamped = &partition.permanent()[0];
