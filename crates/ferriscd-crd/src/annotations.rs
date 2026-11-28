@@ -43,6 +43,40 @@ pub const SYNC_OPTIONS: &str = "ferriscd.io/sync-options";
 /// `ferriscd.io/prune` — `"false"` opts a single live resource out of pruning.
 pub const PRUNE: &str = "ferriscd.io/prune";
 
+/// Prefix of every notification subscription annotation (`T19.4`).
+///
+/// Deliberately **outside** [`CONTROL_ANNOTATIONS`]: subscribing an `Application` to a notification
+/// service changes nothing about how it is reconciled, so the composite watch predicate must ignore
+/// it (an edit emits no reconcile). It is `notifications.ferriscd.io/`, not
+/// [`PREFIX`]`notifications/`, so a tenant cannot mistake it for a control annotation.
+pub const NOTIFICATIONS_PREFIX: &str = "notifications.ferriscd.io/";
+
+/// Prefix of the opt-in notification subscription annotations (`T19.4`).
+///
+/// Full key: `notifications.ferriscd.io/subscribe.<trigger>.<service>`, value: the recipient (the
+/// name of a `ferriscd.io/secret-type=notifications` `Secret` in the control-plane namespace).
+pub const NOTIFICATIONS_SUBSCRIBE_PREFIX: &str = "notifications.ferriscd.io/subscribe.";
+
+/// Trigger: a sync pass succeeded (edge-triggered on entering `Synced`).
+pub const TRIGGER_SYNC_SUCCEEDED: &str = "on-sync-succeeded";
+
+/// Trigger: a sync/reconcile failed (`Ready=False`, edge-triggered).
+pub const TRIGGER_SYNC_FAILED: &str = "on-sync-failed";
+
+/// Trigger: the aggregated health degraded (edge-triggered on entering `Degraded`).
+pub const TRIGGER_HEALTH_DEGRADED: &str = "on-health-degraded";
+
+/// Trigger: the `Application` is out of sync (debounced, see `T19.4`).
+pub const TRIGGER_OUT_OF_SYNC: &str = "on-out-of-sync";
+
+/// Every notification trigger, in documentation order.
+pub const TRIGGER_NAMES: [&str; 4] = [
+    TRIGGER_SYNC_SUCCEEDED,
+    TRIGGER_SYNC_FAILED,
+    TRIGGER_HEALTH_DEGRADED,
+    TRIGGER_OUT_OF_SYNC,
+];
+
 /// Every canonical control annotation key.
 ///
 /// Watch predicates (Phase 05) hash exactly this set plus finalizers and deletion
@@ -115,6 +149,36 @@ mod tests {
         assert_eq!(HOOK_DELETE_POLICY, "ferriscd.io/hook-delete-policy");
         assert_eq!(SYNC_OPTIONS, "ferriscd.io/sync-options");
         assert_eq!(PRUNE, "ferriscd.io/prune");
+    }
+
+    /// **`T19.4`:** the notification subscription keys live outside [`CONTROL_ANNOTATIONS`] (an edit
+    /// must never trigger a reconcile) and their trigger names match the roadmap spelling exactly.
+    #[test]
+    fn notification_annotations_are_outside_the_control_set() {
+        assert_eq!(
+            NOTIFICATIONS_SUBSCRIBE_PREFIX,
+            "notifications.ferriscd.io/subscribe."
+        );
+        assert!(NOTIFICATIONS_SUBSCRIBE_PREFIX.starts_with(NOTIFICATIONS_PREFIX));
+        for key in CONTROL_ANNOTATIONS {
+            assert!(
+                !key.starts_with("notifications."),
+                "{key} must not be a control annotation"
+            );
+        }
+        assert_eq!(
+            TRIGGER_NAMES,
+            [
+                "on-sync-succeeded",
+                "on-sync-failed",
+                "on-health-degraded",
+                "on-out-of-sync",
+            ]
+        );
+        let mut seen = HashSet::new();
+        for trigger in TRIGGER_NAMES {
+            assert!(seen.insert(trigger), "duplicate trigger {trigger}");
+        }
     }
 
     #[test]
