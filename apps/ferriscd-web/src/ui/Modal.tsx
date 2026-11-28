@@ -13,6 +13,8 @@ export interface ModalProps {
   dialogRef?: RefObject<HTMLDivElement | null>;
   /** Panel width utility, e.g. "max-w-lg" (default) or "max-w-2xl". */
   panelClassName?: string;
+  /** Close when the dimmed backdrop is clicked (opt-in per modal). */
+  onBackdropClick?: () => void;
   children: ReactNode;
 }
 
@@ -29,8 +31,8 @@ export interface ModalProps {
  * under `prefers-reduced-motion: reduce`. The backdrop is a separate layer so
  * fading it does not fade the panel with it.
  *
- * No backdrop click handler: closing behaviour (Escape, Cancel, close button)
- * stays exactly where it was, inside each feature modal.
+ * Backdrop clicks are opt-in: the command palette closes on outside clicks,
+ * while the Sync/Rollback modals keep their explicit close paths.
  */
 export function Modal({
   open,
@@ -38,6 +40,7 @@ export function Modal({
   describedBy,
   dialogRef,
   panelClassName,
+  onBackdropClick,
   children,
 }: ModalProps) {
   if (!open) {
@@ -54,6 +57,8 @@ export function Modal({
     >
       <div
         aria-hidden="true"
+        data-testid="modal-backdrop"
+        onClick={onBackdropClick}
         className="motion-fade-in fixed inset-0 bg-slate-950/80 backdrop-blur-sm"
       />
       <div className="relative flex min-h-full items-center justify-center p-4">

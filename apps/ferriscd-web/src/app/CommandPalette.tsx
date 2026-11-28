@@ -218,7 +218,13 @@ function CommandPaletteDialog({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <Modal open labelledBy="command-palette-title" dialogRef={dialogRef} panelClassName="max-w-xl">
+    <Modal
+      open
+      labelledBy="command-palette-title"
+      dialogRef={dialogRef}
+      panelClassName="max-w-xl"
+      onBackdropClick={onClose}
+    >
       <h2 id="command-palette-title" data-command-palette="true" className="sr-only">
         Command palette
       </h2>
